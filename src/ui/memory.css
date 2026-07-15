@@ -1,0 +1,232 @@
+@layer components {
+  .stx-memory-surface {
+    --stx-memory-fg: var(--SmartThemeBodyColor, #edf2f7);
+    --stx-memory-bg: var(--SmartThemeBlurTintColor, #141a22);
+    --stx-memory-border: var(--SmartThemeBorderColor, #667085);
+    --stx-memory-accent: var(--SmartThemeQuoteColor, #67d8ef);
+    --stx-memory-danger: var(--SmartThemeEmColor, #ff8b96);
+    color: var(--stx-memory-fg);
+    background: color-mix(in srgb, var(--stx-memory-bg) 96%, transparent);
+    border-color: var(--stx-memory-border);
+    font-family: var(--mainFontFamily, inherit);
+    color-scheme: dark light;
+  }
+
+  dialog.stx-memory-surface::backdrop {
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor) 72%, transparent);
+  }
+
+  .stx-memory-input {
+    color: var(--stx-memory-fg);
+    background: color-mix(in srgb, var(--stx-memory-bg) 90%, var(--stx-memory-fg) 10%);
+    border-color: var(--stx-memory-border);
+  }
+
+  .stx-memory-input option {
+    color: var(--stx-memory-fg);
+    background: var(--stx-memory-bg);
+  }
+
+  .stx-memory-input::placeholder {
+    color: color-mix(in srgb, var(--SmartThemeBodyColor) 58%, transparent);
+  }
+
+  .stx-memory-muted {
+    color: color-mix(in srgb, var(--stx-memory-fg) 76%, transparent);
+  }
+
+  .stx-memory-divider {
+    border-color: color-mix(in srgb, var(--SmartThemeBorderColor) 62%, transparent);
+  }
+
+  .stx-memory-option,
+  .stx-memory-card,
+  .stx-memory-code {
+    color: var(--SmartThemeBodyColor);
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor) 88%, var(--SmartThemeBodyColor) 12%);
+    border-color: color-mix(in srgb, var(--SmartThemeBorderColor) 72%, transparent);
+  }
+
+  .stx-memory-card:hover {
+    border-color: var(--SmartThemeBorderColor);
+  }
+
+  .stx-memory-tag {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.5rem;
+    padding: 0.15rem 0.55rem;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeQuoteColor) 62%, transparent);
+    border-radius: 999px;
+    color: var(--SmartThemeBodyColor);
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor) 24%, var(--SmartThemeBlurTintColor) 76%);
+  }
+
+  .stx-memory-details {
+    color: color-mix(in srgb, var(--SmartThemeBodyColor) 82%, transparent);
+  }
+
+  .stx-memory-evidence {
+    border-color: color-mix(in srgb, var(--SmartThemeQuoteColor) 58%, transparent);
+  }
+
+  .stx-memory-estimate {
+    color: var(--SmartThemeBodyColor);
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor) 14%, var(--SmartThemeBlurTintColor) 86%);
+    border-color: color-mix(in srgb, var(--SmartThemeQuoteColor) 58%, var(--SmartThemeBorderColor) 42%);
+  }
+
+  .stx-memory-button {
+    color: var(--SmartThemeBodyColor);
+    border-color: var(--SmartThemeBorderColor);
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor) 84%, var(--SmartThemeBodyColor) 16%);
+    transition: background-color 140ms ease, border-color 140ms ease, opacity 140ms ease;
+  }
+
+  .stx-memory-button:hover:not(:disabled),
+  .stx-memory-button:focus-visible {
+    color: var(--SmartThemeBodyColor);
+    border-color: var(--SmartThemeQuoteColor);
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor) 30%, var(--SmartThemeBlurTintColor) 70%);
+  }
+
+  .stx-memory-button:focus-visible,
+  .stx-memory-input:focus-visible {
+    outline: 2px solid var(--SmartThemeQuoteColor);
+    outline-offset: 2px;
+  }
+
+  .stx-memory-button-primary {
+    border-color: var(--SmartThemeQuoteColor);
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor) 38%, var(--SmartThemeBlurTintColor) 62%);
+  }
+
+  .stx-memory-button-quiet {
+    border-color: transparent;
+    background: transparent;
+  }
+
+  .stx-memory-button-danger,
+  .stx-memory-alert {
+    color: var(--SmartThemeEmColor);
+    border-color: color-mix(in srgb, var(--SmartThemeEmColor) 62%, transparent);
+    background: color-mix(in srgb, var(--SmartThemeEmColor) 14%, var(--SmartThemeBlurTintColor) 86%);
+  }
+
+  .stx-memory-button-danger:hover:not(:disabled),
+  .stx-memory-button-danger:focus-visible {
+    color: var(--SmartThemeEmColor);
+    border-color: var(--SmartThemeEmColor);
+    background: color-mix(in srgb, var(--SmartThemeEmColor) 24%, var(--SmartThemeBlurTintColor) 76%);
+  }
+
+  .stx-memory-button:disabled {
+    cursor: wait;
+    opacity: 0.62;
+  }
+
+  .stx-memory-warning {
+    color: color-mix(in srgb, var(--stx-memory-danger) 82%, var(--stx-memory-fg) 18%);
+  }
+
+  .stx-memory-audit-card,
+  .stx-memory-capability,
+  .stx-memory-progress {
+    color: var(--stx-memory-fg);
+    background: color-mix(in srgb, var(--stx-memory-bg) 88%, var(--stx-memory-fg) 12%);
+    border-color: color-mix(in srgb, var(--stx-memory-border) 72%, transparent);
+  }
+
+  .stx-memory-progress progress {
+    height: 0.65rem;
+    accent-color: var(--stx-memory-accent);
+  }
+
+  .stx-memory-sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .stx-memory-surface button,
+  .stx-memory-surface select,
+  .stx-memory-surface input:not([type='checkbox']):not([type='range']) {
+    min-height: 2.75rem;
+  }
+
+  .stx-memory-surface input[type='checkbox'],
+  .stx-memory-surface input[type='range'] {
+    accent-color: var(--SmartThemeQuoteColor);
+  }
+
+  .memory-recall-status,
+  .memory-advanced-recall,
+  .memory-sqlite-status {
+    color: var(--stx-memory-fg);
+    background: color-mix(in srgb, var(--stx-memory-bg) 92%, var(--stx-memory-fg) 8%);
+    border-color: color-mix(in srgb, var(--stx-memory-border) 78%, transparent);
+  }
+
+  .memory-vector-coverage {
+    height: 0.65rem;
+    accent-color: var(--stx-memory-accent);
+  }
+
+  .memory-sqlite-status.stx-memory-alert {
+    color: var(--stx-memory-fg);
+    border-color: color-mix(in srgb, var(--stx-memory-danger) 72%, var(--stx-memory-border) 28%);
+    background: color-mix(in srgb, var(--stx-memory-danger) 12%, var(--stx-memory-bg) 88%);
+  }
+
+  .memory-sqlite-summary > div,
+  .memory-sqlite-status details dl > div {
+    min-width: 0;
+    padding: 0.5rem;
+    border: 1px solid color-mix(in srgb, var(--stx-memory-border) 55%, transparent);
+    border-radius: 0.5rem;
+    background: color-mix(in srgb, var(--stx-memory-bg) 92%, var(--stx-memory-fg) 8%);
+  }
+
+  .memory-advanced-recall summary:focus-visible,
+  .stx-memory-surface input[type='checkbox']:focus-visible,
+  .stx-memory-surface input[type='range']:focus-visible {
+    outline: 2px solid var(--stx-memory-accent);
+    outline-offset: 3px;
+  }
+}
+
+@media (max-width: 640px) {
+  dialog.stx-memory-surface {
+    width: min(98vw, 880px);
+    height: 94vh;
+  }
+
+  .memory-recall-grid,
+  .memory-route-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stx-memory-surface *,
+  .stx-memory-surface *::before,
+  .stx-memory-surface *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .stx-memory-surface,
+  .stx-memory-card,
+  .stx-memory-button,
+  .stx-memory-input {
+    border-color: CanvasText;
+  }
+}

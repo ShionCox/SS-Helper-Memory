@@ -1,0 +1,81 @@
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+test-results/
+testbed/
+
+# Build and tool caches
+.cache/
+cache/
+*.cache
+.vite/
+.turbo/
+.parcel-cache/
+.eslintcache
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Temporary files
+.verification-temp/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local databases and SQLite sidecars
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+!test/fixtures/**/*.db
+!test/fixtures/**/*.sqlite
+!test/fixtures/**/*.sqlite3
+
+# Generated package archives (retain the vendored SDK artifact)
+*.tgz
+!vendor/ss-helper-sdk-1.0.0.tgz
+
+# OMX runtime state
+.omx/

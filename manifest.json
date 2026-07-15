@@ -1,0 +1,15 @@
+{
+  "id": "stx_memory",
+  "display_name": "SS-Helper [记忆]",
+  "loading_order": -9,
+  "requires": [],
+  "dependencies": ["third-party/SS-Helper-SDK"],
+  "optional": [],
+  "js": "dist/index.js",
+  "css": "dist/style.css",
+  "author": "Shion",
+  "version": "V0.0.2",
+  "auto_update": false,
+  "homePage": "https://github.com/ShionCox/SillyTavern-SS-Helper",
+  "email": "348591466@qq.com"
+}
