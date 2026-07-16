@@ -9,13 +9,13 @@ async function readJson(relativePath: string): Promise<Record<string, unknown>> 
 }
 
 describe('版本元数据', () => {
-  it('分别声明插件 V0.0.2 与服务端 0.0.1', async () => {
+  it('只声明前端插件 V0.0.2，不再拥有 Memory 服务端版本', async () => {
     const manifest = await readJson('manifest.json');
     const clientPackage = await readJson('package.json');
-    const serverPackage = await readJson('server/package.json');
+    const config = await readJson('plugin.config.json');
 
     expect(manifest.version).toBe('V0.0.2');
     expect(clientPackage).not.toHaveProperty('version');
-    expect(serverPackage.version).toBe('0.0.1');
+    expect(config.kind).toBe('frontend-extension');
   });
 });

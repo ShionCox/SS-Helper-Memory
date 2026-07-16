@@ -1,4 +1,4 @@
-import { bootstrapSSHelper, type SessionBootstrap } from '@ss-helper/sdk';
+import { bootstrapSSHelper, ensureHostedCore, type SessionBootstrap } from '@ss-helper/sdk';
 import { MemoryRuntime } from './host/memory-runtime';
 import { logger } from './host/runtime-feedback';
 import { MEMORY_PLUGIN_DESCRIPTOR, type MemoryHostCapability } from './ss-helper/plugin';
@@ -32,6 +32,7 @@ export async function start(): Promise<MemoryRuntime | null> {
   let pending!: Promise<MemoryRuntime | null>;
   pending = (async () => {
     try {
+      await ensureHostedCore();
       const nextBootstrap = await bootstrapSSHelper(MEMORY_PLUGIN_DESCRIPTOR, (session) => {
         void activate(session, version).then(resolveFirst, rejectFirst);
       });

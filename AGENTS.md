@@ -3,17 +3,16 @@
 ## 项目定位
 
 - 本项目是供 SillyTavern 使用的 SS-Helper 记忆插件。
-- 当前目标宿主为 `I:\SillyTavern-1.16.0`。
+- 当前目标宿主为 `G:\SillyTavern`（SillyTavern 1.18.0）。
 - 本项目由 `I:\VUE\SillyTavern-SS-Helper` 系列插件中的 MemoryOS 重构而来，但不得恢复旧版 MemoryOS 的版本命名和兼容外观。
 
 ## 版本规则（强制）
 
-- 前端插件发布版本的唯一来源是根目录 `manifest.json`，当前固定为 `V0.0.2`。
+- 前端插件发布版本的唯一来源是根目录 `plugin.config.json` 的 `manifest.version`，当前固定为 `V0.0.2`；`manifest.json` 仅是构建产物。
 - 根目录 `package.json` 不得增加 `version` 字段。
 - 公共前端 API、UI、日志、README、测试名称和测试数据标识不得再次硬编码插件发布版本。
-- 服务端版本的唯一来源是 `server/package.json`，当前固定为 `0.0.1`。
+- `server/package.json` 的 `0.0.1` 仅是 SDK 内嵌 Memory 语义 worker 的内部协议版本；插件发布版本仍只来自 `plugin.config.json`。
 - 服务端运行时必须读取 `server/package.json` 的版本，不得再维护第二份硬编码服务端版本常量。
-- 当前服务端兼容范围为 `0.0.x`；修改服务端版本或兼容范围必须得到用户明确要求。
 - 禁止恢复旧标记，包括但不限于：`Memory 3.0`、`Memory v2`、`Memory v3`、`MemoryPluginApiV3`、`memory-v2` 和插件版本 `3.0.0`。
 - 测试探针、示例 manifest 和其他辅助 package 不得新增独立的插件发布版本。
 

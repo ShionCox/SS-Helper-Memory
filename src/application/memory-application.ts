@@ -114,7 +114,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   private readonly settingsListeners = new Set<(settings: MemoryUiSettings) => void>();
 
-  constructor(readonly repository: MemoryRepository = new MemoryRepository()) {
+  constructor(readonly repository: MemoryRepository) {
     this.vectorIndex = new MemoryVectorIndexService(repository);
     this.semanticRecall = new SemanticRecallService(this.recallIndex, this.vectorIndex);
     this.facts = {
@@ -143,11 +143,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   useHostContext(context: MemoryHostContext): void {
     this.hostContext = context;
-    const requestPort = context.getRequestPort?.();
-    if (requestPort) this.repository.client.useRequestPort(requestPort);
-    const binaryRequestPort = context.getBinaryRequestPort?.();
-    if (binaryRequestPort) this.repository.client.useBinaryRequestPort(binaryRequestPort);
   }
+
+  bindStorageScope(workspaceId: string, sourceChatKey: string): void { this.repository.bind?.(workspaceId, sourceChatKey); }
 
   async start(): Promise<void> {
     this.stopped = false;
@@ -189,10 +187,20 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   async bindCurrentChat(): Promise<void> {
     const chatKey = this.getChatKey();
+    const workspaceId = this.hostContext?.getWorkspaceId() ?? '';
+    this.repository.bind?.(workspaceId, chatKey);
     if (this.boundChatKey && this.boundChatKey !== chatKey) this.captureVersion += 1;
     this.boundChatKey = chatKey;
     if (!this.sqliteAvailable) {
       this.recallIndex.replace([]);
+      return;
+    }
+    if (!workspaceId) {
+      this.recallIndex.replace([]);
+      this.lastRecall = null;
+      this.lastRecallLogId = null;
+      this.error = '当前角色或群组缺少稳定 ID，Memory 暂不整理或召回。';
+      if (this.status === 'error') this.status = 'ready';
       return;
     }
     try {
@@ -213,11 +221,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   getSettings(): MemoryUiSettings {
-    return { ...this.settings, enabled: this.settings.enabled && this.sqliteAvailable };
+    return { ...this.settings, enabled: this.settings.enabled && this.sqliteAvailable && Boolean(this.hostContext?.getWorkspaceId()) };
   }
 
   async saveSettings(settings: MemoryUiSettings): Promise<void> {
-    if (!this.sqliteAvailable) throw new Error('Memory SQLite 服务不可用，设置未保存。');
+    if (!this.sqliteAvailable) throw new Error('Memory workspace 不可用，设置未保存。');
     const nextSettings: MemoryUiSettings = {
       enabled: settings.enabled === true,
       autoOrganize: settings.autoOrganize === true,
@@ -283,7 +291,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       pendingJobs: 0,
       llmAvailable: readMemoryLlmApi() !== null,
       errorCode: message.match(/(?:错误码\s*[=:]|HTTP\s+)([\w-]+)/i)?.[1] ?? 'SQLITE_SERVICE_UNAVAILABLE',
-      error: message || 'Memory SQLite 服务不可用，记忆整理、召回与注入已停用。',
+      error: message || 'Memory workspace 不可用，记忆整理、召回与注入已停用。',
     });
     if (!this.sqliteAvailable) return degraded();
     let facts: MemoryFact[] = [];
@@ -520,7 +528,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         protocolVersion: previous?.protocolVersion ?? 0,
         sqliteVersion: previous?.sqliteVersion ?? 'N/A',
         schemaVersion: previous?.schemaVersion ?? 0,
-        databasePath: previous?.databasePath ?? '_memory/memory.sqlite3',
+        databasePath: previous?.databasePath ?? 'data/_ss-helper/ss-helper.sqlite3',
         databaseSizeBytes: previous?.databaseSizeBytes ?? 0,
         walMode: previous?.walMode ?? 'N/A',
         tableCounts: previous?.tableCounts ?? {},
@@ -532,26 +540,22 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   exportSqliteBackup(): Promise<Blob> {
-    if (!this.sqliteAvailable) throw new Error('Memory SQLite 服务不可用，无法导出备份。');
-    return this.repository.client.exportBackup();
+    if (!this.sqliteAvailable) throw new Error('Memory workspace 不可用，无法导出备份。');
+    return this.repository.exportBackup();
   }
 
   async importSqliteBackup(file: File): Promise<void> {
-    if (!this.sqliteAvailable) throw new Error('Memory SQLite 服务不可用，无法恢复备份。');
+    if (!this.sqliteAvailable) throw new Error('Memory workspace 不可用，无法恢复备份。');
     await this.cancelCapture();
-    await this.repository.client.importBackup(file);
+    await this.repository.importBackup(file);
     await this.loadSettings();
     this.settingsListeners.forEach(listener => listener(this.getSettings()));
     await this.bindCurrentChat();
   }
 
   async checkSqliteIntegrity(): Promise<{ ok: boolean; message: string }> {
-    if (!this.sqliteAvailable) return { ok: false, message: 'Memory SQLite 服务不可用。' };
-    const result = await this.repository.client.query<{ ok: boolean; message?: string; messages?: string[] }>('integrity');
-    return {
-      ok: result.ok,
-      message: result.message ?? result.messages?.join('；') ?? (result.ok ? 'SQLite 完整性检查通过。' : 'SQLite 完整性检查失败。'),
-    };
+    if (!this.sqliteAvailable) return { ok: false, message: 'Memory workspace 不可用。' };
+    return this.repository.checkIntegrity();
   }
 
   async clearCurrentChatData(): Promise<void> {
@@ -560,6 +564,15 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.recallIndex.replace([]);
     this.lastRecall = null;
     this.lastRecallLogId = null;
+  }
+
+  async clearAllMemoryData(): Promise<void> {
+    await this.cancelCapture();
+    await this.repository.clearAllMemory();
+    this.recallIndex.replace([]);
+    this.lastRecall = null;
+    this.lastRecallLogId = null;
+    await this.bindCurrentChat();
   }
 
   observeCompletedRound(visibleText: string): void {

@@ -1,4 +1,10 @@
 import type { IngestCommit, IngestCommitter } from '../application/ingest/types';
+import type {
+  PlainData,
+  WorkspacePort,
+  WorkspaceRecord,
+  WorkspaceTransactionOperation,
+} from '@ss-helper/sdk';
 import {
   ACTIVE_CONFIDENCE_THRESHOLD,
   MAX_FACT_CONTENT_LENGTH,
@@ -24,21 +30,42 @@ import {
   MemorySettingRecord,
   UpsertMemoryFactVectorInput,
 } from '../domain';
-import {
-  MemorySqliteClient,
-  MemorySqliteError,
-  type MemorySqliteBootstrap,
-  type MemorySqliteHealth,
-  type MemorySqliteQueryResource,
-} from './memory-sqlite-client';
 import { float32ArrayToArrayBuffer, sha256Content } from './vector/vector-utils';
 
 const DEFAULT_SEARCH_LIMIT = 50;
 const MAX_SEARCH_LIMIT = 500;
-const MAX_QUERY_LIMIT = 10_000;
 const QUERY_PAGE_SIZE = 1_000;
-const EXPECTED_PROTOCOL_VERSION = 1;
-const EXPECTED_SCHEMA_VERSION = 2;
+const SETTINGS_WORKSPACE_ID = 'settings:global';
+const COLLECTIONS = Object.freeze({
+  facts: ['status', 'kind', 'slotKey', 'chatKey', 'updatedAt'],
+  'fact-slots': ['factId'],
+  evidence: ['factId', 'chatKey', 'occurredAt'],
+  jobs: ['chatKey', 'status', 'type', 'updatedAt'],
+  'job-audits': ['chatKey', 'jobId', 'batchIndex', 'completedAt'],
+  usage: ['chatKey', 'capturedAt'],
+  'recall-logs': ['chatKey', 'createdAt'],
+} as const);
+
+export interface MemoryWorkspaceHealth {
+  connected: boolean;
+  serverVersion: string;
+  nodeVersion: string;
+  protocolVersion: number;
+  sqliteVersion: string;
+  schemaVersion: number;
+  databasePath: string;
+  databaseSizeBytes: number;
+  walMode: string;
+  tableCounts: Record<string, number>;
+  tableBytes: Record<string, number | null>;
+  vectorCoverage?: { indexedFacts?: number; eligibleFacts?: number; ratio?: number; ready?: number; totalFacts?: number; coverage?: number };
+  lastError?: string | { message?: string };
+}
+
+export interface MemoryWorkspaceBootstrap<TFact> extends MemoryWorkspaceHealth { facts: TFact[]; }
+
+function asPlain(value: unknown): PlainData { return structuredClone(value) as PlainData; }
+function workspaceErrorCode(error: unknown): string | undefined { return error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code) : undefined; }
 
 function clampLimit(limit: number | undefined): number {
   return Math.min(MAX_SEARCH_LIMIT, Math.max(1, Math.trunc(limit ?? DEFAULT_SEARCH_LIMIT)));
@@ -68,91 +95,107 @@ function rows<T>(value: T[] | { items?: T[] } | undefined | null): T[] {
   return Array.isArray(value?.items) ? value.items : [];
 }
 
-/**
- * Memory 的唯一仓储。所有持久化读写都通过 SillyTavern 服务端插件完成；
- * 浏览器仅保留当前调用所需的短生命周期对象。
- */
+/** Memory 的唯一仓储。领域逻辑留在 Memory，持久化只使用 SDK 通用 WorkspacePort。 */
 export class MemoryRepository implements IngestCommitter {
-  private healthSnapshot: MemorySqliteHealth | null = null;
+  private healthSnapshot: MemoryWorkspaceHealth | null = null;
+  private workspaceId = '';
+  private sourceChatKey = '';
 
-  constructor(readonly client: MemorySqliteClient = new MemorySqliteClient()) {}
+  constructor(readonly workspace: WorkspacePort) {}
+
+  bind(workspaceId: string, sourceChatKey: string): void {
+    this.workspaceId = workspaceId.trim();
+    this.sourceChatKey = sourceChatKey.trim();
+  }
+
+  private requireWorkspaceId(): string {
+    if (!this.workspaceId) throw new Error('当前角色或群组缺少稳定 ID，Memory workspace 未启用。');
+    return this.workspaceId;
+  }
+
+  private async ensureCollections(workspaceId: string): Promise<void> {
+    await this.workspace.open({ workspaceId, create: true, metadata: { kind: workspaceId.startsWith('group:') ? 'group' : workspaceId === SETTINGS_WORKSPACE_ID ? 'settings' : 'character' } });
+    if (workspaceId === SETTINGS_WORKSPACE_ID) {
+      await this.workspace.defineCollection({ workspaceId, name: 'settings', indexes: ['key'] });
+      return;
+    }
+    for (const [name, indexes] of Object.entries(COLLECTIONS)) await this.workspace.defineCollection({ workspaceId, name, indexes });
+  }
 
   async open(): Promise<void> {
-    this.healthSnapshot = await this.client.health();
-    if (!this.healthSnapshot.connected) {
-      const lastError = typeof this.healthSnapshot.lastError === 'string'
-        ? this.healthSnapshot.lastError
-        : this.healthSnapshot.lastError?.message;
-      throw new Error(lastError || 'Memory SQLite 服务未连接。');
-    }
-    if (this.healthSnapshot.protocolVersion !== EXPECTED_PROTOCOL_VERSION) {
-      throw new Error(`Memory SQLite 协议不兼容：需要 v${EXPECTED_PROTOCOL_VERSION}，服务端为 v${this.healthSnapshot.protocolVersion}。`);
-    }
-    if (this.healthSnapshot.schemaVersion !== EXPECTED_SCHEMA_VERSION) {
-      throw new Error(`Memory SQLite schema 不兼容：需要 v${EXPECTED_SCHEMA_VERSION}，服务端为 v${this.healthSnapshot.schemaVersion}。`);
-    }
-    if (!/^0\.0\./u.test(this.healthSnapshot.serverVersion)) {
-      throw new Error(`Memory SQLite 服务端版本不兼容：需要 0.0.x，当前为 ${this.healthSnapshot.serverVersion}。`);
-    }
+    const health = await this.workspace.health();
+    if (!health.ready) throw new Error(health.error || 'SS-Helper workspace 数据库未连接。');
+    await this.ensureCollections(SETTINGS_WORKSPACE_ID);
+    if (this.workspaceId) await this.ensureCollections(this.workspaceId);
+    this.healthSnapshot = await this.refreshHealth();
   }
 
   close(): void {
     this.healthSnapshot = null;
   }
 
-  getHealthSnapshot(): MemorySqliteHealth | null {
+  getHealthSnapshot(): MemoryWorkspaceHealth | null {
     return this.healthSnapshot ? structuredClone(this.healthSnapshot) : null;
   }
 
-  async refreshHealth(chatKey?: string): Promise<MemorySqliteHealth> {
-    this.healthSnapshot = await this.client.health(chatKey);
+  async refreshHealth(_chatKey?: string): Promise<MemoryWorkspaceHealth> {
+    const health = await this.workspace.health();
+    const tableCounts: Record<string, number> = {};
+    if (health.ready && this.workspaceId) {
+      for (const name of Object.keys(COLLECTIONS)) tableCounts[name.replaceAll('-', '_')] = (await this.listAllRecordRows(name)).length;
+      tableCounts.fact_vectors = (await this.listAllVectors()).length;
+    }
+    this.healthSnapshot = {
+      connected: health.ready,
+      serverVersion: 'SS-Helper SDK 1.0.0',
+      nodeVersion: 'SillyTavern server',
+      protocolVersion: 1,
+      sqliteVersion: health.sqliteVersion ?? 'N/A',
+      schemaVersion: health.schemaVersion,
+      databasePath: `data/_ss-helper/${health.database}`,
+      databaseSizeBytes: 0,
+      walMode: health.walMode ?? 'N/A',
+      tableCounts,
+      tableBytes: {},
+      ...(health.error ? { lastError: health.error } : {}),
+    };
     return structuredClone(this.healthSnapshot);
   }
 
-  async bootstrap(chatKey: string): Promise<MemorySqliteBootstrap<MemoryFact>> {
-    const bootstrap = await this.client.bootstrap<MemoryFact>(chatKey);
-    if (bootstrap.facts.length < MAX_QUERY_LIMIT) return bootstrap;
-    return { ...bootstrap, facts: await this.listAllFacts(chatKey) };
+  async bootstrap(chatKey: string): Promise<MemoryWorkspaceBootstrap<MemoryFact>> {
+    const health = await this.refreshHealth(chatKey);
+    return { ...health, facts: await this.listAllFacts(chatKey) };
   }
 
-  private async listAllFacts(chatKey: string, filters: Record<string, unknown> = {}): Promise<MemoryFact[]> {
-    const facts: MemoryFact[] = [];
-    for (let offset = 0; ; offset += QUERY_PAGE_SIZE) {
-      const page = rows(await this.client.query<MemoryFact[] | { items?: MemoryFact[] }>('facts', {
-        chatKey, filters, limit: QUERY_PAGE_SIZE, offset,
-      }));
-      facts.push(...page);
-      if (page.length < QUERY_PAGE_SIZE) return facts;
-    }
+  private async listAllRecordRows(collection: string, filter: Record<string, PlainData> = {}, orderBy?: { field: string; direction: 'asc' | 'desc' }, workspaceId = this.requireWorkspaceId()): Promise<WorkspaceRecord[]> {
+    const records: WorkspaceRecord[] = []; let cursor: string | undefined;
+    do {
+      const page = await this.workspace.query({ workspaceId, collection, filter, ...(orderBy ? { orderBy } : {}), ...(cursor ? { cursor } : {}), limit: QUERY_PAGE_SIZE });
+      records.push(...page.records); cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return records;
   }
 
-  private async listAllRows<T>(resource: MemorySqliteQueryResource, chatKey: string, filters: Record<string, unknown> = {}): Promise<T[]> {
-    const result: T[] = [];
-    for (let offset = 0; ; offset += QUERY_PAGE_SIZE) {
-      const page = rows(await this.client.query<T[] | { items?: T[] }>(resource, {
-        chatKey, filters, limit: QUERY_PAGE_SIZE, offset,
-      }));
-      result.push(...page);
-      if (page.length < QUERY_PAGE_SIZE) return result;
-    }
+  private async listAllRows<T>(collection: string, filters: Record<string, PlainData> = {}): Promise<T[]> {
+    return (await this.listAllRecordRows(collection, filters)).map((record) => record.value as T);
+  }
+
+  private async listAllFacts(_chatKey?: string, filters: Record<string, PlainData> = {}): Promise<MemoryFact[]> {
+    return this.listAllRows<MemoryFact>('facts', filters);
+  }
+
+  private async listAllVectors() {
+    const vectors = []; let cursor: string | undefined;
+    do { const page = await this.workspace.vectorList({ workspaceId: this.requireWorkspaceId(), ...(cursor ? { cursor } : {}), limit: QUERY_PAGE_SIZE }); vectors.push(...page.vectors); cursor = page.nextCursor ?? undefined; } while (cursor);
+    return vectors;
   }
 
   async listFacts(chatKey: string, options: FactListOptions = {}): Promise<MemoryFact[]> {
-    if (options.limit === undefined) {
-      return this.listAllFacts(chatKey, {
-        ...(options.status ? { status: options.status } : {}),
-        ...(options.kind ? { kind: options.kind } : {}),
-      });
-    }
-    const result = await this.client.query<MemoryFact[] | { items?: MemoryFact[] }>('facts', {
-      chatKey,
-      filters: {
-        ...(options.status ? { status: options.status } : {}),
-        ...(options.kind ? { kind: options.kind } : {}),
-      },
-      limit: clampLimit(options.limit),
+    const facts = await this.listAllFacts(chatKey, {
+      ...(options.status ? { status: options.status } : {}),
+      ...(options.kind ? { kind: options.kind } : {}),
     });
-    return rows(result);
+    return options.limit === undefined ? facts : facts.slice(0, clampLimit(options.limit));
   }
 
   list(chatKey: string, options: FactListOptions = {}): Promise<MemoryFact[]> {
@@ -160,12 +203,9 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async searchFacts(chatKey: string, query: string, limit = DEFAULT_SEARCH_LIMIT): Promise<MemoryFact[]> {
-    const result = await this.client.query<MemoryFact[] | { items?: MemoryFact[] }>('facts', {
-      chatKey,
-      filters: { query },
-      limit: clampLimit(limit),
-    });
-    return rows(result);
+    const needle = query.trim().toLocaleLowerCase();
+    if (!needle) return [];
+    return (await this.listAllFacts(chatKey)).filter((fact) => [fact.content, fact.canonicalKey, ...fact.entityKeys].some((value) => value.toLocaleLowerCase().includes(needle))).slice(0, clampLimit(limit));
   }
 
   search(chatKey: string, query: string, limit = DEFAULT_SEARCH_LIMIT): Promise<MemoryFact[]> {
@@ -173,8 +213,8 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async getFact(chatKey: string, id: string): Promise<MemoryFact | undefined> {
-    const result = await this.client.query<MemoryFact | null>('fact', { chatKey, filters: { id } });
-    return result ?? undefined;
+    const result = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: id });
+    return result?.value as MemoryFact | undefined;
   }
 
   async upsertManualFact(chatKey: string, input: ManualFactInput): Promise<MemoryFact> {
@@ -187,8 +227,8 @@ export class MemoryRepository implements IngestCommitter {
       throw new Error('手动记忆置信度必须位于 0 到 1 之间。');
     }
     const id = input.id ?? createId('fact');
-    const previous = await this.getFact(chatKey, id);
-    if (previous && previous.chatKey !== chatKey) throw new Error('不能跨聊天修改记忆。');
+    const previousRecord = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: id });
+    const previous = previousRecord?.value as MemoryFact | undefined;
     const slotKey = createFactSlotKey(input.subjectKey, input.predicateKey);
     if (previous && previous.slotKey !== slotKey && (previous.supersedesId || previous.supersededById)) {
       throw new Error('已形成历史链的记忆不能修改主体或谓词；请新增记忆或先删除历史链。');
@@ -258,14 +298,21 @@ export class MemoryRepository implements IngestCommitter {
       revision: conflicting.revision + 1,
       updatedAt: now,
     }] : [];
-    return this.client.command<MemoryFact>('fact.upsert', {
-      fact,
-      evidence: [evidence],
-      relatedFacts,
-      expectedRevision: previous?.revision ?? null,
-      expectedSlotFactId,
-      expectedRelatedRevisions: Object.fromEntries(relatedFacts.map(item => [item.id, item.revision - 1])),
-    });
+    const workspaceId = this.requireWorkspaceId();
+    const slotRecord = await this.workspace.get({ workspaceId, collection: 'fact-slots', recordId: slotKey });
+    const slotValue = slotRecord?.value as { factId?: string } | undefined;
+    if ((slotValue?.factId ?? null) !== expectedSlotFactId) throw Object.assign(new Error('记忆槽位已变化，请刷新后重试。'), { code: 'WORKSPACE_CONFLICT' });
+    const operations: WorkspaceTransactionOperation[] = [
+      { action: 'upsert', collection: 'facts', recordId: fact.id, value: asPlain(fact), expectedVersion: previousRecord?.version ?? 0 },
+      { action: 'upsert', collection: 'evidence', recordId: evidence.id, value: asPlain(evidence) },
+    ];
+    for (const related of relatedFacts) {
+      const record = await this.workspace.get({ workspaceId, collection: 'facts', recordId: related.id });
+      operations.push({ action: 'upsert', collection: 'facts', recordId: related.id, value: asPlain(related), expectedVersion: record?.version ?? 0 });
+    }
+    if (status === 'active' || status === 'pending') operations.push({ action: 'upsert', collection: 'fact-slots', recordId: slotKey, value: { factId: fact.id }, expectedVersion: slotRecord?.version ?? 0 });
+    await this.workspace.transaction({ workspaceId, operations });
+    return fact;
   }
 
   upsert(chatKey: string, input: ManualFactInput): Promise<MemoryFact> {
@@ -273,18 +320,35 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async removeFact(chatKey: string, id: string): Promise<boolean> {
-    const target = await this.getFact(chatKey, id);
-    if (!target) return false;
+    const workspaceId = this.requireWorkspaceId();
+    const targetRecord = await this.workspace.get({ workspaceId, collection: 'facts', recordId: id });
+    const target = targetRecord?.value as MemoryFact | undefined;
+    if (!target || !targetRecord) return false;
     const relatedIds = [target.supersedesId, target.supersededById].filter((value): value is string => Boolean(value));
-    const related = await Promise.all(relatedIds.map(relatedId => this.getFact(chatKey, relatedId)));
-    if (related.some(item => !item)) throw new Error('记忆历史链已变化，请刷新后重试。');
-    const result = await this.client.command<boolean | { removed: boolean }>('fact.remove', {
-      chatKey,
-      id,
-      expectedRevision: target.revision,
-      expectedRelatedRevisions: Object.fromEntries(related.map(item => [item!.id, item!.revision])),
-    });
-    return typeof result === 'boolean' ? result : result.removed;
+    const relatedRecords = await Promise.all(relatedIds.map((recordId) => this.workspace.get({ workspaceId, collection: 'facts', recordId })));
+    if (relatedRecords.some(item => !item)) throw new Error('记忆历史链已变化，请刷新后重试。');
+    const operations: WorkspaceTransactionOperation[] = [{ action: 'delete', collection: 'facts', recordId: id, expectedVersion: targetRecord.version }];
+    for (const record of relatedRecords) {
+      const value = structuredClone(record!.value as unknown as MemoryFact);
+      if (value.supersededById === id) { delete value.supersededById; value.status = 'active'; }
+      if (value.supersedesId === id) delete value.supersedesId;
+      value.revision += 1; value.updatedAt = Date.now();
+      operations.push({ action: 'upsert', collection: 'facts', recordId: value.id, value: asPlain(value), expectedVersion: record!.version });
+    }
+    const evidence = await this.listAllRecordRows('evidence', { factId: id });
+    for (const record of evidence) operations.push({ action: 'delete', collection: 'evidence', recordId: record.recordId, expectedVersion: record.version });
+    if (target.slotKey) {
+      const slot = await this.workspace.get({ workspaceId, collection: 'fact-slots', recordId: target.slotKey });
+      if (slot) {
+        const replacement = relatedRecords.map((record) => record!.value as unknown as MemoryFact).find((fact) => fact.status === 'active' || fact.status === 'pending');
+        operations.push(replacement
+          ? { action: 'upsert', collection: 'fact-slots', recordId: target.slotKey, value: { factId: replacement.id }, expectedVersion: slot.version }
+          : { action: 'delete', collection: 'fact-slots', recordId: target.slotKey, expectedVersion: slot.version });
+      }
+    }
+    await this.workspace.transaction({ workspaceId, operations });
+    await this.workspace.vectorDelete({ workspaceId, collection: 'facts', recordId: id }).catch(() => false);
+    return true;
   }
 
   remove(chatKey: string, id: string): Promise<boolean> {
@@ -292,11 +356,8 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async listEvidence(chatKey: string, factId: string): Promise<MemoryEvidence[]> {
-    const result = await this.client.query<MemoryEvidence[] | { items?: MemoryEvidence[] }>('evidence', {
-      chatKey,
-      filters: { factId },
-    });
-    return rows(result);
+    void chatKey;
+    return this.listAllRows<MemoryEvidence>('evidence', { factId });
   }
 
   async commitIngest(input: IngestCommit, retryAttempt = 0): Promise<AutomaticIngestResult> {
@@ -339,7 +400,9 @@ export class MemoryRepository implements IngestCommitter {
       throw new Error(`记忆批次包含无效事实，事务已取消：${rejected.at(-1)?.message ?? ''}`);
     }
 
-    const beforeFacts = await this.listFacts(input.chatKey);
+    const beforeFactRecords = await this.listAllRecordRows('facts');
+    const beforeFacts = beforeFactRecords.map((record) => record.value as unknown as MemoryFact);
+    const beforeVersionById = new Map(beforeFactRecords.map((record) => [record.recordId, record.version]));
     const touchedSlots = new Set(proposals.map(proposal => proposal.slotKey));
     const baseSlotFactIds = Object.fromEntries([...touchedSlots].map(slotKey => [
       slotKey,
@@ -477,19 +540,28 @@ export class MemoryRepository implements IngestCommitter {
       ...(input.audit?.latencyMs === undefined ? {} : { latencyMs: input.audit.latencyMs }),
     };
     try {
-      return await this.client.command<AutomaticIngestResult>('ingest.commit', {
-        job, facts: [...changedFacts.values()], evidence: changedEvidence, audit,
-        baseRevisions: Object.fromEntries(beforeFacts
-          .filter(fact => touchedSlots.has(fact.slotKey ?? createFactSlotKey(fact.subjectKey, fact.predicateKey)))
-          .map(fact => [fact.id, fact.revision])),
-        baseSlotFactIds,
-        accepted: result.accepted, duplicated: result.duplicated, pending: result.pending,
-        superseded: result.superseded, rejected: result.rejected,
-      }, input.audit?.requestId);
-    } catch (error) {
-      if (error instanceof MemorySqliteError && error.code === 'REVISION_CONFLICT' && retryAttempt < 1) {
-        return this.commitIngest(input, retryAttempt + 1);
+      const workspaceId = this.requireWorkspaceId();
+      const operations: WorkspaceTransactionOperation[] = [];
+      for (const fact of changedFacts.values()) operations.push({ action: 'upsert', collection: 'facts', recordId: fact.id, value: asPlain(fact), expectedVersion: beforeVersionById.get(fact.id) ?? 0 });
+      for (const evidence of changedEvidence) operations.push({ action: 'upsert', collection: 'evidence', recordId: evidence.id, value: asPlain(evidence) });
+      for (const slotKey of touchedSlots) {
+        const slotRecord = await this.workspace.get({ workspaceId, collection: 'fact-slots', recordId: slotKey });
+        const slotValue = slotRecord?.value as { factId?: string } | undefined;
+        if ((slotValue?.factId ?? null) !== baseSlotFactIds[slotKey]) throw Object.assign(new Error('记忆槽位已变化。'), { code: 'WORKSPACE_CONFLICT' });
+        const selected = [...workingFacts.values()].filter((fact) => fact.slotKey === slotKey && (fact.status === 'active' || fact.status === 'pending')).sort((left, right) => Number(right.status === 'active') - Number(left.status === 'active') || right.freshestEvidenceAt - left.freshestEvidenceAt || left.id.localeCompare(right.id))[0];
+        operations.push(selected
+          ? { action: 'upsert', collection: 'fact-slots', recordId: slotKey, value: { factId: selected.id }, expectedVersion: slotRecord?.version ?? 0 }
+          : { action: 'delete', collection: 'fact-slots', recordId: slotKey, expectedVersion: slotRecord?.version ?? 0 });
       }
+      const jobRecord = await this.workspace.get({ workspaceId, collection: 'jobs', recordId: job.id });
+      operations.push({ action: 'upsert', collection: 'jobs', recordId: job.id, value: asPlain(job), expectedVersion: jobRecord?.version ?? 0 });
+      operations.push({ action: 'upsert', collection: 'job-audits', recordId: audit.id, value: asPlain(audit) });
+      const snapshot: MemoryBatchSnapshot = { id: `snapshot:${job.id}:${batchIndex}`, chatKey: input.chatKey, jobId: job.id, batchIndex, facts: beforeFacts, evidence: await this.listAllRows<MemoryEvidence>('evidence'), createdAt: startedAt };
+      operations.push({ action: 'upsert', collection: 'job-audits', recordId: snapshot.id, value: asPlain({ ...snapshot, kind: 'snapshot' }) });
+      await this.workspace.transaction({ workspaceId, ...(input.audit?.requestId ? { idempotencyKey: input.audit.requestId } : {}), operations });
+      return result;
+    } catch (error) {
+      if (workspaceErrorCode(error) === 'WORKSPACE_CONFLICT' && retryAttempt < 1) return this.commitIngest(input, retryAttempt + 1);
       throw error;
     }
   }
@@ -499,118 +571,150 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async putJob(job: MemoryJob): Promise<void> {
-    await this.client.command('job.put', { job });
+    const workspaceId = this.requireWorkspaceId(); const current = await this.workspace.get({ workspaceId, collection: 'jobs', recordId: job.id });
+    await this.workspace.upsert({ workspaceId, collection: 'jobs', recordId: job.id, value: asPlain(job), expectedVersion: current?.version ?? 0 });
   }
 
   async listJobs(chatKey: string): Promise<MemoryJob[]> {
-    return this.listAllRows<MemoryJob>('jobs', chatKey);
+    return this.listAllRows<MemoryJob>('jobs', { chatKey });
   }
 
   async addJobBatchAudit(audit: MemoryJobBatchAudit): Promise<void> {
-    await this.client.command('ingest.commit', { audit });
+    await this.workspace.upsert({ workspaceId: this.requireWorkspaceId(), collection: 'job-audits', recordId: audit.id, value: asPlain(audit) });
   }
 
   async listJobBatchAudits(chatKey: string, jobId?: string): Promise<MemoryJobBatchAudit[]> {
-    return this.listAllRows<MemoryJobBatchAudit>('job_batch_audits', chatKey, { ...(jobId ? { jobId } : {}) });
+    return this.listAllRows<MemoryJobBatchAudit>('job-audits', { chatKey, ...(jobId ? { jobId } : {}) });
   }
 
   async addMainChatUsage(usage: MainChatUsage): Promise<void> {
-    await this.client.command('main_chat_usage.add', { usage });
+    await this.workspace.upsert({ workspaceId: this.requireWorkspaceId(), collection: 'usage', recordId: usage.id, value: asPlain(usage) });
   }
 
   async listMainChatUsage(chatKey: string): Promise<MainChatUsage[]> {
-    return this.listAllRows<MainChatUsage>('main_chat_usage', chatKey);
+    return this.listAllRows<MainChatUsage>('usage', { chatKey });
   }
 
-  rollbackJobBatch(jobId: string, batchIndex: number, expectedChatKey?: string): Promise<MemoryBatchSnapshot> {
-    return this.client.command<MemoryBatchSnapshot>('batch.rollback', {
-      jobId,
-      batchIndex,
-      ...(expectedChatKey ? { chatKey: expectedChatKey } : {}),
-    });
+  async rollbackJobBatch(jobId: string, batchIndex: number, expectedChatKey?: string): Promise<MemoryBatchSnapshot> {
+    const workspaceId = this.requireWorkspaceId(); const snapshotId = `snapshot:${jobId}:${batchIndex}`;
+    const record = await this.workspace.get({ workspaceId, collection: 'job-audits', recordId: snapshotId });
+    if (!record) throw new Error('未找到该整理批次的回滚快照。');
+    const snapshot = record.value as unknown as MemoryBatchSnapshot;
+    if (expectedChatKey && snapshot.chatKey !== expectedChatKey) throw new Error('整理批次不属于当前聊天。');
+    const currentFacts = await this.listAllRecordRows('facts'); const currentEvidence = await this.listAllRecordRows('evidence');
+    const operations: WorkspaceTransactionOperation[] = [
+      ...currentFacts.map((item) => ({ action: 'delete' as const, collection: 'facts', recordId: item.recordId, expectedVersion: item.version })),
+      ...currentEvidence.map((item) => ({ action: 'delete' as const, collection: 'evidence', recordId: item.recordId, expectedVersion: item.version })),
+      ...snapshot.facts.map((fact) => ({ action: 'upsert' as const, collection: 'facts', recordId: fact.id, value: asPlain(fact), expectedVersion: 0 })),
+      ...snapshot.evidence.map((evidence) => ({ action: 'upsert' as const, collection: 'evidence', recordId: evidence.id, value: asPlain(evidence), expectedVersion: 0 })),
+    ];
+    await this.workspace.transaction({ workspaceId, operations });
+    await this.rebuildSlots();
+    await this.workspace.vectorClear({ workspaceId, collection: 'facts' });
+    return snapshot;
   }
 
   async getSetting<T>(key: string): Promise<T | undefined> {
-    const result = await this.client.query<MemorySettingRecord | { value?: T } | null>('settings', {
-      filters: { key },
-    });
-    return result && 'value' in result ? result.value as T : undefined;
+    const result = await this.workspace.get({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
+    const value = result?.value as unknown as MemorySettingRecord | undefined;
+    return value?.value as T | undefined;
   }
 
   async setSetting(key: string, value: unknown): Promise<void> {
-    await this.client.command('setting.set', { key, value });
+    await this.ensureCollections(SETTINGS_WORKSPACE_ID); const current = await this.workspace.get({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
+    const setting: MemorySettingRecord = { id: key, namespace: 'stx_memory', key, value, updatedAt: Date.now() };
+    await this.workspace.upsert({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key, value: asPlain(setting), expectedVersion: current?.version ?? 0 });
   }
 
   async setSettings(values: Record<string, unknown>): Promise<void> {
-    await this.client.command('settings.setMany', {
-      settings: Object.entries(values).map(([key, value]) => ({ key, value })),
-    });
+    await this.ensureCollections(SETTINGS_WORKSPACE_ID); const operations: WorkspaceTransactionOperation[] = [];
+    for (const [key, value] of Object.entries(values)) {
+      const current = await this.workspace.get({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
+      operations.push({ action: 'upsert', collection: 'settings', recordId: key, value: asPlain({ id: key, namespace: 'stx_memory', key, value, updatedAt: Date.now() }), expectedVersion: current?.version ?? 0 });
+    }
+    await this.workspace.transaction({ workspaceId: SETTINGS_WORKSPACE_ID, operations });
   }
 
   async addRecallLog(log: MemoryRecallLog): Promise<void> {
-    await this.client.command('recall_log.add', { log });
+    await this.workspace.upsert({ workspaceId: this.requireWorkspaceId(), collection: 'recall-logs', recordId: log.id, value: asPlain(log) });
   }
 
   async getLastRecall(chatKey: string): Promise<MemoryRecallLog | undefined> {
-    const result = await this.client.query<MemoryRecallLog[] | { items?: MemoryRecallLog[] }>('recall_logs', {
-      chatKey,
-      limit: 1,
-    });
-    return rows(result)[0];
+    const page = await this.workspace.query({ workspaceId: this.requireWorkspaceId(), collection: 'recall-logs', filter: { chatKey }, orderBy: { field: 'createdAt', direction: 'desc' }, limit: 1 });
+    return page.records[0]?.value as unknown as MemoryRecallLog | undefined;
   }
 
   async clearCurrentChatData(chatKey: string): Promise<void> {
-    await this.client.command('chat.clear', { chatKey });
+    const workspaceId = this.requireWorkspaceId();
+    const [evidenceRecords, jobRecords, auditRecords, usageRecords, logRecords, factRecords] = await Promise.all([
+      this.listAllRecordRows('evidence', { chatKey }), this.listAllRecordRows('jobs', { chatKey }), this.listAllRecordRows('job-audits', { chatKey }),
+      this.listAllRecordRows('usage', { chatKey }), this.listAllRecordRows('recall-logs', { chatKey }), this.listAllRecordRows('facts'),
+    ]);
+    const removedEvidenceIds = new Set(evidenceRecords.map((record) => record.recordId));
+    const touchedFactIds = new Set(evidenceRecords.map((record) => (record.value as unknown as MemoryEvidence).factId));
+    const allEvidence = await this.listAllRecordRows('evidence'); const remainingEvidence = allEvidence.filter((record) => !removedEvidenceIds.has(record.recordId));
+    const remainingByFact = new Map<string, MemoryEvidence[]>();
+    for (const record of remainingEvidence) { const value = record.value as unknown as MemoryEvidence; const list = remainingByFact.get(value.factId) ?? []; list.push(value); remainingByFact.set(value.factId, list); }
+    const operations: WorkspaceTransactionOperation[] = [...evidenceRecords, ...jobRecords, ...auditRecords, ...usageRecords, ...logRecords].map((record) => ({ action: 'delete', collection: evidenceRecords.includes(record) ? 'evidence' : jobRecords.includes(record) ? 'jobs' : auditRecords.includes(record) ? 'job-audits' : usageRecords.includes(record) ? 'usage' : 'recall-logs', recordId: record.recordId, expectedVersion: record.version }));
+    const deletedFactIds: string[] = []; const affectedSlots = new Set<string>();
+    for (const record of factRecords) {
+      if (!touchedFactIds.has(record.recordId)) continue;
+      const fact = structuredClone(record.value as unknown as MemoryFact); const remaining = remainingByFact.get(fact.id) ?? [];
+      if (fact.slotKey) affectedSlots.add(fact.slotKey);
+      if (!remaining.length) { operations.push({ action: 'delete', collection: 'facts', recordId: fact.id, expectedVersion: record.version }); deletedFactIds.push(fact.id); continue; }
+      fact.evidenceIds = remaining.map((item) => item.id); fact.sourceRefs = [...new Set(remaining.map((item) => item.sourceRef))]; fact.freshestEvidenceAt = Math.max(...remaining.map((item) => item.occurredAt)); fact.revision += 1; fact.updatedAt = Date.now();
+      operations.push({ action: 'upsert', collection: 'facts', recordId: fact.id, value: asPlain(fact), expectedVersion: record.version });
+    }
+    const survivingFacts = factRecords.map((record) => record.value as unknown as MemoryFact).filter((fact) => !deletedFactIds.includes(fact.id));
+    for (const slotKey of affectedSlots) {
+      const slot = await this.workspace.get({ workspaceId, collection: 'fact-slots', recordId: slotKey });
+      const selected = survivingFacts.filter((fact) => fact.slotKey === slotKey && (fact.status === 'active' || fact.status === 'pending')).sort((left, right) => Number(right.status === 'active') - Number(left.status === 'active') || right.freshestEvidenceAt - left.freshestEvidenceAt)[0];
+      if (selected) operations.push({ action: 'upsert', collection: 'fact-slots', recordId: slotKey, value: { factId: selected.id }, expectedVersion: slot?.version ?? 0 });
+      else if (slot) operations.push({ action: 'delete', collection: 'fact-slots', recordId: slotKey, expectedVersion: slot.version });
+    }
+    await this.workspace.transaction({ workspaceId, operations });
+    for (const factId of deletedFactIds) await this.workspace.vectorDelete({ workspaceId, collection: 'facts', recordId: factId }).catch(() => false);
   }
 
   async getChatKeys(): Promise<string[]> {
-    const result = await this.client.query<string[] | { items?: string[] }>('chat_keys');
-    return rows(result);
+    const values = await Promise.all(['evidence', 'jobs', 'job-audits', 'usage', 'recall-logs'].map((collection) => this.listAllRecordRows(collection)));
+    return [...new Set(values.flat().map((record) => (record.value as unknown as { chatKey?: string }).chatKey).filter((value): value is string => Boolean(value)))].sort();
   }
 
   async upsertFactVector(input: UpsertMemoryFactVectorInput): Promise<MemoryFactVector> {
     const now = input.updatedAt ?? Date.now();
     const contentHash = await sha256Content(input.content);
     const vector = float32ArrayToArrayBuffer(input.vector);
-    const metadata = await this.client.command<Omit<MemoryFactVector, 'vector'>>('vector.upsert', {
+    await this.workspace.vectorUpsert({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: input.factId, model: input.model, vector: Array.from(input.vector), metadata: { chatKey: input.chatKey, contentHash, resourceId: input.resourceId, dimensions: input.vector.length, updatedAt: now } });
+    return {
       factId: input.factId,
       chatKey: input.chatKey,
       contentHash,
       resourceId: input.resourceId,
       model: input.model,
-      vector: Array.from(input.vector),
-      updatedAt: now,
-    });
-    return {
-      factId: metadata.factId ?? input.factId,
-      chatKey: metadata.chatKey ?? input.chatKey,
-      contentHash: metadata.contentHash ?? contentHash,
-      resourceId: metadata.resourceId ?? input.resourceId,
-      model: metadata.model ?? input.model,
-      dimensions: metadata.dimensions ?? input.vector.length,
+      dimensions: input.vector.length,
       vector,
-      createdAt: metadata.createdAt ?? now,
-      updatedAt: metadata.updatedAt ?? now,
+      createdAt: now,
+      updatedAt: now,
     };
   }
 
   async deleteFactVector(chatKey: string, factId: string): Promise<boolean> {
-    const result = await this.client.command<boolean | { removed: boolean }>('vector.delete', { chatKey, factId });
-    return typeof result === 'boolean' ? result : result.removed;
+    void chatKey;
+    return this.workspace.vectorDelete({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: factId });
   }
 
   async clearFactVectors(chatKey: string): Promise<number> {
-    const result = await this.client.command<number | { removed: number }>('vector.clear', {
-      chatKey,
-    });
-    return typeof result === 'number' ? result : result.removed;
+    void chatKey;
+    return this.workspace.vectorClear({ workspaceId: this.requireWorkspaceId(), collection: 'facts' });
   }
 
   async getFactVectorCoverage(chatKey: string, target: MemoryFactVectorTarget): Promise<MemoryFactVectorCoverage> {
-    return this.client.query<MemoryFactVectorCoverage>('vector_coverage', {
-      chatKey,
-      filters: { target: { ...target } },
-    });
+    const facts = (await this.listAllFacts()).filter((fact) => fact.status === 'active' || fact.status === 'pending'); const vectors = await this.listAllVectors(); const byId = new Map(vectors.map((item) => [item.recordId, item]));
+    const readyFactIds: string[] = []; const missingFactIds: string[] = []; const staleFactIds: string[] = [];
+    for (const fact of facts) { const vector = byId.get(fact.id); const metadata = vector?.metadata as { resourceId?: string; dimensions?: number } | undefined; if (!vector) missingFactIds.push(fact.id); else if (vector.model !== target.model || metadata?.resourceId !== target.resourceId || (target.dimensions !== undefined && metadata?.dimensions !== target.dimensions)) staleFactIds.push(fact.id); else readyFactIds.push(fact.id); }
+    const factIds = new Set(facts.map((fact) => fact.id)); const orphanedFactIds = vectors.filter((item) => !factIds.has(item.recordId)).map((item) => item.recordId); const totalFacts = facts.length;
+    return { chatKey, totalFacts, ready: readyFactIds.length, missing: missingFactIds.length, stale: staleFactIds.length, orphaned: orphanedFactIds.length, coverage: totalFacts ? readyFactIds.length / totalFacts : 1, readyFactIds, missingFactIds, staleFactIds, orphanedFactIds };
   }
 
   async listFactsNeedingVectorRebuild(
@@ -618,12 +722,8 @@ export class MemoryRepository implements IngestCommitter {
     target: MemoryFactVectorTarget,
     limit = 32,
   ): Promise<MemoryFact[]> {
-    const result = await this.client.query<MemoryFact[] | { items?: MemoryFact[] }>('vector_rebuild', {
-      chatKey,
-      filters: { target: { ...target } },
-      limit: Math.min(32, Math.max(1, Math.trunc(limit))),
-    });
-    return rows(result);
+    const coverage = await this.getFactVectorCoverage(chatKey, target); const ids = new Set([...coverage.missingFactIds, ...coverage.staleFactIds]);
+    return (await this.listAllFacts()).filter((fact) => ids.has(fact.id)).slice(0, Math.min(32, Math.max(1, Math.trunc(limit))));
   }
 
   vectorSearch(input: {
@@ -633,6 +733,44 @@ export class MemoryRepository implements IngestCommitter {
     resourceId?: string;
     model?: string;
   }): Promise<Array<{ factId: string; score: number }>> {
-    return this.client.vectorSearch(input);
+    return this.workspace.vectorSearch({ workspaceId: this.requireWorkspaceId(), collection: 'facts', vector: Array.from(input.vector), ...(input.limit === undefined ? {} : { limit: input.limit }), ...(input.model ? { model: input.model } : {}), ...(input.resourceId ? { metadata: { resourceId: input.resourceId } } : {}) }).then((hits) => hits.map((hit) => ({ factId: hit.recordId, score: hit.score })));
+  }
+
+  async clearAllMemory(): Promise<number> {
+    const removed = await this.workspace.clearOwned({ preserveWorkspaceIds: [SETTINGS_WORKSPACE_ID], idempotencyKey: `memory-clear:${Date.now()}` });
+    if (this.workspaceId) await this.ensureCollections(this.workspaceId);
+    return removed;
+  }
+
+  async exportBackup(): Promise<Blob> {
+    const backup = await this.workspace.exportAll();
+    return new Blob([JSON.stringify({ format: 'ss-helper-memory', version: 1, ...backup })], { type: 'application/vnd.ss-helper.workspace+json' });
+  }
+
+  async importBackup(file: File): Promise<void> {
+    const value = JSON.parse(await file.text()) as { format?: string; version?: number; archive?: unknown; sha256?: string };
+    if (value.format !== 'ss-helper-memory' || value.version !== 1 || !value.archive || typeof value.sha256 !== 'string') throw new Error('Memory 备份格式无效。');
+    await this.workspace.importAll({ archive: value.archive as never, sha256: value.sha256 });
+    await this.ensureCollections(SETTINGS_WORKSPACE_ID); if (this.workspaceId) await this.ensureCollections(this.workspaceId);
+  }
+
+  async checkIntegrity(): Promise<{ ok: boolean; message: string }> {
+    const sqlite = await this.workspace.integrity(); if (!sqlite.ok) return { ok: false, message: sqlite.messages.join('；') };
+    const [facts, evidence, slots, vectors] = await Promise.all([this.listAllRecordRows('facts'), this.listAllRows<MemoryEvidence>('evidence'), this.listAllRecordRows('fact-slots'), this.listAllVectors()]);
+    const factIds = new Set(facts.map((item) => item.recordId));
+    const problems = [
+      ...evidence.filter((item) => !factIds.has(item.factId)).map((item) => `证据 ${item.id} 缺少事实 ${item.factId}`),
+      ...slots.filter((item) => !factIds.has(String((item.value as { factId?: string }).factId ?? ''))).map((item) => `槽位 ${item.recordId} 指向不存在的事实`),
+      ...vectors.filter((item) => !factIds.has(item.recordId)).map((item) => `向量 ${item.recordId} 缺少事实`),
+    ];
+    return { ok: problems.length === 0, message: problems.length ? problems.join('；') : 'SQLite 与 Memory workspace 完整性检查通过。' };
+  }
+
+  private async rebuildSlots(): Promise<void> {
+    const workspaceId = this.requireWorkspaceId(); const facts = await this.listAllFacts(); const current = await this.listAllRecordRows('fact-slots');
+    const slots = new Map<string, MemoryFact[]>(); for (const fact of facts) if (fact.slotKey && (fact.status === 'active' || fact.status === 'pending')) { const values = slots.get(fact.slotKey) ?? []; values.push(fact); slots.set(fact.slotKey, values); }
+    const operations: WorkspaceTransactionOperation[] = current.map((record) => ({ action: 'delete', collection: 'fact-slots', recordId: record.recordId, expectedVersion: record.version }));
+    for (const [slotKey, values] of slots) { const selected = values.sort((left, right) => Number(right.status === 'active') - Number(left.status === 'active') || right.freshestEvidenceAt - left.freshestEvidenceAt)[0]; operations.push({ action: 'upsert', collection: 'fact-slots', recordId: slotKey, value: { factId: selected.id }, expectedVersion: 0 }); }
+    await this.workspace.transaction({ workspaceId, operations });
   }
 }

@@ -1,4 +1,5 @@
 import type { SettingsAdapter, SettingsSchema, SettingsValues } from '@ss-helper/sdk';
+import config from '../../plugin.config.json' with { type: 'json' };
 
 export interface MemorySettings {
   enabled: boolean;
@@ -26,22 +27,28 @@ export const MEMORY_WORKBENCH_POPUP = Object.freeze({
 
 export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
   id: 'ss-helper.memory',
-  title: 'SS-Helper [记忆]',
+  title: config.settingsTitle,
   fields: [
-    { kind: 'toggle', id: 'enabled', label: '启用记忆', description: '控制记忆整理与召回。', defaultValue: true },
-    { kind: 'toggle', id: 'autoOrganize', label: '自动整理', description: '在聊天轮次完成后整理有证据的事实。', defaultValue: true },
-    { kind: 'range', id: 'maxRecallItems', label: '召回条数', description: '单次最多注入的记忆数量。', min: 4, max: 30, step: 1, defaultValue: 12 },
-    { kind: 'range', id: 'promptMaxChars', label: 'Prompt 字符预算', description: '单次记忆注入可使用的最大字符数。', min: 2_000, max: 16_000, step: 500, defaultValue: 8_000 },
-    { kind: 'select', id: 'answerMode', label: '回答模式', options: [
-      { value: 'auto', label: '自动' }, { value: 'roleplay', label: '角色扮演' }, { value: 'diagnostic', label: '诊断' },
-    ], defaultValue: 'auto' },
-    { kind: 'select', id: 'recallMode', label: '召回模式', options: [
-      { value: 'auto', label: '自动' }, { value: 'lexical', label: '关键词' }, { value: 'vector', label: '向量' }, { value: 'hybrid', label: '混合' },
-    ], defaultValue: 'auto' },
-    { kind: 'select', id: 'rerankMode', label: '重排策略', options: [
-      { value: 'off', label: '关闭' }, { value: 'adaptive', label: '自适应' }, { value: 'always', label: '始终' },
-    ], defaultValue: 'adaptive' },
-    { kind: 'action', id: 'workbench', label: '打开记忆工作台', actionId: 'open-workbench', popup: MEMORY_WORKBENCH_POPUP },
+    { kind: 'section', id: 'basic', label: '基础', children: [
+      { kind: 'toggle', id: 'enabled', label: '启用记忆', description: '控制记忆整理与召回。', defaultValue: true },
+      { kind: 'toggle', id: 'autoOrganize', label: '自动整理', description: '在聊天轮次完成后整理有证据的事实。', defaultValue: true },
+      { kind: 'select', id: 'answerMode', label: '回答模式', options: [
+        { value: 'auto', label: '自动' }, { value: 'roleplay', label: '角色扮演' }, { value: 'diagnostic', label: '诊断' },
+      ], defaultValue: 'auto' },
+    ] },
+    { kind: 'section', id: 'recall', label: '召回', children: [
+      { kind: 'range', id: 'maxRecallItems', label: '召回条数', description: '单次最多注入的记忆数量。', min: 4, max: 30, step: 1, defaultValue: 12 },
+      { kind: 'range', id: 'promptMaxChars', label: 'Prompt 字符预算', description: '单次记忆注入可使用的最大字符数。', min: 2_000, max: 16_000, step: 500, defaultValue: 8_000 },
+      { kind: 'select', id: 'recallMode', label: '召回模式', options: [
+        { value: 'auto', label: '自动' }, { value: 'lexical', label: '关键词' }, { value: 'vector', label: '向量' }, { value: 'hybrid', label: '混合' },
+      ], defaultValue: 'auto' },
+      { kind: 'select', id: 'rerankMode', label: '重排策略', options: [
+        { value: 'off', label: '关闭' }, { value: 'adaptive', label: '自适应' }, { value: 'always', label: '始终' },
+      ], defaultValue: 'adaptive' },
+    ] },
+    { kind: 'section', id: 'tools', label: '工具', children: [
+      { kind: 'action', id: 'workbench', label: '打开记忆工作台', actionId: 'open-workbench', popup: MEMORY_WORKBENCH_POPUP },
+    ] },
   ],
 } as const satisfies SettingsSchema);
 

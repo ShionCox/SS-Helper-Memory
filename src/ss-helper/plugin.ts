@@ -9,6 +9,7 @@ import {
 } from '@ss-helper/sdk';
 import { createMemorySettingsAdapter, MEMORY_SETTINGS_SCHEMA, MEMORY_WORKBENCH_POPUP, type MemorySettingsController } from './settings';
 import { registerMemoryServices, type MemoryRecallController } from './services';
+import config from '../../plugin.config.json' with { type: 'json' };
 
 export interface MemoryContributionController extends MemorySettingsController, MemoryRecallController {}
 
@@ -28,8 +29,8 @@ export type MemoryHostCapability = (typeof MEMORY_HOST_CAPABILITIES)[number];
 
 export const MEMORY_PLUGIN_DESCRIPTOR: PluginDescriptor<MemoryHostCapability> = Object.freeze({
   id: MEMORY_PLUGIN_ID,
-  displayName: 'SS-Helper [记忆]',
-  pluginVersion: 'V0.0.2',
+  displayName: config.displayName,
+  pluginVersion: config.manifest.version,
   sdkPackageVersion: SDK_PACKAGE_VERSION,
   apiMajor: API_MAJOR,
   minApiMinor: API_MINOR,

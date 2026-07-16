@@ -170,6 +170,7 @@ export interface MemoryUiController {
   importSqliteBackup(file: File): Promise<void>;
   checkSqliteIntegrity(): Promise<MemorySqliteIntegrityResult>;
   clearCurrentChatData(): Promise<void>;
+  clearAllMemoryData(): Promise<void>;
 }
 
 const WORKBENCH_ID = 'stx-memory-workbench';
@@ -336,7 +337,7 @@ function downloadSqlite(content: Blob): void {
   anchor.href = URL.createObjectURL(content);
   anchor.download = content instanceof File && content.name
     ? content.name
-    : `ss-helper-memory-${new Date().toISOString().slice(0, 10)}.sqlite3`;
+    : `ss-helper-memory-${new Date().toISOString().slice(0, 10)}.json`;
   anchor.click();
   URL.revokeObjectURL(anchor.href);
 }
@@ -508,10 +509,11 @@ async function openWorkbench(controller: MemoryUiController, container?: HTMLEle
         <strong class="mt-4 block">最后一次召回</strong>
         <pre class="stx-memory-code mt-3 max-h-40 overflow-auto whitespace-pre-wrap rounded p-3">${escapeHtml(JSON.stringify(diagnostics, null, 2) || '暂无召回记录')}</pre>
         <div class="mt-3 flex flex-wrap gap-2">
-          <button class="memory-export-sqlite stx-memory-button stx-memory-button-secondary rounded border px-3 py-2" type="button">导出 SQLite 快照</button>
-          <label class="stx-memory-button stx-memory-button-secondary cursor-pointer rounded border px-3 py-2">恢复 SQLite 快照<input class="memory-import-sqlite hidden" type="file" accept="application/vnd.sqlite3,.sqlite,.sqlite3,.db" /></label>
+          <button class="memory-export-sqlite stx-memory-button stx-memory-button-secondary rounded border px-3 py-2" type="button">导出 Memory 归档</button>
+          <label class="stx-memory-button stx-memory-button-secondary cursor-pointer rounded border px-3 py-2">恢复 Memory 归档<input class="memory-import-sqlite hidden" type="file" accept="application/json,.json" /></label>
           <button class="memory-integrity stx-memory-button stx-memory-button-secondary rounded border px-3 py-2" type="button">完整性检查</button>
-          <button class="memory-clear stx-memory-button stx-memory-button-danger rounded border px-3 py-2" type="button">清空当前聊天</button>
+          <button class="memory-clear stx-memory-button stx-memory-button-danger rounded border px-3 py-2" type="button">清空当前聊天来源</button>
+          <button class="memory-clear-all stx-memory-button stx-memory-button-danger rounded border px-3 py-2" type="button">清空全部角色记忆</button>
         </div>
         <p class="memory-integrity-result stx-memory-muted mt-2 text-xs" aria-live="polite">恢复会原子替换当前用户的完整 Memory 数据库；操作前请先导出快照。</p>
       </details>
@@ -588,7 +590,7 @@ async function openWorkbench(controller: MemoryUiController, container?: HTMLEle
     if (!window.confirm(`确认恢复 ${file.name}？这会原子替换当前用户的完整 Memory SQLite 数据库。`)) return;
     void controller.importSqliteBackup(file)
       .then(refresh)
-      .then(() => window.alert('SQLite 快照恢复成功。'))
+      .then(() => window.alert('Memory 归档恢复成功。'))
       .catch((error: unknown) => window.alert(error instanceof Error ? error.message : String(error)))
       .finally(() => { (event.target as HTMLInputElement).value = ''; });
   });
@@ -613,8 +615,13 @@ async function openWorkbench(controller: MemoryUiController, container?: HTMLEle
       .finally(() => { button.disabled = false; });
   });
   dialog.querySelector('.memory-clear')?.addEventListener('click', () => {
-    if (window.confirm('只清空当前聊天的 SQLite 记忆数据？此操作无法撤销。')) {
+    if (window.confirm('只清空当前聊天产生的记忆来源？其他聊天仍有证据支持的事实会保留。此操作无法撤销。')) {
       void controller.clearCurrentChatData().then(refresh);
+    }
+  });
+  dialog.querySelector('.memory-clear-all')?.addEventListener('click', () => {
+    if (window.confirm('清空 Memory 插件的全部角色卡和群组记忆？全局设置会保留，此操作无法撤销。')) {
+      void controller.clearAllMemoryData().then(refresh);
     }
   });
   if (dialog instanceof HTMLDialogElement) {

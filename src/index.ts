@@ -58,6 +58,7 @@ export interface MemoryPluginApi {
   rollbackBatch(jobId: string, batchIndex: number): Promise<void>;
   getSqliteStatus(): Promise<MemorySqliteStatus>;
   clearCurrentChatData(): Promise<void>;
+  clearAllMemoryData(): Promise<void>;
 }
 
 export * from './domain';

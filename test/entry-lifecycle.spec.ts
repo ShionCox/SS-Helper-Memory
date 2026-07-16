@@ -21,6 +21,7 @@ vi.mock('@ss-helper/sdk', () => ({
   API_MINOR: 0,
   MEMORY_PLUGIN_ID: 'ss-helper.memory',
   SDK_PACKAGE_VERSION: '1.0.0',
+  ensureHostedCore: async () => undefined,
 }));
 vi.mock('../src/host/memory-runtime', () => ({
   MemoryRuntime: class {
@@ -36,6 +37,7 @@ describe('entry lifecycle', () => {
   it('cancels an unfinished start and keeps later start-stop-start idempotent', async () => {
     const entry = await import('../src/entry');
     const first = entry.start();
+    await Promise.resolve();
     entry.stop();
     state.releaseStart();
 
@@ -43,12 +45,14 @@ describe('entry lifecycle', () => {
     expect(state.instances[0]?.stop).toHaveBeenCalledTimes(1);
 
     const secondPromise = entry.start();
+    await Promise.resolve();
     state.releaseStart();
     const second = await secondPromise;
     expect(second).not.toBeNull();
     entry.stop();
 
     const thirdPromise = entry.start();
+    await Promise.resolve();
     state.releaseStart();
     expect(await thirdPromise).not.toBeNull();
     entry.stop();

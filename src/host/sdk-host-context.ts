@@ -6,30 +6,43 @@ import type {
 } from '@ss-helper/sdk';
 import type { SourceBlock } from '../application/ingest/types';
 import type { MemoryHostCapability } from '../ss-helper/plugin';
-import type { MemoryPluginBinaryRequestPort, MemoryPluginRequestPort } from '../infrastructure/memory-sqlite-client';
 import { collectCurrentChatSources, type MemorySourceReader } from './source-adapter';
+
+function stableId(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  const id = String(value).trim();
+  return id && !/^(?:null|undefined)$/i.test(id) ? id : '';
+}
 
 export interface MemoryHostContext {
   getChatKey(): string;
+  getWorkspaceId(): string;
   collectSources(chatKey: string): Promise<SourceBlock[]>;
   getRecallContext?(): Promise<{ characterKeys: string[]; worldKeys: string[] }>;
-  getRequestPort?(): MemoryPluginRequestPort;
-  getBinaryRequestPort?(): MemoryPluginBinaryRequestPort;
 }
 
 export class SdkMemoryHostContext implements MemoryHostContext, MemorySourceReader {
-  private chatKey = '';
+  private sourceChatKey = '';
+  private workspaceKey = '';
 
   constructor(private readonly session: PluginSession<MemoryHostCapability>) {}
 
-  getChatKey(): string { return this.chatKey; }
+  getChatKey(): string { return this.sourceChatKey; }
+  getWorkspaceId(): string { return this.workspaceKey; }
 
-  setChatKey(chatKey: string): void { this.chatKey = chatKey.trim(); }
+  setChatKey(chatKey: string): void { this.sourceChatKey = chatKey.trim(); }
 
   async refresh(): Promise<string> {
     const context = await this.session.host.context.read();
-    this.chatKey = String(context.chatKey ?? context.chatId ?? '').trim();
-    return this.chatKey;
+    this.sourceChatKey = String(context.chatKey ?? context.chatId ?? '').trim();
+    const groupId = stableId(context.groupId);
+    if (groupId) this.workspaceKey = `group:${groupId}`;
+    else {
+      const character = await this.session.host.character?.read?.() ?? null;
+      const characterId = stableId(character?.id);
+      this.workspaceKey = characterId ? `character:${characterId}` : '';
+    }
+    return this.workspaceKey;
   }
 
   readMessages() { return this.session.host.chat.readMessages(); }
@@ -40,9 +53,6 @@ export class SdkMemoryHostContext implements MemoryHostContext, MemorySourceRead
   collectSources(chatKey: string): Promise<SourceBlock[]> {
     return collectCurrentChatSources(chatKey, this);
   }
-
-  getRequestPort(): MemoryPluginRequestPort { return this.session.host.request; }
-  getBinaryRequestPort(): MemoryPluginBinaryRequestPort { return this.session.host.binaryRequest; }
 
   async getRecallContext(): Promise<{ characterKeys: string[]; worldKeys: string[] }> {
     const [character, books] = await Promise.all([this.readCharacter(), this.readActiveWorldbooks()]);

@@ -8,6 +8,7 @@ import { captureMainChatUsage } from './main-chat-usage';
 import { SdkMemoryHostContext } from './sdk-host-context';
 import { configureMemoryLlmApi } from '../application/ingest/llm-extractor';
 import { createMemoryLlmApi } from '../ss-helper/llm-adapter';
+import { MemoryRepository } from '../infrastructure/memory-repository';
 
 const SEND_WINDOW_MS = 45_000;
 const MEMORY_PROMPT_ID = 'ss-helper.memory.recall.v1';
@@ -26,7 +27,7 @@ export class MemoryRuntime {
 
   constructor(
     private readonly session: PluginSession<MemoryHostCapability>,
-    application = new MemoryApplication(),
+    application = new MemoryApplication(new MemoryRepository(session.workspace)),
   ) {
     this.application = application;
     this.context = new SdkMemoryHostContext(session);
@@ -37,6 +38,7 @@ export class MemoryRuntime {
     this.stopped = false;
     configureMemoryLlmApi(createMemoryLlmApi(this.session, this.abortController.signal));
     await this.context.refresh();
+    this.application.bindStorageScope(this.context.getWorkspaceId(), this.context.getChatKey());
     await this.application.start();
     const contributions = registerMemoryContributions(
       this.session,
@@ -45,10 +47,10 @@ export class MemoryRuntime {
     );
     this.disposers.push(() => contributions.dispose());
     this.bindHostEvents();
-    const sqlite = await this.application.getSqliteStatus();
-    if (sqlite.connected) logger.success('Memory SQLite 已启动。');
-    else logger.error('Memory SQLite 服务不可用，记忆功能已安全停用。', sqlite.lastError);
-    return sqlite.connected;
+    const storage = await this.application.getSqliteStatus();
+    if (storage.connected) logger.success('Memory workspace 已启动。');
+    else logger.error('Memory workspace 不可用，记忆功能已安全停用。', storage.lastError);
+    return storage.connected;
   }
 
   stop(): void {
@@ -71,7 +73,7 @@ export class MemoryRuntime {
       this.context.setChatKey(event.chatKey);
       this.lastUserMessageAt = 0;
       void this.session.host.prompt.remove(MEMORY_PROMPT_ID).catch(() => undefined);
-      this.scheduleRebind(false);
+      void this.context.refresh().then(() => this.scheduleRebind(false)).catch((error) => logger.warn('Memory workspace refresh failed', error));
     }));
     this.disposers.push(events.subscribe('message-sent', () => {
       this.lastUserMessageAt = Date.now();
@@ -110,6 +112,7 @@ export class MemoryRuntime {
       const injection = await buildMemoryPromptContribution(messages, this.application.recall, settings.maxRecallItems, {
         maxChars: settings.promptMaxChars,
         answerMode: settings.answerMode,
+        currentIdentity: (await this.session.host.persona.read()) ?? undefined,
       });
       if (injection.injected) {
         await this.session.host.prompt.set({ id: MEMORY_PROMPT_ID, content: injection.prompt, position: 0 });

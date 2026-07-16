@@ -1,59 +1,52 @@
 # SS-Helper [记忆]
 
-Memory 是证据优先的 SillyTavern 长期记忆插件。它以 SillyTavern 服务端插件提供的 SQLite 数据库作为唯一持久化来源；浏览器不使用 IndexedDB、Dexie、localStorage 或其他持久缓存保存 Memory 数据。
+Memory 是证据优先的 SillyTavern 长期记忆前端扩展。它拥有全部记忆领域逻辑，通过 `PluginSession.workspace` 使用 SS-Helper SDK 的通用 SQLite workspace；SDK 不包含事实整理、冲突判断、召回或 Memory 路由。
 
 ## 运行架构
 
 ```text
 SillyTavern 前端扩展（Memory）
-  ├─ 来源采集与 Prompt 注入
-  ├─ 关键词 / 向量 / 混合召回与 LLM rerank
-  └─ /api/plugins/ss-helper-memory/v1
+  ├─ 来源采集、事实整理与冲突重试
+  ├─ 关键词 / 向量 / 混合召回与 Prompt 注入
+  ├─ 当前聊天清理、完整性检查与 Memory 归档
+  └─ session.workspace
            │
-SillyTavern 服务端插件（ss-helper-memory-sqlite）
-  ├─ 类型化 query / command / vector API
-  ├─ 专用 Worker Thread + node:sqlite
-  └─ data/<user>/_memory/memory.sqlite3
+SillyTavern 服务端插件（SS-Helper-SDK）
+  ├─ 通用 workspace / collection / transaction / vector API
+  ├─ 所有权、授权、索引、归档和 SQLite 健康检查
+  └─ data/_ss-helper/ss-helper.sqlite3
 ```
 
-- 只支持 SillyTavern 1.16.0、Windows 和 Node.js 24。
-- 服务端使用 SQLite schema v2，并启用 `foreign_keys=ON`、WAL、`synchronous=NORMAL` 和 `busy_timeout=5000`。
-- 每个酒馆用户拥有独立数据库，数据库路径由酒馆用户目录推导，前端不能指定。
-- 服务端不可用时 Memory 停止整理、召回和注入，但不阻止普通聊天。
+- 目标宿主为 SillyTavern 1.18.0 和 Node.js 24。
+- SDK 首次启动时幂等创建唯一共享数据库，并启用外键、WAL 和 `busy_timeout`。
+- 数据不按登录用户或 Persona 隔离。单角色使用 `character:<character.id>`，群聊使用 `group:<group.id>`；设置使用 `settings:global`。
+- 缺少稳定角色/群组 ID 或 workspace 端口不可用时，Memory 停止整理、召回和注入，但不影响普通聊天与 LLM 的非存储功能。
 
 ## 数据与召回
 
-SQLite 保存事实、证据、任务、设置、召回日志、批次审计、主聊天 usage、批次快照和事实向量。业务写入在服务端以高层事务完成，并通过 `requestId` 保证重试幂等。向量以 Float32 BLOB 保存，top-K 在服务端执行。
+Memory 在自己的 workspace 中维护 `facts`、`fact-slots`、`evidence`、`jobs`、`job-audits`、`usage` 和 `recall-logs` collection。事实、证据、槽位、任务与审计通过 SDK 条件事务原子提交；版本冲突时 Memory 重新读取并最多自动重试一次。
 
-自动事实必须引用本批次的来源证据；正文和证据通过严格校验后才能写入。召回支持 `auto | lexical | vector | hybrid`，rerank 支持 `off | adaptive | always`。向量或 rerank 路由失败时只降级召回策略，不影响消息发送。最终注入仍使用统一的 `<memory_context>`。
+`sourceChatKey` 只用于来源审计和当前聊天清理，不参与事实可见性。同一角色卡的不同聊天和不同酒馆登录用户共享角色记忆，不同角色卡或群组默认隔离。关键词搜索、冲突判断、向量覆盖率和事实—向量一致性均由 Memory 计算。
 
-## SQLite 状态与备份
+Persona 在每次生成提示词前实时读取并注入，只声明当前回复对象，不改变 workspace，也不默认沉淀为长期事实。
 
-设置页固定展示服务端连接、服务端/SQLite/schema 版本、数据库相对路径、文件大小、WAL、各表记录数、向量覆盖率和最近事务错误。工作台可以：
+## 清理、完整性与备份
 
-- 导出一致性 SQLite 快照；
-- 用 SQLite 快照原子恢复整个当前用户数据库；
-- 执行 SQLite 完整性检查；
-- 清空当前聊天的数据。
+- “清空当前聊天来源”只删除当前 `sourceChatKey` 的证据、任务、审计、usage 和召回日志，并重新计算受影响事实；仍有其他聊天证据的事实保留。
+- “清空全部角色记忆”删除 Memory 拥有的所有 `character:*` 与 `group:*` workspace，保留 `settings:global`，不影响 LLM 或其他插件数据。
+- 备份是带版本和 SHA-256 校验的 Memory JSON workspace 归档；恢复只替换 `ss-helper.memory` 拥有的数据，不导出或导入原始 SQLite 文件。
 
-批次回滚会撤销所选批次及其后续批次，并恢复到所选批次执行前的事实、证据和替代链状态，避免保留依赖已撤销批次的后续结果。
+本项目不读取、迁移或自动删除旧 Memory 专用表、旧 `_memory/memory.sqlite3`、IndexedDB 或旧 HTTP 备份。
 
-恢复是破坏性操作，应先导出快照。Memory 不读取旧 IndexedDB，不导入旧 JSON backup，也不提供旧链路迁移或回退。
+## 安装与构建
 
-## Core 集成与公共 API
-
-运行后由 SS-Helper Core 管理插件会话、类型化服务、设置与 popup 工作台。Memory 不暴露跨插件全局对象；事实管理、整理、召回、诊断与 SQLite 快照均通过当前插件内部控制器及公开 Core 契约完成。`manifest.json` 的酒馆加载标识保持为 `stx_memory`，公开 Core/settings 标识为 `ss-helper.memory`，SQLite 设置和业务命名空间仍为 `stx_memory`；这是刻意保留既有数据边界，不是重命名，也不提供旧版兼容层。旧 JSON backup 与旧插件 ID 均不兼容。
-
-SDK/Core 的当前外部消费者说明、固定构建输入和所有权边界见 [docs/sdk-integration.md](docs/sdk-integration.md)。[docs/sdk-migration-baseline.md](docs/sdk-migration-baseline.md) 仅保留 G0/G5C 历史证据，不能作为当前操作指南。
-
-## 构建与验证
+Memory 只安装在 SillyTavern 前端扩展目录；SDK 只安装在 `SillyTavern/plugins/SS-Helper-SDK`。`plugin.config.json` 是名称、设置标题和版本的唯一配置源，根项目 `pnpm build` 会在 `dist/SS-Helper-Memory` 生成可发布扩展。
 
 ```powershell
 pnpm typecheck
 pnpm lint
 pnpm test
 pnpm build
-node scripts/legacy-scan.mjs
 ```
 
-本仓库不提供本地安装脚本、`Memory` 子目录命令或开发者机器路径。发布和部署由对应发行流程处理；在此仓库中只运行上述现有验证命令。
+SDK/Core 公共边界见 [docs/sdk-integration.md](docs/sdk-integration.md)。

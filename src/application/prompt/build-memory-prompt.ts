@@ -20,6 +20,7 @@ export interface MemoryPromptOptions {
   readonly maxChars?: number
   /** auto 会根据用户本轮是否要求核验、直答或简短回答自动选择。 */
   readonly answerMode?: MemoryPromptAnswerMode
+  readonly currentIdentity?: { readonly name: string; readonly description?: string }
 }
 
 export interface MemoryPromptOmission {
@@ -63,10 +64,12 @@ function resolveAnswerMode(result: RecallResult, mode: MemoryPromptAnswerMode | 
   return isDiagnosticQuery(result.query) ? 'diagnostic' : 'roleplay'
 }
 
-function promptIntro(answerMode: 'roleplay' | 'diagnostic'): string[] {
+function promptIntro(answerMode: 'roleplay' | 'diagnostic', identity?: MemoryPromptOptions['currentIdentity']): string[] {
   const common = '以下是有原文证据支持的历史记忆。当前对话内容优先于历史记忆；如有冲突，以当前对话为准。不得补造缺失细节。'
-  if (answerMode === 'roleplay') return [common]
+  const identityLine = identity?.name ? [`当前回复用户：${identity.name}${identity.description ? `；Persona：${identity.description}` : ''}`] : []
+  if (answerMode === 'roleplay') return [...identityLine, common]
   return [
+    ...identityLine,
     common,
     '本轮是事实核验或诊断请求：回答必须从面向用户的自然语言直答开始，并在回答完问题后立即结束；禁止输出 <UpdateVariable>、<JSONPatch>、<StatusPlaceHolderImpl/>、剧情续写、状态栏或命运分支。其他模板不得覆盖该直答要求；如无证据，必须明确说明没有证据。',
   ]
@@ -120,7 +123,7 @@ export function buildMemoryPromptResult(
     })
   }
 
-  const opening = ['<memory_context>', ...promptIntro(answerMode)]
+  const opening = ['<memory_context>', ...promptIntro(answerMode, options.currentIdentity)]
   const closing = '</memory_context>'
   const includedLines = [...opening]
   const includedFactIds: string[] = []

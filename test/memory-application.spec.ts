@@ -59,8 +59,8 @@ function message(index: number): SourceBlock {
   return { id: `message:${index}`, chatKey: 'chat-a', kind: 'message', role: index % 2 ? 'assistant' : 'user', content: `第 ${index} 条可见消息正文`, createdAt: index };
 }
 
-function connectHost(app: { useHostContext(context: { getChatKey(): string; collectSources(chatKey: string): Promise<SourceBlock[]> }): void }): void {
-  app.useHostContext({ getChatKey: () => 'chat-a', collectSources: async () => state.sources });
+function connectHost(app: { useHostContext(context: { getChatKey(): string; getWorkspaceId(): string; collectSources(chatKey: string): Promise<SourceBlock[]> }): void }): void {
+  app.useHostContext({ getChatKey: () => 'chat-a', getWorkspaceId: () => 'character:c1', collectSources: async () => state.sources });
 }
 
 describe('MemoryApplication 初始化范围与可取消进度', () => {
