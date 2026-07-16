@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 
-const EXPECTED_SDK_SHA256 = '1e40f5510e817292c4b9a7510ac536da725b8410de4b3c2ce0c89ceac28902dd';
+const EXPECTED_SDK_SHA256 = 'b8feb5dd0eee34b39c39c1cddf3ff3f4a44dd537af8bb0f9f0991e49c9aff5c4';
 
 describe('G012 G5C SDK managed artifact', () => {
   it('pins the exact approved tarball without workspace/link/absolute path dependencies', async () => {

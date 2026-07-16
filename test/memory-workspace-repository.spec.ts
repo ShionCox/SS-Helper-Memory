@@ -41,7 +41,7 @@ describe('MemoryRepository workspace concurrency', () => {
     expect(port.open).toHaveBeenCalledWith(expect.objectContaining({ workspaceId: 'settings:global' }));
   });
 
-  it('starts in safe standby when SillyTavern has no selected character', async () => {
+  it('keeps the global enabled preference while SillyTavern has no selected character', async () => {
     const application = new MemoryApplication(new MemoryRepository(workspace()));
     application.useHostContext({
       getChatKey: () => '',
@@ -50,7 +50,7 @@ describe('MemoryRepository workspace concurrency', () => {
     });
     await application.start();
     await expect(application.getSqliteStatus()).resolves.toMatchObject({ connected: true });
-    expect(application.getSettings().enabled).toBe(false);
+    expect(application.getSettings().enabled).toBe(true);
   });
 
   it('keeps Memory domain writes in a generic CAS transaction', async () => {

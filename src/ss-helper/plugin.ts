@@ -7,7 +7,7 @@ import {
   type PluginDescriptor,
   type PluginSession,
 } from '@ss-helper/sdk';
-import { createMemorySettingsAdapter, MEMORY_SETTINGS_SCHEMA, MEMORY_WORKBENCH_POPUP, type MemorySettingsController } from './settings';
+import { createMemorySettingsAdapter, MEMORY_SETTINGS_SCHEMA, MEMORY_WORKBENCH_POPUP, type MemorySettingsController, type MemorySettingsStatusSource } from './settings';
 import { registerMemoryServices, type MemoryRecallController } from './services';
 import config from '../../plugin.config.json' with { type: 'json' };
 
@@ -15,6 +15,7 @@ export interface MemoryContributionController extends MemorySettingsController, 
 
 export const MEMORY_HOST_CAPABILITIES = Object.freeze([
   'tavern.context.read',
+  'core.ui.notification.v1',
   'tavern.character.read',
   'tavern.persona.read',
   'tavern.chat.read',
@@ -41,11 +42,12 @@ export function registerMemoryContributions(
   session: PluginSession<MemoryHostCapability>,
   controller: MemoryContributionController,
   renderWorkbench: (container: HTMLElement) => void | (() => void),
+  statusSource?: MemorySettingsStatusSource,
 ): { dispose(): void; publishUpdated: ReturnType<typeof registerMemoryServices>['publishUpdated'] } {
   const services = registerMemoryServices(session, controller);
   const disposers = [
     services.dispose,
-    session.registerSettings(MEMORY_SETTINGS_SCHEMA, createMemorySettingsAdapter(controller)),
+    session.registerSettings(MEMORY_SETTINGS_SCHEMA, createMemorySettingsAdapter(controller, statusSource, (notification) => session.ui.showToast(notification))),
     session.registerPopup({
       token: MEMORY_WORKBENCH_POPUP,
       title: '记忆工作台',

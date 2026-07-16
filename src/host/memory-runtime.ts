@@ -9,6 +9,7 @@ import { SdkMemoryHostContext } from './sdk-host-context';
 import { configureMemoryLlmApi } from '../application/ingest/llm-extractor';
 import { createMemoryLlmApi } from '../ss-helper/llm-adapter';
 import { MemoryRepository } from '../infrastructure/memory-repository';
+import { MemoryLlmCapabilityMonitor } from '../ss-helper/llm-capability-monitor';
 
 const SEND_WINDOW_MS = 45_000;
 const MEMORY_PROMPT_ID = 'ss-helper.memory.recall.v1';
@@ -40,13 +41,26 @@ export class MemoryRuntime {
     await this.context.refresh();
     this.application.bindStorageScope(this.context.getWorkspaceId(), this.context.getChatKey());
     await this.application.start();
+    const capabilityMonitor = new MemoryLlmCapabilityMonitor(
+      this.session,
+      () => this.application.getEffectiveSettings(),
+      (listener) => this.application.onSettingsChanged(() => listener()),
+      () => !this.application.getEffectiveSettings().enabled
+        ? { value: '未启用', tone: 'neutral', description: '启用记忆后，当前角色或群组状态会在这里显示。' }
+        : this.context.getWorkspaceId()
+        ? { value: '已就绪', tone: 'success', description: '当前角色或群组可用于记忆整理与召回。' }
+        : { value: '未选择', tone: 'warning', description: '请先选择一个角色或加入群组；设置已保存，但当前暂不整理或召回。' },
+    );
+    await capabilityMonitor.start();
+    this.disposers.push(() => capabilityMonitor.dispose());
     const contributions = registerMemoryContributions(
       this.session,
       this.application,
       (container) => renderMemoryWorkbench(container, this.application),
+      capabilityMonitor,
     );
     this.disposers.push(() => contributions.dispose());
-    this.bindHostEvents();
+    this.bindHostEvents(capabilityMonitor);
     const storage = await this.application.getSqliteStatus();
     if (storage.connected) logger.success('Memory workspace 已启动。');
     else logger.error('Memory workspace 不可用，记忆功能已安全停用。', storage.lastError);
@@ -67,13 +81,18 @@ export class MemoryRuntime {
     logger.info('Memory 已停止。');
   }
 
-  private bindHostEvents(): void {
+  private bindHostEvents(capabilityMonitor: MemoryLlmCapabilityMonitor): void {
     const events = this.session.host.events;
     this.disposers.push(events.subscribe('chat-changed', (event) => {
       this.context.setChatKey(event.chatKey);
       this.lastUserMessageAt = 0;
       void this.session.host.prompt.remove(MEMORY_PROMPT_ID).catch(() => undefined);
-      void this.context.refresh().then(() => this.scheduleRebind(false)).catch((error) => logger.warn('Memory workspace refresh failed', error));
+      void this.context.refresh()
+        .then(async () => {
+          await capabilityMonitor.refreshNow();
+          this.scheduleRebind(false);
+        })
+        .catch((error) => logger.warn('Memory workspace refresh failed', error));
     }));
     this.disposers.push(events.subscribe('message-sent', () => {
       this.lastUserMessageAt = Date.now();
@@ -103,7 +122,7 @@ export class MemoryRuntime {
 
   private async onPromptReady(messages: Parameters<typeof buildMemoryPromptContribution>[0]): Promise<void> {
     await this.rebindPromise;
-    const settings = this.application.getSettings();
+    const settings = this.application.getEffectiveSettings();
     if (!settings.enabled || Date.now() - this.lastUserMessageAt > SEND_WINDOW_MS) {
       await this.session.host.prompt.remove(MEMORY_PROMPT_ID).catch(() => undefined);
       return;

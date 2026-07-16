@@ -17,6 +17,7 @@ function stableId(value: unknown): string {
 export interface MemoryHostContext {
   getChatKey(): string;
   getWorkspaceId(): string;
+  getChatName?(): string;
   collectSources(chatKey: string): Promise<SourceBlock[]>;
   getRecallContext?(): Promise<{ characterKeys: string[]; worldKeys: string[] }>;
 }
@@ -24,17 +25,21 @@ export interface MemoryHostContext {
 export class SdkMemoryHostContext implements MemoryHostContext, MemorySourceReader {
   private sourceChatKey = '';
   private workspaceKey = '';
+  private chatName = '';
 
   constructor(private readonly session: PluginSession<MemoryHostCapability>) {}
 
   getChatKey(): string { return this.sourceChatKey; }
   getWorkspaceId(): string { return this.workspaceKey; }
+  getChatName(): string { return this.chatName; }
 
   setChatKey(chatKey: string): void { this.sourceChatKey = chatKey.trim(); }
 
   async refresh(): Promise<string> {
-    const context = await this.session.host.context.read();
+    const readCurrent = this.session.host.chat?.readCurrent;
+    const [context, chat] = await Promise.all([this.session.host.context.read(), readCurrent ? readCurrent() : Promise.resolve(null)]);
     this.sourceChatKey = String(context.chatKey ?? context.chatId ?? '').trim();
+    this.chatName = String(chat?.name ?? chat?.key ?? this.sourceChatKey).trim();
     const groupId = stableId(context.groupId);
     if (groupId) this.workspaceKey = `group:${groupId}`;
     else {

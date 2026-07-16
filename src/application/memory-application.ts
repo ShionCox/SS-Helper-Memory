@@ -38,7 +38,9 @@ import type {
 } from '../ui/memory-ui';
 import type { MemoryHostContext } from '../host/sdk-host-context';
 
-const DEFAULT_SETTINGS: Readonly<MemoryUiSettings> = Object.freeze({
+type MemoryGlobalSettings = Omit<MemoryUiSettings, 'chatMode'>;
+
+const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   enabled: true,
   autoOrganize: true,
   maxRecallItems: recallLimits.default,
@@ -92,7 +94,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   readonly backup: MemoryPluginApi['backup'];
   readonly diagnostics: MemoryPluginApi['diagnostics'];
 
-  private settings: MemoryUiSettings = { ...DEFAULT_SETTINGS };
+  private settings: MemoryGlobalSettings = { ...DEFAULT_SETTINGS };
+  private chatOverrides: Record<string, boolean> = {};
   private readonly recallIndex = new MemoryRecallIndex();
   private readonly vectorIndex: MemoryVectorIndexService;
   private readonly semanticRecall: SemanticRecallService;
@@ -180,6 +183,26 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return this.hostContext?.getChatKey() ?? '';
   }
 
+  private getCurrentScopeKey(): string {
+    const workspaceId = this.hostContext?.getWorkspaceId() ?? '';
+    const chatKey = this.getChatKey();
+    return workspaceId && chatKey ? JSON.stringify([workspaceId, chatKey]) : '';
+  }
+
+  getCurrentChatInfo(): { available: boolean; name: string; key: string; mode: MemoryUiSettings['chatMode']; effectiveEnabled: boolean } {
+    const key = this.getChatKey();
+    const scopeKey = this.getCurrentScopeKey();
+    const override = scopeKey ? this.chatOverrides[scopeKey] : undefined;
+    const mode: MemoryUiSettings['chatMode'] = override === true ? 'enabled' : override === false ? 'disabled' : 'inherit';
+    return {
+      available: Boolean(scopeKey),
+      name: this.hostContext?.getChatName?.() || key,
+      key,
+      mode,
+      effectiveEnabled: Boolean(scopeKey) && (override ?? this.settings.enabled),
+    };
+  }
+
   listChatKeys(): Promise<string[]> {
     if (!this.sqliteAvailable) return Promise.resolve([]);
     return this.repository.getChatKeys();
@@ -191,6 +214,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.repository.bind?.(workspaceId, chatKey);
     if (this.boundChatKey && this.boundChatKey !== chatKey) this.captureVersion += 1;
     this.boundChatKey = chatKey;
+    this.settingsListeners.forEach((listener) => listener(this.getSettings()));
     if (!this.sqliteAvailable) {
       this.recallIndex.replace([]);
       return;
@@ -215,18 +239,26 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.error = error instanceof Error ? error.message : String(error);
       return;
     }
-    if (chatKey && this.settings.recallMode !== 'lexical') this.vectorIndex.scheduleSync(chatKey);
+    const effective = this.getEffectiveSettings();
+    if (effective.enabled && chatKey && effective.recallMode !== 'lexical') this.vectorIndex.scheduleSync(chatKey);
     this.lastRecall = null;
     this.lastRecallLogId = null;
   }
 
   getSettings(): MemoryUiSettings {
-    return { ...this.settings, enabled: this.settings.enabled && this.sqliteAvailable && Boolean(this.hostContext?.getWorkspaceId()) };
+    return { ...this.settings, chatMode: this.getCurrentChatInfo().mode };
+  }
+
+  getEffectiveSettings(settings: MemoryUiSettings = this.getSettings()): MemoryGlobalSettings {
+    const available = this.getCurrentChatInfo().available;
+    const enabled = available && (settings.chatMode === 'enabled' || (settings.chatMode === 'inherit' && settings.enabled));
+    const { chatMode: _chatMode, ...global } = settings;
+    return { ...global, enabled };
   }
 
   async saveSettings(settings: MemoryUiSettings): Promise<void> {
     if (!this.sqliteAvailable) throw new Error('Memory workspace 不可用，设置未保存。');
-    const nextSettings: MemoryUiSettings = {
+    const nextSettings: MemoryGlobalSettings = {
       enabled: settings.enabled === true,
       autoOrganize: settings.autoOrganize === true,
       maxRecallItems: clampMaxItems(settings.maxRecallItems),
@@ -237,12 +269,32 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         : 'auto',
       rerankMode: settings.rerankMode === 'off' || settings.rerankMode === 'always' ? settings.rerankMode : 'adaptive',
     };
-    await this.repository.setSettings({ ...nextSettings });
+    const scopeKey = this.getCurrentScopeKey();
+    const nextOverrides = { ...this.chatOverrides };
+    if (settings.chatMode !== 'inherit' && !scopeKey) throw new Error('请先进入角色或群组聊天，再修改当前聊天设置。');
+    if (scopeKey) {
+      if (settings.chatMode === 'inherit') delete nextOverrides[scopeKey];
+      else nextOverrides[scopeKey] = settings.chatMode === 'enabled';
+    }
+    await this.repository.setSettings({ ...nextSettings, chatOverrides: nextOverrides });
     this.settings = nextSettings;
+    this.chatOverrides = nextOverrides;
     this.settingsListeners.forEach((listener) => listener(this.getSettings()));
-    if (!this.settings.enabled) this.status = 'disabled';
+    const effective = this.getEffectiveSettings();
+    if (!effective.enabled) this.status = 'disabled';
     else if (this.status === 'disabled') this.status = 'ready';
-    if (this.settings.enabled && this.settings.recallMode !== 'lexical') this.vectorIndex.scheduleSync(this.getChatKey());
+    if (effective.enabled && effective.recallMode !== 'lexical') this.vectorIndex.scheduleSync(this.getChatKey());
+  }
+
+  async resetSettings(): Promise<void> {
+    if (!this.sqliteAvailable) throw new Error('Memory workspace 不可用，设置未恢复。');
+    await this.repository.setSettings({ ...DEFAULT_SETTINGS, chatOverrides: {} });
+    this.settings = { ...DEFAULT_SETTINGS };
+    this.chatOverrides = {};
+    this.settingsListeners.forEach((listener) => listener(this.getSettings()));
+    const effective = this.getEffectiveSettings();
+    this.status = effective.enabled ? 'ready' : 'disabled';
+    if (effective.enabled && effective.recallMode !== 'lexical') this.vectorIndex.scheduleSync(this.getChatKey());
   }
 
   async getRecallStatus(): Promise<import('../ui/memory-ui').MemoryRecallStatus> {
@@ -314,7 +366,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const llmRoute = await readMemoryLlmRouteDiagnostic();
     const errorCode = this.error.match(/(?:错误码\s*[=:]|HTTP\s+)([\w-]+)/i)?.[1];
     return {
-      status: this.settings.enabled ? this.status : 'disabled',
+      status: this.getEffectiveSettings().enabled ? this.status : 'disabled',
       bound: Boolean(chatKey && this.boundChatKey === chatKey),
       ...(chatKey ? { chatKey } : {}),
       factCount: facts.length,
@@ -404,7 +456,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   /** LLMHub 延迟挂载时重试任务注册，并继续未完成的向量回填。 */
   refreshLlmRegistration(): void {
-    if (this.sqliteAvailable && this.settings.recallMode !== 'lexical') {
+    const settings = this.getEffectiveSettings();
+    if (this.sqliteAvailable && settings.enabled && settings.recallMode !== 'lexical') {
       this.vectorIndex.scheduleSync(this.getChatKey());
     }
   }
@@ -576,7 +629,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   observeCompletedRound(visibleText: string): void {
-    if (!this.settings.enabled || !this.settings.autoOrganize) return;
+    const settings = this.getEffectiveSettings();
+    if (!settings.enabled || !settings.autoOrganize) return;
     const chatKey = this.getChatKey();
     if (!chatKey) return;
     const decision = this.trigger.observeRound(chatKey, visibleText);
@@ -584,7 +638,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   private async loadSettings(): Promise<void> {
-    const [enabled, autoOrganize, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode] = await Promise.all([
+    const [enabled, autoOrganize, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode, chatOverrides] = await Promise.all([
       this.repository.getSetting<boolean>('enabled'),
       this.repository.getSetting<boolean>('autoOrganize'),
       this.repository.getSetting<number>('maxRecallItems'),
@@ -592,6 +646,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.repository.getSetting<MemoryUiSettings['answerMode']>('answerMode'),
       this.repository.getSetting<MemoryUiSettings['recallMode']>('recallMode'),
       this.repository.getSetting<MemoryUiSettings['rerankMode']>('rerankMode'),
+      this.repository.getSetting<Record<string, boolean>>('chatOverrides'),
     ]);
     this.settings = {
       enabled: enabled ?? DEFAULT_SETTINGS.enabled,
@@ -602,20 +657,25 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       recallMode: recallMode === 'lexical' || recallMode === 'vector' || recallMode === 'hybrid' ? recallMode : 'auto',
       rerankMode: rerankMode === 'off' || rerankMode === 'always' ? rerankMode : 'adaptive',
     };
+    this.chatOverrides = chatOverrides && typeof chatOverrides === 'object' && !Array.isArray(chatOverrides)
+      ? Object.fromEntries(Object.entries(chatOverrides).filter((entry): entry is [string, boolean] => typeof entry[1] === 'boolean'))
+      : {};
   }
 
   private async previewRecall(input: Omit<RecallQuery, 'chatKey'> & { query: string }): Promise<RecallResult> {
     const chatKey = this.requireChatKey();
+    const settings = this.getEffectiveSettings();
+    if (!settings.enabled) throw new Error('当前聊天未启用记忆。');
     const recallContext = await this.hostContext?.getRecallContext?.();
     const query: RecallQuery = {
       ...input,
       chatKey,
-      maxItems: input.maxItems ?? this.settings.maxRecallItems,
+      maxItems: input.maxItems ?? settings.maxRecallItems,
       characterKeys: input.characterKeys ?? recallContext?.characterKeys ?? [],
       worldKeys: input.worldKeys ?? recallContext?.worldKeys ?? [],
     };
     const recallVersion = this.captureVersion;
-    const result = await this.semanticRecall.recall(query, this.settings.recallMode, this.settings.rerankMode);
+    const result = await this.semanticRecall.recall(query, settings.recallMode, settings.rerankMode);
     if (this.stopped || recallVersion !== this.captureVersion || this.getChatKey() !== chatKey) {
       throw new Error('召回结果已因聊天切换而丢弃。');
     }
@@ -662,7 +722,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     resumeJob?: MemoryJob,
     selectedSourceGroups?: string[],
   ): Promise<void> {
-    if (!this.settings.enabled) return;
+    if (!this.getEffectiveSettings().enabled) return;
     const chatKey = this.requireChatKey();
     const captureVersion = this.captureVersion;
     const effectiveSelectedSourceGroups = resumeJob?.checkpoint.selectedSourceGroupIds ?? selectedSourceGroups;
@@ -779,7 +839,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
             id: jobId, chatKey, type: mode, status: 'paused', checkpoint, createdAt, updatedAt: Date.now(),
           });
         }
-        this.status = this.settings.enabled ? 'ready' : 'disabled';
+        this.status = this.getEffectiveSettings().enabled ? 'ready' : 'disabled';
         this.activeCaptureProgress = {
           status: this.cancelRequested ? 'cancelled' : 'paused', jobId,
           batchIndex: checkpoint.batchIndex, totalBatches: allBatches.length,
@@ -815,7 +875,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   private async resumePausedWork(): Promise<void> {
     const chatKey = this.getChatKey();
-    if (!chatKey || !this.settings.enabled) return;
+    if (!chatKey || !this.getEffectiveSettings().enabled) return;
     const paused = (await this.repository.listJobs(chatKey)).find((job) => job.status === 'paused');
     if (paused) await this.flushCapture(paused.type, paused);
   }

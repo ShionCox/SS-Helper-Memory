@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MemoryJob, MemoryRecallLog } from '../src/domain';
 import type { SourceBlock } from '../src/application/ingest/types';
+import { MEMORY_DEFAULT_SETTINGS } from '../src/ss-helper/settings';
 
 const state = vi.hoisted(() => ({
   sources: [] as SourceBlock[],
@@ -43,11 +44,14 @@ class FakeRepository {
     else this.jobs.push(structuredClone(job));
   });
   readonly commit = vi.fn(async () => undefined);
+  readonly settings = new Map<string, unknown>();
   async open(): Promise<void> {}
   close(): void {}
-  async getSetting(): Promise<undefined> { return undefined; }
+  async getSetting<T>(key: string): Promise<T | undefined> { return this.settings.get(key) as T | undefined; }
   async setSetting(): Promise<void> {}
+  async setSettings(values: Record<string, unknown>): Promise<void> { Object.entries(values).forEach(([key, value]) => this.settings.set(key, structuredClone(value))); }
   async listFacts(): Promise<[]> { return []; }
+  async bootstrap(): Promise<{ facts: []; vectorFacts: [] }> { return { facts: [], vectorFacts: [] }; }
   async listJobs(): Promise<MemoryJob[]> { return [...this.jobs].sort((a, b) => b.updatedAt - a.updatedAt); }
   async listJobBatchAudits(): Promise<Array<{ sourceRefs: string[] }>> { return structuredClone(this.audits); }
   async listEvidence(): Promise<[]> { return []; }
@@ -157,6 +161,44 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       injectedPrompt: prompt,
       promptDiagnostics: { usedChars: prompt.length, answerMode: 'diagnostic' },
     });
+    app.stop();
+  });
+
+  it('按 workspace/chatKey 隔离三态覆盖，聊天切换后刷新，并在恢复默认时清空全部覆盖', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    const app = new MemoryApplication(repository as never);
+    let workspaceId = 'character:c1';
+    let chatKey = 'chat-a';
+    let chatName = 'Alice';
+    app.useHostContext({
+      getChatKey: () => chatKey,
+      getWorkspaceId: () => workspaceId,
+      getChatName: () => chatName,
+      collectSources: async () => [],
+    });
+    await app.start();
+
+    await app.saveSettings({ ...app.getSettings(), enabled: false, chatMode: 'enabled' });
+    expect(app.getCurrentChatInfo()).toMatchObject({ name: 'Alice', key: 'chat-a', mode: 'enabled', effectiveEnabled: true });
+    expect(repository.settings.get('chatOverrides')).toEqual({ '["character:c1","chat-a"]': true });
+
+    chatKey = 'chat-b'; chatName = 'Bob';
+    await app.bindCurrentChat();
+    expect(app.getCurrentChatInfo()).toMatchObject({ name: 'Bob', key: 'chat-b', mode: 'inherit', effectiveEnabled: false });
+    await app.saveSettings({ ...app.getSettings(), chatMode: 'disabled' });
+    expect(repository.settings.get('chatOverrides')).toEqual({
+      '["character:c1","chat-a"]': true,
+      '["character:c1","chat-b"]': false,
+    });
+
+    workspaceId = 'group:g1'; chatKey = 'chat-a'; chatName = 'Group chat';
+    await app.bindCurrentChat();
+    expect(app.getCurrentChatInfo()).toMatchObject({ mode: 'inherit', effectiveEnabled: false });
+
+    await app.resetSettings();
+    expect(repository.settings.get('chatOverrides')).toEqual({});
+    expect(app.getSettings()).toMatchObject({ ...MEMORY_DEFAULT_SETTINGS, chatMode: 'inherit' });
     app.stop();
   });
 });

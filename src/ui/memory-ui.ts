@@ -15,6 +15,7 @@ export interface MemoryUiSettings {
   answerMode: 'auto' | 'roleplay' | 'diagnostic';
   recallMode: 'auto' | 'lexical' | 'vector' | 'hybrid';
   rerankMode: 'off' | 'adaptive' | 'always';
+  chatMode: 'inherit' | 'enabled' | 'disabled';
 }
 
 export interface MemoryRecallRouteStatus {

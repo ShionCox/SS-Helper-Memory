@@ -9,7 +9,10 @@ describe('SS-Helper Memory typed adapters', () => {
     const listeners = new Set<(value: typeof settings) => void>();
     const adapter = createMemorySettingsAdapter({
       getSettings: () => ({ ...settings }),
+      getEffectiveSettings: (value = settings) => { const { chatMode: _chatMode, ...effective } = value; return effective; },
       saveSettings: async (value) => { settings = value; listeners.forEach((listener) => listener(settings)); },
+      resetSettings: async () => { settings = { ...MEMORY_DEFAULT_SETTINGS }; listeners.forEach((listener) => listener(settings)); },
+      getCurrentChatInfo: () => ({ available: true, name: 'Chat A', key: 'chat-a', mode: settings.chatMode, effectiveEnabled: settings.enabled }),
       onSettingsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     });
     expect(MEMORY_SETTINGS_SCHEMA.id).toBe('ss-helper.memory');
@@ -18,6 +21,59 @@ describe('SS-Helper Memory typed adapters', () => {
     expect(settings).toMatchObject({ enabled: false, maxRecallItems: 6, promptMaxChars: 8_000 });
     await adapter.reset();
     expect(settings).toEqual(MEMORY_DEFAULT_SETTINGS);
+  });
+
+  it('exposes exactly the global and current-chat tabs and disables overrides without a chat', async () => {
+    expect(MEMORY_SETTINGS_SCHEMA.fields.map((field) => field.id)).toEqual(['global', 'currentChat']);
+    let settings = { ...MEMORY_DEFAULT_SETTINGS };
+    const listeners = new Set<(value: typeof settings) => void>();
+    const adapter = createMemorySettingsAdapter({
+      getSettings: () => ({ ...settings }),
+      getEffectiveSettings: (value = settings) => { const { chatMode: _chatMode, ...effective } = value; return { ...effective, enabled: false }; },
+      saveSettings: async (value) => { settings = value; listeners.forEach((listener) => listener(settings)); },
+      resetSettings: async () => { settings = { ...MEMORY_DEFAULT_SETTINGS }; listeners.forEach((listener) => listener(settings)); },
+      getCurrentChatInfo: () => ({ available: false, name: '', key: '', mode: 'inherit', effectiveEnabled: false }),
+      onSettingsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
+    });
+    expect(await adapter.loadFieldState?.()).toEqual({ chatMode: { disabled: true, disabledReason: '请先进入角色或群组聊天，再修改当前聊天设置。' } });
+    await expect(adapter.loadStatus?.()).resolves.toMatchObject({
+      currentChatIdentity: { value: '不可用', tone: 'warning' },
+      currentChatEffective: { value: '未生效', tone: 'warning' },
+    });
+  });
+
+  it('blocks strict capability changes, warns on graceful degradation, and reports persistence failures once', async () => {
+    let settings = { ...MEMORY_DEFAULT_SETTINGS, enabled: false, autoOrganize: false };
+    const saveSettings = vi.fn(async (value: typeof settings) => { settings = value; });
+    const toast = vi.fn();
+    const assess = vi.fn(async (next: { recallMode: string }) => next.recallMode === 'vector'
+      ? { blocked: { title: '无法启用所选召回模式', message: 'Embedding API 不可用。', code: 'MEMORY_EMBEDDING_UNAVAILABLE' }, warnings: [] }
+      : { warnings: [{ title: '召回已自动降级', message: '将使用关键词召回。', code: 'MEMORY_EMBEDDING_DEGRADED' }] });
+    const controller = {
+      getSettings: () => ({ ...settings }),
+      getEffectiveSettings: (value = settings) => { const { chatMode: _chatMode, ...effective } = value; return effective; },
+      saveSettings,
+      resetSettings: async () => {},
+      getCurrentChatInfo: () => ({ available: true, name: 'Alice', key: 'chat-a', mode: settings.chatMode, effectiveEnabled: settings.enabled }),
+      onSettingsChanged: () => () => {},
+    };
+    const adapter = createMemorySettingsAdapter(controller, { loadStatus: () => ({}), subscribeStatus: () => () => {}, assess }, toast);
+
+    await expect(adapter.save({ ...settings, enabled: true, recallMode: 'vector' })).rejects.toThrow('Embedding API 不可用。');
+    expect(saveSettings).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ level: 'error', code: 'MEMORY_EMBEDDING_UNAVAILABLE', durationMs: 0 }));
+
+    toast.mockClear();
+    await adapter.save({ ...settings, enabled: true, recallMode: 'auto' });
+    expect(saveSettings).toHaveBeenCalledOnce();
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ level: 'warning', code: 'MEMORY_EMBEDDING_DEGRADED' }));
+
+    saveSettings.mockRejectedValueOnce(new Error('workspace transaction failed'));
+    toast.mockClear();
+    await expect(adapter.save({ ...settings, maxRecallItems: 14 })).rejects.toThrow('workspace transaction failed');
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ level: 'error', code: 'MEMORY_SETTINGS_SAVE_FAILED', durationMs: 0 }));
   });
 
   it('exposes MEMORY_RECALL_V1 and publishes MEMORY_UPDATED_V1 as plain DTOs', async () => {
