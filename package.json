@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ss-helper/sdk": "file:vendor/ss-helper-sdk-1.0.0.tgz"
+    "@ss-helper/sdk": "file:vendor/ss-helper-sdk-2.0.0.tgz"
   },
   "devDependencies": {
     "@types/node": "^25.3.3",

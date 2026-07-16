@@ -443,7 +443,23 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   async rollbackBatch(jobId: string, batchIndex: number): Promise<void> {
-    await this.repository.rollbackJobBatch(jobId, batchIndex, this.requireChatKey());
+    const chatKey = this.requireChatKey();
+    let affectedFactIds: string[];
+    try {
+      affectedFactIds = await this.repository.rollbackJobBatch(jobId, batchIndex, chatKey);
+    } catch (error) {
+      await this.bindCurrentChat();
+      throw error;
+    }
+    try {
+      if (affectedFactIds.length > 0) {
+        await this.vectorIndex.rebuildFacts(chatKey, affectedFactIds);
+        await this.repository.completeRollbackIndexRepair(jobId, batchIndex);
+      }
+    } catch {
+      await this.bindCurrentChat();
+      throw Object.assign(new Error('回滚已提交，向量索引修复等待重试。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
+    }
     await this.bindCurrentChat();
   }
 

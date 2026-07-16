@@ -31,6 +31,9 @@ class FakeVectorRepository {
   }
 
   async clearFactVectors(): Promise<void> { this.vectors.length = 0; }
+  async getFact(chatKey: string, factId: string): Promise<MemoryFact | null> {
+    return this.facts.find((fact) => fact.chatKey === chatKey && fact.id === factId) ?? null;
+  }
   async vectorSearch(input: { vector: Float32Array; resourceId?: string; model?: string }) {
     return this.vectors
       .filter(vector => vector.resourceId === input.resourceId && vector.model === input.model)
@@ -65,6 +68,19 @@ const routes = async () => ({
 afterEach(() => vi.useRealTimers());
 
 describe('事实向量索引服务', () => {
+  it('回滚后只重建受影响事实的向量', async () => {
+    const repository = new FakeVectorRepository(3);
+    const embed = vi.fn(async ({ texts }: { texts: string[] }) => ({ ok: true as const, vectors: texts.map(() => [1, 0]), model: 'BAAI/bge-m3' }));
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    service.start();
+
+    await service.rebuildFacts('chat-a', ['fact-1']);
+
+    expect(embed).toHaveBeenCalledWith(expect.objectContaining({ texts: [expect.stringContaining('fact-1')] }));
+    expect(repository.upsertFactVector).toHaveBeenCalledTimes(1);
+    expect(repository.upsertFactVector).toHaveBeenCalledWith(expect.objectContaining({ factId: 'fact-1' }));
+  });
+
   it('拒绝同批非法维度且不写入半批数据', async () => {
     const repository = new FakeVectorRepository();
     const embed = vi.fn(async () => ({ ok: true as const, vectors: [[1, 0], [1, 0, 0]], model: 'BAAI/bge-m3' }));

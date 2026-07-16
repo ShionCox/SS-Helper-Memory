@@ -8,7 +8,7 @@
 
 ## 版本规则（强制）
 
-- 前端插件发布版本的唯一来源是根目录 `plugin.config.json` 的 `manifest.version`，当前固定为 `V0.0.2`；`manifest.json` 仅是构建产物。
+- 前端插件发布版本的唯一来源是根目录 `plugin.config.json` 的 `manifest.version`，当前固定为裸 SemVer `0.0.2`；`manifest.json` 仅是构建产物。设置 UI 负责显示为 `v0.0.2`。
 - 根目录 `package.json` 不得增加 `version` 字段。
 - 公共前端 API、UI、日志、README、测试名称和测试数据标识不得再次硬编码插件发布版本。
 - `server/package.json` 的 `0.0.1` 仅是 SDK 内嵌 Memory 语义 worker 的内部协议版本；插件发布版本仍只来自 `plugin.config.json`。

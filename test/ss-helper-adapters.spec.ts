@@ -3,6 +3,15 @@ import { MEMORY_RECALL_V1, MEMORY_UPDATED_V1, type PluginSession } from '@ss-hel
 import { createMemorySettingsAdapter, MEMORY_DEFAULT_SETTINGS, MEMORY_SETTINGS_SCHEMA } from '../src/ss-helper/settings';
 import { registerMemoryServices } from '../src/ss-helper/services';
 
+const liveStatusSource = {
+  loadStatus: () => ({ workspaceStatus: { value: '已就绪', tone: 'success' as const } }),
+  subscribeStatus: (listener: (status: Record<string, { value: string; tone: 'success' }>) => void) => {
+    listener({ workspaceStatus: { value: '已就绪', tone: 'success' } });
+    return () => {};
+  },
+  assess: async () => ({ warnings: [] }),
+};
+
 describe('SS-Helper Memory typed adapters', () => {
   it('uses the Core settings schema/adapter without a second settings root', async () => {
     let settings = { ...MEMORY_DEFAULT_SETTINGS };
@@ -14,7 +23,7 @@ describe('SS-Helper Memory typed adapters', () => {
       resetSettings: async () => { settings = { ...MEMORY_DEFAULT_SETTINGS }; listeners.forEach((listener) => listener(settings)); },
       getCurrentChatInfo: () => ({ available: true, name: 'Chat A', key: 'chat-a', mode: settings.chatMode, effectiveEnabled: settings.enabled }),
       onSettingsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
-    });
+    }, liveStatusSource);
     expect(MEMORY_SETTINGS_SCHEMA.id).toBe('ss-helper.memory');
     expect(await adapter.load()).toMatchObject({ enabled: true, maxRecallItems: 12 });
     await adapter.save({ enabled: false, maxRecallItems: 6 });
@@ -34,12 +43,34 @@ describe('SS-Helper Memory typed adapters', () => {
       resetSettings: async () => { settings = { ...MEMORY_DEFAULT_SETTINGS }; listeners.forEach((listener) => listener(settings)); },
       getCurrentChatInfo: () => ({ available: false, name: '', key: '', mode: 'inherit', effectiveEnabled: false }),
       onSettingsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
-    });
+    }, liveStatusSource);
     expect(await adapter.loadFieldState?.()).toEqual({ chatMode: { disabled: true, disabledReason: '请先进入角色或群组聊天，再修改当前聊天设置。' } });
     await expect(adapter.loadStatus?.()).resolves.toMatchObject({
+      workspaceStatus: { value: '已就绪', tone: 'success' },
       currentChatIdentity: { value: '不可用', tone: 'warning' },
       currentChatEffective: { value: '未生效', tone: 'warning' },
     });
+  });
+
+  it('updates current-chat status live without exposing the internal chat key', async () => {
+    let chat = { available: true, name: 'Alice', key: 'private/chat/key', mode: 'inherit' as const, effectiveEnabled: true };
+    const listeners = new Set<() => void>();
+    const adapter = createMemorySettingsAdapter({
+      getSettings: () => ({ ...MEMORY_DEFAULT_SETTINGS }),
+      getEffectiveSettings: (value = MEMORY_DEFAULT_SETTINGS) => { const { chatMode: _chatMode, ...effective } = value; return effective; },
+      saveSettings: async () => {},
+      resetSettings: async () => {},
+      getCurrentChatInfo: () => chat,
+      onSettingsChanged: (listener) => { const callback = () => listener({ ...MEMORY_DEFAULT_SETTINGS }); listeners.add(callback); return () => listeners.delete(callback); },
+    }, liveStatusSource);
+    const snapshots: Array<Record<string, { value: string; description?: string }>> = [];
+    const dispose = adapter.subscribeStatus?.((status) => snapshots.push(status as typeof snapshots[number]));
+    chat = { ...chat, name: 'Group B', key: 'private/group/key' };
+    listeners.forEach((listener) => listener());
+    const latest = snapshots.at(-1)?.currentChatIdentity;
+    expect(latest?.value).toBe('Group B');
+    expect(JSON.stringify(latest)).not.toContain('private/group/key');
+    dispose?.();
   });
 
   it('blocks strict capability changes, warns on graceful degradation, and reports persistence failures once', async () => {

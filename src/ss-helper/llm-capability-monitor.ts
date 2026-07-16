@@ -35,15 +35,16 @@ const action = (value: string, tone: 'warning' | 'error', description: string): 
 export class MemoryLlmCapabilityMonitor {
   private readonly listeners = new Set<(status: MemoryCapabilityStatusMap) => void>();
   private status: MemoryCapabilityStatusMap = Object.freeze({
-    generationStatus: neutral('未检查'),
-    embeddingStatus: neutral('未检查'),
-    rerankStatus: neutral('未检查'),
-    workspaceStatus: neutral('未检查'),
+    generationStatus: neutral('正在同步'),
+    embeddingStatus: neutral('正在同步'),
+    rerankStatus: neutral('正在同步'),
+    workspaceStatus: neutral('正在同步'),
   });
   private revision = -1;
   private availability: Readonly<{ generation: boolean; embedding: boolean; rerank: boolean }> = Object.freeze({ generation: false, embedding: false, rerank: false });
   private timer: ReturnType<typeof setTimeout> | undefined;
   private disposed = false;
+  private refreshGeneration = 0;
   private unsubscribeSettings: (() => void) | undefined;
   private unsubscribeEvent: (() => void) | undefined;
   private unsubscribeHostEvent: (() => void) | undefined;
@@ -106,6 +107,7 @@ export class MemoryLlmCapabilityMonitor {
 
   dispose(): void {
     this.disposed = true;
+    this.refreshGeneration += 1;
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.unsubscribeEvent?.();
     this.unsubscribeHostEvent?.();
@@ -115,6 +117,7 @@ export class MemoryLlmCapabilityMonitor {
 
   private async refresh(): Promise<void> {
     if (this.disposed) return;
+    const refreshGeneration = ++this.refreshGeneration;
     const settings = this.readSettings();
     let response: LlmCapabilityStatusResponse | undefined;
     try {
@@ -128,7 +131,7 @@ export class MemoryLlmCapabilityMonitor {
     } catch {
       response = undefined;
     }
-    if (this.disposed) return;
+    if (this.disposed || refreshGeneration !== this.refreshGeneration) return;
     if (response && response.revision < this.revision) return;
     if (response) this.revision = response.revision;
     const byId = new Map((response?.checks ?? []).map((entry) => [entry.id, entry]));
@@ -140,23 +143,27 @@ export class MemoryLlmCapabilityMonitor {
     try {
       next.workspaceStatus = this.readWorkspaceStatus
         ? await this.readWorkspaceStatus()
-        : neutral('未检查');
+        : action('状态不可用', 'warning', '当前运行时没有提供工作区状态读取器。');
     } catch {
       next.workspaceStatus = neutral('暂不可用', '无法读取当前角色或群组状态。');
     }
+    if (this.disposed || refreshGeneration !== this.refreshGeneration) return;
+    const resourceDescription = (entry: typeof generation): string | undefined => entry?.model
+      ? `${entry.source === 'tavern' ? '酒馆模型' : '自定义资源'} · ${entry.model}`
+      : entry?.source === 'tavern' ? '酒馆模型' : entry?.source === 'custom' ? '自定义资源' : undefined;
     next.generationStatus = !settings.enabled || !settings.autoOrganize
       ? neutral('未启用')
       : generation?.available
-        ? success('已连接', [generation.resourceId, generation.model].filter(Boolean).join(' · ') || (generation.source === 'tavern' ? '酒馆模型' : undefined))
+        ? success('已连接', resourceDescription(generation))
         : action('不可用', 'error', reasonText[generation?.reason ?? 'status_unavailable'] ?? '无法满足整理任务。');
     if (!settings.enabled || settings.recallMode === 'lexical') next.embeddingStatus = neutral('无需配置');
-    else if (embedding?.available) next.embeddingStatus = success('已连接', [embedding.resourceId, embedding.model].filter(Boolean).join(' · ') || (embedding.source === 'tavern' ? '酒馆模型' : undefined));
+    else if (embedding?.available) next.embeddingStatus = success('已连接', resourceDescription(embedding));
     else if (settings.recallMode === 'auto') next.embeddingStatus = action('降级为关键词', 'warning', `${reasonText[embedding?.reason ?? 'status_unavailable'] ?? 'Embedding 不可用'} 自动召回将使用关键词召回。`);
     else next.embeddingStatus = action('不可用', 'error', reasonText[embedding?.reason ?? 'status_unavailable'] ?? '当前召回模式需要 Embedding。');
     next.rerankStatus = !settings.enabled || settings.rerankMode === 'off'
       ? neutral('未启用')
       : rerank?.available
-        ? success('已连接', [rerank.resourceId, rerank.model].filter(Boolean).join(' · ') || (rerank.source === 'tavern' ? '酒馆模型' : undefined))
+        ? success('已连接', resourceDescription(rerank))
         : settings.rerankMode === 'adaptive'
           ? action('降级为基础排序', 'warning', `${reasonText[rerank?.reason ?? 'status_unavailable'] ?? 'Rerank 不可用'} 将保留基础排序结果。`)
           : action('不可用', 'error', reasonText[rerank?.reason ?? 'status_unavailable'] ?? '当前重排策略需要 Rerank。');

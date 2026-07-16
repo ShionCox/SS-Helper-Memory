@@ -31,6 +31,7 @@ export type MemoryHostCapability = (typeof MEMORY_HOST_CAPABILITIES)[number];
 export const MEMORY_PLUGIN_DESCRIPTOR: PluginDescriptor<MemoryHostCapability> = Object.freeze({
   id: MEMORY_PLUGIN_ID,
   displayName: config.displayName,
+  settingsDisplayName: config.settingsDisplayName,
   pluginVersion: config.manifest.version,
   sdkPackageVersion: SDK_PACKAGE_VERSION,
   apiMajor: API_MAJOR,
@@ -42,7 +43,7 @@ export function registerMemoryContributions(
   session: PluginSession<MemoryHostCapability>,
   controller: MemoryContributionController,
   renderWorkbench: (container: HTMLElement) => void | (() => void),
-  statusSource?: MemorySettingsStatusSource,
+  statusSource: MemorySettingsStatusSource,
 ): { dispose(): void; publishUpdated: ReturnType<typeof registerMemoryServices>['publishUpdated'] } {
   const services = registerMemoryServices(session, controller);
   const disposers = [

@@ -44,9 +44,9 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
     { kind: 'section', id: 'global', label: '全局', children: [
       { kind: 'section', id: 'globalBasic', label: '基础', children: [
         { kind: 'toggle', id: 'enabled', label: '默认启用记忆', description: '作为未单独设置聊天时的默认值；当前聊天可以覆盖。', defaultValue: true },
-        { kind: 'status', id: 'workspaceStatus', label: '当前工作区', value: '未检查', tone: 'neutral' },
+        { kind: 'status', id: 'workspaceStatus', label: '当前工作区', value: '正在同步', tone: 'neutral' },
         { kind: 'toggle', id: 'autoOrganize', label: '自动整理', description: '在聊天轮次完成后整理有证据的事实。', defaultValue: true },
-        { kind: 'status', id: 'generationStatus', label: '大语言模型', value: '未检查', tone: 'neutral', action: MEMORY_LLM_RESOURCE_ACTION },
+        { kind: 'status', id: 'generationStatus', label: '大语言模型', value: '正在同步', tone: 'neutral', action: MEMORY_LLM_RESOURCE_ACTION },
         { kind: 'select', id: 'answerMode', label: '回答模式', options: [
           { value: 'auto', label: '自动' }, { value: 'roleplay', label: '角色扮演' }, { value: 'diagnostic', label: '诊断' },
         ], defaultValue: 'auto' },
@@ -57,11 +57,11 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
         { kind: 'select', id: 'recallMode', label: '召回模式', options: [
           { value: 'auto', label: '自动' }, { value: 'lexical', label: '关键词' }, { value: 'vector', label: '向量' }, { value: 'hybrid', label: '混合' },
         ], defaultValue: 'auto' },
-        { kind: 'status', id: 'embeddingStatus', label: 'Embedding API', value: '未检查', tone: 'neutral', action: MEMORY_LLM_RESOURCE_ACTION },
+        { kind: 'status', id: 'embeddingStatus', label: 'Embedding API', value: '正在同步', tone: 'neutral', action: MEMORY_LLM_RESOURCE_ACTION },
         { kind: 'select', id: 'rerankMode', label: '重排策略', options: [
           { value: 'off', label: '关闭' }, { value: 'adaptive', label: '自适应' }, { value: 'always', label: '始终' },
         ], defaultValue: 'adaptive' },
-        { kind: 'status', id: 'rerankStatus', label: 'Rerank API', value: '未检查', tone: 'neutral', action: MEMORY_LLM_RESOURCE_ACTION },
+        { kind: 'status', id: 'rerankStatus', label: 'Rerank API', value: '正在同步', tone: 'neutral', action: MEMORY_LLM_RESOURCE_ACTION },
       ] },
       { kind: 'section', id: 'globalTools', label: '工具', children: [
         { kind: 'action', id: 'workbench', label: '记忆工作台', description: '查看、整理和维护当前聊天的记忆。', actionId: 'open-workbench', popup: MEMORY_WORKBENCH_POPUP, placement: 'inline', buttonLabel: '打开工作台' },
@@ -123,7 +123,7 @@ function chatStatuses(controller: MemorySettingsController): Readonly<Record<str
   });
   const modeText = chat.mode === 'inherit' ? '跟随全局' : chat.mode === 'enabled' ? '强制开启' : '强制关闭';
   return Object.freeze({
-    currentChatIdentity: { value: chat.name || chat.key, tone: 'success', description: `聊天标识：${chat.key}` },
+    currentChatIdentity: { value: chat.name || '当前聊天', tone: 'success', description: '状态会随角色或群组聊天切换实时更新。' },
     currentChatEffective: { value: chat.effectiveEnabled ? '已启用' : '已关闭', tone: chat.effectiveEnabled ? 'success' : 'neutral', description: `当前策略：${modeText}` },
   });
 }
@@ -141,7 +141,7 @@ function notify(sink: ((notification: ToastNotification) => void) | undefined, n
 
 export function createMemorySettingsAdapter(
   controller: MemorySettingsController,
-  statusSource?: MemorySettingsStatusSource,
+  statusSource: MemorySettingsStatusSource,
   toast?: (notification: ToastNotification) => void,
 ): SettingsAdapter {
   let latestCapabilityStatus: MemoryCapabilityStatusMap = Object.freeze({});
@@ -152,7 +152,7 @@ export function createMemorySettingsAdapter(
       const next = fromValues(values, previous);
       const previousEffective = controller.getEffectiveSettings(previous);
       const nextEffective = controller.getEffectiveSettings(next);
-      const assessment = statusSource === undefined ? { warnings: [] } : await statusSource.assess(nextEffective, previousEffective);
+      const assessment = await statusSource.assess(nextEffective, previousEffective);
       if (assessment.blocked !== undefined) {
         notify(toast, { level: 'error', ...assessment.blocked, durationMs: 0 });
         throw new Error(assessment.blocked.message);
@@ -169,13 +169,13 @@ export function createMemorySettingsAdapter(
     },
     reset: async () => { await controller.resetSettings(); return toValues(controller.getSettings()); },
     subscribe: (listener) => controller.onSettingsChanged((settings) => listener(toValues(settings))),
-    loadStatus: async () => ({ ...(statusSource === undefined ? {} : await statusSource.loadStatus()), ...chatStatuses(controller) }),
+    loadStatus: async () => ({ ...await statusSource.loadStatus(), ...chatStatuses(controller) }),
     subscribeStatus: (listener) => {
       const emit = (): void => listener(Object.freeze({ ...latestCapabilityStatus, ...chatStatuses(controller) }));
-      const disposeCapability = statusSource?.subscribeStatus((status) => { latestCapabilityStatus = status; emit(); });
+      const disposeCapability = statusSource.subscribeStatus((status) => { latestCapabilityStatus = status; emit(); });
       const disposeSettings = controller.onSettingsChanged(emit);
       emit();
-      return () => { disposeCapability?.(); disposeSettings(); };
+      return () => { disposeCapability(); disposeSettings(); };
     },
     loadFieldState: () => fieldState(controller),
     subscribeFieldState: (listener) => controller.onSettingsChanged(() => listener(fieldState(controller))),

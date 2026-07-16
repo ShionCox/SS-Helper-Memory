@@ -41,4 +41,39 @@ describe('Memory settings capability policy', () => {
     });
     monitor.dispose();
   });
+
+  it('publishes live capability changes, hides internal resource IDs, and stops after disposal', async () => {
+    let revision = 1;
+    let model = 'embed-a';
+    let eventListener: ((payload: { revision: number }) => void) | undefined;
+    const call = vi.fn(async () => ({
+      revision,
+      checks: [
+        { id: 'generation', configured: true, available: true, source: 'tavern', model: 'chat-a' },
+        { id: 'embedding', configured: true, available: true, source: 'custom', resourceId: 'private-resource-id', model },
+        { id: 'rerank', configured: false, available: false, reason: 'no_resource' },
+      ],
+    }));
+    const monitor = new MemoryLlmCapabilityMonitor({
+      services: { call },
+      events: { subscribe: vi.fn((_token, listener) => { eventListener = listener; return () => { eventListener = undefined; }; }) },
+      host: { events: { subscribe: vi.fn(() => () => {}) } },
+    } as unknown as PluginSession, () => ({ enabled: true, autoOrganize: true, recallMode: 'vector', rerankMode: 'off' }));
+    const snapshots: Array<Record<string, { value: string; description?: string }>> = [];
+    monitor.subscribeStatus((status) => snapshots.push(status as typeof snapshots[number]));
+    await monitor.start();
+    expect(snapshots.at(-1)?.embeddingStatus.description).toContain('embed-a');
+    expect(JSON.stringify(snapshots.at(-1))).not.toContain('private-resource-id');
+
+    revision = 2;
+    model = 'embed-b';
+    eventListener?.({ revision });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(snapshots.at(-1)?.embeddingStatus.description).toContain('embed-b');
+    const count = snapshots.length;
+    monitor.dispose();
+    eventListener?.({ revision: 3 });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(snapshots).toHaveLength(count);
+  });
 });

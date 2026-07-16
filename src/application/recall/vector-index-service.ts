@@ -164,6 +164,50 @@ export class MemoryVectorIndexService {
     await this.syncPromise;
   }
 
+  async rebuildFacts(chatKey: string, factIds: readonly string[]): Promise<void> {
+    if (!this.active || !chatKey) throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
+    if (this.syncPromise) await this.syncPromise;
+    const lifecycleRevision = this.lifecycleRevision;
+    const route = (await this.getRoutes()).embedding;
+    const llm = this.getLlm();
+    if (!route.available || !route.resourceId || !route.model || route.blockedReason || !llm?.embed) {
+      throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
+    }
+    const facts = (await Promise.all([...new Set(factIds)].map((factId) => this.repository.getFact(chatKey, factId))))
+      .filter((fact): fact is MemoryFact => Boolean(fact && (fact.status === 'active' || fact.status === 'pending')));
+    this.queryCache.clear();
+    try {
+      for (let offset = 0; offset < facts.length; offset += VECTOR_BATCH_SIZE) {
+        if (!this.active || lifecycleRevision !== this.lifecycleRevision) throw new Error('Memory 生命周期已变化。');
+        const batch = facts.slice(offset, offset + VECTOR_BATCH_SIZE);
+        const response = await withTimeout(llm.embed({
+          consumer: MEMORY_PLUGIN_ID,
+          taskKey: MEMORY_EMBED_TASK,
+          taskDescription: '回滚后选择性重建事实向量',
+          texts: batch.map(embeddingText),
+          budget: { maxLatencyMs: EMBEDDING_TIMEOUT_MS },
+          enqueue: { displayMode: 'silent' },
+        }), EMBEDDING_TIMEOUT_MS, '回滚向量修复');
+        if (!response.ok || response.vectors.length !== batch.length) throw new Error('回滚向量修复失败。');
+        const vectors = response.vectors.map(validateVector);
+        const dimensions = vectors[0]?.length;
+        if (!dimensions || vectors.some((vector) => vector.length !== dimensions)) throw new Error('回滚向量维度不一致。');
+        const resourceId = response.meta?.resourceId ?? route.resourceId;
+        const model = response.meta?.model ?? response.model ?? route.model;
+        await Promise.all(batch.map((fact, index) => this.repository.upsertFactVector({
+          factId: fact.id,
+          chatKey,
+          content: embeddingText(fact),
+          resourceId,
+          model,
+          vector: vectors[index]!,
+        })));
+      }
+    } catch {
+      throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
+    }
+  }
+
   async getStatus(chatKey: string): Promise<VectorIndexStatus> {
     const diagnostics = await this.getRoutes();
     const route = diagnostics.embedding;
