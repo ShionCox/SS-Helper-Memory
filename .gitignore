@@ -75,7 +75,7 @@ env/
 
 # Generated package archives (retain the vendored SDK artifact)
 *.tgz
-!vendor/ss-helper-sdk-1.0.0.tgz
+!vendor/ss-helper-sdk-*.tgz
 
 # OMX runtime state
 .omx/

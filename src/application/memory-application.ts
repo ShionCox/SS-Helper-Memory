@@ -223,7 +223,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.recallIndex.replace([]);
       this.lastRecall = null;
       this.lastRecallLogId = null;
-      this.error = '当前角色或群组缺少稳定 ID，Memory 暂不整理或召回。';
+      this.error = '';
       if (this.status === 'error') this.status = 'ready';
       return;
     }

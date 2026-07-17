@@ -9,9 +9,10 @@ const json = async (relativePath: string) => JSON.parse(await text(relativePath)
 describe('SDK workspace architecture baseline', () => {
   it('keeps Memory as one frontend extension with a single version source', async () => {
     const [config, manifest, rootPackage] = await Promise.all([json('plugin.config.json'), json('manifest.json'), json('package.json')]);
+    const configuredVersion = (config.manifest as { version?: unknown }).version;
     expect(config.kind).toBe('frontend-extension');
-    expect((config.manifest as { version?: string }).version).toBe('0.0.2');
-    expect(manifest.version).toBe('0.0.2');
+    expect(configuredVersion).toMatch(/^\d+\.\d+\.\d+$/u);
+    expect(manifest.version).toBe(configuredVersion);
     expect(rootPackage).not.toHaveProperty('version');
     await expect(access(path.join(root, 'server', 'index.js'))).rejects.toThrow();
   });

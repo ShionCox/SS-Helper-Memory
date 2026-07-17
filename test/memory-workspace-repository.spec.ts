@@ -17,7 +17,7 @@ function commitInput(): IngestCommit {
 
 function workspace(overrides: Partial<WorkspacePort> = {}): WorkspacePort {
   return {
-    health: vi.fn(async () => ({ ready: true, database: 'ss-helper.sqlite3', schemaVersion: 2 })),
+    health: vi.fn(async () => ({ ready: true, database: 'ss-helper.sqlite3', schemaVersion: 4 })),
     integrity: vi.fn(async () => ({ ok: true, messages: ['ok'] })),
     open: vi.fn(async (request) => ({ ownerPluginId: 'ss-helper.memory', workspaceId: request.workspaceId, created: false })),
     list: vi.fn(async () => ({ workspaces: [], nextCursor: null })),
@@ -52,6 +52,9 @@ describe('MemoryRepository workspace concurrency', () => {
     await application.start();
     await expect(application.getSqliteStatus()).resolves.toMatchObject({ connected: true });
     expect(application.getSettings().enabled).toBe(true);
+    const overview = await application.getOverview();
+    expect(overview).toMatchObject({ status: 'disabled', bound: false });
+    expect(overview.error).toBeUndefined();
   });
 
   it('keeps Memory domain writes in a generic CAS transaction', async () => {

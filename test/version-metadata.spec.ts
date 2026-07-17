@@ -13,8 +13,10 @@ describe('版本元数据', () => {
     const manifest = await readJson('manifest.json');
     const clientPackage = await readJson('package.json');
     const config = await readJson('plugin.config.json');
+    const configuredVersion = (config.manifest as { version?: unknown }).version;
 
-    expect(manifest.version).toBe('0.0.2');
+    expect(configuredVersion).toMatch(/^\d+\.\d+\.\d+$/u);
+    expect(manifest.version).toBe(configuredVersion);
     expect(clientPackage).not.toHaveProperty('version');
     expect(config.kind).toBe('frontend-extension');
   });

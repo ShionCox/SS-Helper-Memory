@@ -1,8 +1,8 @@
 # SDK/Core 外部消费者集成指南
 
-Memory 是 `@ss-helper/sdk` 的前端消费者，不是 SDK 的服务端子模块。仓库内唯一 SDK 依赖是 `vendor/ss-helper-sdk-1.0.0.tgz`，当前 SHA-256 为：
+Memory 是 `@ss-helper/sdk` 的前端消费者，不是 SDK 的服务端子模块。仓库内唯一 SDK 依赖由 `package.json` 指向 `vendor/ss-helper-sdk-<当前 SDK 版本>.tgz`；包名和包内版本必须与 `SS-Helper-SDK/packages/sdk/package.json` 一致。
 
-`1e40f5510e817292c4b9a7510ac536da725b8410de4b3c2ce0c89ceac28902dd`
+开发阶段允许覆盖同版本 tgz，因此不把某次开发构建的 SHA-256 固定为测试或集成契约。只有手动发布阶段成果时，才为最终发行包记录不可变哈希。
 
 ## 加载与会话
 

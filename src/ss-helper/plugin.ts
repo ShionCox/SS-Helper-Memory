@@ -53,6 +53,7 @@ export function registerMemoryContributions(
       token: MEMORY_WORKBENCH_POPUP,
       title: '记忆工作台',
       ariaLabel: 'SS-Helper 记忆工作台',
+      presentation: 'workspace',
       render: (container) => renderWorkbench(container),
     }),
   ];

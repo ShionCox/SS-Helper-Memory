@@ -1,19 +1,42 @@
-import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { gunzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 
-const EXPECTED_SDK_SHA256 = '53d02683cd1b8b7182428bb50b33a81a7e7ff06cc78dc9d57cc0794546197f12';
+function readPackedPackageJson(archive: Buffer): Record<string, unknown> {
+  const tar = gunzipSync(archive);
+  let offset = 0;
+  while (offset + 512 <= tar.length) {
+    const header = tar.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/u, '');
+    const sizeText = header.subarray(124, 136).toString('ascii').replace(/\0.*$/u, '').trim();
+    const size = Number.parseInt(sizeText || '0', 8);
+    const bodyStart = offset + 512;
+    if (name === 'package/package.json') {
+      return JSON.parse(tar.subarray(bodyStart, bodyStart + size).toString('utf8')) as Record<string, unknown>;
+    }
+    offset = bodyStart + Math.ceil(size / 512) * 512;
+  }
+  throw new Error('SDK archive does not contain package/package.json');
+}
 
 describe('G012 G5C SDK managed artifact', () => {
-  it('pins the exact approved tarball without workspace/link/absolute path dependencies', async () => {
-    const [archive, packageJson, lockfile] = await Promise.all([
-      readFile(new URL('../vendor/ss-helper-sdk-2.0.0.tgz', import.meta.url)),
+  it('keeps the dependency, archive name and packed SDK metadata consistent', async () => {
+    const [packageJson, sdkPackageJson, lockfile] = await Promise.all([
       readFile(new URL('../package.json', import.meta.url), 'utf8'),
+      readFile(new URL('../../SS-Helper-SDK/packages/sdk/package.json', import.meta.url), 'utf8'),
       readFile(new URL('../pnpm-lock.yaml', import.meta.url), 'utf8'),
     ]);
-    expect(createHash('sha256').update(archive).digest('hex')).toBe(EXPECTED_SDK_SHA256);
     const manifest = JSON.parse(packageJson) as { dependencies?: Record<string, string> };
-    expect(manifest.dependencies?.['@ss-helper/sdk']).toBe('file:vendor/ss-helper-sdk-2.0.0.tgz');
+    const sdkManifest = JSON.parse(sdkPackageJson) as { name?: string; version?: string };
+    const dependency = manifest.dependencies?.['@ss-helper/sdk'];
+    expect(dependency).toBe(`file:vendor/ss-helper-sdk-${sdkManifest.version}.tgz`);
+    if (dependency === undefined || !dependency.startsWith('file:')) throw new Error('SDK dependency must use a vendored file archive');
+    const archive = await readFile(new URL(`../${dependency.slice('file:'.length)}`, import.meta.url));
+    const packedManifest = readPackedPackageJson(archive);
+    expect(packedManifest.name).toBe(sdkManifest.name);
+    expect(packedManifest.version).toBe(sdkManifest.version);
+    expect(lockfile).toContain(dependency);
     expect(lockfile).not.toMatch(/(?:workspace:|link:|I:\\|\.\.\/\.\.\/SDK|SillyTavern-SS-Helper)/u);
   });
 });
