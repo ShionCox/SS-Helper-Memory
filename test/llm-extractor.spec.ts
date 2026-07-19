@@ -12,7 +12,11 @@ describe('Memory LLMHub 三任务契约', () => {
     const extractor = new LlmMemoryExtractor(() => ({ runTask } as unknown as MemoryLlmApi));
     const result = await extractor.extract({ chatKey: 'c', sources: [{ id: 'm1', chatKey: 'c', kind: 'message', role: 'user', content: '足够明确的来源正文', createdAt: 1 }] });
     expect(runTask).toHaveBeenCalledTimes(1);
-    expect((runTask.mock.calls[0] as unknown[])[0]).toMatchObject({ budget: { maxTokens: MEMORY_EXTRACT_MAX_TOKENS } });
+    const request = (runTask.mock.calls[0] as unknown[])[0] as { budget: unknown; input: { messages: Array<{ content: string }> } };
+    expect(request).toMatchObject({ budget: { maxTokens: MEMORY_EXTRACT_MAX_TOKENS } });
+    expect(request.input.messages[0]?.content).toContain('不得添加聊天名');
+    expect(request.input.messages[1]?.content).toContain('允许的 sourceRef（必须逐字复制其中一个值）：["m1"]');
+    expect(request.input.messages[1]?.content).not.toContain('chatKey=');
     expect(result.audit).toEqual({
       requestId: 'req-1',
       resourceId: 'deepseek-main',

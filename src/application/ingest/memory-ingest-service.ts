@@ -29,6 +29,41 @@ function normalizeKey(value: string): string {
   return value.trim().toLocaleLowerCase().replace(/\s+/g, ' ');
 }
 
+/**
+ * Some providers prepend a human-readable chat label to the source id even
+ * though the extraction contract asks for the id alone.  Only recover an
+ * unambiguous, exact known id at the end of that value; never fuzzy-match a
+ * source because provenance must stay auditable.
+ */
+function normalizeSourceReference(value: string, sources: ReadonlyMap<string, SourceBlock>): string {
+  const sourceRef = value.trim();
+  if (sources.has(sourceRef)) return sourceRef;
+  const matches = [...sources.keys()].filter((sourceId) => {
+    if (!sourceRef.endsWith(sourceId)) return false;
+    const prefix = sourceRef.slice(0, -sourceId.length).trimEnd();
+    return prefix.length > 0 && /[\s/\\|>：:;；]$/u.test(prefix);
+  });
+  return matches.length === 1 ? matches[0]! : sourceRef;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Preserve the source's original substring when a model changed only the
+ * whitespace around a quoted excerpt.  Text and punctuation still have to be
+ * exact, so paraphrases remain rejected by the normal validation below.
+ */
+function recoverExactEvidenceExcerpt(sourceContent: string, value: string): string {
+  const excerpt = value.trim();
+  if (!excerpt || sourceContent.includes(excerpt)) return excerpt;
+  const tokens = excerpt.split(/\s+/u).filter(Boolean);
+  if (tokens.length === 0) return excerpt;
+  const match = sourceContent.match(new RegExp(tokens.map(escapeRegExp).join('\\s+'), 'u'));
+  return match?.[0] ?? excerpt;
+}
+
 function stateSnapshotProposals(sources: readonly SourceBlock[]): ValidatedFactProposal[] {
   return sources.filter(source => source.kind === 'state').flatMap((source) => source.content.split('\n').flatMap((line) => {
     const [marker, rawPath, ...valueParts] = line.split('\t');
@@ -98,7 +133,8 @@ export class MemoryIngestService {
       const canonicalKey = [proposal.kind, proposal.subjectKey, proposal.predicateKey, proposal.objectKey ?? '']
         .map(normalizeKey)
         .join('|');
-      const source = sourceMap.get(proposal.sourceRef);
+      const sourceRef = normalizeSourceReference(proposal.sourceRef, sourceMap);
+      const source = sourceMap.get(sourceRef);
       const scope = proposal.stable === true && source?.kind === 'character'
         ? { characterKeys: source.entityKeys?.length ? [...source.entityKeys] : [proposal.subjectKey] }
         : proposal.stable === true && source?.kind === 'worldbook' && source.entityKeys?.[0]
@@ -106,6 +142,8 @@ export class MemoryIngestService {
           : undefined;
       const candidate: ValidatedFactProposal = {
         ...proposal,
+        sourceRef,
+        evidenceExcerpt: source ? recoverExactEvidenceExcerpt(source.content, proposal.evidenceExcerpt) : proposal.evidenceExcerpt.trim(),
         canonicalKey,
         stable: scope !== undefined,
         ...(scope ? { scope } : {}),

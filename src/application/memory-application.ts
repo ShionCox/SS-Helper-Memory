@@ -531,6 +531,12 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       selectedSourceKinds: [...(latestCompleted?.checkpoint.selectedSourceGroupIds ?? [])],
       ...(latestCompleted?.checkpoint.qualityStatus ? { qualityStatus: latestCompleted.checkpoint.qualityStatus } : {}),
       ...(latestCompleted?.checkpoint.pendingReviewCount === undefined ? {} : { pendingReviewCount: latestCompleted.checkpoint.pendingReviewCount }),
+      ...(latestCompleted?.checkpoint.stagedBatchCount === undefined ? {} : { stagedBatchCount: latestCompleted.checkpoint.stagedBatchCount }),
+      ...(latestCompleted?.checkpoint.mergedDuplicateCount === undefined ? {} : { mergedDuplicateCount: latestCompleted.checkpoint.mergedDuplicateCount }),
+      ...(latestCompleted?.checkpoint.supersededCount === undefined ? {} : { supersededCount: latestCompleted.checkpoint.supersededCount }),
+      ...(latestCompleted?.checkpoint.conflictBucketCount === undefined ? {} : { conflictBucketCount: latestCompleted.checkpoint.conflictBucketCount }),
+      ...(latestCompleted?.checkpoint.ruleResolvedCount === undefined ? {} : { ruleResolvedCount: latestCompleted.checkpoint.ruleResolvedCount }),
+      ...(latestCompleted?.checkpoint.llmResolvedCount === undefined ? {} : { llmResolvedCount: latestCompleted.checkpoint.llmResolvedCount }),
       attempts: initializationJobs.slice(0, 5).map((job) => ({
         jobId: job.id,
         status: this.activeCaptureProgress?.jobId === job.id && this.activeCaptureProgress.status === 'cancelled'
@@ -649,11 +655,15 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       (await this.repository.listEvidence(chatKey, fact.id)).map((item) => ({ sourceRef: item.sourceRef, excerpt: item.excerpt })),
       audits
         .filter((audit) => audit.sourceRefs.some((sourceRef) => fact.sourceRefs.includes(sourceRef)))
-        .map((audit) => ({
-          jobId: audit.jobId,
-          batchIndex: audit.batchIndex,
-          status: audit.rolledBackAt ? '已回滚' : '已完成',
-        })),
+        .map((audit) => {
+          const kind = (audit as { kind?: unknown }).kind;
+          return {
+            jobId: audit.jobId,
+            batchIndex: audit.batchIndex,
+            status: audit.rolledBackAt ? '已回滚' : '已完成',
+            ...(typeof kind === 'string' ? { kind } : {}),
+          };
+        }),
     )));
   }
 

@@ -251,6 +251,15 @@ function serializeSources(sources: readonly SourceBlock[]): string {
   })).join('\n');
 }
 
+function serializeExtractionInput(sources: readonly SourceBlock[]): string {
+  const sourceRefs = sources.map((source) => source.id);
+  return [
+    `允许的 sourceRef（必须逐字复制其中一个值）：${JSON.stringify(sourceRefs)}`,
+    'source blocks（JSONL）：',
+    serializeSources(sources),
+  ].join('\n');
+}
+
 export class LlmMemoryExtractor implements MemoryExtractor {
   constructor(private readonly getLlm: () => MemoryLlmApi | null = readMemoryLlmApi) {}
 
@@ -268,14 +277,15 @@ export class LlmMemoryExtractor implements MemoryExtractor {
             role: 'system',
             content: [
               '你是严谨的记忆提炼器。只依据给定 source blocks 输出事实，不得推测。',
-              '每条事实必须是 20–240 字的单一命题，并逐字复制一段能在对应来源正文中找到的 evidenceExcerpt。',
+              'sourceRef 必须逐字复制允许列表中的一个 id；不得添加聊天名、角色名、楼层、斜杠、注释或任何前后缀。',
+              '每条事实必须是 20–240 字的单一命题；evidenceExcerpt 必须逐字复制对应来源正文中的一段连续原文，保留原有标点和换行，不得概括、改写、翻译或补全。',
               '输出前必须逐条计算 content 字符数；少于 20 字时，用“明确表示、已确认、当前”等不增加新事实的完整陈述扩写到 20 字以上。',
               '长度示例：不要写“林舟出生在云港”；应写“林舟明确表示自己出生在云港，云港是其已经确认的出生地点”。',
               '最多输出 12 条；不确定、缺少证据、仅为措辞重复的内容不要输出。',
               '新事实可能替代旧状态时使用 supersede，但不要自行裁决数据库冲突。',
             ].join('\n'),
           },
-          { role: 'user', content: `chatKey=${input.chatKey}\n${serializeSources(input.sources)}` },
+          { role: 'user', content: serializeExtractionInput(input.sources) },
         ],
       },
       schema: EXTRACTION_SCHEMA,

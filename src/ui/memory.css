@@ -439,6 +439,51 @@
   overflow-wrap: anywhere;
 }
 
+.stx-memory-workbench .stx-memory-initialize-pipeline {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stx-memory-workbench .stx-memory-initialize-pipeline li {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 7px;
+  align-items: start;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--ss-theme-success) 24%, var(--ss-theme-border));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--ss-theme-success) 5%, var(--ss-theme-surface-2));
+}
+
+.stx-memory-workbench .stx-memory-initialize-pipeline i {
+  margin-top: 2px;
+  color: var(--ss-theme-success);
+  font-size: .72rem;
+}
+
+.stx-memory-workbench .stx-memory-initialize-pipeline strong,
+.stx-memory-workbench .stx-memory-initialize-pipeline small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.stx-memory-workbench .stx-memory-initialize-pipeline strong {
+  color: var(--ss-theme-text);
+  font-size: .7rem;
+}
+
+.stx-memory-workbench .stx-memory-initialize-pipeline small {
+  margin-top: 3px;
+  color: var(--ss-theme-muted);
+  font-size: .62rem;
+  line-height: 1.35;
+}
+
 .stx-memory-workbench .stx-memory-initialize-note,
 .stx-memory-workbench .stx-memory-locked-sources {
   min-width: 0;
@@ -666,6 +711,7 @@
   .stx-memory-workbench .stx-memory-initialize-layout { grid-template-columns: 1fr; }
   .stx-memory-workbench .stx-memory-initialize-layout > .stx-memory-panel { min-height: 0; }
   .stx-memory-workbench .stx-memory-initialize-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stx-memory-workbench .stx-memory-initialize-pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .stx-memory-workbench .stx-memory-reinitialize-drawer { width: 100%; min-width: 0; }
   .stx-memory-workbench .stx-memory-reinitialize-drawer > footer { position: sticky; bottom: 0; z-index: 1; }
 }
@@ -681,6 +727,7 @@
   .stx-memory-workbench .stx-memory-initialize-success > span:first-child { width: 38px; height: 38px; }
   .stx-memory-workbench .stx-memory-initialize-success > [data-ss-helper-control="status"] { grid-column: 2; justify-self: start; }
   .stx-memory-workbench .stx-memory-initialize-metrics { grid-template-columns: 1fr; }
+  .stx-memory-workbench .stx-memory-initialize-pipeline { grid-template-columns: 1fr; }
   .stx-memory-workbench .stx-memory-drawer-body .stx-memory-source-list { grid-template-columns: 1fr; }
   .stx-memory-workbench .stx-memory-reinitialize-drawer > footer { grid-template-columns: 1fr; }
 }

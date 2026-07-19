@@ -54,7 +54,12 @@ function staging(): InitializationStagingBatch {
       content: '盖乌斯已确认当前训练成果达到要求，并认可墨染尘在这一阶段的稳定表现。', entityKeys: ['盖乌斯', '墨染尘'], confidence: 0.96,
       sourceRef: 'message:1', evidenceExcerpt: excerpt, actionHint: 'supersede', canonicalKey: 'state|盖乌斯|训练评价|认可',
     }],
-    rejections: [], createdAt: 100, updatedAt: 100,
+    rejections: [],
+    audit: {
+      requestId: 'req-1', resourceId: '__builtin_tavern__', model: 'deepseek-chat', latencyMs: 321,
+      usage: { promptTokens: 100, completionTokens: 20, cacheReadTokens: null, cacheWriteTokens: null, totalTokens: 120 },
+    },
+    createdAt: 100, updatedAt: 100,
   };
 }
 
@@ -80,6 +85,18 @@ describe('initialization finalization repository transaction', () => {
     expect([...records.get('job-audits')!.values()].some((record) => (record.value as { kind?: string }).kind === 'initialization-staging-v1')).toBe(false);
     expect(await repository.getInitializationResolution('chat-a', 'job-a')).toBeUndefined();
     expect(records.get('jobs')?.get('job-a')?.value).toMatchObject({ status: 'completed' });
+    const finalAudit = [...records.get('job-audits')!.values()].find((record) => (record.value as { kind?: string }).kind === 'initialization-finalization-v1');
+    expect(finalAudit?.value).toMatchObject({
+      routeSummary: {
+        requestCount: 1,
+        resourceIds: ['__builtin_tavern__'],
+        models: ['deepseek-chat'],
+        latencyMs: 321,
+        usage: { promptTokens: 100, completionTokens: 20, totalTokens: 120 },
+      },
+      resourceId: '__builtin_tavern__',
+      model: 'deepseek-chat',
+    });
   });
 
   it('keeps a manual fact protected when an automatic initialization targets its slot', async () => {

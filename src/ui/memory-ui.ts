@@ -94,7 +94,7 @@ export interface MemoryUiFact {
   evidence: Array<{ sourceRef: string; excerpt: string }>;
   supersedesId?: string;
   supersededById?: string;
-  auditBatches?: Array<{ jobId: string; batchIndex: number; status: string }>;
+  auditBatches?: Array<{ jobId: string; batchIndex: number; status: string; kind?: string }>;
   updatedAt: number;
 }
 
@@ -148,6 +148,12 @@ export interface MemoryInitializationState {
   attempts: MemoryInitializationAttempt[];
   qualityStatus?: 'ready' | 'needs_review';
   pendingReviewCount?: number;
+  stagedBatchCount?: number;
+  mergedDuplicateCount?: number;
+  supersededCount?: number;
+  conflictBucketCount?: number;
+  ruleResolvedCount?: number;
+  llmResolvedCount?: number;
 }
 
 export interface MemoryAuditRecord {
@@ -161,6 +167,27 @@ export interface MemoryAuditRecord {
   rejected?: unknown[];
   model?: string;
   resource?: string;
+  resourceId?: string;
+  kind?: string;
+  finalization?: {
+    stagedBatchCount?: number;
+    extractedFactCount?: number;
+    acceptedFactCount?: number;
+    mergedDuplicateCount?: number;
+    supersededCount?: number;
+    conflictBucketCount?: number;
+    ruleResolvedCount?: number;
+    llmResolvedCount?: number;
+    pendingReviewCount?: number;
+    qualityStatus?: 'ready' | 'needs_review';
+  };
+  routeSummary?: {
+    requestCount?: number;
+    resourceIds?: string[];
+    models?: string[];
+    latencyMs?: number | null;
+    usage?: unknown;
+  };
   usage?: unknown;
   createdAt?: number;
   [key: string]: unknown;
@@ -227,6 +254,17 @@ export function formatAuditResource(value: unknown): string {
   if (!resource) return '未记录';
   if (resource === '__builtin_tavern__') return '酒馆内置';
   return resource;
+}
+function auditStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? [...new Set(value.map((item) => String(item ?? '').trim()).filter(Boolean))]
+    : [];
+}
+function formatAuditRoute(values: unknown, fallback: string, formatter: (value: string) => string = (value) => value): string {
+  const entries = auditStringList(values);
+  if (entries.length === 0) return fallback;
+  if (entries.length === 1) return formatter(entries[0]!);
+  return `多个（${entries.length}）`;
 }
 export function translateOverviewStatus(value: MemoryUiOverview['status']): string { return OVERVIEW_STATUS_LABELS[value]; }
 export function translateChatBinding(value: boolean | undefined): string { return value === true ? '已绑定' : value === false ? '未绑定' : '待确认'; }
@@ -573,7 +611,7 @@ export function renderMemoryWorkbench(container: HTMLElement, controller: Memory
         ${editing ? `<label class="stx-memory-field-label" for="stx-memory-edit-content">编辑记忆内容</label><textarea id="stx-memory-edit-content" class="stx-memory-textarea-layout" ${uiControl('textarea')} data-edit-content>${escapeHtml(selected.content)}</textarea><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="save-fact" data-fact-id="${escapeHtml(selected.id)}" ${state.busyAction === 'save-fact' ? 'disabled' : ''}>保存</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-edit">取消</button></div>` : `<section class="stx-memory-content-card" aria-labelledby="stx-memory-content-label"><h4 id="stx-memory-content-label">记忆内容</h4><p class="stx-memory-fact-content">${escapeHtml(selected.content)}</p></section><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="edit-fact" data-fact-id="${escapeHtml(selected.id)}">编辑</button>${confirming ? `<span class="stx-memory-confirm-inline"><span>确认删除？</span><button ${uiControl('button', 'danger')} type="button" data-action="confirm-delete" data-fact-id="${escapeHtml(selected.id)}">确认</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-delete">取消</button></span>` : `<button ${uiControl('button', 'danger')} type="button" data-action="delete-fact" data-fact-id="${escapeHtml(selected.id)}">删除</button>`}</div>`}
         <section class="stx-memory-detail-section"><div class="stx-memory-section-heading"><div><h4>来源与证据</h4><p>核对记忆是否忠于聊天原文</p></div><span>${selected.evidence.length} 条</span></div><div class="stx-memory-evidence-list">${selected.evidence.length ? selected.evidence.map((item) => `<blockquote class="stx-memory-evidence"><p>${escapeHtml(item.excerpt)}</p><footer><i class="fa-solid fa-link" aria-hidden="true"></i>${escapeHtml(formatSourceReference(item.sourceRef))}</footer></blockquote>`).join('') : '<p class="stx-memory-muted">没有可展示的来源证据。</p>'}</div></section>
         <div class="stx-memory-detail-grid"><section><h4>来源引用</h4><div class="stx-memory-reference-list">${selected.sourceRefs.length ? selected.sourceRefs.map((item) => `<span>${escapeHtml(formatSourceReference(item))}</span>`).join('') : '<span>无</span>'}</div></section><section><h4>版本关系</h4><p>${escapeHtml(replacement)}</p></section></div>
-        <section class="stx-memory-detail-section"><h4>整理记录</h4><div class="stx-memory-reference-list">${selected.auditBatches?.length ? selected.auditBatches.map((item) => `<span>第 ${item.batchIndex + 1} 批 · ${escapeHtml(translateRecordStatus(item.status))}</span>`).join('') : '<span>暂无匹配批次</span>'}</div></section>`;
+        <section class="stx-memory-detail-section"><h4>整理记录</h4><div class="stx-memory-reference-list">${selected.auditBatches?.length ? selected.auditBatches.map((item) => `<span>${item.kind === 'initialization-finalization-v1' ? '初始化全局整理' : `第 ${Math.max(1, item.batchIndex)} 批`} · ${escapeHtml(translateRecordStatus(item.status))}</span>`).join('') : '<span>暂无匹配批次</span>'}</div></section>`;
     })();
     const chatIdentity = formatChatIdentity(state.overview);
     const renderMultiFilter = (filter: 'kind' | 'status', allLabel: string, selectedValues: readonly string[], options: Readonly<Record<string, string>>): string => {
@@ -643,7 +681,8 @@ export function renderMemoryWorkbench(container: HTMLElement, controller: Memory
     if (running || submitting) return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout is-running">${progressMarkup}<section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization?.attempts.length ?? 0} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div></div>`;
     if (initialization?.initialized) {
       const reviewRequired = initialization.qualityStatus === 'needs_review' && (initialization.pendingReviewCount ?? 0) > 0;
-      return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout"><section class="stx-memory-panel stx-memory-initialize-summary"><div class="stx-memory-initialize-success"><span><i class="fa-solid fa-circle-check" aria-hidden="true"></i></span><div><span class="stx-memory-kicker">初始化状态</span><h3>已初始化</h3><p>完成于 ${escapeHtml(formatTime(initialization.lastCompletedAt))}</p></div>${renderStatusChip(reviewRequired ? `有 ${formatNumber(initialization.pendingReviewCount ?? 0)} 项待审阅` : '召回可用', reviewRequired ? 'warning' : 'success')}</div><dl class="stx-memory-initialize-metrics"><div><dt>来源覆盖</dt><dd>${formatNumber(sourceCoverage)} / ${formatNumber(sourceTotal)}</dd></div><div><dt>记忆事实</dt><dd>${formatNumber(state.overview?.factCount ?? 0)}</dd></div><div><dt>占用空间</dt><dd>${escapeHtml(formatBytes(state.overview?.currentChatSizeBytes ?? 0))}</dd></div><div><dt>预计批次</dt><dd>${formatNumber(state.estimate?.batchCount ?? 0)}</dd></div></dl><p class="stx-memory-initialize-note"><i class="fa-solid fa-circle-info" aria-hidden="true"></i><span>${reviewRequired ? '可靠记忆已可用于召回；存在无法自动裁决的冲突，已保留为待审阅状态。' : '当前聊天已经可以使用记忆召回。最近的失败任务只会记录在右侧，不会覆盖这次有效初始化。'}</span></p><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="view-library"><i class="fa-solid fa-book-open" aria-hidden="true"></i>查看记忆库</button><button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><i class="fa-solid fa-rotate" aria-hidden="true"></i>重新初始化</button></div></section><section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization.attempts.length} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div>${drawer}</div>`;
+      const pipeline = initialization.stagedBatchCount === undefined ? '' : `<ol class="stx-memory-initialize-pipeline" aria-label="本次初始化处理阶段"><li><i class="fa-solid fa-check" aria-hidden="true"></i><span><strong>提取记忆</strong><small>已暂存 ${formatNumber(initialization.stagedBatchCount)} 批</small></span></li><li><i class="fa-solid fa-check" aria-hidden="true"></i><span><strong>整理归并</strong><small>合并 ${formatNumber(initialization.mergedDuplicateCount ?? 0)} 条重复</small></span></li><li><i class="fa-solid fa-check" aria-hidden="true"></i><span><strong>解决冲突</strong><small>${(initialization.conflictBucketCount ?? 0) === 0 ? '无待裁决冲突' : `规则 ${formatNumber(initialization.ruleResolvedCount ?? 0)} · 模型 ${formatNumber(initialization.llmResolvedCount ?? 0)}`}</small></span></li><li><i class="fa-solid fa-check" aria-hidden="true"></i><span><strong>写入记忆</strong><small>${reviewRequired ? `${formatNumber(initialization.pendingReviewCount ?? 0)} 项待审阅` : '统一写入完成'}</small></span></li></ol>`;
+      return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout"><section class="stx-memory-panel stx-memory-initialize-summary"><div class="stx-memory-initialize-success"><span><i class="fa-solid fa-circle-check" aria-hidden="true"></i></span><div><span class="stx-memory-kicker">初始化状态</span><h3>已初始化</h3><p>完成于 ${escapeHtml(formatTime(initialization.lastCompletedAt))}</p></div>${renderStatusChip(reviewRequired ? `有 ${formatNumber(initialization.pendingReviewCount ?? 0)} 项待审阅` : '召回可用', reviewRequired ? 'warning' : 'success')}</div><dl class="stx-memory-initialize-metrics"><div><dt>来源覆盖</dt><dd>${formatNumber(sourceCoverage)} / ${formatNumber(sourceTotal)}</dd></div><div><dt>记忆事实</dt><dd>${formatNumber(state.overview?.factCount ?? 0)}</dd></div><div><dt>占用空间</dt><dd>${escapeHtml(formatBytes(state.overview?.currentChatSizeBytes ?? 0))}</dd></div><div><dt>预计批次</dt><dd>${formatNumber(state.estimate?.batchCount ?? 0)}</dd></div></dl>${pipeline}<p class="stx-memory-initialize-note"><i class="fa-solid fa-circle-info" aria-hidden="true"></i><span>${reviewRequired ? '可靠记忆已可用于召回；存在无法自动裁决的冲突，已保留为待审阅状态。' : '当前聊天已经可以使用记忆召回。最近的失败任务只会记录在右侧，不会覆盖这次有效初始化。'}</span></p><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="view-library"><i class="fa-solid fa-book-open" aria-hidden="true"></i>查看记忆库</button><button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><i class="fa-solid fa-rotate" aria-hidden="true"></i>重新初始化</button></div></section><section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization.attempts.length} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div>${drawer}</div>`;
     }
     const clearedAfterFailure = latestAttempt?.status === 'failed';
     const resumable = latestAttempt?.status === 'paused';
@@ -675,18 +714,41 @@ export function renderMemoryWorkbench(container: HTMLElement, controller: Memory
       const key = `${record.jobId ?? record.id ?? index}:${Number(record.batchIndex ?? index)}`;
       const canRollback = Boolean(record.jobId && Number.isInteger(record.batchIndex));
       const confirming = state.confirmBatchKey === key;
-      const resource = formatAuditResource(record.resourceId ?? record.resource);
-      const metrics = [
-        ['来源', `${Array.isArray(record.sourceRefs) ? record.sourceRefs.length : 0} 项`],
-        ['拒绝', `${Array.isArray(record.rejected) ? record.rejected.length : 0} 项`],
-        ['资源', resource],
-        ['模型', String(record.model ?? '未记录')],
-      ];
+      const isFinalization = record.kind === 'initialization-finalization-v1';
+      const finalization = record.finalization;
+      const routeSummary = record.routeSummary;
+      const sourceCount = Array.isArray(record.sourceRefs) ? record.sourceRefs.length : 0;
+      const rejectedCount = Array.isArray(record.rejected) ? record.rejected.length : 0;
+      const resource = isFinalization
+        ? formatAuditRoute(routeSummary?.resourceIds, '提供方未上报', formatAuditResource)
+        : formatAuditResource(record.resourceId ?? record.resource);
+      const model = isFinalization
+        ? formatAuditRoute(routeSummary?.models, '提供方未上报')
+        : String(record.model ?? '未记录');
+      const acceptedCount = Number(finalization?.acceptedFactCount ?? record.accepted ?? 0);
+      const batchNumber = Number.isInteger(record.batchIndex) ? Math.max(1, record.batchIndex!) : index + 1;
+      const metrics = isFinalization
+        ? [
+          ['整理范围', `汇总 ${formatNumber(finalization?.stagedBatchCount ?? 0)} 批 · ${formatNumber(sourceCount)} 项`],
+          ['提取候选', `${formatNumber(finalization?.extractedFactCount ?? acceptedCount)} 条`],
+          ['接纳', `${formatNumber(acceptedCount)} 条`],
+          ['拒绝', `${formatNumber(rejectedCount)} 项`],
+          ['资源', resource],
+          ['模型', model],
+        ]
+        : [
+          ['来源', `${formatNumber(sourceCount)} 项`],
+          ['拒绝', `${formatNumber(rejectedCount)} 项`],
+          ['资源', resource],
+          ['模型', model],
+        ];
       const rollback = !canRollback ? '' : confirming
-        ? `<div class="stx-memory-confirm-inline"><span>确认回滚此批及后续批次？</span><button ${uiControl('button', 'danger')} type="button" data-action="confirm-rollback" data-job-id="${escapeHtml(record.jobId)}" data-batch-index="${Number(record.batchIndex)}">确认回滚</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-rollback">取消</button></div>`
-        : `<button ${uiControl('button', 'danger')} type="button" data-action="rollback" data-rollback-key="${escapeHtml(key)}">回滚此批及后续批次</button>`;
+        ? `<div class="stx-memory-confirm-inline"><span>${isFinalization ? '确认撤销本次初始化？' : '确认回滚此批及后续批次？'}</span><button ${uiControl('button', 'danger')} type="button" data-action="confirm-rollback" data-job-id="${escapeHtml(record.jobId)}" data-batch-index="${Number(record.batchIndex)}">${isFinalization ? '确认撤销' : '确认回滚'}</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-rollback">取消</button></div>`
+        : `<button ${uiControl('button', 'danger')} type="button" data-action="rollback" data-rollback-key="${escapeHtml(key)}">${isFinalization ? '撤销本次初始化' : '回滚此批及后续批次'}</button>`;
 
-      return `<article class="stx-memory-audit-item"><div class="stx-memory-audit-heading"><div><span class="stx-memory-kicker">${record.type === 'recall' ? '召回' : `批次 ${Number(record.batchIndex ?? index) + 1}`}</span><h3>${escapeHtml(translateRecordStatus(String(record.status ?? '已记录')))}</h3></div>${renderStatusChip(`${Number(record.accepted ?? 0)} 条已接纳`, 'neutral')}</div><dl class="stx-memory-audit-metrics">${metrics.map(([label, value]) => `<div title="${escapeHtml(value)}"><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl><details class="stx-memory-audit-details"><summary>查看技术明细</summary><pre class="stx-memory-code">${escapeHtml(formatJson(record))}</pre></details>${rollback ? `<div class="stx-memory-audit-actions">${rollback}</div>` : ''}</article>`;
+      const kicker = isFinalization ? '初始化最终写入' : record.type === 'recall' ? '召回' : `提取批次 ${batchNumber}`;
+      const heading = isFinalization ? '全局归约已完成' : translateRecordStatus(String(record.status ?? '已记录'));
+      return `<article class="stx-memory-audit-item ${isFinalization ? 'is-initialization-finalization' : ''}"><div class="stx-memory-audit-heading"><div><span class="stx-memory-kicker">${kicker}</span><h3>${escapeHtml(heading)}</h3></div>${renderStatusChip(`${formatNumber(acceptedCount)} 条已接纳`, 'neutral')}</div><dl class="stx-memory-audit-metrics">${metrics.map(([label, value]) => `<div title="${escapeHtml(value)}"><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>${isFinalization ? `<p class="stx-memory-muted">已完成跨批次归并、冲突裁决与统一写入；这不是额外的第 ${batchNumber} 个提取批次。</p>` : ''}<details class="stx-memory-audit-details"><summary>查看技术明细</summary><pre class="stx-memory-code">${escapeHtml(formatJson(record))}</pre></details>${rollback ? `<div class="stx-memory-audit-actions">${rollback}</div>` : ''}</article>`;
     }).join('') : renderEmpty('暂无批次审计', '新整理完成后会在这里出现。');
     return `<div class="stx-memory-page-actions"><p class="stx-memory-muted">审计记录只读展示已提交的整理结果。</p><button ${uiControl('button', 'neutral')} type="button" data-action="refresh-audit" ${state.busyAction ? 'disabled' : ''}><i class="fa-solid fa-rotate" aria-hidden="true"></i>刷新审计</button></div><div class="stx-memory-audit-list">${records}</div><details class="stx-memory-panel stx-memory-usage"><summary>主聊天 Token / usage（${state.usages.length} 条）</summary><pre class="stx-memory-code">${escapeHtml(formatJson(state.usages))}</pre></details>`;
   };

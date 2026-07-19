@@ -118,6 +118,30 @@ describe('Memory UI 展示适配', () => {
     dispose();
   });
 
+  it('将初始化最终写入展示为全局整理，而不是虚假的额外提取批次', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listAuditRecords: async () => [{
+        id: 'initialization-finalization:job-a', kind: 'initialization-finalization-v1', jobId: 'job:a', batchIndex: 7, status: 'completed', accepted: 33,
+        sourceRefs: Array.from({ length: 35 }, (_, index) => `message:${index}`), rejected: Array.from({ length: 29 }, () => ({})),
+        finalization: { stagedBatchCount: 7, extractedFactCount: 33, acceptedFactCount: 33, mergedDuplicateCount: 0, conflictBucketCount: 0 },
+        routeSummary: { requestCount: 7, resourceIds: ['__builtin_tavern__'], models: ['deepseek-chat'] },
+      }],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="audit"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.textContent).toContain('初始化最终写入');
+    expect(container.textContent).toContain('全局归约已完成');
+    expect(container.textContent).toContain('汇总 7 批 · 35 项');
+    expect(container.textContent).toContain('这不是额外的第 7 个提取批次');
+    expect(container.textContent).not.toContain('提取批次 8');
+    expect(container.querySelector('.stx-memory-audit-metrics')?.children).toHaveLength(6);
+    dispose();
+  });
+
   it('按类型与状态筛选，并支持确定性排序', () => {
     const facts: MemoryUiFact[] = [
       { id: 'a', kind: 'state', status: 'active', content: 'a', confidence: 0.8, sourceRefs: [], evidence: [], updatedAt: 10 },

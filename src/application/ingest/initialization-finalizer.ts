@@ -4,6 +4,7 @@ import {
   normalizeFactContent,
   type AutomaticIngestRejection,
   type FactStatus,
+  type MemoryTokenUsage,
 } from '../../domain';
 import type {
   FactKind,
@@ -114,6 +115,15 @@ export interface InitializationFinalizationStats {
   qualityStatus: InitializationQualityStatus;
 }
 
+/** Aggregated from staged extraction calls and retained after bulky staging is removed. */
+export interface InitializationRouteSummary {
+  requestCount: number;
+  resourceIds: string[];
+  models: string[];
+  latencyMs: number | null;
+  usage: MemoryTokenUsage | null;
+}
+
 export interface InitializationReduction {
   facts: InitializationReducedFact[];
   conflictBuckets: InitializationConflictBucket[];
@@ -134,6 +144,43 @@ function stableHash(input: string): string {
 
 function uniqueStrings(values: readonly string[]): string[] {
   return [...new Set(values.map((value) => String(value ?? '').trim()).filter(Boolean))];
+}
+
+const TOKEN_USAGE_FIELDS = ['promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens'] as const;
+
+/**
+ * The final audit outlives per-batch staging, so preserve a truthful route
+ * summary instead of rendering the final write as if it were another extract
+ * batch. Missing provider fields intentionally remain null/empty.
+ */
+export function summarizeInitializationRoutes(batches: readonly InitializationStagingBatch[]): InitializationRouteSummary {
+  const audits = batches.flatMap((batch) => batch.audit ? [batch.audit] : []);
+  const latencyValues = audits
+    .map((audit) => audit.latencyMs)
+    .filter((value): value is number => Number.isFinite(value));
+  const usageValues = audits
+    .map((audit) => audit.usage)
+    .filter((value): value is MemoryTokenUsage => value !== null && value !== undefined);
+  const usage = usageValues.length === 0 ? null : TOKEN_USAGE_FIELDS.reduce<MemoryTokenUsage>((total, field) => {
+    const values = usageValues
+      .map((item) => item[field])
+      .filter((value): value is number => Number.isFinite(value));
+    total[field] = values.length === 0 ? null : values.reduce((sum, value) => sum + value, 0);
+    return total;
+  }, {
+    promptTokens: null,
+    completionTokens: null,
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    totalTokens: null,
+  });
+  return {
+    requestCount: audits.length,
+    resourceIds: uniqueStrings(audits.map((audit) => audit.resourceId ?? '')),
+    models: uniqueStrings(audits.map((audit) => audit.model ?? '')),
+    latencyMs: latencyValues.length === 0 ? null : latencyValues.reduce((sum, value) => sum + value, 0),
+    usage,
+  };
 }
 
 function normalized(value: string | undefined): string {

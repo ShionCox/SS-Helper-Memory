@@ -87,6 +87,27 @@ describe('Memory 写入主链', () => {
     });
   });
 
+  it('仅恢复带可验证后缀的来源引用，并保留来源正文的原始空白字符', async () => {
+    const sources = [block('message:256', '盖乌斯确认训练成果已达到当前要求。\n语气中带有赞许。')];
+    const proposals: ExtractedFactProposal[] = [{
+        kind: 'state', subjectKey: '盖乌斯', predicateKey: '训练评价', objectKey: '认可',
+        content: '盖乌斯确认墨染尘的训练成果已达到当前要求，语气中带有明确的赞许。', entityKeys: ['盖乌斯', '墨染尘'],
+        confidence: 0.94, sourceRef: 'Assistant - 2026-07-18 / message:256',
+        evidenceExcerpt: '盖乌斯确认训练成果已达到当前要求。 语气中带有赞许。', actionHint: 'supersede',
+      }];
+    const extractor: MemoryExtractor = { extract: vi.fn(async () => proposals) };
+    const commits: IngestCommit[] = [];
+    const service = new MemoryIngestService({ extractor, commit: async (input) => void commits.push(input) });
+
+    const result = await service.ingest({ chatKey: 'chat-a', jobId: 'job-source-normalization', sources });
+
+    expect(result).toMatchObject({ accepted: 1, rejected: 0 });
+    expect(commits[0]?.facts[0]).toMatchObject({
+      sourceRef: 'message:256',
+      evidenceExcerpt: '盖乌斯确认训练成果已达到当前要求。\n语气中带有赞许。',
+    });
+  });
+
   it('变量状态来源不调用 LLM，并生成可覆盖旧状态的确定性事实', async () => {
     const stateSource: SourceBlock = {
       id: 'state:last:hash', chatKey: 'chat-a', kind: 'state', role: 'metadata', createdAt: 100, floor: 100,

@@ -1,9 +1,11 @@
 import type { IngestCommit, IngestCommitter } from '../application/ingest/types';
+import { summarizeInitializationRoutes } from '../application/ingest/initialization-finalizer';
 import type {
   InitializationFinalizationStats,
   InitializationReducedFact,
   InitializationReduction,
   InitializationResolutionStaging,
+  InitializationRouteSummary,
   InitializationStagingBatch,
 } from '../application/ingest/initialization-finalizer';
 import type {
@@ -1087,10 +1089,16 @@ export class MemoryRepository implements IngestCommitter {
       },
       updatedAt: now,
     };
-    const finalAudit: MemoryJobBatchAudit & { kind: 'initialization-finalization-v1'; finalization: InitializationFinalizationStats } = {
+    const routeSummary = summarizeInitializationRoutes(input.batches);
+    const finalAudit: MemoryJobBatchAudit & {
+      kind: 'initialization-finalization-v1';
+      finalization: InitializationFinalizationStats;
+      routeSummary: InitializationRouteSummary;
+    } = {
       id: finalAuditId,
       kind: 'initialization-finalization-v1',
       finalization: stats,
+      routeSummary,
       chatKey,
       jobId: input.job.id,
       batchIndex: input.job.checkpoint.totalBatches ?? input.job.checkpoint.batchIndex,
@@ -1103,7 +1111,10 @@ export class MemoryRepository implements IngestCommitter {
       rejections: input.batches.flatMap((batch) => batch.rejections),
       startedAt: input.job.createdAt,
       completedAt: now,
-      usage: null,
+      usage: routeSummary.usage,
+      ...(routeSummary.resourceIds.length === 1 ? { resourceId: routeSummary.resourceIds[0] } : {}),
+      ...(routeSummary.models.length === 1 ? { model: routeSummary.models[0] } : {}),
+      ...(routeSummary.latencyMs === null ? {} : { latencyMs: routeSummary.latencyMs }),
     };
     operations.push({ action: 'upsert', collection: 'jobs', recordId: completedJob.id, value: asPlain(completedJob), expectedVersion: jobRecord?.version ?? 0 });
     operations.push({ action: 'upsert', collection: 'job-audits', recordId: finalAudit.id, value: asPlain(finalAudit), expectedVersion: existingFinal?.version ?? 0 });
