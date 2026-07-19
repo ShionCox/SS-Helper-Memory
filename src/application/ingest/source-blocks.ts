@@ -1,16 +1,5 @@
 import type { SourceBlock } from './types';
 
-export const HISTORY_BATCH_MAX_MESSAGES = 20;
-export const HISTORY_BATCH_MAX_CHARS = 12_000;
-export const HISTORY_BATCH_OVERLAP = 2;
-
-export interface InitializationEstimate {
-  messageCount: number;
-  batchCount: number;
-  tokenLow: number;
-  tokenHigh: number;
-}
-
 const CONTROL_BLOCK_PATTERNS = [
   /<(?:think|analysis|tool|debug|memory)\b[^>]*>[\s\S]*?<\/(?:think|analysis|tool|debug|memory)\s*>/giu,
   /<UpdateVariable\b[^>]*>[\s\S]*?<\/UpdateVariable\s*>/giu,
@@ -144,82 +133,10 @@ export function sanitizeSourceContent(value: string): string {
 
 /** 只保留用户授权且模型可见的来源块。 */
 export function filterSourceBlocks(blocks: readonly SourceBlock[]): SourceBlock[] {
-  return splitOversizedSourceBlocks(blocks.flatMap((block): SourceBlock[] => {
+  return blocks.flatMap((block): SourceBlock[] => {
     if (block.hidden || block.role === 'system' || block.role === 'tool') return [];
     const content = sanitizeSourceContent(block.content);
     if (!content) return [];
     return [{ ...block, content }];
-  }));
-}
-
-/** 将超长来源完整切成稳定分片，证据和检查点均使用分片 ID。 */
-export function splitOversizedSourceBlocks(blocks: readonly SourceBlock[]): SourceBlock[] {
-  return blocks.flatMap((block) => {
-    if (block.content.length <= HISTORY_BATCH_MAX_CHARS) return [block];
-    const parts: SourceBlock[] = [];
-    for (let offset = 0, part = 1; offset < block.content.length; offset += HISTORY_BATCH_MAX_CHARS, part += 1) {
-      parts.push({
-        ...block,
-        id: `${block.id}:part:${part}`,
-        content: block.content.slice(offset, offset + HISTORY_BATCH_MAX_CHARS),
-      });
-    }
-    return parts;
   });
-}
-
-/** 构造可恢复的历史批次，批次间只保留两条上下文。 */
-export function buildHistoryBatches(blocks: readonly SourceBlock[]): SourceBlock[][] {
-  const normalizedBlocks = splitOversizedSourceBlocks(blocks);
-  const batches: SourceBlock[][] = [];
-  let cursor = 0;
-  while (cursor < normalizedBlocks.length) {
-    const batch: SourceBlock[] = [];
-    let charCount = 0;
-    let index = cursor;
-    while (index < normalizedBlocks.length && batch.length < HISTORY_BATCH_MAX_MESSAGES) {
-      const next = normalizedBlocks[index]!;
-      const nextLength = next.content.length;
-      if (batch.length > 0 && charCount + nextLength > HISTORY_BATCH_MAX_CHARS) break;
-      batch.push(next);
-      charCount += nextLength;
-      index += 1;
-    }
-    batches.push(batch);
-    if (index >= normalizedBlocks.length) break;
-    cursor = Math.max(cursor + 1, index - HISTORY_BATCH_OVERLAP);
-  }
-  return batches;
-}
-
-/**
- * 按实际历史批次估算初始化输入成本。
- * 估算包含每批固定提示词余量，但最终消耗仍以 LLMHub 的供应商 usage 为准。
- */
-export function estimateHistoryInitialization(
-  messageCount: number,
-  batches: readonly (readonly SourceBlock[])[],
-): InitializationEstimate {
-  const estimatedInputTokens = batches.reduce((total, batch) => (
-    total + Math.ceil(batch.reduce((chars, source) => chars + source.content.length, 0) * 0.9) + 1_200
-  ), 0);
-  const roundToHundred = (value: number): number => Math.ceil(value / 100) * 100;
-  return {
-    messageCount,
-    batchCount: batches.length,
-    tokenLow: roundToHundred(estimatedInputTokens * 0.75),
-    tokenHigh: roundToHundred(estimatedInputTokens * 1.25),
-  };
-}
-
-/** 增量窗口只提交可完整容纳的连续来源；未进入本批的来源保留到下次检查点。 */
-export function buildIncrementalBatch(blocks: readonly SourceBlock[]): SourceBlock[] {
-  const selected: SourceBlock[] = [];
-  let charCount = 0;
-  for (const block of splitOversizedSourceBlocks(blocks)) {
-    if (selected.length >= HISTORY_BATCH_MAX_MESSAGES || charCount + block.content.length > HISTORY_BATCH_MAX_CHARS) break;
-    selected.push(block);
-    charCount += block.content.length;
-  }
-  return selected;
 }

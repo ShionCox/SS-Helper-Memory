@@ -27,7 +27,9 @@ describe('Memory settings capability policy', () => {
     [{ enabled: true, autoOrganize: false, recallMode: 'lexical', rerankMode: 'always' }, 'MEMORY_RERANK_UNAVAILABLE'],
   ] as const)('blocks an unavailable strict setting without persisting it', async (next, code) => {
     const monitor = unavailableMonitor();
-    await expect(monitor.assess(next, disabled)).resolves.toMatchObject({ blocked: { code }, warnings: [] });
+    const assessment = await monitor.assess(next, disabled);
+    expect(assessment).toMatchObject({ blocked: { code }, warnings: [] });
+    expect(assessment.blocked?.message).toContain('LLM');
     monitor.dispose();
   });
 
@@ -35,8 +37,8 @@ describe('Memory settings capability policy', () => {
     const monitor = unavailableMonitor();
     await expect(monitor.assess({ enabled: true, autoOrganize: false, recallMode: 'auto', rerankMode: 'adaptive' }, disabled)).resolves.toMatchObject({
       warnings: [
-        { code: 'MEMORY_EMBEDDING_DEGRADED' },
-        { code: 'MEMORY_RERANK_DEGRADED' },
+        { code: 'MEMORY_EMBEDDING_DEGRADED', message: expect.stringContaining('LLM') },
+        { code: 'MEMORY_RERANK_DEGRADED', message: expect.stringContaining('LLM') },
       ],
     });
     monitor.dispose();
@@ -75,5 +77,39 @@ describe('Memory settings capability policy', () => {
     eventListener?.({ revision: 3 });
     await new Promise((resolve) => setTimeout(resolve, 120));
     expect(snapshots).toHaveLength(count);
+  });
+
+  it('reports real resource availability even when Memory is globally disabled', async () => {
+    const response = {
+      revision: 1,
+      checks: [
+        { id: 'generation', available: true, source: 'tavern', model: 'chat-a' },
+        { id: 'embedding', available: true, source: 'custom', model: 'embed-a' },
+        { id: 'rerank', available: true, source: 'custom', model: 'rerank-a' },
+      ],
+    };
+    const monitor = new MemoryLlmCapabilityMonitor({
+      services: { call: vi.fn(async () => response) },
+      events: { subscribe: vi.fn(() => () => {}) },
+      host: { events: { subscribe: vi.fn(() => () => {}) } },
+    } as unknown as PluginSession, () => disabled);
+    await monitor.start();
+    expect(monitor.getStatus()).toMatchObject({
+      generationStatus: { value: '已连接', description: '酒馆模型 · chat-a' },
+      embeddingStatus: { value: '已连接', description: '自定义资源 · embed-a' },
+      rerankStatus: { value: '已连接', description: '自定义资源 · rerank-a' },
+    });
+    monitor.dispose();
+  });
+
+  it('uses neutral unconfigured statuses for optional resources that the current strategy does not need', async () => {
+    const monitor = unavailableMonitor();
+    await monitor.start();
+    expect(monitor.getStatus()).toMatchObject({
+      generationStatus: { value: '不可用', tone: 'error' },
+      embeddingStatus: { value: '未配置', tone: 'neutral' },
+      rerankStatus: { value: '未配置', tone: 'neutral' },
+    });
+    monitor.dispose();
   });
 });

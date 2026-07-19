@@ -99,7 +99,7 @@ export interface MemoryLlmApi {
       taskKey: string;
       taskKind: MemoryLlmTaskKind;
       requiredCapabilities?: string[];
-    }): Promise<{ resourceId?: string; model?: string; blockedReason?: string }> | { resourceId?: string; model?: string; blockedReason?: string };
+    }): Promise<{ available?: boolean; resourceId?: string; model?: string; blockedReason?: string }> | { available?: boolean; resourceId?: string; model?: string; blockedReason?: string };
   };
 }
 
@@ -120,12 +120,15 @@ export interface MemoryRecallRouteDiagnostics {
 }
 
 export class MemoryLlmTaskError extends Error {
+  readonly code: string;
+
   constructor(
     message: string,
     readonly details: { reasonCode?: string; resourceId?: string; model?: string } = {},
   ) {
     super(message);
     this.name = 'MemoryLlmTaskError';
+    this.code = details.reasonCode?.toUpperCase() || 'MEMORY_LLM_TASK_FAILED';
   }
 }
 
@@ -203,7 +206,7 @@ async function readRouteDiagnostic(
 ): Promise<MemoryLlmRouteDiagnostic> {
   const llm = readMemoryLlmApi();
   if (!llm) return { available: false, blockedReason: 'LLMHub 未加载或版本过旧' };
-  if (!llm.inspect?.previewRoute) return { available: true };
+  if (!llm.inspect?.previewRoute) return { available: false, blockedReason: '当前 LLM 不支持资源状态检查，请更新 LLM 插件' };
   try {
     const route = await llm.inspect.previewRoute({
       consumer: MEMORY_PLUGIN_ID,
@@ -211,14 +214,16 @@ async function readRouteDiagnostic(
       taskKind,
       requiredCapabilities,
     });
+    const available = route.available === true
+      || (route.available === undefined && !route.blockedReason && Boolean(route.resourceId || route.model));
     return {
-      available: true,
+      available,
       ...(route.resourceId ? { resourceId: route.resourceId } : {}),
       ...(route.model ? { model: route.model } : {}),
       ...(route.blockedReason ? { blockedReason: route.blockedReason } : {}),
     };
-  } catch (error) {
-    return { available: true, blockedReason: error instanceof Error ? error.message : String(error) };
+  } catch {
+    return { available: false, blockedReason: '暂时无法读取 LLM 资源状态' };
   }
 }
 

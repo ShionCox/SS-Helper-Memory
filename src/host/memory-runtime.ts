@@ -1,4 +1,4 @@
-import type { PluginSession } from '@ss-helper/sdk';
+import type { PluginSession, SettingsStatusSnapshot } from '@ss-helper/sdk';
 import { MemoryApplication } from '../application/memory-application';
 import { registerMemoryContributions, type MemoryHostCapability } from '../ss-helper/plugin';
 import { renderMemoryWorkbench } from '../ui/memory-ui';
@@ -13,6 +13,13 @@ import { MemoryLlmCapabilityMonitor } from '../ss-helper/llm-capability-monitor'
 
 const SEND_WINDOW_MS = 45_000;
 const MEMORY_PROMPT_ID = 'ss-helper.memory.recall.v1';
+
+export function memoryWorkspaceStatus(application: Pick<MemoryApplication, 'getCurrentChatInfo'>): SettingsStatusSnapshot {
+  const chat = application.getCurrentChatInfo();
+  if (!chat.available) return { value: '未选择', tone: 'warning', description: '请先选择一个角色或加入群组聊天；全局记忆设置和 LLM 连接仍然有效。' };
+  if (!chat.effectiveEnabled) return { value: '已关闭', tone: 'neutral', description: '当前聊天按聊天级策略关闭了记忆；可在“当前聊天”中改为强制开启。' };
+  return { value: '已就绪', tone: 'success', description: '当前角色或群组可用于记忆整理与召回。' };
+}
 
 /** Production runtime backed exclusively by the SDK session public surface. */
 export class MemoryRuntime {
@@ -43,20 +50,19 @@ export class MemoryRuntime {
     await this.application.start();
     const capabilityMonitor = new MemoryLlmCapabilityMonitor(
       this.session,
-      () => this.application.getEffectiveSettings(),
+      // LLM resource status is global.  Current-chat activation is reported by
+      // currentChatEffective/workspaceStatus and must not make a healthy LLM
+      // look like it is disabled merely because no chat is selected yet.
+      () => this.application.getSettings(),
       (listener) => this.application.onSettingsChanged(() => listener()),
-      () => !this.application.getEffectiveSettings().enabled
-        ? { value: '未启用', tone: 'neutral', description: '启用记忆后，当前角色或群组状态会在这里显示。' }
-        : this.context.getWorkspaceId()
-        ? { value: '已就绪', tone: 'success', description: '当前角色或群组可用于记忆整理与召回。' }
-        : { value: '未选择', tone: 'warning', description: '请先选择一个角色或加入群组；设置已保存，但当前暂不整理或召回。' },
+      () => memoryWorkspaceStatus(this.application),
     );
     await capabilityMonitor.start();
     this.disposers.push(() => capabilityMonitor.dispose());
     const contributions = registerMemoryContributions(
       this.session,
       this.application,
-      (container) => renderMemoryWorkbench(container, this.application, (notification) => this.session.ui.showToast(notification)),
+      (container, popupUi) => renderMemoryWorkbench(container, this.application, (notification) => this.session.ui.showToast(notification), popupUi),
       capabilityMonitor,
     );
     this.disposers.push(() => contributions.dispose());
@@ -93,6 +99,14 @@ export class MemoryRuntime {
           this.scheduleRebind(false);
         })
         .catch((error) => logger.warn('Memory workspace refresh failed', error));
+    }));
+    this.disposers.push(events.subscribe('identity-changed', () => {
+      void this.context.refresh()
+        .then(async () => {
+          await capabilityMonitor.refreshNow();
+          this.scheduleRebind(false);
+        })
+        .catch((error) => logger.warn('Memory identity refresh failed', error));
     }));
     this.disposers.push(events.subscribe('message-sent', () => {
       this.lastUserMessageAt = Date.now();

@@ -22,6 +22,7 @@ describe('SS-Helper Memory typed adapters', () => {
       saveSettings: async (value) => { settings = value; listeners.forEach((listener) => listener(settings)); },
       resetSettings: async () => { settings = { ...MEMORY_DEFAULT_SETTINGS }; listeners.forEach((listener) => listener(settings)); },
       getCurrentChatInfo: () => ({ available: true, name: 'Chat A', key: 'chat-a', mode: settings.chatMode, effectiveEnabled: settings.enabled }),
+      getSummaryProgressInfo: () => ({ available: true, initialized: false }),
       onSettingsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     }, liveStatusSource);
     expect(MEMORY_SETTINGS_SCHEMA.id).toBe('ss-helper.memory');
@@ -32,8 +33,8 @@ describe('SS-Helper Memory typed adapters', () => {
     expect(settings).toEqual(MEMORY_DEFAULT_SETTINGS);
   });
 
-  it('exposes exactly the global and current-chat tabs and disables overrides without a chat', async () => {
-    expect(MEMORY_SETTINGS_SCHEMA.fields.map((field) => field.id)).toEqual(['global', 'currentChat']);
+  it('exposes 基础、总结、召回、当前聊天 four tabs and disables overrides without a chat', async () => {
+    expect(MEMORY_SETTINGS_SCHEMA.fields.map((field) => field.id)).toEqual(['basic', 'summary', 'recall', 'currentChat']);
     let settings = { ...MEMORY_DEFAULT_SETTINGS };
     const listeners = new Set<(value: typeof settings) => void>();
     const adapter = createMemorySettingsAdapter({
@@ -42,13 +43,42 @@ describe('SS-Helper Memory typed adapters', () => {
       saveSettings: async (value) => { settings = value; listeners.forEach((listener) => listener(settings)); },
       resetSettings: async () => { settings = { ...MEMORY_DEFAULT_SETTINGS }; listeners.forEach((listener) => listener(settings)); },
       getCurrentChatInfo: () => ({ available: false, name: '', key: '', mode: 'inherit', effectiveEnabled: false }),
+      getSummaryProgressInfo: () => ({ available: false, initialized: false }),
       onSettingsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     }, liveStatusSource);
-    expect(await adapter.loadFieldState?.()).toEqual({ chatMode: { disabled: true, disabledReason: '请先进入角色或群组聊天，再修改当前聊天设置。' } });
+    expect(await adapter.loadFieldState?.()).toMatchObject({
+      chatMode: { disabled: true, disabledReason: '请先进入角色或群组聊天，再修改当前聊天设置。' },
+      summaryBatchFloors: { disabled: false },
+      summaryBatchChars: { disabled: true },
+    });
     await expect(adapter.loadStatus?.()).resolves.toMatchObject({
       workspaceStatus: { value: '已就绪', tone: 'success' },
       currentChatIdentity: { value: '不可用', tone: 'warning' },
       currentChatEffective: { value: '未生效', tone: 'warning' },
+      summaryProgress: { value: '未选择聊天', tone: 'warning' },
+    });
+  });
+
+  it('uses global summary defaults and switches the active batch control with the batch mode', async () => {
+    let settings = { ...MEMORY_DEFAULT_SETTINGS };
+    const controller = {
+      getSettings: () => ({ ...settings }),
+      getEffectiveSettings: (value = settings) => { const { chatMode: _chatMode, ...effective } = value; return effective; },
+      saveSettings: async (value: typeof settings) => { settings = value; },
+      resetSettings: async () => {},
+      getCurrentChatInfo: () => ({ available: true, name: 'Chat A', key: 'chat-a', mode: settings.chatMode, effectiveEnabled: true }),
+      getSummaryProgressInfo: () => ({ available: true, initialized: true, completedFloor: 60, nextWindow: '下一窗口：第 61–65 层', waitingFloors: 1 }),
+      onSettingsChanged: () => () => {},
+    };
+    const adapter = createMemorySettingsAdapter(controller, liveStatusSource);
+    await adapter.save({ ...settings, summaryBatchMode: 'chars', summaryBatchChars: 12_000, summaryIntervalFloors: 5 });
+    expect(settings).toMatchObject({ summaryBatchMode: 'chars', summaryBatchChars: 12_000, summaryIntervalFloors: 5, summaryOverlapFloors: 2 });
+    expect(await adapter.loadFieldState?.()).toMatchObject({
+      summaryBatchFloors: { disabled: true },
+      summaryBatchChars: { disabled: false },
+    });
+    await expect(adapter.loadStatus?.()).resolves.toMatchObject({
+      summaryProgress: { value: '已总结至第 60 层', description: expect.stringContaining('下一窗口：第 61–65 层') },
     });
   });
 
@@ -61,6 +91,7 @@ describe('SS-Helper Memory typed adapters', () => {
       saveSettings: async () => {},
       resetSettings: async () => {},
       getCurrentChatInfo: () => chat,
+      getSummaryProgressInfo: () => ({ available: chat.available, initialized: false }),
       onSettingsChanged: (listener) => { const callback = () => listener({ ...MEMORY_DEFAULT_SETTINGS }); listeners.add(callback); return () => listeners.delete(callback); },
     }, liveStatusSource);
     const snapshots: Array<Record<string, { value: string; description?: string }>> = [];
@@ -86,6 +117,7 @@ describe('SS-Helper Memory typed adapters', () => {
       saveSettings,
       resetSettings: async () => {},
       getCurrentChatInfo: () => ({ available: true, name: 'Alice', key: 'chat-a', mode: settings.chatMode, effectiveEnabled: settings.enabled }),
+      getSummaryProgressInfo: () => ({ available: true, initialized: false }),
       onSettingsChanged: () => () => {},
     };
     const adapter = createMemorySettingsAdapter(controller, { loadStatus: () => ({}), subscribeStatus: () => () => {}, assess }, toast);
@@ -105,6 +137,30 @@ describe('SS-Helper Memory typed adapters', () => {
     await expect(adapter.save({ ...settings, maxRecallItems: 14 })).rejects.toThrow('workspace transaction failed');
     expect(toast).toHaveBeenCalledTimes(1);
     expect(toast).toHaveBeenCalledWith(expect.objectContaining({ level: 'error', code: 'MEMORY_SETTINGS_SAVE_FAILED', durationMs: 0 }));
+  });
+
+  it('validates globally enabled resource modes even when no chat is selected', async () => {
+    let settings = { ...MEMORY_DEFAULT_SETTINGS, autoOrganize: false, recallMode: 'auto' as const };
+    const saveSettings = vi.fn(async (value: typeof settings) => { settings = value; });
+    const assess = vi.fn(async (next: { enabled: boolean; recallMode: string }) => next.recallMode === 'vector' && next.enabled
+      ? { blocked: { title: '无法启用向量召回', message: '请先在 LLM 中配置向量资源。', code: 'MEMORY_EMBEDDING_UNAVAILABLE' }, warnings: [] }
+      : { warnings: [] });
+    const adapter = createMemorySettingsAdapter({
+      getSettings: () => ({ ...settings }),
+      getEffectiveSettings: (value = settings) => { const { chatMode: _chatMode, ...effective } = value; return { ...effective, enabled: false }; },
+      saveSettings,
+      resetSettings: async () => undefined,
+      getCurrentChatInfo: () => ({ available: false, name: '', key: '', mode: 'inherit', effectiveEnabled: false }),
+      getSummaryProgressInfo: () => ({ available: false, initialized: false }),
+      onSettingsChanged: () => () => undefined,
+    }, { loadStatus: () => ({}), subscribeStatus: () => () => undefined, assess });
+
+    await expect(adapter.save({ ...settings, recallMode: 'vector' })).rejects.toThrow('请先在 LLM 中配置向量资源');
+    expect(assess).toHaveBeenCalledWith(
+      expect.objectContaining({ enabled: true, recallMode: 'vector' }),
+      expect.objectContaining({ enabled: true, recallMode: 'auto' }),
+    );
+    expect(saveSettings).not.toHaveBeenCalled();
   });
 
   it('exposes MEMORY_RECALL_V1 and publishes MEMORY_UPDATED_V1 as plain DTOs', async () => {

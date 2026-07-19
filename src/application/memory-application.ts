@@ -15,7 +15,6 @@ import {
   type RecallQuery,
   type RecallResult,
 } from './recall';
-import { AdaptiveIngestTrigger } from './ingest/adaptive-trigger';
 import {
   LlmMemoryExtractor,
   readMemoryLlmApi,
@@ -23,13 +22,30 @@ import {
   readMemoryRecallRouteDiagnostics,
 } from './ingest/llm-extractor';
 import { MemoryIngestService } from './ingest/memory-ingest-service';
-import { buildHistoryBatches, buildIncrementalBatch, estimateHistoryInitialization, filterSourceBlocks } from './ingest/source-blocks';
+import {
+  applyInitializationConflictResolutions,
+  reduceInitializationBatches,
+  snapshotsFromSources,
+} from './ingest/initialization-finalizer';
+import { resolveInitializationConflicts } from './ingest/initialization-conflict-resolver';
+import { filterSourceBlocks } from './ingest/source-blocks';
+import {
+  buildSummaryBatches,
+  DEFAULT_SUMMARY_STRATEGY,
+  estimateSummaryInitialization,
+  getSummaryWaitingFloors,
+  normalizeSummaryStrategy,
+  selectAutomaticSummaryWindow,
+  visibleConversationMessages,
+  type SummaryProgress,
+} from './ingest/summary-strategy';
 import type { SourceBlock } from './ingest/types';
 import { collectCurrentChatSources, selectSourceGroups, summarizeSourceGroups } from '../host/source-adapter';
 import type { MemoryPluginApi, MemorySqliteStatus } from '../index';
 import type {
   MemoryCaptureProgress,
   MemoryInitializationEstimate,
+  MemoryInitializationState,
   MemoryInitializationSourceOption,
   MemoryUiController,
   MemoryUiFact,
@@ -37,12 +53,18 @@ import type {
   MemoryUiSettings,
 } from '../ui/memory-ui';
 import type { MemoryHostContext } from '../host/sdk-host-context';
+import { describeMemoryError, type MemoryErrorDiagnostic } from '../diagnostics/memory-error';
 
 type MemoryGlobalSettings = Omit<MemoryUiSettings, 'chatMode'>;
 
 const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   enabled: true,
   autoOrganize: true,
+  summaryBatchMode: DEFAULT_SUMMARY_STRATEGY.batchMode,
+  summaryBatchFloors: DEFAULT_SUMMARY_STRATEGY.batchFloors,
+  summaryBatchChars: DEFAULT_SUMMARY_STRATEGY.batchChars,
+  summaryIntervalFloors: DEFAULT_SUMMARY_STRATEGY.triggerIntervalFloors,
+  summaryOverlapFloors: DEFAULT_SUMMARY_STRATEGY.overlapFloors,
   maxRecallItems: recallLimits.default,
   promptMaxChars: 8_000,
   answerMode: 'auto',
@@ -82,8 +104,29 @@ function clampPromptMaxChars(value: number): number {
   return Math.min(16_000, Math.max(2_000, Math.trunc(value || DEFAULT_SETTINGS.promptMaxChars)));
 }
 
+function summaryStrategyFromSettings(settings: MemoryGlobalSettings) {
+  return normalizeSummaryStrategy({
+    batchMode: settings.summaryBatchMode,
+    batchFloors: settings.summaryBatchFloors,
+    batchChars: settings.summaryBatchChars,
+    triggerIntervalFloors: settings.summaryIntervalFloors,
+    overlapFloors: settings.summaryOverlapFloors,
+  });
+}
+
 class CaptureCancelledError extends Error {
   constructor() { super('记忆整理已因停止或聊天切换而取消。'); }
+}
+
+function isRetryableInitializationError(error: unknown): boolean {
+  const code = String(
+    error && typeof error === 'object'
+      ? ((error as { details?: { reasonCode?: unknown }; code?: unknown }).details?.reasonCode
+        ?? (error as { code?: unknown }).code
+        ?? '')
+      : '',
+  ).toLocaleLowerCase();
+  return !['auth_failed', 'credential_missing', 'llm_disabled', 'no_resource', 'resource_disabled', 'route_unavailable', '401', '403'].some((value) => code.includes(value));
 }
 
 /** Memory 唯一应用服务，SQLite 是唯一持久数据源。 */
@@ -99,16 +142,20 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   private readonly recallIndex = new MemoryRecallIndex();
   private readonly vectorIndex: MemoryVectorIndexService;
   private readonly semanticRecall: SemanticRecallService;
-  private readonly trigger = new AdaptiveIngestTrigger();
+  private summaryProgressByChat: Record<string, SummaryProgress> = {};
+  private readonly summaryWaitingByChat = new Map<string, number>();
   private lastRecall: RecallResult | null = null;
   private lastRecallLogId: string | null = null;
   private lastOrganizedAt: number | null = null;
   private status: MemoryUiOverview['status'] = 'ready';
   private error = '';
+  private errorDiagnostic: MemoryErrorDiagnostic | undefined;
   private capturePromise: Promise<void> | null = null;
   private captureVersion = 0;
+  private bindVersion = 0;
   private stopped = false;
   private boundChatKey = '';
+  private boundScopeKey = '';
   private captureStartedAt = 0;
   private activeCaptureProgress: MemoryCaptureProgress | null = null;
   private cancelRequested = false;
@@ -162,8 +209,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.sqliteAvailable = false;
       this.vectorIndex.stop();
       this.recallIndex.replace([]);
-      this.status = 'error';
-      this.error = error instanceof Error ? error.message : String(error);
+      this.setRuntimeError(error, 'SQLITE_SERVICE_UNAVAILABLE', 'startup');
       return;
     }
     void this.resumePausedWork().catch(() => undefined);
@@ -172,7 +218,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   stop(): void {
     this.stopped = true;
     this.captureVersion += 1;
-    this.trigger.reset();
+    this.bindVersion += 1;
     this.recallIndex.replace([]);
     this.vectorIndex.stop();
     this.repository.close();
@@ -203,6 +249,23 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     };
   }
 
+  getSummaryProgressInfo(): import('../ss-helper/settings').MemorySummaryProgressInfo {
+    const chat = this.getCurrentChatInfo();
+    if (!chat.available) return { available: false, initialized: false };
+    const progress = this.summaryProgressByChat[chat.key];
+    if (!progress) return { available: true, initialized: false };
+    const strategy = summaryStrategyFromSettings(this.settings);
+    const nextStart = progress.completedFloor + 1;
+    const nextEnd = progress.completedFloor + strategy.triggerIntervalFloors;
+    return {
+      available: true,
+      initialized: true,
+      completedFloor: progress.completedFloor,
+      nextWindow: `下一窗口：第 ${nextStart}–${nextEnd} 层`,
+      waitingFloors: this.summaryWaitingByChat.get(chat.key),
+    };
+  }
+
   listChatKeys(): Promise<string[]> {
     if (!this.sqliteAvailable) return Promise.resolve([]);
     return this.repository.getChatKeys();
@@ -211,38 +274,65 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   async bindCurrentChat(): Promise<void> {
     const chatKey = this.getChatKey();
     const workspaceId = this.hostContext?.getWorkspaceId() ?? '';
+    const scopeKey = workspaceId && chatKey ? JSON.stringify([workspaceId, chatKey]) : '';
+    const bindVersion = ++this.bindVersion;
+    const isCurrent = (): boolean => !this.stopped
+      && this.bindVersion === bindVersion
+      && this.getChatKey() === chatKey
+      && (this.hostContext?.getWorkspaceId() ?? '') === workspaceId;
     this.repository.bind?.(workspaceId, chatKey);
-    if (this.boundChatKey && this.boundChatKey !== chatKey) this.captureVersion += 1;
-    this.boundChatKey = chatKey;
+    if (this.boundScopeKey !== scopeKey) this.captureVersion += 1;
+    this.boundScopeKey = scopeKey;
+    this.boundChatKey = '';
     this.settingsListeners.forEach((listener) => listener(this.getSettings()));
-    if (!this.sqliteAvailable) {
-      this.recallIndex.replace([]);
-      return;
-    }
     if (!workspaceId) {
       this.recallIndex.replace([]);
       this.lastRecall = null;
       this.lastRecallLogId = null;
-      this.error = '';
-      if (this.status === 'error') this.status = 'ready';
+      this.clearRuntimeError();
       return;
+    }
+    if (!this.sqliteAvailable) {
+      try {
+        // A previous transient server/startup failure must not permanently
+        // poison later chat switches. Reopen against the latest bound scope.
+        await this.repository.open();
+        if (!isCurrent()) return;
+        this.sqliteAvailable = true;
+        this.vectorIndex.start();
+        await this.loadSettings();
+        if (!isCurrent()) return;
+      } catch (error) {
+        if (!isCurrent()) return;
+        this.recallIndex.replace([]);
+        this.vectorIndex.stop();
+        this.setRuntimeError(error, 'SQLITE_SERVICE_UNAVAILABLE', 'chat-bind');
+        return;
+      }
     }
     try {
       const bootstrap = chatKey ? await this.repository.bootstrap(chatKey) : null;
+      if (!isCurrent()) return;
       this.recallIndex.replace(bootstrap?.facts ?? []);
-      this.error = '';
-      if (this.status === 'error') this.status = 'ready';
+      this.boundChatKey = chatKey;
+      this.clearRuntimeError();
     } catch (error) {
-      this.sqliteAvailable = false;
+      if (!isCurrent()) return;
       this.recallIndex.replace([]);
-      this.status = 'error';
-      this.error = error instanceof Error ? error.message : String(error);
+      // A character/group workspace error is not automatically a global
+      // SQLite outage. Keeping the service available lets “重新检查” repair it.
+      this.setRuntimeError(error, 'MEMORY_CHAT_BIND_FAILED', 'chat-bind');
       return;
     }
     const effective = this.getEffectiveSettings();
+    if (!effective.enabled) this.status = 'disabled';
+    else if (this.status === 'disabled' || this.status === 'unselected') this.status = 'ready';
     if (effective.enabled && chatKey && effective.recallMode !== 'lexical') this.vectorIndex.scheduleSync(chatKey);
     this.lastRecall = null;
     this.lastRecallLogId = null;
+    if (chatKey) {
+      void this.ensureSummaryProgress(chatKey).then(() => this.emitSettingsChanged()).catch(() => undefined);
+    }
   }
 
   getSettings(): MemoryUiSettings {
@@ -261,6 +351,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const nextSettings: MemoryGlobalSettings = {
       enabled: settings.enabled === true,
       autoOrganize: settings.autoOrganize === true,
+      summaryBatchMode: settings.summaryBatchMode === 'chars' ? 'chars' : 'floors',
+      summaryBatchFloors: Math.min(20, Math.max(1, Math.trunc(settings.summaryBatchFloors))),
+      summaryBatchChars: Math.min(16_000, Math.max(2_000, Math.round(settings.summaryBatchChars / 500) * 500)),
+      summaryIntervalFloors: Math.min(50, Math.max(1, Math.trunc(settings.summaryIntervalFloors))),
+      summaryOverlapFloors: Math.min(10, Math.max(0, Math.trunc(settings.summaryOverlapFloors))),
       maxRecallItems: clampMaxItems(settings.maxRecallItems),
       promptMaxChars: clampPromptMaxChars(settings.promptMaxChars),
       answerMode: settings.answerMode === 'diagnostic' || settings.answerMode === 'roleplay' ? settings.answerMode : 'auto',
@@ -279,7 +374,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     await this.repository.setSettings({ ...nextSettings, chatOverrides: nextOverrides });
     this.settings = nextSettings;
     this.chatOverrides = nextOverrides;
-    this.settingsListeners.forEach((listener) => listener(this.getSettings()));
+    this.emitSettingsChanged();
     const effective = this.getEffectiveSettings();
     if (!effective.enabled) this.status = 'disabled';
     else if (this.status === 'disabled') this.status = 'ready';
@@ -288,10 +383,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   async resetSettings(): Promise<void> {
     if (!this.sqliteAvailable) throw new Error('Memory workspace 不可用，设置未恢复。');
-    await this.repository.setSettings({ ...DEFAULT_SETTINGS, chatOverrides: {} });
+    await this.repository.setSettings({ ...DEFAULT_SETTINGS, chatOverrides: {}, summaryProgressByChat: {} });
     this.settings = { ...DEFAULT_SETTINGS };
     this.chatOverrides = {};
-    this.settingsListeners.forEach((listener) => listener(this.getSettings()));
+    this.summaryProgressByChat = {};
+    this.emitSettingsChanged();
     const effective = this.getEffectiveSettings();
     this.status = effective.enabled ? 'ready' : 'disabled';
     if (effective.enabled && effective.recallMode !== 'lexical') this.vectorIndex.scheduleSync(this.getChatKey());
@@ -326,25 +422,46 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     await this.flushCapture('initialize', undefined, selectedKinds);
   }
 
+  async reinitialize(selectedKinds?: string[]): Promise<void> {
+    await this.cancelCapture();
+    await this.clearCurrentChatData();
+    await this.initialize(selectedKinds);
+  }
+
   async retry(): Promise<void> {
-    this.error = '';
-    const paused = (await this.repository.listJobs(this.requireChatKey())).find((job) => job.status === 'paused');
+    this.clearRuntimeError();
+    const paused = (await this.repository.listJobs(this.requireChatKey()))
+      .filter((job) => job.status === 'paused')
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
     await this.flushCapture(paused?.type ?? 'incremental', paused);
   }
 
   async getOverview(): Promise<MemoryUiOverview> {
     const chatKey = this.getChatKey();
-    const degraded = (message = this.error): MemoryUiOverview => ({
+    const storage = this.repository.getHealthSnapshot();
+    const currentChatSizeBytes = storage?.currentChatSizeBytes ?? 0;
+    const currentChatUsageRatio = storage?.workspaceSizeBytes
+      ? currentChatSizeBytes / storage.workspaceSizeBytes
+      : 0;
+    const degraded = (message = this.error): MemoryUiOverview => {
+      const diagnostic = this.errorDiagnostic ?? describeMemoryError(message, 'SQLITE_SERVICE_UNAVAILABLE', 'health');
+      const currentChat = this.getCurrentChatInfo();
+      return ({
       status: 'error',
       bound: false,
       ...(chatKey ? { chatKey } : {}),
+      ...(currentChat.name ? { chatName: currentChat.name } : {}),
       factCount: 0,
+      currentChatSizeBytes,
+      currentChatUsageRatio,
       lastOrganizedAt: this.lastOrganizedAt,
       pendingJobs: 0,
       llmAvailable: readMemoryLlmApi() !== null,
-      errorCode: message.match(/(?:错误码\s*[=:]|HTTP\s+)([\w-]+)/i)?.[1] ?? 'SQLITE_SERVICE_UNAVAILABLE',
-      error: message || 'Memory workspace 不可用，记忆整理、召回与注入已停用。',
+      errorCode: diagnostic.code,
+      error: diagnostic.reason,
+      errorDiagnostic: diagnostic,
     });
+    };
     if (!this.sqliteAvailable) return degraded();
     let facts: MemoryFact[] = [];
     let jobs: MemoryJob[] = [];
@@ -352,11 +469,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       try {
         [facts, jobs] = await Promise.all([this.repository.listFacts(chatKey), this.repository.listJobs(chatKey)]);
       } catch (error) {
-        this.sqliteAvailable = false;
-        this.status = 'error';
-        this.error = error instanceof Error ? error.message : String(error);
         this.recallIndex.replace([]);
-        this.vectorIndex.stop();
+        this.setRuntimeError(error, 'MEMORY_CHAT_READ_FAILED', 'chat-bind');
         return degraded(this.error);
       }
     }
@@ -364,12 +478,17 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       .filter((job) => job.status === 'completed')
       .reduce<number | null>((latest, job) => latest === null ? job.updatedAt : Math.max(latest, job.updatedAt), null);
     const llmRoute = await readMemoryLlmRouteDiagnostic();
-    const errorCode = this.error.match(/(?:错误码\s*[=:]|HTTP\s+)([\w-]+)/i)?.[1];
+    const errorCode = this.errorDiagnostic?.code;
+    const currentChat = this.getCurrentChatInfo();
+    const bound = Boolean(chatKey && this.boundChatKey === chatKey);
     return {
-      status: this.getEffectiveSettings().enabled ? this.status : 'disabled',
-      bound: Boolean(chatKey && this.boundChatKey === chatKey),
+      status: this.status === 'error' ? 'error' : !currentChat.available ? 'unselected' : currentChat.effectiveEnabled ? this.status : 'disabled',
+      bound,
       ...(chatKey ? { chatKey } : {}),
+      ...(currentChat.name ? { chatName: currentChat.name } : {}),
       factCount: facts.length,
+      currentChatSizeBytes,
+      currentChatUsageRatio,
       lastOrganizedAt: this.lastOrganizedAt ?? latestCompletedAt,
       pendingJobs: jobs.filter((job) => job.status === 'queued' || job.status === 'running' || job.status === 'paused').length,
       llmAvailable: readMemoryLlmApi() !== null,
@@ -377,26 +496,60 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ...(llmRoute.model ? { llmModel: llmRoute.model } : {}),
       ...(errorCode ? { errorCode } : {}),
       ...(this.error ? { error: this.error } : {}),
+      ...(this.errorDiagnostic ? { errorDiagnostic: this.errorDiagnostic } : {}),
     };
   }
 
   async getInitializationSources(): Promise<MemoryInitializationSourceOption[]> {
     const chatKey = this.getChatKey();
     if (!chatKey) return [];
-    return summarizeSourceGroups(filterSourceBlocks(await this.collectSources(chatKey))).map((group) => ({
+    const [groups, initialization] = await Promise.all([
+      this.collectSources(chatKey).then((sources) => summarizeSourceGroups(filterSourceBlocks(sources))),
+      this.getInitializationState(),
+    ]);
+    const selectedKinds = initialization.selectedSourceKinds.length > 0
+      ? new Set(initialization.selectedSourceKinds)
+      : new Set(groups.map((group) => group.id));
+    return groups.map((group) => ({
       kind: group.id,
       label: group.label,
       count: group.count,
-      selected: true,
+      selected: selectedKinds.has(group.id),
     }));
+  }
+
+  async getInitializationState(): Promise<MemoryInitializationState> {
+    const chatKey = this.getChatKey();
+    if (!chatKey) return { initialized: false, lastCompletedAt: null, selectedSourceKinds: [], attempts: [] };
+    const initializationJobs = (await this.repository.listJobs(chatKey))
+      .filter((job) => job.type === 'initialize')
+      .sort((left, right) => right.updatedAt - left.updatedAt);
+    const latestCompleted = initializationJobs.find((job) => job.status === 'completed');
+    return {
+      initialized: Boolean(latestCompleted),
+      lastCompletedAt: latestCompleted?.updatedAt ?? null,
+      selectedSourceKinds: [...(latestCompleted?.checkpoint.selectedSourceGroupIds ?? [])],
+      ...(latestCompleted?.checkpoint.qualityStatus ? { qualityStatus: latestCompleted.checkpoint.qualityStatus } : {}),
+      ...(latestCompleted?.checkpoint.pendingReviewCount === undefined ? {} : { pendingReviewCount: latestCompleted.checkpoint.pendingReviewCount }),
+      attempts: initializationJobs.slice(0, 5).map((job) => ({
+        jobId: job.id,
+        status: this.activeCaptureProgress?.jobId === job.id && this.activeCaptureProgress.status === 'cancelled'
+          ? 'cancelled'
+          : job.status,
+        updatedAt: job.updatedAt,
+        totalBatches: job.checkpoint.totalBatches ?? job.checkpoint.batchIndex,
+        selectedSourceKinds: [...(job.checkpoint.selectedSourceGroupIds ?? [])],
+        ...(job.error ? { error: job.error } : {}),
+      })),
+    };
   }
 
   async getInitializationEstimate(selectedKinds?: string[]): Promise<MemoryInitializationEstimate> {
     const chatKey = this.getChatKey();
-    if (!chatKey) return estimateHistoryInitialization(0, []);
+    if (!chatKey) return estimateSummaryInitialization(0, []);
     const sources = selectSourceGroups(filterSourceBlocks(await this.collectSources(chatKey)), selectedKinds);
     const messageCount = sources.filter((source) => source.kind === 'message').length;
-    return estimateHistoryInitialization(messageCount, buildHistoryBatches(sources));
+    return estimateSummaryInitialization(messageCount, buildSummaryBatches(sources, summaryStrategyFromSettings(this.settings)));
   }
 
   async getCaptureProgress(): Promise<MemoryCaptureProgress> {
@@ -409,7 +562,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       };
     }
     const chatKey = this.getChatKey();
-    const latest = chatKey ? (await this.repository.listJobs(chatKey))[0] : undefined;
+    const latest = chatKey
+      ? (await this.repository.listJobs(chatKey)).sort((left, right) => right.updatedAt - left.updatedAt)[0]
+      : undefined;
     if (!latest) return { status: 'idle', batchIndex: 0, totalBatches: 0, processedCount: 0, elapsedMs: 0 };
     return {
       status: latest.status,
@@ -419,6 +574,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       processedCount: latest.checkpoint.processedCount,
       elapsedMs: Math.max(0, latest.updatedAt - latest.createdAt),
       ...(latest.error ? { error: latest.error } : {}),
+      ...(latest.checkpoint.phase ? { phase: latest.checkpoint.phase } : {}),
+      ...(latest.checkpoint.stagedBatchCount === undefined ? {} : { stagedBatchCount: latest.checkpoint.stagedBatchCount }),
+      ...(latest.checkpoint.conflictBucketCount === undefined ? {} : { conflictBucketCount: latest.checkpoint.conflictBucketCount }),
+      ...(latest.checkpoint.pendingReviewCount === undefined ? {} : { pendingReviewCount: latest.checkpoint.pendingReviewCount }),
+      ...(latest.checkpoint.qualityStatus ? { qualityStatus: latest.checkpoint.qualityStatus } : {}),
     };
   }
 
@@ -557,9 +717,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       const health = await this.repository.refreshHealth(this.getChatKey());
       const wasAvailable = this.sqliteAvailable;
       this.sqliteAvailable = health.connected;
-      if (health.connected && !wasAvailable && !this.stopped) {
+      if (health.connected && (!wasAvailable || this.status === 'error') && !this.stopped) {
         this.vectorIndex.start();
-        await this.loadSettings();
+        if (!wasAvailable) await this.loadSettings();
         await this.bindCurrentChat();
       }
       const sqliteCoverage = health.vectorCoverage;
@@ -579,6 +739,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         schemaVersion: health.schemaVersion,
         databasePath: health.databasePath,
         databaseSizeBytes: health.databaseSizeBytes,
+        workspaceSizeBytes: health.workspaceSizeBytes,
+        currentChatSizeBytes: health.currentChatSizeBytes,
+        currentChatUsageRatio: health.workspaceSizeBytes ? health.currentChatSizeBytes / health.workspaceSizeBytes : 0,
         walMode: health.walMode,
         tableCounts: { ...health.tableCounts },
         tableBytes: { ...health.tableBytes },
@@ -586,10 +749,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         ...(lastError ? { lastError } : {}),
       };
     } catch (error) {
-      const wasAvailable = this.sqliteAvailable;
       this.sqliteAvailable = false;
+      this.vectorIndex.stop();
+      this.setRuntimeError(error, 'SQLITE_SERVICE_UNAVAILABLE', 'health');
       const previous = this.repository.getHealthSnapshot();
-      const message = error instanceof Error ? error.message : String(error);
       return {
         connected: false,
         serverVersion: previous?.serverVersion ?? 'N/A',
@@ -599,13 +762,29 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         schemaVersion: previous?.schemaVersion ?? 0,
         databasePath: previous?.databasePath ?? 'data/_ss-helper/ss-helper.sqlite3',
         databaseSizeBytes: previous?.databaseSizeBytes ?? 0,
+        workspaceSizeBytes: previous?.workspaceSizeBytes ?? 0,
+        currentChatSizeBytes: previous?.currentChatSizeBytes ?? 0,
+        currentChatUsageRatio: previous?.workspaceSizeBytes ? previous.currentChatSizeBytes / previous.workspaceSizeBytes : 0,
         walMode: previous?.walMode ?? 'N/A',
         tableCounts: previous?.tableCounts ?? {},
         tableBytes: previous?.tableBytes ?? {},
         vectorCoverage: { indexedFacts: 0, eligibleFacts: 0, ratio: 0 },
-        lastError: message,
+        lastError: this.errorDiagnostic?.reason ?? 'SQLite 工作区服务未连接。',
       };
     }
+  }
+
+  private setRuntimeError(error: unknown, fallbackCode: string, stage: Parameters<typeof describeMemoryError>[2]): void {
+    const diagnostic = describeMemoryError(error, fallbackCode, stage);
+    this.status = 'error';
+    this.errorDiagnostic = diagnostic;
+    this.error = diagnostic.reason;
+  }
+
+  private clearRuntimeError(): void {
+    this.error = '';
+    this.errorDiagnostic = undefined;
+    if (this.status === 'error') this.status = 'ready';
   }
 
   exportSqliteBackup(): Promise<Blob> {
@@ -630,43 +809,68 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   async clearCurrentChatData(): Promise<void> {
     const chatKey = this.requireChatKey();
     await this.repository.clearCurrentChatData(chatKey);
+    if (this.summaryProgressByChat[chatKey]) {
+      const next = { ...this.summaryProgressByChat };
+      delete next[chatKey];
+      await this.repository.setSettings({ summaryProgressByChat: next });
+      this.summaryProgressByChat = next;
+      this.summaryWaitingByChat.delete(chatKey);
+      this.emitSettingsChanged();
+    }
     this.recallIndex.replace([]);
     this.lastRecall = null;
     this.lastRecallLogId = null;
+    this.lastOrganizedAt = null;
+    this.activeCaptureProgress = null;
+    this.captureStartedAt = 0;
+    this.cancelRequested = false;
+    this.clearRuntimeError();
   }
 
   async clearAllMemoryData(): Promise<void> {
     await this.cancelCapture();
     await this.repository.clearAllMemory();
+    await this.repository.setSettings({ summaryProgressByChat: {} });
+    this.summaryProgressByChat = {};
+    this.summaryWaitingByChat.clear();
     this.recallIndex.replace([]);
     this.lastRecall = null;
     this.lastRecallLogId = null;
     await this.bindCurrentChat();
   }
 
-  observeCompletedRound(visibleText: string): void {
+  observeCompletedRound(_visibleText: string): void {
     const settings = this.getEffectiveSettings();
     if (!settings.enabled || !settings.autoOrganize) return;
-    const chatKey = this.getChatKey();
-    if (!chatKey) return;
-    const decision = this.trigger.observeRound(chatKey, visibleText);
-    if (decision.shouldFlush) void this.flushCapture('incremental');
+    if (!this.getChatKey()) return;
+    void this.flushCapture('incremental').catch(() => undefined);
   }
 
   private async loadSettings(): Promise<void> {
-    const [enabled, autoOrganize, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode, chatOverrides] = await Promise.all([
+    const [enabled, autoOrganize, summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode, chatOverrides, summaryProgressByChat] = await Promise.all([
       this.repository.getSetting<boolean>('enabled'),
       this.repository.getSetting<boolean>('autoOrganize'),
+      this.repository.getSetting<MemoryGlobalSettings['summaryBatchMode']>('summaryBatchMode'),
+      this.repository.getSetting<number>('summaryBatchFloors'),
+      this.repository.getSetting<number>('summaryBatchChars'),
+      this.repository.getSetting<number>('summaryIntervalFloors'),
+      this.repository.getSetting<number>('summaryOverlapFloors'),
       this.repository.getSetting<number>('maxRecallItems'),
       this.repository.getSetting<number>('promptMaxChars'),
       this.repository.getSetting<MemoryUiSettings['answerMode']>('answerMode'),
       this.repository.getSetting<MemoryUiSettings['recallMode']>('recallMode'),
       this.repository.getSetting<MemoryUiSettings['rerankMode']>('rerankMode'),
       this.repository.getSetting<Record<string, boolean>>('chatOverrides'),
+      this.repository.getSetting<Record<string, SummaryProgress>>('summaryProgressByChat'),
     ]);
     this.settings = {
       enabled: enabled ?? DEFAULT_SETTINGS.enabled,
       autoOrganize: autoOrganize ?? DEFAULT_SETTINGS.autoOrganize,
+      summaryBatchMode: summaryBatchMode === 'chars' ? 'chars' : 'floors',
+      summaryBatchFloors: Math.min(20, Math.max(1, Math.trunc(summaryBatchFloors ?? DEFAULT_SETTINGS.summaryBatchFloors))),
+      summaryBatchChars: Math.min(16_000, Math.max(2_000, Math.round((summaryBatchChars ?? DEFAULT_SETTINGS.summaryBatchChars) / 500) * 500)),
+      summaryIntervalFloors: Math.min(50, Math.max(1, Math.trunc(summaryIntervalFloors ?? DEFAULT_SETTINGS.summaryIntervalFloors))),
+      summaryOverlapFloors: Math.min(10, Math.max(0, Math.trunc(summaryOverlapFloors ?? DEFAULT_SETTINGS.summaryOverlapFloors))),
       maxRecallItems: clampMaxItems(maxRecallItems ?? DEFAULT_SETTINGS.maxRecallItems),
       promptMaxChars: clampPromptMaxChars(promptMaxChars ?? DEFAULT_SETTINGS.promptMaxChars),
       answerMode: answerMode === 'diagnostic' || answerMode === 'roleplay' ? answerMode : 'auto',
@@ -675,6 +879,15 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     };
     this.chatOverrides = chatOverrides && typeof chatOverrides === 'object' && !Array.isArray(chatOverrides)
       ? Object.fromEntries(Object.entries(chatOverrides).filter((entry): entry is [string, boolean] => typeof entry[1] === 'boolean'))
+      : {};
+    this.summaryProgressByChat = summaryProgressByChat && typeof summaryProgressByChat === 'object' && !Array.isArray(summaryProgressByChat)
+      ? Object.fromEntries(Object.entries(summaryProgressByChat).filter((entry): entry is [string, SummaryProgress] => {
+        const value = entry[1];
+        return Boolean(value) && typeof value === 'object'
+          && typeof value.completedFloor === 'number'
+          && typeof value.completedMessageId === 'string'
+          && typeof value.updatedAt === 'number';
+      }))
       : {};
   }
 
@@ -724,7 +937,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   private flushCapture(
-    mode: 'initialize' | 'history' | 'incremental',
+    mode: 'initialize' | 'incremental',
     resumeJob?: MemoryJob,
     selectedSourceGroups?: string[],
   ): Promise<void> {
@@ -734,7 +947,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   private async runCapture(
-    mode: 'initialize' | 'history' | 'incremental',
+    mode: 'initialize' | 'incremental',
     resumeJob?: MemoryJob,
     selectedSourceGroups?: string[],
   ): Promise<void> {
@@ -747,15 +960,38 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       mode === 'incremental' ? undefined : effectiveSelectedSourceGroups,
     );
     this.assertCaptureCurrent(captureVersion, chatKey);
-    const sources = mode === 'incremental' ? await this.onlyUnprocessedSources(chatKey, allSources) : allSources;
+    const existingProgress = await this.ensureSummaryProgress(chatKey, allSources);
+    if (existingProgress) {
+      const waiting = getSummaryWaitingFloors(allSources, existingProgress, summaryStrategyFromSettings(this.settings));
+      if (waiting !== undefined) this.summaryWaitingByChat.set(chatKey, waiting);
+      this.emitSettingsChanged();
+    }
+    const automaticWindow = mode === 'incremental'
+      ? selectAutomaticSummaryWindow(allSources, existingProgress, summaryStrategyFromSettings(this.settings))
+      : undefined;
+    const sources = automaticWindow?.sources ?? (mode === 'incremental' ? [] : allSources);
     if (sources.length === 0) {
-      this.trigger.markFlushed(chatKey);
       return;
     }
-    const allBatches = mode === 'incremental' ? [buildIncrementalBatch(sources)] : buildHistoryBatches(sources);
-    const resumeBatchIndex = mode === 'incremental' ? 0 : resumeJob?.checkpoint.batchIndex ?? 0;
+    const messageSources = visibleConversationMessages(sources);
+    const target = automaticWindow
+      ? { startFloor: automaticWindow.startFloor, endFloor: automaticWindow.endFloor, endMessageId: automaticWindow.endMessageId }
+      : messageSources.length > 0
+        ? {
+          startFloor: messageSources[0]?.floor ?? 1,
+          endFloor: messageSources.at(-1)?.floor ?? messageSources.length,
+          endMessageId: messageSources.at(-1)?.id ?? '',
+        }
+        : undefined;
+    const allBatches = buildSummaryBatches(sources, summaryStrategyFromSettings(this.settings));
+    const initializationPhase = mode === 'initialize'
+      ? (resumeJob?.checkpoint.phase ?? 'extract')
+      : undefined;
+    const resumeBatchIndex = initializationPhase && initializationPhase !== 'extract'
+      ? allBatches.length
+      : resumeJob?.checkpoint.batchIndex ?? 0;
     const batches = allBatches.slice(resumeBatchIndex);
-    if (batches.length === 0) return;
+    if (batches.length === 0 && mode !== 'initialize') return;
     const jobId = resumeJob?.id ?? createId('job');
     const createdAt = resumeJob?.createdAt ?? Date.now();
     this.status = 'working';
@@ -768,6 +1004,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       totalBatches: allBatches.length,
       processedCount: resumeJob?.checkpoint.processedCount ?? 0,
       elapsedMs: 0,
+      ...(initializationPhase ? { phase: initializationPhase } : {}),
     };
     this.assertCaptureCurrent(captureVersion, chatKey);
     await this.repository.putJob({
@@ -778,6 +1015,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         processedCount: resumeJob?.checkpoint.processedCount ?? 0,
         ...(resumeJob?.checkpoint.metadataSourceRefs === undefined ? {} : { metadataSourceRefs: resumeJob.checkpoint.metadataSourceRefs }),
         ...(effectiveSelectedSourceGroups === undefined ? {} : { selectedSourceGroupIds: effectiveSelectedSourceGroups }),
+        ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
+        ...(initializationPhase ? {
+          phase: initializationPhase,
+          ...(resumeJob?.checkpoint.stagedBatchCount === undefined ? {} : { stagedBatchCount: resumeJob.checkpoint.stagedBatchCount }),
+        } : {}),
       },
       createdAt, updatedAt: Date.now(),
     });
@@ -797,51 +1039,155 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ...(resumeJob?.checkpoint.overlapSourceRefs === undefined ? {} : { overlapSourceRefs: resumeJob.checkpoint.overlapSourceRefs }),
       ...(resumeJob?.checkpoint.metadataSourceRefs === undefined ? {} : { metadataSourceRefs: resumeJob.checkpoint.metadataSourceRefs }),
       ...(effectiveSelectedSourceGroups === undefined ? {} : { selectedSourceGroupIds: effectiveSelectedSourceGroups }),
+      ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
+      ...(initializationPhase ? {
+        phase: initializationPhase,
+        ...(resumeJob?.checkpoint.stagedBatchCount === undefined ? {} : { stagedBatchCount: resumeJob.checkpoint.stagedBatchCount }),
+      } : {}),
     };
     const processedMetadataRefs = new Set(resumeJob?.checkpoint.metadataSourceRefs ?? []);
+    const processedMessageRefs = new Set<string>();
     try {
-      for (let index = 0; index < batches.length; index += 1) {
-        const batch = batches[index]!;
+      if (mode === 'initialize') {
+        const stagedBefore = await this.repository.listInitializationStagingBatches(chatKey, jobId);
+        const stagedBatchIndices = new Set(stagedBefore.map((batch) => batch.batchIndex));
+        if (initializationPhase === 'extract') {
+          for (let index = 0; index < allBatches.length; index += 1) {
+            const batch = allBatches[index]!;
+            const batchIndex = index + 1;
+            if (stagedBatchIndices.has(batchIndex)) continue;
+            this.activeCaptureProgress = {
+              status: 'running', jobId, phase: 'extract', batchIndex, totalBatches: allBatches.length,
+              processedCount, stagedBatchCount: stagedBatchIndices.size, elapsedMs: Date.now() - this.captureStartedAt,
+            };
+            batch.filter((source) => source.kind !== 'message').forEach((source) => processedMetadataRefs.add(source.id));
+            for (const source of batch) {
+              if (source.kind === 'message' && !processedMessageRefs.has(source.id)) {
+                processedMessageRefs.add(source.id);
+                processedCount += 1;
+              }
+            }
+            const prepared = await service.prepare({ chatKey, sources: batch });
+            this.assertCaptureCurrent(captureVersion, chatKey);
+            await this.repository.putInitializationStagingBatch({
+              id: '', kind: 'initialization-staging-v1', chatKey, jobId, batchIndex,
+              totalBatches: allBatches.length, processedCount,
+              sources: snapshotsFromSources(prepared.sources), facts: prepared.facts,
+              rejections: prepared.rejections, ...(prepared.audit ? { audit: prepared.audit } : {}),
+              createdAt: Date.now(), updatedAt: Date.now(),
+            });
+            stagedBatchIndices.add(batchIndex);
+            checkpoint = {
+              batchIndex, totalBatches: allBatches.length, processedCount,
+              lastSourceRef: batch.at(-1)?.id,
+              overlapSourceRefs: batch.slice(-2).map((source) => source.id),
+              metadataSourceRefs: [...processedMetadataRefs],
+              ...(effectiveSelectedSourceGroups === undefined ? {} : { selectedSourceGroupIds: effectiveSelectedSourceGroups }),
+              ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
+              phase: 'extract', stagedBatchCount: stagedBatchIndices.size,
+            };
+            await this.repository.putJob({ id: jobId, chatKey, type: mode, status: 'running', checkpoint, createdAt, updatedAt: Date.now() });
+          }
+        }
+        const stagedBatches = await this.repository.listInitializationStagingBatches(chatKey, jobId);
+        const storedResolution = initializationPhase === 'apply'
+          ? await this.repository.getInitializationResolution(chatKey, jobId)
+          : undefined;
+        let finalized = storedResolution?.reduction;
+        if (!finalized) {
+          this.assertCaptureCurrent(captureVersion, chatKey);
+          this.activeCaptureProgress = {
+            status: 'running', jobId, phase: 'reduce', batchIndex: allBatches.length, totalBatches: allBatches.length,
+            processedCount, stagedBatchCount: stagedBatches.length, elapsedMs: Date.now() - this.captureStartedAt,
+          };
+          checkpoint = { ...checkpoint, batchIndex: allBatches.length, totalBatches: allBatches.length, processedCount, phase: 'reduce', stagedBatchCount: stagedBatches.length };
+          await this.repository.putJob({ id: jobId, chatKey, type: mode, status: 'running', checkpoint, createdAt, updatedAt: Date.now() });
+          const reduced = reduceInitializationBatches(jobId, stagedBatches);
+          this.assertCaptureCurrent(captureVersion, chatKey);
+          this.activeCaptureProgress = {
+            status: 'running', jobId, phase: 'resolve', batchIndex: allBatches.length, totalBatches: allBatches.length,
+            processedCount, stagedBatchCount: stagedBatches.length, conflictBucketCount: reduced.conflictBuckets.length,
+            elapsedMs: Date.now() - this.captureStartedAt,
+          };
+          checkpoint = { ...checkpoint, phase: 'resolve', conflictBucketCount: reduced.conflictBuckets.length, ruleResolvedCount: reduced.stats.ruleResolvedCount };
+          await this.repository.putJob({ id: jobId, chatKey, type: mode, status: 'running', checkpoint, createdAt, updatedAt: Date.now() });
+          const conflictResult = await resolveInitializationConflicts({ llm: readMemoryLlmApi(), buckets: reduced.conflictBuckets, facts: reduced.facts });
+          finalized = applyInitializationConflictResolutions(reduced, conflictResult.resolutions);
+          await this.repository.putInitializationResolution({
+            id: '', kind: 'initialization-resolution-v1', chatKey, jobId, reduction: finalized, createdAt: Date.now(), updatedAt: Date.now(),
+          });
+        }
+        this.assertCaptureCurrent(captureVersion, chatKey);
         this.activeCaptureProgress = {
-          status: 'running',
-          jobId,
-          batchIndex: resumeBatchIndex + index + 1,
-          totalBatches: allBatches.length,
-          processedCount,
+          status: 'running', jobId, phase: 'apply', batchIndex: allBatches.length, totalBatches: allBatches.length,
+          processedCount, stagedBatchCount: stagedBatches.length, conflictBucketCount: finalized.stats.conflictBucketCount,
+          pendingReviewCount: finalized.stats.pendingReviewCount, qualityStatus: finalized.stats.qualityStatus,
           elapsedMs: Date.now() - this.captureStartedAt,
         };
-        batch.filter((source) => source.kind !== 'message').forEach((source) => processedMetadataRefs.add(source.id));
-        processedCount += Math.max(0, batch.length - (index === 0 ? 0 : 2));
-        await service.ingest({
-          chatKey,
-          jobId,
-          sources: batch,
-          jobType: mode,
-          jobStatus: index === batches.length - 1 ? 'completed' : 'paused',
-          batchIndex: resumeBatchIndex + index + 1,
-          totalBatches: allBatches.length,
-          processedCount,
-          metadataSourceRefs: [...processedMetadataRefs],
-          ...(effectiveSelectedSourceGroups === undefined ? {} : { selectedSourceGroupIds: effectiveSelectedSourceGroups }),
-        });
         checkpoint = {
-          batchIndex: resumeBatchIndex + index + 1,
-          totalBatches: allBatches.length,
-          processedCount,
-          lastSourceRef: batch.at(-1)?.id,
-          overlapSourceRefs: batch.slice(-2).map((source) => source.id),
-          metadataSourceRefs: [...processedMetadataRefs],
-          ...(effectiveSelectedSourceGroups === undefined ? {} : { selectedSourceGroupIds: effectiveSelectedSourceGroups }),
+          ...checkpoint, phase: 'apply', stagedBatchCount: finalized.stats.stagedBatchCount,
+          mergedDuplicateCount: finalized.stats.mergedDuplicateCount, supersededCount: finalized.stats.supersededCount,
+          conflictBucketCount: finalized.stats.conflictBucketCount, ruleResolvedCount: finalized.stats.ruleResolvedCount,
+          llmResolvedCount: finalized.stats.llmResolvedCount, pendingReviewCount: finalized.stats.pendingReviewCount,
+          qualityStatus: finalized.stats.qualityStatus,
         };
+        const finalizationStats = await this.repository.applyInitializationFinalization({
+          chatKey,
+          job: { id: jobId, chatKey, type: mode, status: 'running', checkpoint, createdAt, updatedAt: Date.now() },
+          batches: stagedBatches,
+          reduction: finalized,
+        });
+        checkpoint = { ...checkpoint, ...finalizationStats, phase: 'apply' };
         await this.bindCurrentChat();
+      } else {
+        for (let index = 0; index < batches.length; index += 1) {
+          const batch = batches[index]!;
+          this.activeCaptureProgress = {
+            status: 'running', jobId, batchIndex: resumeBatchIndex + index + 1, totalBatches: allBatches.length,
+            processedCount, elapsedMs: Date.now() - this.captureStartedAt,
+          };
+          batch.filter((source) => source.kind !== 'message').forEach((source) => processedMetadataRefs.add(source.id));
+          for (const source of batch) {
+            if (source.kind === 'message' && !processedMessageRefs.has(source.id)) {
+              processedMessageRefs.add(source.id);
+              processedCount += 1;
+            }
+          }
+          await service.ingest({
+            chatKey, jobId, sources: batch, jobType: mode, jobStatus: index === batches.length - 1 ? 'completed' : 'paused',
+            batchIndex: resumeBatchIndex + index + 1, totalBatches: allBatches.length, processedCount,
+            metadataSourceRefs: [...processedMetadataRefs],
+            ...(effectiveSelectedSourceGroups === undefined ? {} : { selectedSourceGroupIds: effectiveSelectedSourceGroups }),
+            ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
+          });
+          checkpoint = {
+            batchIndex: resumeBatchIndex + index + 1, totalBatches: allBatches.length, processedCount,
+            lastSourceRef: batch.at(-1)?.id, overlapSourceRefs: batch.slice(-2).map((source) => source.id), metadataSourceRefs: [...processedMetadataRefs],
+            ...(effectiveSelectedSourceGroups === undefined ? {} : { selectedSourceGroupIds: effectiveSelectedSourceGroups }),
+            ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
+          };
+          await this.bindCurrentChat();
+        }
       }
       this.lastOrganizedAt = Date.now();
+      if (target) {
+        await this.saveSummaryProgress(chatKey, target.endFloor, target.endMessageId, jobId);
+        const waiting = getSummaryWaitingFloors(allSources, this.summaryProgressByChat[chatKey], summaryStrategyFromSettings(this.settings));
+        if (waiting !== undefined) this.summaryWaitingByChat.set(chatKey, waiting);
+        this.emitSettingsChanged();
+      }
       this.status = 'ready';
-      this.error = '';
-      this.trigger.markFlushed(chatKey);
+      this.clearRuntimeError();
       this.activeCaptureProgress = {
         status: 'completed', jobId, batchIndex: allBatches.length, totalBatches: allBatches.length,
         processedCount, elapsedMs: Date.now() - this.captureStartedAt,
+        ...(mode === 'initialize' ? {
+          phase: 'apply' as const,
+          stagedBatchCount: checkpoint.stagedBatchCount,
+          conflictBucketCount: checkpoint.conflictBucketCount,
+          pendingReviewCount: checkpoint.pendingReviewCount,
+          qualityStatus: checkpoint.qualityStatus,
+        } : {}),
       };
     } catch (error) {
       if (
@@ -864,35 +1210,47 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
-      this.error = message;
-      this.status = 'error';
+      this.setRuntimeError(error, 'MEMORY_CAPTURE_FAILED', 'operation');
+      const pauseForRetry = mode === 'initialize' && isRetryableInitializationError(error);
       await this.repository.putJob({
-        id: jobId, chatKey, type: mode, status: 'failed',
+        id: jobId, chatKey, type: mode, status: pauseForRetry ? 'paused' : 'failed',
         checkpoint, error: message, createdAt, updatedAt: Date.now(),
       });
       this.activeCaptureProgress = {
-        status: 'failed', jobId, batchIndex: checkpoint.batchIndex, totalBatches: allBatches.length,
+        status: pauseForRetry ? 'paused' : 'failed', jobId, batchIndex: checkpoint.batchIndex, totalBatches: allBatches.length,
         processedCount: checkpoint.processedCount, elapsedMs: Date.now() - this.captureStartedAt, error: message,
       };
       throw error;
     }
   }
 
-  private async onlyUnprocessedSources(chatKey: string, sources: SourceBlock[]): Promise<SourceBlock[]> {
-    const completedSourceRefs = new Set(
-      (await this.repository.listJobBatchAudits(chatKey)).flatMap(audit => audit.sourceRefs),
-    );
-    if (completedSourceRefs.size === 0) {
-      const metadata = sources.filter(source => source.kind !== 'message');
-      return [...metadata, ...sources.filter(source => source.kind === 'message').slice(-20)];
-    }
-    return sources.filter(source => !completedSourceRefs.has(source.id));
+  private async ensureSummaryProgress(chatKey: string, suppliedSources?: SourceBlock[]): Promise<SummaryProgress | undefined> {
+    const existing = this.summaryProgressByChat[chatKey];
+    if (!existing) return undefined;
+    const sources = suppliedSources ?? filterSourceBlocks(await this.collectSources(chatKey));
+    const waiting = getSummaryWaitingFloors(sources, existing, summaryStrategyFromSettings(this.settings));
+    if (waiting !== undefined) this.summaryWaitingByChat.set(chatKey, waiting);
+    return existing;
+  }
+
+  private async saveSummaryProgress(chatKey: string, completedFloor: number, completedMessageId: string, lastJobId?: string): Promise<void> {
+    const progress: SummaryProgress = { completedFloor, completedMessageId, updatedAt: Date.now(), ...(lastJobId ? { lastJobId } : {}) };
+    this.summaryProgressByChat = { ...this.summaryProgressByChat, [chatKey]: progress };
+    this.summaryWaitingByChat.delete(chatKey);
+    await this.repository.setSettings({ summaryProgressByChat: this.summaryProgressByChat });
+    this.emitSettingsChanged();
+  }
+
+  private emitSettingsChanged(): void {
+    this.settingsListeners.forEach((listener) => listener(this.getSettings()));
   }
 
   private async resumePausedWork(): Promise<void> {
     const chatKey = this.getChatKey();
     if (!chatKey || !this.getEffectiveSettings().enabled) return;
-    const paused = (await this.repository.listJobs(chatKey)).find((job) => job.status === 'paused');
+    const paused = (await this.repository.listJobs(chatKey))
+      .filter((job) => job.status === 'paused')
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
     if (paused) await this.flushCapture(paused.type, paused);
   }
 

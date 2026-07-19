@@ -158,8 +158,10 @@ export interface MemoryEvidence {
   createdAt: number;
 }
 
-export type MemoryJobType = 'initialize' | 'history' | 'incremental';
+export type MemoryJobType = 'initialize' | 'incremental';
 export type MemoryJobStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed';
+export type MemoryInitializationPhase = 'extract' | 'reduce' | 'resolve' | 'apply';
+export type MemoryInitializationQualityStatus = 'ready' | 'needs_review';
 
 export interface MemoryJobCheckpoint {
   batchIndex: number;
@@ -169,6 +171,20 @@ export interface MemoryJobCheckpoint {
   overlapSourceRefs?: string[];
   metadataSourceRefs?: string[];
   selectedSourceGroupIds?: string[];
+  /** 总结窗口的聊天楼层边界；用于断点恢复和进度诊断。 */
+  summaryStartFloor?: number;
+  summaryEndFloor?: number;
+  summaryEndMessageId?: string;
+  /** Initialization-only progress. Optional so existing persisted jobs remain readable. */
+  phase?: MemoryInitializationPhase;
+  stagedBatchCount?: number;
+  mergedDuplicateCount?: number;
+  supersededCount?: number;
+  conflictBucketCount?: number;
+  ruleResolvedCount?: number;
+  llmResolvedCount?: number;
+  pendingReviewCount?: number;
+  qualityStatus?: MemoryInitializationQualityStatus;
 }
 
 export interface MemoryJob {

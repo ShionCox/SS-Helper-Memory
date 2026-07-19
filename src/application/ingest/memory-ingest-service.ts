@@ -1,6 +1,6 @@
 import { filterSourceBlocks } from './source-blocks';
 import type { AutomaticIngestRejection, AutomaticProposalErrorCode } from '../../domain';
-import type { IngestCommit, IngestCommitter, MemoryExtractor, SourceBlock, ValidatedFactProposal } from './types';
+import type { IngestCommit, IngestCommitter, MemoryExtractor, PreparedMemoryIngest, SourceBlock, ValidatedFactProposal } from './types';
 
 export interface MemoryIngestInput {
   chatKey: string;
@@ -13,6 +13,9 @@ export interface MemoryIngestInput {
   processedCount?: number;
   metadataSourceRefs?: string[];
   selectedSourceGroupIds?: string[];
+  summaryStartFloor?: number;
+  summaryEndFloor?: number;
+  summaryEndMessageId?: string;
 }
 
 export interface MemoryIngestResult {
@@ -73,9 +76,9 @@ function validateProposal(
 export class MemoryIngestService {
   constructor(private readonly dependencies: { extractor: MemoryExtractor; commit: IngestCommitter['commit'] }) {}
 
-  async ingest(input: MemoryIngestInput): Promise<MemoryIngestResult> {
+  async prepare(input: Pick<MemoryIngestInput, 'chatKey' | 'sources'>): Promise<PreparedMemoryIngest> {
     const sources = filterSourceBlocks(input.sources);
-    if (sources.length === 0) return { accepted: 0, rejected: 0, rejections: [], skipped: true };
+    if (sources.length === 0) return { sources: [], facts: [], rejections: [], skipped: true };
 
     const modelSources = sources.filter(source => source.kind !== 'state');
     const extraction = modelSources.length > 0
@@ -120,26 +123,41 @@ export class MemoryIngestService {
       facts.push(candidate);
     }
 
+    return {
+      sources,
+      facts,
+      rejections,
+      ...(audit ? { audit } : {}),
+      skipped: false,
+    };
+  }
+
+  async ingest(input: MemoryIngestInput): Promise<MemoryIngestResult> {
+    const prepared = await this.prepare(input);
+    if (prepared.skipped) return { accepted: 0, rejected: 0, rejections: [], skipped: true };
     await this.dependencies.commit({
       chatKey: input.chatKey,
       jobId: input.jobId,
-      facts,
-      sources,
+      facts: prepared.facts,
+      sources: prepared.sources,
       checkpoint: {
-        sourceIds: sources.map((source) => source.id),
+        sourceIds: prepared.sources.map((source) => source.id),
         completedAt: Date.now(),
         ...(input.batchIndex === undefined ? {} : { batchIndex: input.batchIndex }),
         ...(input.totalBatches === undefined ? {} : { totalBatches: input.totalBatches }),
         ...(input.processedCount === undefined ? {} : { processedCount: input.processedCount }),
-        overlapSourceRefs: sources.slice(-2).map((source) => source.id),
+        overlapSourceRefs: prepared.sources.slice(-2).map((source) => source.id),
         ...(input.metadataSourceRefs === undefined ? {} : { metadataSourceRefs: input.metadataSourceRefs }),
         ...(input.selectedSourceGroupIds === undefined ? {} : { selectedSourceGroupIds: input.selectedSourceGroupIds }),
+        ...(input.summaryStartFloor === undefined ? {} : { summaryStartFloor: input.summaryStartFloor }),
+        ...(input.summaryEndFloor === undefined ? {} : { summaryEndFloor: input.summaryEndFloor }),
+        ...(input.summaryEndMessageId === undefined ? {} : { summaryEndMessageId: input.summaryEndMessageId }),
       },
       ...(input.jobType === undefined ? {} : { jobType: input.jobType }),
       ...(input.jobStatus === undefined ? {} : { jobStatus: input.jobStatus }),
-      rejections,
-      ...(audit ? { audit } : {}),
+      rejections: prepared.rejections,
+      ...(prepared.audit ? { audit: prepared.audit } : {}),
     });
-    return { accepted: facts.length, rejected: rejections.length, rejections, skipped: false };
+    return { accepted: prepared.facts.length, rejected: prepared.rejections.length, rejections: prepared.rejections, skipped: false };
   }
 }

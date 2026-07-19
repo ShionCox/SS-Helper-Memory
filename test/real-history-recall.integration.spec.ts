@@ -3,7 +3,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { LlmMemoryExtractor, type MemoryLlmApi } from '../src/application/ingest/llm-extractor';
 import { MemoryIngestService } from '../src/application/ingest/memory-ingest-service';
-import { buildHistoryBatches, filterSourceBlocks } from '../src/application/ingest/source-blocks';
+import { filterSourceBlocks } from '../src/application/ingest/source-blocks';
+import { buildSummaryBatches } from '../src/application/ingest/summary-strategy';
 import type { IngestCommit, SourceBlock, ValidatedFactProposal } from '../src/application/ingest/types';
 import { MemoryRecallIndex, type RecallFact, type RecallFactStatus } from '../src/application/recall/memory-recall-index';
 import { buildMemoryPrompt } from '../src/application/prompt/build-memory-prompt';
@@ -183,7 +184,7 @@ describe('真实 SillyTavern 长历史召回', () => {
     const rows = (await readFile(DATASET, 'utf8')).split(/\r?\n/u).filter(Boolean).map(line => JSON.parse(line) as TavernMessage);
     const messages = rows.filter(row => typeof row.mes === 'string');
     const sources = filterSourceBlocks(sourceBlocks(messages));
-    const batches = buildHistoryBatches(sources);
+    const batches = buildSummaryBatches(sources, { batchMode: 'floors', batchFloors: 5, overlapFloors: 2 });
     const sourceById = new Map(sources.map(source => [source.id, source]));
     const metrics: LlmUsageMetrics = {
       calls: 0,
@@ -208,7 +209,7 @@ describe('真实 SillyTavern 长历史召回', () => {
         chatKey: CHAT_KEY,
         jobId: 'real-history',
         sources: batch,
-        jobType: 'history',
+        jobType: 'initialize',
         jobStatus: batchIndex === batches.length - 1 ? 'completed' : 'running',
         batchIndex,
         processedCount: Math.max(...batch.map(source => source.floor ?? 0)) + 1,

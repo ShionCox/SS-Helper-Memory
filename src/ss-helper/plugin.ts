@@ -4,6 +4,7 @@ import {
   MEMORY_PLUGIN_ID,
   SDK_PACKAGE_VERSION,
   type HostCapability,
+  type PopupUiContext,
   type PluginDescriptor,
   type PluginSession,
 } from '@ss-helper/sdk';
@@ -42,7 +43,7 @@ export const MEMORY_PLUGIN_DESCRIPTOR: PluginDescriptor<MemoryHostCapability> = 
 export function registerMemoryContributions(
   session: PluginSession<MemoryHostCapability>,
   controller: MemoryContributionController,
-  renderWorkbench: (container: HTMLElement) => void | (() => void),
+  renderWorkbench: (container: HTMLElement, popupUi?: PopupUiContext) => void | (() => void),
   statusSource: MemorySettingsStatusSource,
 ): { dispose(): void; publishUpdated: ReturnType<typeof registerMemoryServices>['publishUpdated'] } {
   const services = registerMemoryServices(session, controller);
@@ -53,8 +54,9 @@ export function registerMemoryContributions(
       token: MEMORY_WORKBENCH_POPUP,
       title: '记忆工作台',
       ariaLabel: 'SS-Helper 记忆工作台',
+      closeLabel: '关闭记忆工作台',
       presentation: 'workspace',
-      render: (container) => renderWorkbench(container),
+      render: (container, _input, popupUi) => renderWorkbench(container, popupUi),
     }),
   ];
   return {

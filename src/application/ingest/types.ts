@@ -52,8 +52,12 @@ export interface IngestCommit {
     overlapSourceRefs?: string[];
     metadataSourceRefs?: string[];
     selectedSourceGroupIds?: string[];
+    /** 总结窗口的聊天楼层边界；仅写入 JSON 检查点，不改变存储表结构。 */
+    summaryStartFloor?: number;
+    summaryEndFloor?: number;
+    summaryEndMessageId?: string;
   };
-  jobType?: 'initialize' | 'history' | 'incremental';
+  jobType?: 'initialize' | 'incremental';
   jobStatus?: 'queued' | 'running' | 'paused' | 'completed' | 'failed';
   /** LLM 输出在应用层被拒绝的明细，持久层会与事务校验拒绝合并进批次审计。 */
   rejections?: AutomaticIngestRejection[];
@@ -72,6 +76,15 @@ export interface MemoryExtractionAudit {
 export interface MemoryExtractionResult {
   facts: ExtractedFactProposal[];
   audit?: MemoryExtractionAudit;
+}
+
+/** Validated extraction output that can either be staged or committed. */
+export interface PreparedMemoryIngest {
+  sources: SourceBlock[];
+  facts: ValidatedFactProposal[];
+  rejections: AutomaticIngestRejection[];
+  audit?: MemoryExtractionAudit;
+  skipped: boolean;
 }
 
 export interface MemoryExtractor {

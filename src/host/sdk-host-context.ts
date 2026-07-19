@@ -38,13 +38,22 @@ export class SdkMemoryHostContext implements MemoryHostContext, MemorySourceRead
   async refresh(): Promise<string> {
     const readCurrent = this.session.host.chat?.readCurrent;
     const [context, chat] = await Promise.all([this.session.host.context.read(), readCurrent ? readCurrent() : Promise.resolve(null)]);
-    this.sourceChatKey = String(context.chatKey ?? context.chatId ?? '').trim();
+    // Some SillyTavern builds expose the active chat only through the chat
+    // snapshot while the context surface is still catching up with the
+    // `CHAT_CHANGED` event. Prefer the context key when present, but use the
+    // public chat snapshot as the authoritative fallback so the workbench
+    // never remains falsely "unselected" after entering a chat.
+    this.sourceChatKey = String(context.chatKey ?? context.chatId ?? chat?.key ?? '').trim();
     this.chatName = String(chat?.name ?? chat?.key ?? this.sourceChatKey).trim();
     const groupId = stableId(context.groupId);
     if (groupId) this.workspaceKey = `group:${groupId}`;
     else {
       const character = await this.session.host.character?.read?.() ?? null;
-      const characterId = stableId(character?.id);
+      // `character.read()` can legitimately return null during the brief
+      // transition into an imported/legacy chat. The 1.18 context still
+      // exposes a stable character index in that case; keep it as a scoped
+      // fallback rather than dropping the workspace binding altogether.
+      const characterId = stableId(character?.id) || stableId(context.characterId);
       this.workspaceKey = characterId ? `character:${characterId}` : '';
     }
     return this.workspaceKey;

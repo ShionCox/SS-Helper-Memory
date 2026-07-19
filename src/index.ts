@@ -17,6 +17,9 @@ export interface MemorySqliteStatus {
   schemaVersion: number;
   databasePath: string;
   databaseSizeBytes: number;
+  workspaceSizeBytes: number;
+  currentChatSizeBytes: number;
+  currentChatUsageRatio: number;
   walMode: string;
   tableCounts: Record<string, number>;
   tableBytes: Record<string, number | null>;
@@ -52,6 +55,8 @@ export interface MemoryPluginApi {
     getLastRecall(): Promise<MemoryRecallLog | RecallResult | null>;
   };
   getCaptureProgress(): Promise<MemoryCaptureProgress>;
+  getInitializationState(): Promise<import('./ui/memory-ui').MemoryInitializationState>;
+  reinitialize(selectedKinds?: string[]): Promise<void>;
   cancelCapture(): Promise<void>;
   listAuditRecords(): Promise<Array<Record<string, unknown>>>;
   getMainChatUsage(): Promise<MainChatUsage[]>;

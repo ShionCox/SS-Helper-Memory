@@ -1,11 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AdaptiveIngestTrigger } from '../src/application/ingest/adaptive-trigger';
-import {
-  HISTORY_BATCH_MAX_CHARS,
-  buildHistoryBatches,
-  buildIncrementalBatch,
-  filterSourceBlocks,
-} from '../src/application/ingest/source-blocks';
+import { filterSourceBlocks } from '../src/application/ingest/source-blocks';
+import { buildSummaryBatches } from '../src/application/ingest/summary-strategy';
 import { MemoryIngestService } from '../src/application/ingest/memory-ingest-service';
 import type { ExtractedFactProposal, IngestCommit, MemoryExtractor, SourceBlock } from '../src/application/ingest/types';
 
@@ -14,58 +9,28 @@ function block(id: string, content: string, role: SourceBlock['role'] = 'user'):
 }
 
 describe('Memory 写入主链', () => {
-  it('普通窗口第 6 轮触发且一个窗口只触发一次', () => {
-    const trigger = new AdaptiveIngestTrigger();
-    for (let round = 1; round <= 5; round += 1) {
-      expect(trigger.observeRound('chat-a', `普通闲聊 ${round}`).shouldFlush).toBe(false);
-    }
-    expect(trigger.observeRound('chat-a', '普通闲聊 6').shouldFlush).toBe(true);
-    expect(trigger.observeRound('chat-a', '普通闲聊 7').shouldFlush).toBe(false);
-    trigger.markFlushed('chat-a');
-    expect(trigger.observeRound('chat-a', '普通闲聊 8').shouldFlush).toBe(false);
-  });
-
-  it('高信号最早在第 3 轮提前触发', () => {
-    const trigger = new AdaptiveIngestTrigger();
-    expect(trigger.observeRound('chat-a', '我答应以后去北境').shouldFlush).toBe(false);
-    expect(trigger.observeRound('chat-a', '我们关系发生改变').shouldFlush).toBe(false);
-    expect(trigger.observeRound('chat-a', '新的目标是找到王冠').shouldFlush).toBe(true);
-  });
-
-  it('过滤隐藏与控制文本，并按 20 条/12000 字切批且重叠 2 条', () => {
+  it('过滤隐藏与控制文本，并按当前总结策略分批', () => {
     const blocks = [
       block('system', '系统消息', 'system'),
       block('tool', '工具消息', 'tool'),
       block('hidden', '隐藏推理', 'assistant'),
-      ...Array.from({ length: 25 }, (_, index) => block(`m${index}`, `可见消息 ${index}`)),
+      ...Array.from({ length: 25 }, (_, index) => ({ ...block(`m${index}`, `可见消息 ${index}`), floor: index })),
     ];
     blocks[2] = { ...blocks[2]!, hidden: true };
     const visible = filterSourceBlocks(blocks);
     expect(visible).toHaveLength(25);
-    const batches = buildHistoryBatches(visible);
+    const batches = buildSummaryBatches(visible, { batchMode: 'floors', batchFloors: 20, overlapFloors: 2 });
     expect(batches).toHaveLength(2);
     expect(batches[0]).toHaveLength(20);
     expect(batches[1]?.slice(0, 2).map((item) => item.id)).toEqual(['m18', 'm19']);
   });
 
-  it('完整分片单条超长历史来源，并把增量窗口限制为一次 12000 字调用', () => {
-    const oversized = block('oversized', '长'.repeat(HISTORY_BATCH_MAX_CHARS + 500));
-    const oversizedParts = buildHistoryBatches([oversized]).flat();
-    expect(oversizedParts).toHaveLength(2);
-    expect(oversizedParts.map(part => part.content).join('')).toBe(oversized.content);
-    expect(oversizedParts.map(part => part.id)).toEqual(['oversized:part:1', 'oversized:part:2']);
-
-    const metadata: SourceBlock = {
-      ...block('character', '角色设定'.repeat(1_000)), kind: 'character', role: 'metadata',
-    };
-    const recent = Array.from({ length: 12 }, (_, index) => block(`m${index}`, `第${index}轮`.repeat(800)));
-    const batch = buildIncrementalBatch([metadata, ...recent]);
-    expect(batch.reduce((sum, source) => sum + source.content.length, 0)).toBeLessThanOrEqual(HISTORY_BATCH_MAX_CHARS);
-    expect(batch.filter((source) => source.kind === 'message').length).toBeGreaterThan(0);
-
-    const deferred = block('deferred', '尾'.repeat(9_000));
-    expect(buildIncrementalBatch([{ ...metadata, content: '设'.repeat(4_000) }, deferred]).map(item => item.id)).toEqual(['character']);
-    expect(buildIncrementalBatch([deferred])[0]?.content).toBe(deferred.content);
+  it('按字数模式完整分片超长消息', () => {
+    const oversized = block('oversized', '长'.repeat(12_500));
+    const batches = buildSummaryBatches([oversized], { batchMode: 'chars', batchChars: 2_000, overlapFloors: 0 });
+    const parts = batches.flat();
+    expect(parts.map(part => part.content).join('')).toBe(oversized.content);
+    expect(parts.every(part => part.content.length <= 2_000)).toBe(true);
   });
 
   it('每批只调用一次 memory_extract，并只提交有精确证据的原子事实', async () => {

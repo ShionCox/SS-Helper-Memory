@@ -19,9 +19,12 @@ const forbidden = [
   /renderMemorySettings/u,
   /registerConsumer\s*\(/u,
   /stx:memory-state/u,
+  /--memory-/u,
+  /\bstx-ui-/u,
+  /\bstx-memory-(?:button|input|chip|select-wrap)\b/u,
 ];
 
-const executableExtensions = new Set(['.ts', '.js', '.mjs', '.cjs', '.json']);
+const executableExtensions = new Set(['.ts', '.js', '.mjs', '.cjs', '.json', '.css']);
 
 // This baseline document preserves pre-migration facts. These phrases are evidence,
 // not live compatibility code, so exceptions remain limited to this one document.
@@ -49,8 +52,12 @@ export function shouldScan(path) {
 }
 
 async function listGitTrackedPaths() {
-  const { stdout } = await execFileAsync('git', ['ls-files', '-z']);
-  return stdout.split('\0').filter(shouldScan);
+  const [{ stdout }, { stdout: deleted }] = await Promise.all([
+    execFileAsync('git', ['ls-files', '-z']),
+    execFileAsync('git', ['ls-files', '--deleted', '-z']),
+  ]);
+  const deletedPaths = new Set(deleted.split('\0').filter(Boolean));
+  return stdout.split('\0').filter((path) => !deletedPaths.has(path) && shouldScan(path));
 }
 
 export async function trackedScanPaths({

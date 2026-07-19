@@ -90,17 +90,17 @@ export class MemoryLlmCapabilityMonitor {
       return { blocked: { title: '无法启用自动整理', message: '当前没有可用的大语言模型资源，请先完成 LLM 配置。', code: 'MEMORY_GENERATION_UNAVAILABLE' }, warnings: [] };
     }
     if (next.enabled && (next.recallMode === 'vector' || next.recallMode === 'hybrid') && (activating || next.recallMode !== previous.recallMode) && !this.availability.embedding) {
-      return { blocked: { title: '无法启用所选召回模式', message: '当前没有可用的 Embedding API，请先完成资源配置。', code: 'MEMORY_EMBEDDING_UNAVAILABLE' }, warnings: [] };
+      return { blocked: { title: '无法启用所选召回模式', message: '当前没有可用的向量模型，请先在 LLM 中配置向量资源。', code: 'MEMORY_EMBEDDING_UNAVAILABLE' }, warnings: [] };
     }
     if (next.enabled && next.rerankMode === 'always' && (activating || previous.rerankMode !== 'always') && !this.availability.rerank) {
-      return { blocked: { title: '无法启用始终重排', message: '当前没有可用的 Rerank API，请先完成资源配置。', code: 'MEMORY_RERANK_UNAVAILABLE' }, warnings: [] };
+      return { blocked: { title: '无法启用始终重排', message: '当前没有可用的重排序模型，请先在 LLM 中配置重排序资源。', code: 'MEMORY_RERANK_UNAVAILABLE' }, warnings: [] };
     }
     const warnings: MemorySettingsNotice[] = [];
     if (next.enabled && next.recallMode === 'auto' && (activating || next.recallMode !== previous.recallMode) && !this.availability.embedding) {
-      warnings.push({ title: '召回已自动降级', message: 'Embedding API 当前不可用，将使用关键词召回。', code: 'MEMORY_EMBEDDING_DEGRADED' });
+      warnings.push({ title: '召回已自动降级', message: '向量模型当前不可用，请先在 LLM 中配置；目前将使用关键词召回。', code: 'MEMORY_EMBEDDING_DEGRADED' });
     }
     if (next.enabled && next.rerankMode === 'adaptive' && (activating || next.rerankMode !== previous.rerankMode) && !this.availability.rerank) {
-      warnings.push({ title: '重排已自动降级', message: 'Rerank API 当前不可用，将保留基础排序结果。', code: 'MEMORY_RERANK_DEGRADED' });
+      warnings.push({ title: '重排已自动降级', message: '重排序模型当前不可用，请先在 LLM 中配置；目前将保留基础排序结果。', code: 'MEMORY_RERANK_DEGRADED' });
     }
     return { warnings };
   }
@@ -151,22 +151,20 @@ export class MemoryLlmCapabilityMonitor {
     const resourceDescription = (entry: typeof generation): string | undefined => entry?.model
       ? `${entry.source === 'tavern' ? '酒馆模型' : '自定义资源'} · ${entry.model}`
       : entry?.source === 'tavern' ? '酒馆模型' : entry?.source === 'custom' ? '自定义资源' : undefined;
-    next.generationStatus = !settings.enabled || !settings.autoOrganize
-      ? neutral('未启用')
-      : generation?.available
-        ? success('已连接', resourceDescription(generation))
-        : action('不可用', 'error', reasonText[generation?.reason ?? 'status_unavailable'] ?? '无法满足整理任务。');
-    if (!settings.enabled || settings.recallMode === 'lexical') next.embeddingStatus = neutral('无需配置');
-    else if (embedding?.available) next.embeddingStatus = success('已连接', resourceDescription(embedding));
-    else if (settings.recallMode === 'auto') next.embeddingStatus = action('降级为关键词', 'warning', `${reasonText[embedding?.reason ?? 'status_unavailable'] ?? 'Embedding 不可用'} 自动召回将使用关键词召回。`);
-    else next.embeddingStatus = action('不可用', 'error', reasonText[embedding?.reason ?? 'status_unavailable'] ?? '当前召回模式需要 Embedding。');
-    next.rerankStatus = !settings.enabled || settings.rerankMode === 'off'
-      ? neutral('未启用')
-      : rerank?.available
-        ? success('已连接', resourceDescription(rerank))
+    next.generationStatus = generation?.available
+      ? success('已连接', resourceDescription(generation))
+      : action('不可用', 'error', reasonText[generation?.reason ?? 'status_unavailable'] ?? '无法满足整理任务。');
+    if (embedding?.available) next.embeddingStatus = success('已连接', resourceDescription(embedding));
+    else if (settings.recallMode === 'lexical') next.embeddingStatus = neutral('未配置', '当前使用关键词召回，不需要向量模型。');
+    else if (settings.recallMode === 'auto') next.embeddingStatus = action('降级为关键词', 'warning', `${reasonText[embedding?.reason ?? 'status_unavailable'] ?? '向量模型不可用'} 自动召回将使用关键词召回；如需向量召回，请先在 LLM 中配置。`);
+    else next.embeddingStatus = action('不可用', 'error', `${reasonText[embedding?.reason ?? 'status_unavailable'] ?? '当前召回模式需要向量模型。'} 请先在 LLM 中配置。`);
+    next.rerankStatus = rerank?.available
+      ? success('已连接', resourceDescription(rerank))
+      : settings.rerankMode === 'off'
+        ? neutral('未配置', '当前未启用重排序，不需要重排序模型。')
         : settings.rerankMode === 'adaptive'
-          ? action('降级为基础排序', 'warning', `${reasonText[rerank?.reason ?? 'status_unavailable'] ?? 'Rerank 不可用'} 将保留基础排序结果。`)
-          : action('不可用', 'error', reasonText[rerank?.reason ?? 'status_unavailable'] ?? '当前重排策略需要 Rerank。');
+          ? action('降级为基础排序', 'warning', `${reasonText[rerank?.reason ?? 'status_unavailable'] ?? '重排序模型不可用'} 将保留基础排序结果；如需模型重排，请先在 LLM 中配置。`)
+          : action('不可用', 'error', `${reasonText[rerank?.reason ?? 'status_unavailable'] ?? '当前重排策略需要重排序模型。'} 请先在 LLM 中配置。`);
     this.status = Object.freeze(next);
     this.listeners.forEach((listener) => listener(this.status));
   }

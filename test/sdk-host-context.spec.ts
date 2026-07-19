@@ -12,7 +12,7 @@ describe('SDK Memory HostPort context', () => {
         variables: [{ stat_data: { 核心储备: 4 } }],
       }]) },
       character: { read: vi.fn(async () => ({ id: 'c1', name: '角色' })) },
-      persona: { read: vi.fn(async () => ({ id: 'p1', name: '用户', description: 'Persona' })) },
+      persona: { read: vi.fn(async () => ({ name: '用户', description: '当前 Persona 描述' })) },
       worldbooks: { active: vi.fn(async () => [{ id: 'w1', name: '世界', active: true, entries: [] }]) },
     };
     const context = new SdkMemoryHostContext({ host } as unknown as PluginSession<MemoryHostCapability>);
@@ -25,7 +25,7 @@ describe('SDK Memory HostPort context', () => {
       expect.objectContaining({ id: 'message:m1', content: 'visible' }),
       expect.objectContaining({ kind: 'state', content: expect.stringContaining('核心储备') }),
       expect.objectContaining({ kind: 'character' }),
-      expect.objectContaining({ kind: 'persona' }),
+      expect.objectContaining({ kind: 'persona', content: '用户名：用户\nPersona：当前 Persona 描述' }),
     ]));
   });
 
@@ -47,5 +47,28 @@ describe('SDK Memory HostPort context', () => {
     const context = new SdkMemoryHostContext({ host } as unknown as PluginSession<MemoryHostCapability>);
     await expect(context.refresh()).resolves.toBe('group:group-7');
     expect(readCharacter).not.toHaveBeenCalled();
+  });
+
+  it('uses the current chat snapshot when context.chatKey is temporarily absent', async () => {
+    const host = {
+      context: { read: async () => ({ characterId: '2' }) },
+      chat: { readCurrent: async () => ({ key: 'Assistant - imported-chat', name: 'Assistant' }) },
+      character: { read: async () => ({ id: 'assistant-avatar', name: 'Assistant' }) },
+    };
+    const context = new SdkMemoryHostContext({ host } as unknown as PluginSession<MemoryHostCapability>);
+    await expect(context.refresh()).resolves.toBe('character:assistant-avatar');
+    expect(context.getChatKey()).toBe('Assistant - imported-chat');
+    expect(context.getChatName()).toBe('Assistant');
+  });
+
+  it('keeps a character-index workspace while the character snapshot is loading', async () => {
+    const host = {
+      context: { read: async () => ({ chatKey: 'chat-loading', characterId: '4' }) },
+      chat: { readCurrent: async () => ({ key: 'chat-loading', name: '角色' }) },
+      character: { read: async () => null },
+    };
+    const context = new SdkMemoryHostContext({ host } as unknown as PluginSession<MemoryHostCapability>);
+    await expect(context.refresh()).resolves.toBe('character:4');
+    expect(context.getChatKey()).toBe('chat-loading');
   });
 });
