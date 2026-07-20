@@ -78,6 +78,33 @@ export interface MemoryExtractionResult {
   audit?: MemoryExtractionAudit;
 }
 
+/**
+ * A read-only, opaque reference to an already-persisted fact.  It exists only
+ * to help the extractor distinguish duplicates, additions, and state changes;
+ * it deliberately carries neither sourceRef nor evidence text.
+ */
+export interface ExistingMemoryContextItem {
+  /** Sequential prompt-local identifier, never a persistence record id. */
+  referenceId: string;
+  kind: string;
+  subjectKey: string;
+  predicateKey: string;
+  objectKey?: string;
+  content: string;
+  validFrom?: number;
+  validUntil?: number;
+  stable?: boolean;
+}
+
+export interface MemoryExtractionInput {
+  chatKey: string;
+  sources: readonly SourceBlock[];
+  /** Read-only facts relevant to this batch; never valid evidence for output. */
+  existingMemoryContext?: readonly ExistingMemoryContextItem[];
+  /** Enables source-grounded relation-fact guidance in the existing single call. */
+  graphLlmRelationEnabled?: boolean;
+}
+
 /** Validated extraction output that can either be staged or committed. */
 export interface PreparedMemoryIngest {
   sources: SourceBlock[];
@@ -88,7 +115,7 @@ export interface PreparedMemoryIngest {
 }
 
 export interface MemoryExtractor {
-  extract(input: { chatKey: string; sources: readonly SourceBlock[] }): Promise<ExtractedFactProposal[] | MemoryExtractionResult>;
+  extract(input: MemoryExtractionInput): Promise<ExtractedFactProposal[] | MemoryExtractionResult>;
 }
 
 export interface IngestCommitter {

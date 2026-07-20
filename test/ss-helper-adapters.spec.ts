@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MEMORY_RECALL_V1, MEMORY_UPDATED_V1, type PluginSession } from '@ss-helper/sdk';
+import { MEMORY_GRAPH_V1, MEMORY_RECALL_V1, MEMORY_UPDATED_V1, type PluginSession } from '@ss-helper/sdk';
 import { createMemorySettingsAdapter, MEMORY_DEFAULT_SETTINGS, MEMORY_SETTINGS_SCHEMA } from '../src/ss-helper/settings';
 import { registerMemoryServices } from '../src/ss-helper/services';
 
@@ -26,15 +26,47 @@ describe('SS-Helper Memory typed adapters', () => {
       onSettingsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     }, liveStatusSource);
     expect(MEMORY_SETTINGS_SCHEMA.id).toBe('ss-helper.memory');
-    expect(await adapter.load()).toMatchObject({ enabled: true, maxRecallItems: 12 });
+    expect(await adapter.load()).toMatchObject({
+      enabled: true,
+      maxRecallItems: 12,
+      preExtractReferenceEnabled: true,
+      preExtractReferenceItems: 8,
+      preExtractReferenceMode: 'auto',
+      preExtractReferenceMaxChars: 2_400,
+      graphEnabled: true,
+      graphLlmRelationEnabled: true,
+      graphMaxHops: 1,
+      graphMaxEdges: 12,
+    });
     await adapter.save({ enabled: false, maxRecallItems: 6 });
     expect(settings).toMatchObject({ enabled: false, maxRecallItems: 6, promptMaxChars: 8_000 });
+    await adapter.save({ ...settings, preExtractReferenceItems: 99, preExtractReferenceMode: 'vector', preExtractReferenceMaxChars: 4_099 });
+    expect(settings).toMatchObject({ preExtractReferenceItems: 10, preExtractReferenceMode: 'vector', preExtractReferenceMaxChars: 4_000 });
+    await adapter.save({ ...settings, graphMaxHops: 2, graphMaxEdges: 99 });
+    expect(settings).toMatchObject({ graphEnabled: true, graphLlmRelationEnabled: true, graphMaxHops: 2, graphMaxEdges: 24 });
     await adapter.reset();
     expect(settings).toEqual(MEMORY_DEFAULT_SETTINGS);
   });
 
-  it('exposes 基础、总结、召回、当前聊天 four tabs and disables overrides without a chat', async () => {
-    expect(MEMORY_SETTINGS_SCHEMA.fields.map((field) => field.id)).toEqual(['basic', 'summary', 'recall', 'currentChat']);
+  it('exposes 基础、总结、召回、高级、当前聊天 tabs and graph controls without a chat', async () => {
+    expect(MEMORY_SETTINGS_SCHEMA.fields.map((field) => field.id)).toEqual(['basic', 'summary', 'recall', 'advanced', 'currentChat']);
+    const advanced = MEMORY_SETTINGS_SCHEMA.fields.find((field) => field.id === 'advanced');
+    expect(advanced).toMatchObject({ label: '高级' });
+    const groups = advanced?.kind === 'section' ? advanced.children : [];
+    const oldMemory = groups.find((field) => field.id === 'preExtractReference');
+    expect(oldMemory).toMatchObject({ id: 'preExtractReference', label: '提取前参考旧记忆' });
+    expect(oldMemory?.kind === 'section' ? oldMemory.children.map((field) => field.id) : []).toEqual([
+      'preExtractReferenceEnabled', 'preExtractReferenceItems', 'preExtractReferenceMode', 'preExtractReferenceMaxChars',
+    ]);
+    const graph = groups.find((field) => field.id === 'relationshipGraph');
+    expect(graph).toMatchObject({ id: 'relationshipGraph', label: '关系图谱' });
+    expect(graph?.kind === 'section' ? graph.children.map((field) => field.id) : []).toEqual([
+      'graphEnabled', 'graphLlmRelationEnabled', 'graphMaxHops', 'graphMaxEdges', 'graphStatus', 'graphWorkbench',
+    ]);
+    const graphFields = graph?.kind === 'section' ? graph.children : [];
+    expect(graphFields.find((field) => field.id === 'graphMaxHops')).toMatchObject({ min: 1, max: 2, defaultValue: 1 });
+    expect(graphFields.find((field) => field.id === 'graphMaxEdges')).toMatchObject({ min: 4, max: 24, defaultValue: 12 });
+    expect(graphFields.find((field) => field.id === 'graphWorkbench')).toMatchObject({ actionId: 'rebuild-relationship-graph', buttonLabel: '重建关系图谱' });
     let settings = { ...MEMORY_DEFAULT_SETTINGS };
     const listeners = new Set<(value: typeof settings) => void>();
     const adapter = createMemorySettingsAdapter({
@@ -50,12 +82,14 @@ describe('SS-Helper Memory typed adapters', () => {
       chatMode: { disabled: true, disabledReason: '请先进入角色或群组聊天，再修改当前聊天设置。' },
       summaryBatchFloors: { disabled: false },
       summaryBatchChars: { disabled: true },
+      graphWorkbench: { disabled: true, disabledReason: '请先进入角色或群组聊天，再重建关系图谱。' },
     });
     await expect(adapter.loadStatus?.()).resolves.toMatchObject({
       workspaceStatus: { value: '已就绪', tone: 'success' },
       currentChatIdentity: { value: '不可用', tone: 'warning' },
       currentChatEffective: { value: '未生效', tone: 'warning' },
       summaryProgress: { value: '未选择聊天', tone: 'warning' },
+      graphStatus: { value: '未选择聊天', tone: 'warning' },
     });
   });
 
@@ -163,12 +197,12 @@ describe('SS-Helper Memory typed adapters', () => {
     expect(saveSettings).not.toHaveBeenCalled();
   });
 
-  it('exposes MEMORY_RECALL_V1 and publishes MEMORY_UPDATED_V1 as plain DTOs', async () => {
-    let handler: ((request: any, context: { signal: AbortSignal }) => Promise<any>) | undefined;
+  it('exposes MEMORY_RECALL_V1 and MEMORY_GRAPH_V1 without leaking graph evidence', async () => {
+    const handlers = new Map<object, (request: any, context: { signal: AbortSignal }) => Promise<any>>();
     const publish = vi.fn();
     const dispose = vi.fn();
     const session = {
-      services: { expose: vi.fn((token, next) => { expect(token).toBe(MEMORY_RECALL_V1); handler = next; return dispose; }) },
+      services: { expose: vi.fn((token, next) => { handlers.set(token, next); return dispose; }) },
       events: { publish },
     } as unknown as PluginSession;
     const registration = registerMemoryServices(session, {
@@ -177,16 +211,27 @@ describe('SS-Helper Memory typed adapters', () => {
         chatKey: 'chat-a', query: 'q', maxItems: 4, createdAt: 1, candidates: [], diagnostics: { candidateCount: 1, eligibleCount: 1, selectedCount: 1, llmCalls: 0 },
         items: [{ fact: { id: 'fact-a', chatKey: 'chat-a', kind: 'identity', subjectKey: 'a', predicateKey: 'is', content: 'plain memory', entityKeys: [], confidence: 1, status: 'active', sourceRefs: ['source-a'], updatedAt: 1 }, score: 0.9, reason: { lexical: true, entity: false, context: false, stableAnchor: false } }],
       }) },
+      graph: { preview: async () => ({
+        nodes: [{ id: 'node-a', label: '艾琳' }, { id: 'node-b', label: '雷暴' }],
+        edges: [{ id: 'edge-fact-a', from: 'node-a', to: 'node-b', predicate: '害怕', kind: 'relationship', confidence: 0.9, backingFactId: 'fact-a' }],
+      }) },
     });
     const context = { signal: new AbortController().signal };
+    const handler = handlers.get(MEMORY_RECALL_V1);
     await expect(handler?.({ query: 'q', chatKey: 'chat-b' }, context)).resolves.toEqual({ items: [] });
     await expect(handler?.({ query: 'q', chatKey: 'chat-a', limit: 4 }, context)).resolves.toEqual({ items: [{ id: 'fact-a', text: 'plain memory', score: 0.9, source: 'source-a' }] });
     const aborted = new AbortController();
     aborted.abort();
     await expect(handler?.({ query: 'q', chatKey: 'chat-a' }, { signal: aborted.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    const graphHandler = handlers.get(MEMORY_GRAPH_V1);
+    await expect(graphHandler?.({ query: 'q', chatKey: 'chat-b' }, context)).resolves.toEqual({ nodes: [], edges: [] });
+    await expect(graphHandler?.({ query: '雷暴', chatKey: 'chat-a', limit: 4 }, context)).resolves.toEqual({
+      nodes: [{ id: 'node-a', label: '艾琳' }, { id: 'node-b', label: '雷暴' }],
+      edges: [{ id: 'edge-fact-a', from: 'node-a', to: 'node-b', predicate: '害怕', kind: 'relationship', confidence: 0.9, backingFactId: 'fact-a' }],
+    });
     registration.publishUpdated({ chatKey: 'chat-a', operation: 'created', recordIds: ['fact-a'] });
     expect(publish).toHaveBeenCalledWith(MEMORY_UPDATED_V1, { chatKey: 'chat-a', operation: 'created', recordIds: ['fact-a'] });
     registration.dispose();
-    expect(dispose).toHaveBeenCalledOnce();
+    expect(dispose).toHaveBeenCalledTimes(2);
   });
 });

@@ -359,7 +359,7 @@ packages:
     os: [win32]
 
   '@ss-helper/sdk@file:vendor/ss-helper-sdk-2.1.0.tgz':
-    resolution: {integrity: sha512-3sY51tCUKG8C8d30nIXTI9tvWRBKEpflJtnGhHsdXzKbuOOZNiwPtsQIoeUTq/G3gYHN3MLeXp5iyFfYSDTyGA==, tarball: file:vendor/ss-helper-sdk-2.1.0.tgz}
+    resolution: {integrity: sha512-vjSSSuxDcV7deJRZDj5FyJ4wrQlJ9j5S1SWGoohy8SvlZAFl/r1QB+bkyLsO6xgA1GgxojFg0ao2+Nqeh1c+vg==, tarball: file:vendor/ss-helper-sdk-2.1.0.tgz}
     version: 2.1.0
     engines: {node: '>=20'}
 

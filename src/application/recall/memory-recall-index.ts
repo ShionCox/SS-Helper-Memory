@@ -49,6 +49,7 @@ export interface RecallQuery {
 export interface RecallReason {
   readonly lexical: boolean
   readonly vector?: boolean
+  readonly graph?: boolean
   readonly entity: boolean
   readonly context: boolean
   readonly stableAnchor: boolean
@@ -60,8 +61,10 @@ export interface RecallItem {
   readonly reason: RecallReason
   readonly lexicalScore?: number
   readonly vectorScore?: number
+  readonly graphScore?: number
   readonly lexicalRank?: number
   readonly vectorRank?: number
+  readonly graphRank?: number
   readonly fusionScore?: number
   readonly rerankScore?: number
 }
@@ -75,6 +78,11 @@ export interface RecallDiagnostics {
   readonly resolvedMode?: 'lexical' | 'vector' | 'hybrid'
   readonly lexicalCandidateCount?: number
   readonly vectorCandidateCount?: number
+  readonly graphCandidateCount?: number
+  readonly graphHitCount?: number
+  readonly graphSeedNodeCount?: number
+  readonly graphLatencyMs?: number
+  readonly graphDegradedReason?: string
   readonly fusedCandidateCount?: number
   readonly degradedReason?: string
   readonly embedding?: RecallLlmStageDiagnostic
@@ -109,8 +117,10 @@ export interface RecallCandidateDecision {
   readonly omittedReason?: string
   readonly lexicalScore?: number
   readonly vectorScore?: number
+  readonly graphScore?: number
   readonly lexicalRank?: number
   readonly vectorRank?: number
+  readonly graphRank?: number
   readonly fusionScore?: number
   readonly rerankScore?: number
 }
@@ -118,6 +128,8 @@ export interface RecallCandidateDecision {
 export interface RecallExternalSignals {
   readonly mode: 'lexical' | 'vector' | 'hybrid'
   readonly vectorScores?: ReadonlyMap<string, number>
+  /** Fact ids nominated by the fact-backed relation graph. */
+  readonly graphScores?: ReadonlyMap<string, number>
   /** 仅供混合召回编排扩大 rerank 候选池；公开设置仍受 4–30 条约束。 */
   readonly candidateLimit?: number
 }
@@ -506,6 +518,7 @@ export class MemoryRecallIndex {
       : Math.min(60, Math.max(1, Math.trunc(signals.candidateLimit)))
     const mode = signals?.mode ?? 'lexical'
     const vectorScores = signals?.vectorScores ?? new Map<string, number>()
+    const graphScores = signals?.graphScores ?? new Map<string, number>()
     const facets = requestedFacets(query.query)
     const queryTokens = [...new Set([
       ...tokenize(query.query),
@@ -539,6 +552,9 @@ export class MemoryRecallIndex {
       for (const [factId, score] of vectorScores) {
         if (Number.isFinite(score) && score > 0) candidateIds.add(factId)
       }
+    }
+    for (const [factId, score] of graphScores) {
+      if (Number.isFinite(score) && score > 0) candidateIds.add(factId)
     }
     if (mode === 'vector' && needsTemporalSafety) {
       for (const factId of lexicalCandidateIds) {
@@ -611,6 +627,8 @@ export class MemoryRecallIndex {
       const lexical = lexicalScore > 0
       const vectorScore = vectorScores.get(indexed.fact.id)
       const vector = mode !== 'lexical' && vectorScore !== undefined && Number.isFinite(vectorScore) && vectorScore > 0
+      const graphScore = graphScores.get(indexed.fact.id)
+      const graph = graphScore !== undefined && Number.isFinite(graphScore) && graphScore > 0
       const entity = entityScore > 0
       const context = contextScore > 0
 
@@ -624,7 +642,7 @@ export class MemoryRecallIndex {
         }))
         continue
       }
-      if (lexical && !vector && !entity && !context && !matchingAnchor && !hasMinimumLexicalOverlap(queryTokens, indexed.tokenCounts)) {
+      if (lexical && !vector && !graph && !entity && !context && !matchingAnchor && !hasMinimumLexicalOverlap(queryTokens, indexed.tokenCounts)) {
         omitted.push(Object.freeze({
           factId,
           score: 0,
@@ -635,7 +653,7 @@ export class MemoryRecallIndex {
         continue
       }
 
-      if (!lexical && !vector && !entity && !context && !matchingAnchor) {
+      if (!lexical && !vector && !graph && !entity && !context && !matchingAnchor) {
         omitted.push(Object.freeze({ factId, score: 0, selected: false, reasonCodes: Object.freeze([]), omittedReason: '与本轮查询无相关性' }))
         continue
       }
@@ -660,7 +678,8 @@ export class MemoryRecallIndex {
         score,
         lexicalScore: score,
         ...(vector ? { vectorScore } : {}),
-        reason: { lexical, vector, entity, context, stableAnchor: matchingAnchor },
+        ...(graph ? { graphScore } : {}),
+        reason: { lexical, vector, graph, entity, context, stableAnchor: matchingAnchor },
       }
 
       if (matchingAnchor) anchors.push(item)
@@ -678,14 +697,22 @@ export class MemoryRecallIndex {
       .sort((left, right) => (right.vectorScore ?? 0) - (left.vectorScore ?? 0)
         || right.fact.updatedAt - left.fact.updatedAt
         || left.fact.id.localeCompare(right.fact.id))
+    const graphRanked = allEligible
+      .filter(item => item.graphScore !== undefined)
+      .sort((left, right) => (right.graphScore ?? 0) - (left.graphScore ?? 0)
+        || right.fact.updatedAt - left.fact.updatedAt
+        || left.fact.id.localeCompare(right.fact.id))
     const lexicalRanks = new Map(lexicalRanked.map((item, index) => [item.fact.id, index + 1]))
     const vectorRanks = new Map(vectorRanked.map((item, index) => [item.fact.id, index + 1]))
+    const graphRanks = new Map(graphRanked.map((item, index) => [item.fact.id, index + 1]))
     const applyModeScore = (item: RecallItem): RecallItem => {
       const lexicalRank = lexicalRanks.get(item.fact.id)
       const vectorRank = vectorRanks.get(item.fact.id)
+      const graphRank = graphRanks.get(item.fact.id)
       const fusionScore = mode === 'hybrid'
-        ? (lexicalRank === undefined ? 0 : 1 / (60 + lexicalRank))
-          + (vectorRank === undefined ? 0 : 1 / (60 + vectorRank))
+        ? (lexicalRank === undefined ? 0 : 0.4 / (60 + lexicalRank))
+          + (vectorRank === undefined ? 0 : 0.4 / (60 + vectorRank))
+          + (graphRank === undefined ? 0 : 0.2 / (60 + graphRank))
         : undefined
       const score = mode === 'vector'
         ? item.vectorScore ?? 0
@@ -697,6 +724,7 @@ export class MemoryRecallIndex {
         score,
         ...(lexicalRank === undefined ? {} : { lexicalRank }),
         ...(vectorRank === undefined ? {} : { vectorRank }),
+        ...(graphRank === undefined ? {} : { graphRank }),
         ...(fusionScore === undefined ? {} : { fusionScore }),
       }
     }
@@ -763,8 +791,10 @@ export class MemoryRecallIndex {
         reasonCodes: Object.freeze(Object.entries(item.reason).filter(([, matched]) => matched).map(([reason]) => reason)),
         ...(item.lexicalScore === undefined ? {} : { lexicalScore: item.lexicalScore }),
         ...(item.vectorScore === undefined ? {} : { vectorScore: item.vectorScore }),
+        ...(item.graphScore === undefined ? {} : { graphScore: item.graphScore }),
         ...(item.lexicalRank === undefined ? {} : { lexicalRank: item.lexicalRank }),
         ...(item.vectorRank === undefined ? {} : { vectorRank: item.vectorRank }),
+        ...(item.graphRank === undefined ? {} : { graphRank: item.graphRank }),
         ...(item.fusionScore === undefined ? {} : { fusionScore: item.fusionScore }),
         ...(selectedIds.has(item.fact.id)
           ? {}
@@ -789,6 +819,7 @@ export class MemoryRecallIndex {
       resolvedMode: mode,
       lexicalCandidateCount: lexicalCandidateIds.size,
       vectorCandidateCount: vectorScores.size,
+      graphCandidateCount: graphScores.size,
       fusedCandidateCount: mode === 'hybrid' ? candidateIds.size : undefined,
     })
 

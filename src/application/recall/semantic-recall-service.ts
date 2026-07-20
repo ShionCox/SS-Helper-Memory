@@ -14,10 +14,15 @@ import {
   type RecallQuery,
   type RecallResult,
 } from './memory-recall-index';
+import type { GraphRecallCandidateProvider, GraphRecallSearchResult } from '../graph';
 import { MemoryVectorIndexService, type VectorSearchResult } from './vector-index-service';
 
 export type MemoryRecallMode = 'auto' | 'lexical' | 'vector' | 'hybrid';
 export type MemoryRerankMode = 'off' | 'adaptive' | 'always';
+export interface MemoryGraphRecallOptions {
+  maxHops: 1 | 2;
+  maxEdges: number;
+}
 
 const RERANK_TIMEOUT_MS = 15_000;
 const TOTAL_EXTRA_RECALL_BUDGET_MS = 19_000;
@@ -59,8 +64,12 @@ function adaptiveRerankRequired(items: readonly RecallItem[]): boolean {
   const vectorTop = [...items]
     .filter(item => item.vectorRank !== undefined)
     .sort((left, right) => (left.vectorRank ?? Number.MAX_SAFE_INTEGER) - (right.vectorRank ?? Number.MAX_SAFE_INTEGER))[0];
+  const graphTop = [...items]
+    .filter(item => item.graphRank !== undefined)
+    .sort((left, right) => (left.graphRank ?? Number.MAX_SAFE_INTEGER) - (right.graphRank ?? Number.MAX_SAFE_INTEGER))[0];
   const top = items[0];
   if (lexicalTop && vectorTop && lexicalTop.fact.id !== vectorTop.fact.id) return true;
+  if (graphTop && ((lexicalTop && graphTop.fact.id !== lexicalTop.fact.id) || (vectorTop && graphTop.fact.id !== vectorTop.fact.id))) return true;
   if (top?.reason.vector && !top.reason.lexical && !top.reason.entity && !top.reason.context) return true;
   const firstScore = items[0]?.score ?? 0;
   const secondScore = items[1]?.score ?? 0;
@@ -85,16 +94,27 @@ function updateCandidate(
 
 /** 组合本地硬过滤、向量扫描、RRF 与可选 LLM 重排，并保证失败时可降级。 */
 export class SemanticRecallService {
+  private readonly graph: GraphRecallCandidateProvider | undefined;
+  private readonly getLlm: () => MemoryLlmApi | null;
+
   constructor(
     private readonly index: MemoryRecallIndex,
     private readonly vectors: MemoryVectorIndexService,
-    private readonly getLlm: () => MemoryLlmApi | null = readMemoryLlmApi,
-  ) {}
+    graphOrGetLlm?: GraphRecallCandidateProvider | (() => MemoryLlmApi | null),
+    getLlm: () => MemoryLlmApi | null = readMemoryLlmApi,
+  ) {
+    if (typeof graphOrGetLlm === 'function') this.getLlm = graphOrGetLlm;
+    else {
+      this.graph = graphOrGetLlm;
+      this.getLlm = getLlm;
+    }
+  }
 
   async recall(
     query: RecallQuery,
     requestedMode: MemoryRecallMode,
     rerankMode: MemoryRerankMode,
+    graphOptions?: MemoryGraphRecallOptions,
   ): Promise<RecallResult> {
     const startedAt = Date.now();
     const deadline = startedAt + TOTAL_EXTRA_RECALL_BUDGET_MS;
@@ -121,11 +141,44 @@ export class SemanticRecallService {
     }
 
     const vectorScores = new Map((vectorResult?.candidates ?? []).map(item => [item.factId, item.score]));
-    const base = this.index.recall(query, {
+    const initial = this.index.recall(query, {
       mode: resolvedMode,
       vectorScores,
       candidateLimit: candidatePoolSize,
     });
+    let graphResult: GraphRecallSearchResult | undefined;
+    let graphDegradedReason = '';
+    let graphScores = new Map<string, number>();
+    if (this.graph && graphOptions) {
+      try {
+        const seedEntityKeys = [...new Set(initial.items.flatMap((item) => [
+          item.fact.subjectKey,
+          ...(item.fact.objectKey ? [item.fact.objectKey] : []),
+          ...item.fact.entityKeys,
+        ]).map((value) => value.trim()).filter(Boolean))];
+        graphResult = await this.graph.search({
+          chatKey: query.chatKey,
+          query: query.query,
+          seedEntityKeys,
+          maxHops: graphOptions.maxHops,
+          maxEdges: graphOptions.maxEdges,
+        });
+        graphScores = new Map(graphResult.candidates.map((item) => [item.factId, item.score]));
+      } catch {
+        // Do not persist graph labels, query text, or evidence in diagnostics.
+        graphDegradedReason = '关系图谱候选不可用，已回退到原有召回。';
+      }
+    }
+    const finalMode: 'lexical' | 'vector' | 'hybrid' = graphScores.size > 0 ? 'hybrid' : resolvedMode;
+    const base = graphScores.size > 0
+      ? this.index.recall(query, {
+        mode: finalMode,
+        vectorScores,
+        graphScores,
+        candidateLimit: candidatePoolSize,
+      })
+      : initial;
+    if (graphDegradedReason) degradedReason = degradedReason || graphDegradedReason;
     let orderedItems = [...base.items];
     const temporalHeadSize = HISTORICAL_QUERY_PATTERN.test(query.query)
       && STATE_HISTORY_TOPIC_PATTERN.test(query.query)
@@ -257,9 +310,14 @@ export class SemanticRecallService {
       selectedCount: items.length,
       llmCalls,
       requestedMode,
-      resolvedMode,
+      resolvedMode: finalMode,
       vectorCandidateCount: vectorScores.size,
-      fusedCandidateCount: resolvedMode === 'hybrid' ? base.diagnostics.candidateCount : undefined,
+      graphCandidateCount: graphScores.size,
+      graphHitCount: graphResult?.edgeHitCount,
+      graphSeedNodeCount: graphResult?.seedNodeCount,
+      graphLatencyMs: graphResult?.latencyMs,
+      ...(graphDegradedReason ? { graphDegradedReason } : {}),
+      fusedCandidateCount: finalMode === 'hybrid' ? base.diagnostics.candidateCount : undefined,
       ...(degradedReason ? { degradedReason } : {}),
       embedding: embeddingDiagnostic,
       rerank: rerankDiagnostic,

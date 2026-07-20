@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   EXPECTED_SQLITE_SCHEMA_VERSION,
   filterAndSortFacts,
@@ -21,7 +21,7 @@ import type { MemoryUiController, MemoryUiFact } from '../src/ui/memory-ui';
 function workbenchController(overrides: Partial<MemoryUiController> = {}): MemoryUiController {
   const facts: MemoryUiFact[] = [{ id: 'fact-1', kind: 'state', status: 'active', content: '当前状态稳定', confidence: 0.9, sourceRefs: ['message:1'], evidence: [{ sourceRef: 'message:1', excerpt: '证据摘录' }], updatedAt: 10 }];
   return {
-    getSettings: () => ({ enabled: true, autoOrganize: true, summaryBatchMode: 'floors' as const, summaryBatchFloors: 5, summaryBatchChars: 12_000, summaryIntervalFloors: 5, summaryOverlapFloors: 2, maxRecallItems: 12, promptMaxChars: 9000, answerMode: 'auto', recallMode: 'hybrid', rerankMode: 'adaptive', chatMode: 'enabled' }),
+    getSettings: () => ({ enabled: true, autoOrganize: true, summaryBatchMode: 'floors' as const, summaryBatchFloors: 5, summaryBatchChars: 12_000, summaryIntervalFloors: 5, summaryOverlapFloors: 2, maxRecallItems: 12, promptMaxChars: 9000, answerMode: 'auto', recallMode: 'hybrid', rerankMode: 'adaptive', preExtractReferenceEnabled: true, preExtractReferenceItems: 8, preExtractReferenceMode: 'auto' as const, preExtractReferenceMaxChars: 2_400, graphEnabled: true, graphLlmRelationEnabled: true, graphMaxHops: 1 as const, graphMaxEdges: 12, chatMode: 'enabled' }),
     saveSettings: async () => undefined,
     getOverview: async () => ({ status: 'ready', bound: true, chatName: 'Assistant', chatKey: 'Assistant - 2026-07-18@03h29m55s201ms', factCount: facts.length, currentChatSizeBytes: 2048, currentChatUsageRatio: 0.25, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: true }),
     getInitializationEstimate: async () => ({ messageCount: 1, batchCount: 1, tokenLow: 10, tokenHigh: 20 }),
@@ -40,6 +40,9 @@ function workbenchController(overrides: Partial<MemoryUiController> = {}): Memor
     getMainChatUsage: async () => [],
     getRecallStatus: async () => ({ resolvedMode: 'hybrid', embedding: { available: true, resourceId: 'embed' }, rerank: { available: true, resourceId: 'rerank' }, indexedFacts: 1, eligibleFacts: 1, pendingFacts: 0, rebuilding: false, batches: [] }),
     rebuildVectorIndex: async () => undefined,
+    getGraphStatus: () => ({ chatKey: 'chat:1', enabled: true, phase: 'ready' as const, nodeCount: 2, edgeCount: 1, updatedAt: 10, lastRebuiltAt: 10 }),
+    getRelationshipGraph: async () => ({ nodes: [{ id: 'node-a', label: '艾琳' }, { id: 'node-b', label: '雷暴' }], edges: [{ id: 'edge-a', from: 'node-a', to: 'node-b', predicate: '害怕', kind: 'relationship' as const, status: 'active' as const, confidence: 0.9, backingFactId: 'fact-1' }] }),
+    rebuildGraph: async () => undefined,
     rollbackBatch: async () => undefined,
     getSqliteStatus: async () => ({ connected: true, serverVersion: '1', nodeVersion: 'v22.17.0', protocolVersion: 1, sqliteVersion: '3', schemaVersion: 4, databasePath: 'memory.db', databaseSizeBytes: 4096, workspaceSizeBytes: 8192, currentChatSizeBytes: 2048, currentChatUsageRatio: 0.25, walMode: 'wal', tableCounts: {}, tableBytes: {}, vectorCoverage: { indexedFacts: 1, eligibleFacts: 1, ratio: 1 } }),
     exportSqliteBackup: async () => new Blob(['{}'], { type: 'application/json' }),
@@ -171,7 +174,7 @@ describe('Memory UI 展示适配', () => {
     expect(MEMORY_CAPABILITY_BOUNDARIES.some((item) => item.status === '停止')).toBe(true);
     expect(MEMORY_CAPABILITY_BOUNDARIES.some((item) => item.status === '替代')).toBe(true);
     expect(MEMORY_CAPABILITY_BOUNDARIES.some((item) => item.status === '可用')).toBe(true);
-    expect(MEMORY_CAPABILITY_BOUNDARIES.find((item) => item.name === '关系图谱')?.status).toBe('未实现');
+    expect(MEMORY_CAPABILITY_BOUNDARIES.find((item) => item.name === '关系图谱')?.status).toBe('可用');
   });
 
   it('明确 SQLite schema v4 与级联批次回滚语义', () => {
@@ -182,7 +185,7 @@ describe('Memory UI 展示适配', () => {
     expect(confirmation).toContain('之后批次的整理结果也会一并撤销');
   });
 
-  it('渲染五个工作台页面并支持内联事实编辑', async () => {
+  it('渲染六个工作台页面并支持内联事实编辑', async () => {
     const container = document.createElement('div');
     document.body.append(container);
     const updates: string[] = [];
@@ -190,7 +193,7 @@ describe('Memory UI 展示适配', () => {
     const dispose = renderMemoryWorkbench(container, controller);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(container.querySelectorAll('[data-action="navigate"]')).toHaveLength(5);
+    expect(container.querySelectorAll('[data-action="navigate"]')).toHaveLength(6);
     expect(container.querySelector('[data-action="select-fact"]')).not.toBeNull();
     expect(container.querySelector('[data-action="select-fact"]')?.getAttribute('data-ss-helper-control')).toBe('button');
     expect(container.querySelector('[data-action="refresh"]')?.getAttribute('data-ss-helper-tone')).toBe('neutral');
@@ -212,6 +215,46 @@ describe('Memory UI 展示适配', () => {
     expect(updates).toEqual(['更新后的事实']);
     dispose();
     expect(container.textContent).toBe('');
+  });
+
+  it('以只读方式展示当前聊天的关系图谱、背书事实和重建入口', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const rebuildGraph = vi.fn(async () => undefined);
+    const dispose = renderMemoryWorkbench(container, workbenchController({ rebuildGraph }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="graph"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.textContent).toContain('关系图谱');
+    expect(container.textContent).toContain('艾琳 — 害怕 → 雷暴');
+    expect(container.textContent).toContain('当前状态稳定');
+    expect(container.textContent).toContain('证据摘录');
+    expect(container.textContent).toContain('不会把语义相似度当作实体关系');
+    expect(container.querySelector('[data-action="rebuild-graph"]')?.getAttribute('data-ss-helper-control')).toBe('button');
+    (container.querySelector('[data-action="rebuild-graph"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(rebuildGraph).toHaveBeenCalledOnce();
+    dispose();
+  });
+
+  it('从设置页的重建操作打开关系图谱并立即执行当前聊天的重建', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const rebuildGraph = vi.fn(async () => undefined);
+    const dispose = renderMemoryWorkbench(
+      container,
+      workbenchController({ rebuildGraph }),
+      () => undefined,
+      undefined,
+      'rebuild-relationship-graph',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.querySelector('.stx-memory-page-heading h2')?.textContent).toBe('关系图谱');
+    expect(rebuildGraph).toHaveBeenCalledOnce();
+    dispose();
   });
 
   it('每次重绘刷新 SDK 控件并让多选筛选立即驱动列表', async () => {

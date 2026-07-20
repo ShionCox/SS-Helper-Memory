@@ -69,6 +69,13 @@ interface CachedQueryVector {
   cached: boolean;
 }
 
+interface ResolvedEmbeddingTarget {
+  requestedResourceId: string;
+  requestedModel: string;
+  resourceId: string;
+  model: string;
+}
+
 function memoryUsage(usage: { promptTokens: number; completionTokens: number; totalTokens: number } | undefined): MemoryTokenUsage | null {
   return usage ? {
     promptTokens: Number.isFinite(usage.promptTokens) ? usage.promptTokens : null,
@@ -117,6 +124,13 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
 export class MemoryVectorIndexService {
   private readonly queryCache = new Map<string, CachedQueryVector>();
   private readonly statuses = new Map<string, VectorIndexStatus>();
+  /**
+   * LLMHub may execute an embedding request on a fallback route.  Keep that
+   * route for the current service lifetime so the next sync looks for the
+   * vectors it actually wrote instead of continuously rebuilding them against
+   * the diagnostic route.
+   */
+  private readonly resolvedEmbeddingTargets = new Map<string, ResolvedEmbeddingTarget>();
   private syncPromise: Promise<void> | null = null;
   private pendingSyncChatKey = '';
   private active = false;
@@ -137,6 +151,7 @@ export class MemoryVectorIndexService {
     this.active = false;
     this.lifecycleRevision += 1;
     this.queryCache.clear();
+    this.resolvedEmbeddingTargets.clear();
     this.pendingSyncChatKey = '';
   }
 
@@ -160,6 +175,7 @@ export class MemoryVectorIndexService {
     if (this.syncPromise) await this.syncPromise;
     await this.repository.clearFactVectors(chatKey);
     this.queryCache.clear();
+    this.resolvedEmbeddingTargets.delete(chatKey);
     this.syncPromise = this.syncChat(chatKey).finally(() => { this.syncPromise = null; });
     await this.syncPromise;
   }
@@ -176,6 +192,7 @@ export class MemoryVectorIndexService {
     const facts = (await Promise.all([...new Set(factIds)].map((factId) => this.repository.getFact(chatKey, factId))))
       .filter((fact): fact is MemoryFact => Boolean(fact && (fact.status === 'active' || fact.status === 'pending')));
     this.queryCache.clear();
+    let observedResponseRoute: { resourceId: string; model: string } | undefined;
     try {
       for (let offset = 0; offset < facts.length; offset += VECTOR_BATCH_SIZE) {
         if (!this.active || lifecycleRevision !== this.lifecycleRevision) throw new Error('Memory 生命周期已变化。');
@@ -194,6 +211,10 @@ export class MemoryVectorIndexService {
         if (!dimensions || vectors.some((vector) => vector.length !== dimensions)) throw new Error('回滚向量维度不一致。');
         const resourceId = response.meta?.resourceId ?? route.resourceId;
         const model = response.meta?.model ?? response.model ?? route.model;
+        if (observedResponseRoute && (observedResponseRoute.resourceId !== resourceId || observedResponseRoute.model !== model)) {
+          throw new Error('embedding 路由在修复期间发生变化。');
+        }
+        observedResponseRoute = { resourceId, model };
         await Promise.all(batch.map((fact, index) => this.repository.upsertFactVector({
           factId: fact.id,
           chatKey,
@@ -202,6 +223,7 @@ export class MemoryVectorIndexService {
           model,
           vector: vectors[index]!,
         })));
+        this.rememberEmbeddingTarget(chatKey, route.resourceId, route.model, { resourceId, model });
       }
     } catch {
       throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
@@ -212,7 +234,7 @@ export class MemoryVectorIndexService {
     const diagnostics = await this.getRoutes();
     const route = diagnostics.embedding;
     const target = route.resourceId && route.model
-      ? { resourceId: route.resourceId, model: route.model }
+      ? this.getEmbeddingTarget(chatKey, route.resourceId, route.model)
       : null;
     const coverage = target ? await this.repository.getFactVectorCoverage(chatKey, target) : null;
     const previous = this.statuses.get(chatKey);
@@ -287,11 +309,13 @@ export class MemoryVectorIndexService {
     }
     status({ rebuilding: true });
     let dimensions: number | undefined;
+    let targetRoute = this.getEmbeddingTarget(chatKey, route.resourceId, route.model);
+    let observedResponseRoute: { resourceId: string; model: string } | undefined;
     let batchIndex = 0;
     try {
       while (true) {
         if (!this.active || lifecycleRevision !== this.lifecycleRevision) return;
-        const target = { resourceId: route.resourceId, model: route.model, ...(dimensions ? { dimensions } : {}) };
+        const target = { ...targetRoute, ...(dimensions ? { dimensions } : {}) };
         const facts = await this.repository.listFactsNeedingVectorRebuild(chatKey, target, VECTOR_BATCH_SIZE);
         const coverage = await this.repository.getFactVectorCoverage(chatKey, target);
         status({ coverage, pendingFacts: coverage.missing + coverage.stale });
@@ -319,6 +343,10 @@ export class MemoryVectorIndexService {
         if (!this.active || lifecycleRevision !== this.lifecycleRevision) return;
         const resourceId = response.meta?.resourceId ?? route.resourceId;
         const model = response.meta?.model ?? response.model ?? route.model;
+        if (observedResponseRoute && (observedResponseRoute.resourceId !== resourceId || observedResponseRoute.model !== model)) {
+          throw new Error('embedding 路由在回填期间发生变化。');
+        }
+        observedResponseRoute = { resourceId, model };
         await Promise.all(facts.map((fact, index) => this.repository.upsertFactVector({
           factId: fact.id,
           chatKey,
@@ -327,6 +355,8 @@ export class MemoryVectorIndexService {
           model,
           vector: normalized[index]!,
         })));
+        targetRoute = { resourceId, model };
+        this.rememberEmbeddingTarget(chatKey, route.resourceId, route.model, targetRoute);
         batchIndex += 1;
         batches.push({
           batchIndex,
@@ -341,12 +371,37 @@ export class MemoryVectorIndexService {
           usage: memoryUsage(response.usage),
         });
       }
-      const target = { resourceId: route.resourceId, model: route.model, ...(dimensions ? { dimensions } : {}) };
+      const target = { ...targetRoute, ...(dimensions ? { dimensions } : {}) };
       const coverage = await this.repository.getFactVectorCoverage(chatKey, target);
       status({ rebuilding: false, coverage, pendingFacts: coverage.missing + coverage.stale });
     } catch (error) {
       status({ rebuilding: false, lastError: error instanceof Error ? error.message : String(error) });
     }
+  }
+
+  private getEmbeddingTarget(chatKey: string, requestedResourceId: string, requestedModel: string): { resourceId: string; model: string } {
+    const remembered = this.resolvedEmbeddingTargets.get(chatKey);
+    if (remembered
+      && remembered.requestedResourceId === requestedResourceId
+      && remembered.requestedModel === requestedModel) {
+      return { resourceId: remembered.resourceId, model: remembered.model };
+    }
+    if (remembered) this.resolvedEmbeddingTargets.delete(chatKey);
+    return { resourceId: requestedResourceId, model: requestedModel };
+  }
+
+  private rememberEmbeddingTarget(
+    chatKey: string,
+    requestedResourceId: string,
+    requestedModel: string,
+    actual: { resourceId: string; model: string },
+  ): void {
+    this.resolvedEmbeddingTargets.set(chatKey, {
+      requestedResourceId,
+      requestedModel,
+      resourceId: actual.resourceId,
+      model: actual.model,
+    });
   }
 
   private async embedQuery(query: string): Promise<CachedQueryVector> {

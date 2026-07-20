@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { MemoryJob, MemoryRecallLog } from '../src/domain';
-import type { SourceBlock } from '../src/application/ingest/types';
+import type { MemoryFact, MemoryJob, MemoryRecallLog } from '../src/domain';
+import type { ExistingMemoryContextItem, SourceBlock } from '../src/application/ingest/types';
 import { MEMORY_DEFAULT_SETTINGS } from '../src/ss-helper/settings';
 
 const state = vi.hoisted(() => ({
@@ -8,6 +8,7 @@ const state = vi.hoisted(() => ({
   release: null as null | (() => void),
   extractCalls: 0,
   lastExtractSources: [] as SourceBlock[],
+  lastExtractExistingMemoryContext: [] as readonly ExistingMemoryContextItem[],
 }));
 
 vi.mock('../src/host/source-adapter', async () => {
@@ -26,15 +27,17 @@ vi.mock('../src/application/ingest/llm-extractor', () => ({
   MEMORY_EMBED_TASK: 'memory_embed',
   MEMORY_RERANK_TASK: 'memory_rerank',
   LlmMemoryExtractor: class {
-    extract(input: { sources: SourceBlock[] }): Promise<[]> {
+    extract(input: { sources: SourceBlock[]; existingMemoryContext?: readonly ExistingMemoryContextItem[] }): Promise<[]> {
       state.extractCalls += 1;
       state.lastExtractSources = [...input.sources];
+      state.lastExtractExistingMemoryContext = [...(input.existingMemoryContext ?? [])];
       return new Promise((resolve) => { state.release = () => resolve([]); });
     }
   },
 }));
 
 class FakeRepository {
+  readonly facts: MemoryFact[] = [];
   readonly jobs: MemoryJob[] = [];
   readonly audits: Array<{ sourceRefs: string[] }> = [];
   readonly staged: Array<Record<string, unknown>> = [];
@@ -46,6 +49,9 @@ class FakeRepository {
     else this.jobs.push(structuredClone(job));
   });
   readonly commit = vi.fn(async () => undefined);
+  readonly importBackup = vi.fn(async () => undefined);
+  readonly getChatKeys = vi.fn(async () => ['chat-a']);
+  readonly reconcileGraphProjection = vi.fn(async () => undefined);
   readonly putInitializationStagingBatch = vi.fn(async (batch: Record<string, unknown>) => {
     const index = this.staged.findIndex((item) => item.id === batch.id || (item.jobId === batch.jobId && item.batchIndex === batch.batchIndex));
     if (index >= 0) this.staged[index] = structuredClone(batch);
@@ -64,7 +70,7 @@ class FakeRepository {
   async getSetting<T>(key: string): Promise<T | undefined> { return this.settings.get(key) as T | undefined; }
   async setSetting(): Promise<void> {}
   async setSettings(values: Record<string, unknown>): Promise<void> { Object.entries(values).forEach(([key, value]) => this.settings.set(key, structuredClone(value))); }
-  async listFacts(): Promise<[]> { return []; }
+  async listFacts(): Promise<MemoryFact[]> { return structuredClone(this.facts); }
   async bootstrap(): Promise<{ facts: []; vectorFacts: [] }> { return { facts: [], vectorFacts: [] }; }
   async listJobs(): Promise<MemoryJob[]> { return [...this.jobs].sort((a, b) => b.updatedAt - a.updatedAt); }
   async listJobBatchAudits(): Promise<Array<{ sourceRefs: string[] }>> { return structuredClone(this.audits); }
@@ -83,6 +89,15 @@ function message(index: number): SourceBlock {
   return { id: `message:${index}`, chatKey: 'chat-a', kind: 'message', role: index % 2 ? 'assistant' : 'user', content: `第 ${index} 条可见消息正文`, createdAt: index };
 }
 
+function fact(id: string, content: string): MemoryFact {
+  return {
+    id, chatKey: 'chat-a', kind: 'preference', subjectKey: 'Aerin', predicateKey: 'fears', objectKey: 'thunder',
+    canonicalKey: `preference|aerin|fears|thunder|${id}`, slotKey: 'aerin|fears', content, entityKeys: ['Aerin', 'thunder'],
+    confidence: 0.95, status: 'active', sourceRefs: ['message:old'], evidenceIds: [], freshestEvidenceAt: 1,
+    origin: 'automatic', revision: 1, createdAt: 1, updatedAt: 1,
+  };
+}
+
 function connectHost(app: { useHostContext(context: { getChatKey(): string; getWorkspaceId(): string; collectSources(chatKey: string): Promise<SourceBlock[]> }): void }): void {
   app.useHostContext({ getChatKey: () => 'chat-a', getWorkspaceId: () => 'character:c1', collectSources: async () => state.sources });
 }
@@ -93,6 +108,53 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     state.release = null;
     state.extractCalls = 0;
     state.lastExtractSources = [];
+    state.lastExtractExistingMemoryContext = [];
+  });
+
+  it('旧设置缺失时启用旧记忆参考默认值，并收敛损坏的持久化范围', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    repository.settings.set('preExtractReferenceItems', 0);
+    repository.settings.set('preExtractReferenceMode', 'unknown');
+    repository.settings.set('preExtractReferenceMaxChars', 9_999);
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+
+    await app.start();
+
+    expect(app.getSettings()).toMatchObject({
+      preExtractReferenceEnabled: true,
+      preExtractReferenceItems: 1,
+      preExtractReferenceMode: 'auto',
+      preExtractReferenceMaxChars: 4_000,
+      graphEnabled: true,
+      graphLlmRelationEnabled: true,
+      graphMaxHops: 1,
+      graphMaxEdges: 12,
+    });
+    app.stop();
+  });
+
+  it('图谱公共预览在没有当前聊天或聊天键不匹配时安全返回空结果', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+
+    await expect(app.graph.preview({ chatKey: 'other-chat', query: '艾琳' })).resolves.toEqual({ nodes: [], edges: [] });
+    app.stop();
+  });
+
+  it('导入归档后为当前工作区的聊天排队图谱回填', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    repository.getChatKeys.mockResolvedValue(['chat-a', 'chat-b']);
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    await app.start();
+
+    await app.importSqliteBackup(new File(['{}'], 'memory-backup.json', { type: 'application/json' }));
+    await vi.waitFor(() => expect(repository.getChatKeys).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(repository.reconcileGraphProjection).toHaveBeenCalled());
+    app.stop();
   });
 
   it('按来源组裁剪后实时重算初始化批次', async () => {
@@ -177,6 +239,37 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     await flush;
 
     expect(state.lastExtractSources.map(source => source.id)).toEqual(['message:0', 'message:1']);
+    app.stop();
+  });
+
+  it('提取前只参考 capture 开始时当前聊天的基线事实，且不写召回日志', async () => {
+    state.sources = [
+      { ...message(0), content: 'Aerin fears thunder when storms arrive.' },
+      { ...message(1), content: 'Aerin still fears thunder after a storm.' },
+      message(2),
+    ];
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    repository.facts.push(fact('fact-baseline', 'Aerin fears thunder because of a childhood storm.'));
+    repository.settings.set('summaryProgressByChat', {
+      'chat-a': { completedFloor: 1, completedMessageId: 'message:0', updatedAt: 1 },
+    });
+    repository.settings.set('summaryIntervalFloors', 1);
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    await app.start();
+
+    const flush = app.capture.flush();
+    for (let index = 0; index < 20 && !state.release; index += 1) await Promise.resolve();
+    repository.facts.push(fact('fact-written-during-job', 'Aerin fears thunder during new jobs.'));
+    state.release?.();
+    await flush;
+
+    expect(state.lastExtractExistingMemoryContext).toEqual([
+      expect.objectContaining({ referenceId: 'M1', content: 'Aerin fears thunder because of a childhood storm.' }),
+    ]);
+    expect(state.lastExtractExistingMemoryContext.some((item) => item.content.includes('new jobs'))).toBe(false);
+    expect(repository.recallLog).toBeUndefined();
     app.stop();
   });
 

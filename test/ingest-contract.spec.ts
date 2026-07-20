@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { filterSourceBlocks } from '../src/application/ingest/source-blocks';
 import { buildSummaryBatches } from '../src/application/ingest/summary-strategy';
 import { MemoryIngestService } from '../src/application/ingest/memory-ingest-service';
-import type { ExtractedFactProposal, IngestCommit, MemoryExtractor, SourceBlock } from '../src/application/ingest/types';
+import type { ExistingMemoryContextItem, ExtractedFactProposal, IngestCommit, MemoryExtractor, SourceBlock } from '../src/application/ingest/types';
 
 function block(id: string, content: string, role: SourceBlock['role'] = 'user'): SourceBlock {
   return { id, chatKey: 'chat-a', kind: 'message', role, content, createdAt: 1 };
@@ -63,6 +63,33 @@ describe('Memory 写入主链', () => {
     expect(commits[0]?.rejections).toEqual([
       expect.objectContaining({ code: 'excerpt_mismatch', message: expect.stringContaining('逐字匹配') }),
     ]);
+  });
+
+  it('将只读旧记忆单独传给提取器，不把它写入来源或证据链', async () => {
+    const sources = [block('m1', '艾琳再次明确表示自己在雷雨天气会感到恐惧。')];
+    const reference: ExistingMemoryContextItem = {
+      referenceId: 'M1', kind: 'preference', subjectKey: '艾琳', predicateKey: '恐惧对象', objectKey: '雷声',
+      content: '艾琳害怕雷声，因为童年曾遭遇过雷暴。',
+    };
+    const extractor: MemoryExtractor = { extract: vi.fn(async () => []) };
+    const loadExistingMemoryContext = vi.fn(async () => [reference]);
+    const commits: IngestCommit[] = [];
+    const service = new MemoryIngestService({
+      extractor,
+      loadExistingMemoryContext,
+      commit: async (input) => void commits.push(input),
+    });
+
+    await service.ingest({ chatKey: 'chat-a', jobId: 'job-reference', sources });
+
+    expect(loadExistingMemoryContext).toHaveBeenCalledWith({ chatKey: 'chat-a', sources });
+    expect(extractor.extract).toHaveBeenCalledWith({
+      chatKey: 'chat-a',
+      sources,
+      existingMemoryContext: [reference],
+    });
+    expect(commits[0]?.sources).toEqual(sources);
+    expect(commits[0]?.checkpoint.sourceIds).toEqual(['m1']);
   });
 
   it('把 LLM 路由与真实 Token usage 原样提交给批次审计', async () => {

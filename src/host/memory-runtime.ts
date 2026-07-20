@@ -62,7 +62,13 @@ export class MemoryRuntime {
     const contributions = registerMemoryContributions(
       this.session,
       this.application,
-      (container, popupUi) => renderMemoryWorkbench(container, this.application, (notification) => this.session.ui.showToast(notification), popupUi),
+      (container, actionId, popupUi) => renderMemoryWorkbench(
+        container,
+        this.application,
+        (notification) => this.session.ui.showToast(notification),
+        popupUi,
+        actionId,
+      ),
       capabilityMonitor,
     );
     this.disposers.push(() => contributions.dispose());

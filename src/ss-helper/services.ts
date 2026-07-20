@@ -1,4 +1,4 @@
-import { MEMORY_RECALL_V1, MEMORY_UPDATED_V1, type MemoryUpdatedPayload, type PluginSession } from '@ss-helper/sdk';
+import { MEMORY_GRAPH_V1, MEMORY_RECALL_V1, MEMORY_UPDATED_V1, type MemoryUpdatedPayload, type PluginSession } from '@ss-helper/sdk';
 
 interface MemoryRecallResult {
   readonly items: readonly {
@@ -14,6 +14,12 @@ interface MemoryRecallResult {
 export interface MemoryRecallController {
   getChatKey(): string;
   recall: { preview(input: { query: string; maxItems?: number }): Promise<MemoryRecallResult> };
+  graph?: {
+    preview(input: { chatKey: string; query: string; limit?: number }): Promise<{
+      nodes: readonly { id: string; label: string }[];
+      edges: readonly { id: string; from: string; to: string; predicate: string; kind: string; confidence: number; backingFactId: string }[];
+    }>;
+  };
 }
 
 export function registerMemoryServices(
@@ -34,8 +40,29 @@ export function registerMemoryServices(
       })),
     };
   });
+  const disposeGraph = session.services.expose(MEMORY_GRAPH_V1, async (request, context) => {
+    context.signal.throwIfAborted();
+    if (request.chatKey !== controller.getChatKey()) return { nodes: [], edges: [] };
+    if (!controller.graph) return { nodes: [], edges: [] };
+    const graph = await controller.graph.preview({ chatKey: request.chatKey, query: request.query, limit: request.limit });
+    context.signal.throwIfAborted();
+    // Contract DTO is intentionally safe: no evidence excerpts, prompt text,
+    // database chat keys, or internal status fields leave the plugin.
+    return {
+      nodes: graph.nodes.map((node) => ({ id: node.id, label: node.label })),
+      edges: graph.edges.map((edge) => ({
+        id: edge.id,
+        from: edge.from,
+        to: edge.to,
+        predicate: edge.predicate,
+        kind: edge.kind,
+        confidence: edge.confidence,
+        backingFactId: edge.backingFactId,
+      })),
+    };
+  });
   return {
-    dispose: disposeRecall,
+    dispose: () => { disposeGraph(); disposeRecall(); },
     publishUpdated: (payload) => session.events.publish(MEMORY_UPDATED_V1, payload),
   };
 }

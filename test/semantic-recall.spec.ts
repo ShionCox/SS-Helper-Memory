@@ -70,6 +70,29 @@ describe('语义、混合召回与 LLM rerank', () => {
     expect(result.items.find(item => item.fact.id === 'semantic')?.vectorRank).toBe(1);
   });
 
+  it('在关键词/向量候选之后把事实背书图谱作为第三个 RRF 信号，并在图失败时保持原排序', async () => {
+    const seed = fact('seed', '白夕小时明确提到了灯塔周边的行程安排。', { subjectKey: '白夕小时', entityKeys: ['白夕小时'] });
+    const linked = fact('linked', '灯塔附近的守卫安排已经由可信来源确认。', { subjectKey: '灯塔', entityKeys: ['灯塔'] });
+    const vectors = { search: vi.fn(async () => vectorResult([])) };
+    const graph = {
+      search: vi.fn(async () => ({ candidates: [{ factId: 'linked', score: 0.9, rank: 1 }], seedNodeCount: 1, edgeHitCount: 1, latencyMs: 3 })),
+    };
+    const result = await new SemanticRecallService(new MemoryRecallIndex([seed, linked]), vectors as never, graph)
+      .recall({ chatKey: 'chat-a', query: '白夕小时的安排', now: NOW }, 'lexical', 'off', { maxHops: 1, maxEdges: 12 });
+
+    expect(result.items.map((item) => item.fact.id)).toEqual(expect.arrayContaining(['seed', 'linked']));
+    expect(result.items.find((item) => item.fact.id === 'linked')).toMatchObject({ graphRank: 1, reason: { graph: true } });
+    expect(result.diagnostics).toMatchObject({ resolvedMode: 'hybrid', graphCandidateCount: 1, graphHitCount: 1, graphSeedNodeCount: 1, graphLatencyMs: 3 });
+    expect(graph.search).toHaveBeenCalledWith(expect.objectContaining({ chatKey: 'chat-a', maxHops: 1, maxEdges: 12 }));
+
+    const failingGraph = { search: vi.fn(async () => { throw new Error('raw graph detail'); }) };
+    const fallback = await new SemanticRecallService(new MemoryRecallIndex([seed]), vectors as never, failingGraph)
+      .recall({ chatKey: 'chat-a', query: '白夕小时的安排', now: NOW }, 'lexical', 'off', { maxHops: 1, maxEdges: 12 });
+    expect(fallback.items.map((item) => item.fact.id)).toEqual(['seed']);
+    expect(fallback.diagnostics.graphDegradedReason).toBe('关系图谱候选不可用，已回退到原有召回。');
+    expect(JSON.stringify(fallback.diagnostics)).not.toContain('raw graph detail');
+  });
+
   it('最早期多子主题查询在词法、向量和混合模式都保留每个物资分面', async () => {
     const supplies = [
       fact('water', '最初清点了3箱纯净水和60瓶气泡水。', {

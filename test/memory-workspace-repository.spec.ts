@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { WorkspacePort, WorkspaceRecord } from '@ss-helper/sdk';
 import type { IngestCommit } from '../src/application/ingest/types';
 import { MemoryApplication } from '../src/application/memory-application';
-import { createFactSlotKey } from '../src/domain';
+import { createFactSlotKey, deriveMemoryGraphProjection } from '../src/domain';
 import { MemoryRepository } from '../src/infrastructure/memory-repository';
 
 function commitInput(): IngestCommit {
@@ -372,9 +372,42 @@ describe('MemoryRepository workspace concurrency', () => {
     expect(deleted).not.toEqual(expect.arrayContaining([expect.objectContaining({ recordId: 'fact-b' })]));
     expect(query).toHaveBeenCalledWith(expect.objectContaining({ collection: 'facts', filter: { chatKey: 'chat-a' } }));
     expect(new Set(query.mock.calls.map(call => call[0].collection))).toEqual(new Set([
-      'evidence', 'jobs', 'job-audits', 'usage', 'recall-logs', 'facts', 'fact-slots',
+      'evidence', 'jobs', 'job-audits', 'usage', 'recall-logs', 'facts', 'fact-slots', 'graph-nodes', 'graph-edges',
     ]));
     expect(vectorClear).toHaveBeenCalledWith(expect.objectContaining({ metadata: { chatKey: 'chat-a' } }));
+  });
+
+  it('reconciles fact-derived graph records idempotently and never writes another chat projection', async () => {
+    const records = new Map<string, Map<string, { value: unknown; version: number }>>();
+    const query = vi.fn(async (request: { collection: string; filter?: { chatKey?: string } }) => {
+      const collection = records.get(request.collection) ?? new Map();
+      const rows = [...collection.entries()]
+        .filter(([, record]) => !request.filter?.chatKey || (record.value as { chatKey?: string }).chatKey === request.filter.chatKey)
+        .map(([recordId, record]) => ({ recordId, value: record.value, version: record.version, updatedAt: 1 }));
+      return { records: rows, nextCursor: null };
+    });
+    const transaction = vi.fn(async (request: { operations: Array<{ action: string; collection: string; recordId: string; value?: unknown }> }) => {
+      for (const operation of request.operations) {
+        const collection = records.get(operation.collection) ?? new Map();
+        records.set(operation.collection, collection);
+        if (operation.action === 'delete') collection.delete(operation.recordId);
+        else collection.set(operation.recordId, { value: operation.value, version: (collection.get(operation.recordId)?.version ?? 0) + 1 });
+      }
+      return { operationCount: request.operations.length, replayed: false, results: [] };
+    });
+    const repository = new MemoryRepository(workspace({ query: query as never, transaction: transaction as never }));
+    repository.bind('character:c1', 'chat-a');
+    const relationA = { ...fact('relation-a', 'chat-a'), kind: 'relationship' as const, subjectKey: '艾琳', predicateKey: '认识', objectKey: '贝塔', confidence: 0.9 };
+    const relationB = { ...fact('relation-b', 'chat-b'), kind: 'relationship' as const, subjectKey: '艾琳', predicateKey: '认识', objectKey: '跨聊天对象', confidence: 0.9 };
+    const projection = deriveMemoryGraphProjection([relationA, relationB]);
+
+    await repository.reconcileGraphProjection('chat-a', projection);
+    await repository.reconcileGraphProjection('chat-a', projection);
+
+    expect(records.get('graph-edges')?.size).toBe(1);
+    expect([...records.get('graph-edges')!.values()][0]?.value).toMatchObject({ chatKey: 'chat-a', backingFactId: 'relation-a' });
+    expect(records.get('graph-nodes')?.size).toBe(2);
+    expect(transaction).toHaveBeenCalledTimes(1);
   });
 
   it('reports missing and conflicting chat identity during integrity checks', async () => {

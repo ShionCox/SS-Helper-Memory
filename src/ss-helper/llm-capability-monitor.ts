@@ -12,6 +12,9 @@ export type MemoryCapabilitySettings = {
   autoOrganize: boolean;
   recallMode: 'auto' | 'lexical' | 'vector' | 'hybrid';
   rerankMode: 'off' | 'adaptive' | 'always';
+  /** Optional for backward-compatible capability probes from older callers. */
+  preExtractReferenceEnabled?: boolean;
+  preExtractReferenceMode?: 'auto' | 'lexical' | 'vector' | 'hybrid';
 };
 export interface MemorySettingsNotice { readonly title: string; readonly message: string; readonly code: string; }
 export interface MemorySettingsAssessment { readonly blocked?: MemorySettingsNotice; readonly warnings: readonly MemorySettingsNotice[]; }
@@ -102,6 +105,19 @@ export class MemoryLlmCapabilityMonitor {
     if (next.enabled && next.rerankMode === 'adaptive' && (activating || next.rerankMode !== previous.rerankMode) && !this.availability.rerank) {
       warnings.push({ title: '重排已自动降级', message: '重排序模型当前不可用，请先在 LLM 中配置；目前将保留基础排序结果。', code: 'MEMORY_RERANK_DEGRADED' });
     }
+    const referenceUsesEmbedding = next.enabled
+      && next.preExtractReferenceEnabled === true
+      && next.preExtractReferenceMode !== 'lexical';
+    const referenceChanged = activating
+      || next.preExtractReferenceEnabled !== previous.preExtractReferenceEnabled
+      || next.preExtractReferenceMode !== previous.preExtractReferenceMode;
+    if (referenceUsesEmbedding && referenceChanged && !this.availability.embedding) {
+      warnings.push({
+        title: '旧记忆参考已自动降级',
+        message: '向量模型当前不可用；提取前参考旧记忆将使用关键词检索，或在无候选时直接继续整理。',
+        code: 'MEMORY_PRE_EXTRACT_REFERENCE_DEGRADED',
+      });
+    }
     return { warnings };
   }
 
@@ -154,8 +170,12 @@ export class MemoryLlmCapabilityMonitor {
     next.generationStatus = generation?.available
       ? success('已连接', resourceDescription(generation))
       : action('不可用', 'error', reasonText[generation?.reason ?? 'status_unavailable'] ?? '无法满足整理任务。');
+    const referenceUsesEmbedding = settings.enabled
+      && settings.preExtractReferenceEnabled === true
+      && settings.preExtractReferenceMode !== 'lexical';
     if (embedding?.available) next.embeddingStatus = success('已连接', resourceDescription(embedding));
-    else if (settings.recallMode === 'lexical') next.embeddingStatus = neutral('未配置', '当前使用关键词召回，不需要向量模型。');
+    else if (settings.recallMode === 'lexical' && !referenceUsesEmbedding) next.embeddingStatus = neutral('未配置', '当前使用关键词召回，不需要向量模型。');
+    else if (settings.recallMode === 'lexical' && referenceUsesEmbedding) next.embeddingStatus = action('旧记忆参考降级为关键词', 'warning', `${reasonText[embedding?.reason ?? 'status_unavailable'] ?? '向量模型不可用'} 提取前参考旧记忆将使用关键词检索。`);
     else if (settings.recallMode === 'auto') next.embeddingStatus = action('降级为关键词', 'warning', `${reasonText[embedding?.reason ?? 'status_unavailable'] ?? '向量模型不可用'} 自动召回将使用关键词召回；如需向量召回，请先在 LLM 中配置。`);
     else next.embeddingStatus = action('不可用', 'error', `${reasonText[embedding?.reason ?? 'status_unavailable'] ?? '当前召回模式需要向量模型。'} 请先在 LLM 中配置。`);
     next.rerankStatus = rerank?.available

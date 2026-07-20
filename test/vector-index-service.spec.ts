@@ -94,6 +94,31 @@ describe('事实向量索引服务', () => {
     expect(status.lastError).toContain('维度不一致');
   });
 
+  it('服务端返回备用 embedding 路由时，后续批次使用实际路由而不重复回填', async () => {
+    const repository = new FakeVectorRepository(2);
+    const embed = vi.fn(async ({ texts }: { texts: string[] }) => {
+      if (embed.mock.calls.length > 1) return { ok: false as const, error: '不应重复回填同一批事实' };
+      return {
+        ok: true as const,
+        vectors: texts.map(() => [1, 0]),
+        model: 'fallback-embedding-model',
+        meta: { resourceId: 'fallback-resource', model: 'fallback-embedding-model' },
+      };
+    });
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    service.start();
+
+    await service.rebuild('chat-a');
+    const status = await service.getStatus('chat-a');
+
+    expect(embed).toHaveBeenCalledTimes(1);
+    expect(repository.upsertFactVector).toHaveBeenCalledTimes(2);
+    expect(repository.upsertFactVector).toHaveBeenCalledWith(expect.objectContaining({
+      resourceId: 'fallback-resource', model: 'fallback-embedding-model',
+    }));
+    expect(status.coverage).toMatchObject({ ready: 2, missing: 0, stale: 0 });
+  });
+
   it('64 项 LRU 查询缓存会复用十分钟内的查询向量', async () => {
     const repository = new FakeVectorRepository(1);
     repository.vectors.push({

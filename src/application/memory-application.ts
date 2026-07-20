@@ -1,9 +1,12 @@
 import { MemoryRepository } from '../infrastructure';
+import { deriveMemoryGraphProjection } from '../domain';
 import type {
   FactListOptions,
   MainChatUsage,
   ManualFactInput,
   MemoryFact,
+  MemoryGraphPreview,
+  MemoryGraphStatus,
   MemoryJob,
   MemoryRecallLog,
 } from '../domain';
@@ -15,6 +18,7 @@ import {
   type RecallQuery,
   type RecallResult,
 } from './recall';
+import { MemoryGraphRecallIndex, MemoryGraphService } from './graph';
 import {
   LlmMemoryExtractor,
   readMemoryLlmApi,
@@ -22,6 +26,7 @@ import {
   readMemoryRecallRouteDiagnostics,
 } from './ingest/llm-extractor';
 import { MemoryIngestService } from './ingest/memory-ingest-service';
+import { ExistingMemoryContextRetriever } from './ingest/existing-memory-context';
 import {
   applyInitializationConflictResolutions,
   reduceInitializationBatches,
@@ -70,6 +75,14 @@ const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   answerMode: 'auto',
   recallMode: 'auto',
   rerankMode: 'adaptive',
+  preExtractReferenceEnabled: true,
+  preExtractReferenceItems: 8,
+  preExtractReferenceMode: 'auto',
+  preExtractReferenceMaxChars: 2_400,
+  graphEnabled: true,
+  graphLlmRelationEnabled: true,
+  graphMaxHops: 1,
+  graphMaxEdges: 12,
 });
 
 function createId(prefix: string): string {
@@ -104,6 +117,32 @@ function clampPromptMaxChars(value: number): number {
   return Math.min(16_000, Math.max(2_000, Math.trunc(value || DEFAULT_SETTINGS.promptMaxChars)));
 }
 
+function clampPreExtractReferenceItems(value: number): number {
+  const candidate = Number.isFinite(value) ? value : DEFAULT_SETTINGS.preExtractReferenceItems;
+  return Math.min(10, Math.max(1, Math.trunc(candidate)));
+}
+
+function clampPreExtractReferenceMaxChars(value: number): number {
+  const candidate = Number.isFinite(value) ? value : DEFAULT_SETTINGS.preExtractReferenceMaxChars;
+  return Math.min(4_000, Math.max(500, Math.round(candidate / 100) * 100));
+}
+
+function clampGraphMaxHops(value: number): 1 | 2 {
+  return value === 2 ? 2 : 1;
+}
+
+function clampGraphMaxEdges(value: number): number {
+  const candidate = Number.isFinite(value) ? value : DEFAULT_SETTINGS.graphMaxEdges;
+  return Math.min(24, Math.max(4, Math.trunc(candidate)));
+}
+
+function usesVectorIndex(settings: MemoryGlobalSettings): boolean {
+  return settings.recallMode !== 'lexical'
+    || (settings.enabled
+      && settings.preExtractReferenceEnabled
+      && settings.preExtractReferenceMode !== 'lexical');
+}
+
 function summaryStrategyFromSettings(settings: MemoryGlobalSettings) {
   return normalizeSummaryStrategy({
     batchMode: settings.summaryBatchMode,
@@ -134,6 +173,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   readonly facts: MemoryPluginApi['facts'];
   readonly capture: MemoryPluginApi['capture'];
   readonly recall: MemoryPluginApi['recall'];
+  readonly graph: MemoryPluginApi['graph'];
   readonly backup: MemoryPluginApi['backup'];
   readonly diagnostics: MemoryPluginApi['diagnostics'];
 
@@ -141,6 +181,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   private chatOverrides: Record<string, boolean> = {};
   private readonly recallIndex = new MemoryRecallIndex();
   private readonly vectorIndex: MemoryVectorIndexService;
+  private readonly graphService: MemoryGraphService;
   private readonly semanticRecall: SemanticRecallService;
   private summaryProgressByChat: Record<string, SummaryProgress> = {};
   private readonly summaryWaitingByChat = new Map<string, number>();
@@ -166,7 +207,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   constructor(readonly repository: MemoryRepository) {
     this.vectorIndex = new MemoryVectorIndexService(repository);
-    this.semanticRecall = new SemanticRecallService(this.recallIndex, this.vectorIndex);
+    this.graphService = new MemoryGraphService(repository);
+    this.graphService.onStatusChanged((status) => {
+      if (!this.stopped && status.chatKey === this.getChatKey()) this.emitSettingsChanged();
+    });
+    this.semanticRecall = new SemanticRecallService(this.recallIndex, this.vectorIndex, this.graphService);
     this.facts = {
       list: (options) => this.repository.listFacts(this.requireChatKey(), options),
       search: (query, options) => this.repository.searchFacts(this.requireChatKey(), query, options?.limit),
@@ -174,15 +219,26 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         const fact = await this.repository.upsertManualFact(this.requireChatKey(), input);
         this.recallIndex.upsert(fact);
         this.vectorIndex.scheduleSync(fact.chatKey);
+        this.scheduleGraph(fact.chatKey);
         return fact;
       },
       remove: async (id) => {
         await this.repository.removeFact(this.requireChatKey(), id);
         this.recallIndex.remove(id);
+        this.scheduleGraph(this.requireChatKey());
       },
     };
     this.capture = { flush: () => this.flushCapture('incremental') };
     this.recall = { preview: (input) => this.previewRecall(input) };
+    this.graph = {
+      preview: async (input) => {
+        const currentChatKey = this.getChatKey();
+        if (!currentChatKey || input.chatKey !== currentChatKey) return { nodes: [], edges: [] };
+        return this.graphService.preview(input.chatKey, input.query, input.limit, this.getEffectiveSettings().graphEnabled);
+      },
+      getStatus: () => this.getGraphStatus(),
+      rebuild: () => this.rebuildGraph(),
+    };
     this.backup = {
       export: () => this.exportSqliteBackup(),
       import: (file) => this.importSqliteBackup(file),
@@ -327,7 +383,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const effective = this.getEffectiveSettings();
     if (!effective.enabled) this.status = 'disabled';
     else if (this.status === 'disabled' || this.status === 'unselected') this.status = 'ready';
-    if (effective.enabled && chatKey && effective.recallMode !== 'lexical') this.vectorIndex.scheduleSync(chatKey);
+    if (effective.enabled && chatKey && usesVectorIndex(effective)) this.vectorIndex.scheduleSync(chatKey);
+    if (effective.enabled && chatKey) this.scheduleGraph(chatKey);
     this.lastRecall = null;
     this.lastRecallLogId = null;
     if (chatKey) {
@@ -363,6 +420,16 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         ? settings.recallMode
         : 'auto',
       rerankMode: settings.rerankMode === 'off' || settings.rerankMode === 'always' ? settings.rerankMode : 'adaptive',
+      preExtractReferenceEnabled: settings.preExtractReferenceEnabled === true,
+      preExtractReferenceItems: clampPreExtractReferenceItems(settings.preExtractReferenceItems),
+      preExtractReferenceMode: settings.preExtractReferenceMode === 'lexical' || settings.preExtractReferenceMode === 'vector' || settings.preExtractReferenceMode === 'hybrid'
+        ? settings.preExtractReferenceMode
+        : 'auto',
+      preExtractReferenceMaxChars: clampPreExtractReferenceMaxChars(settings.preExtractReferenceMaxChars),
+      graphEnabled: settings.graphEnabled === true,
+      graphLlmRelationEnabled: settings.graphLlmRelationEnabled === true,
+      graphMaxHops: clampGraphMaxHops(settings.graphMaxHops),
+      graphMaxEdges: clampGraphMaxEdges(settings.graphMaxEdges),
     };
     const scopeKey = this.getCurrentScopeKey();
     const nextOverrides = { ...this.chatOverrides };
@@ -378,7 +445,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const effective = this.getEffectiveSettings();
     if (!effective.enabled) this.status = 'disabled';
     else if (this.status === 'disabled') this.status = 'ready';
-    if (effective.enabled && effective.recallMode !== 'lexical') this.vectorIndex.scheduleSync(this.getChatKey());
+    if (effective.enabled && usesVectorIndex(effective)) this.vectorIndex.scheduleSync(this.getChatKey());
+    if (effective.enabled) this.scheduleGraph(this.getChatKey());
   }
 
   async resetSettings(): Promise<void> {
@@ -390,7 +458,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.emitSettingsChanged();
     const effective = this.getEffectiveSettings();
     this.status = effective.enabled ? 'ready' : 'disabled';
-    if (effective.enabled && effective.recallMode !== 'lexical') this.vectorIndex.scheduleSync(this.getChatKey());
+    if (effective.enabled && usesVectorIndex(effective)) this.vectorIndex.scheduleSync(this.getChatKey());
+    if (effective.enabled) this.scheduleGraph(this.getChatKey());
   }
 
   async getRecallStatus(): Promise<import('../ui/memory-ui').MemoryRecallStatus> {
@@ -416,6 +485,24 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   async rebuildVectorIndex(): Promise<void> {
     await this.vectorIndex.rebuild(this.requireChatKey());
+  }
+
+  getGraphStatus(): MemoryGraphStatus {
+    const chatKey = this.getChatKey();
+    return this.graphService.getStatus(chatKey, Boolean(chatKey) && this.getEffectiveSettings().enabled && this.getEffectiveSettings().graphEnabled);
+  }
+
+  async getRelationshipGraph(query = '', limit?: number): Promise<MemoryGraphPreview> {
+    const chatKey = this.requireChatKey();
+    return this.graphService.preview(chatKey, query, limit, this.getEffectiveSettings().enabled && this.getEffectiveSettings().graphEnabled);
+  }
+
+  async rebuildGraph(): Promise<void> {
+    const chatKey = this.requireChatKey();
+    const enabled = this.getEffectiveSettings().enabled && this.getEffectiveSettings().graphEnabled;
+    if (!enabled) return;
+    await this.graphService.rebuild(chatKey, true);
+    this.emitSettingsChanged();
   }
 
   async initialize(selectedKinds?: string[]): Promise<void> {
@@ -639,7 +726,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   /** LLMHub 延迟挂载时重试任务注册，并继续未完成的向量回填。 */
   refreshLlmRegistration(): void {
     const settings = this.getEffectiveSettings();
-    if (this.sqliteAvailable && settings.enabled && settings.recallMode !== 'lexical') {
+    if (this.sqliteAvailable && settings.enabled && usesVectorIndex(settings)) {
       this.vectorIndex.scheduleSync(this.getChatKey());
     }
   }
@@ -694,6 +781,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const fact = await this.repository.upsertManualFact(chatKey, input);
     this.recallIndex.upsert(fact);
     this.vectorIndex.scheduleSync(chatKey);
+    this.scheduleGraph(chatKey);
   }
 
   async removeFact(id: string): Promise<void> {
@@ -809,6 +897,16 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     await this.loadSettings();
     this.settingsListeners.forEach(listener => listener(this.getSettings()));
     await this.bindCurrentChat();
+    // Import can restore several chats from the current character/group
+    // Workspace. Reconcile each independently so old archives without graph
+    // records backfill in the background; a later chat bind handles other
+    // Workspaces in the same archive.
+    if (this.settings.enabled && this.settings.graphEnabled) {
+      void Promise.resolve()
+        .then(() => this.repository.getChatKeys())
+        .then((chatKeys) => chatKeys.forEach((chatKey) => this.graphService.schedule(chatKey, true)))
+        .catch(() => undefined);
+    }
   }
 
   async checkSqliteIntegrity(): Promise<{ ok: boolean; message: string }> {
@@ -835,6 +933,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.captureStartedAt = 0;
     this.cancelRequested = false;
     this.clearRuntimeError();
+    this.scheduleGraph(chatKey);
   }
 
   async clearAllMemoryData(): Promise<void> {
@@ -857,7 +956,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   private async loadSettings(): Promise<void> {
-    const [enabled, autoOrganize, summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode, chatOverrides, summaryProgressByChat] = await Promise.all([
+    const [enabled, autoOrganize, summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode, preExtractReferenceEnabled, preExtractReferenceItems, preExtractReferenceMode, preExtractReferenceMaxChars, graphEnabled, graphLlmRelationEnabled, graphMaxHops, graphMaxEdges, chatOverrides, summaryProgressByChat] = await Promise.all([
       this.repository.getSetting<boolean>('enabled'),
       this.repository.getSetting<boolean>('autoOrganize'),
       this.repository.getSetting<MemoryGlobalSettings['summaryBatchMode']>('summaryBatchMode'),
@@ -870,6 +969,14 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.repository.getSetting<MemoryUiSettings['answerMode']>('answerMode'),
       this.repository.getSetting<MemoryUiSettings['recallMode']>('recallMode'),
       this.repository.getSetting<MemoryUiSettings['rerankMode']>('rerankMode'),
+      this.repository.getSetting<boolean>('preExtractReferenceEnabled'),
+      this.repository.getSetting<number>('preExtractReferenceItems'),
+      this.repository.getSetting<MemoryUiSettings['preExtractReferenceMode']>('preExtractReferenceMode'),
+      this.repository.getSetting<number>('preExtractReferenceMaxChars'),
+      this.repository.getSetting<boolean>('graphEnabled'),
+      this.repository.getSetting<boolean>('graphLlmRelationEnabled'),
+      this.repository.getSetting<number>('graphMaxHops'),
+      this.repository.getSetting<number>('graphMaxEdges'),
       this.repository.getSetting<Record<string, boolean>>('chatOverrides'),
       this.repository.getSetting<Record<string, SummaryProgress>>('summaryProgressByChat'),
     ]);
@@ -886,6 +993,16 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       answerMode: answerMode === 'diagnostic' || answerMode === 'roleplay' ? answerMode : 'auto',
       recallMode: recallMode === 'lexical' || recallMode === 'vector' || recallMode === 'hybrid' ? recallMode : 'auto',
       rerankMode: rerankMode === 'off' || rerankMode === 'always' ? rerankMode : 'adaptive',
+      preExtractReferenceEnabled: preExtractReferenceEnabled ?? DEFAULT_SETTINGS.preExtractReferenceEnabled,
+      preExtractReferenceItems: clampPreExtractReferenceItems(preExtractReferenceItems ?? DEFAULT_SETTINGS.preExtractReferenceItems),
+      preExtractReferenceMode: preExtractReferenceMode === 'lexical' || preExtractReferenceMode === 'vector' || preExtractReferenceMode === 'hybrid'
+        ? preExtractReferenceMode
+        : 'auto',
+      preExtractReferenceMaxChars: clampPreExtractReferenceMaxChars(preExtractReferenceMaxChars ?? DEFAULT_SETTINGS.preExtractReferenceMaxChars),
+      graphEnabled: graphEnabled ?? DEFAULT_SETTINGS.graphEnabled,
+      graphLlmRelationEnabled: graphLlmRelationEnabled ?? DEFAULT_SETTINGS.graphLlmRelationEnabled,
+      graphMaxHops: clampGraphMaxHops(graphMaxHops ?? DEFAULT_SETTINGS.graphMaxHops),
+      graphMaxEdges: clampGraphMaxEdges(graphMaxEdges ?? DEFAULT_SETTINGS.graphMaxEdges),
     };
     this.chatOverrides = chatOverrides && typeof chatOverrides === 'object' && !Array.isArray(chatOverrides)
       ? Object.fromEntries(Object.entries(chatOverrides).filter((entry): entry is [string, boolean] => typeof entry[1] === 'boolean'))
@@ -914,7 +1031,12 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       worldKeys: input.worldKeys ?? recallContext?.worldKeys ?? [],
     };
     const recallVersion = this.captureVersion;
-    const result = await this.semanticRecall.recall(query, settings.recallMode, settings.rerankMode);
+    const result = await this.semanticRecall.recall(
+      query,
+      settings.recallMode,
+      settings.rerankMode,
+      settings.graphEnabled ? { maxHops: settings.graphMaxHops, maxEdges: settings.graphMaxEdges } : undefined,
+    );
     if (this.stopped || recallVersion !== this.captureVersion || this.getChatKey() !== chatKey) {
       throw new Error('召回结果已因聊天切换而丢弃。');
     }
@@ -934,8 +1056,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         ...(candidate.omittedReason === undefined ? {} : { omittedReason: candidate.omittedReason }),
         ...(candidate.lexicalScore === undefined ? {} : { lexicalScore: candidate.lexicalScore }),
         ...(candidate.vectorScore === undefined ? {} : { vectorScore: candidate.vectorScore }),
+        ...(candidate.graphScore === undefined ? {} : { graphScore: candidate.graphScore }),
         ...(candidate.lexicalRank === undefined ? {} : { lexicalRank: candidate.lexicalRank }),
         ...(candidate.vectorRank === undefined ? {} : { vectorRank: candidate.vectorRank }),
+        ...(candidate.graphRank === undefined ? {} : { graphRank: candidate.graphRank }),
         ...(candidate.fusionScore === undefined ? {} : { fusionScore: candidate.fusionScore }),
         ...(candidate.rerankScore === undefined ? {} : { rerankScore: candidate.rerankScore }),
       })),
@@ -961,9 +1085,24 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     resumeJob?: MemoryJob,
     selectedSourceGroups?: string[],
   ): Promise<void> {
-    if (!this.getEffectiveSettings().enabled) return;
+    const captureSettings = this.getEffectiveSettings();
+    if (!captureSettings.enabled) return;
     const chatKey = this.requireChatKey();
     const captureVersion = this.captureVersion;
+    const [baselineFacts, referenceScope] = captureSettings.preExtractReferenceEnabled
+      ? await Promise.all([
+        this.repository.listFacts(chatKey),
+        this.hostContext?.getRecallContext?.() ?? Promise.resolve(undefined),
+      ])
+      : [[], undefined] as const;
+    this.assertCaptureCurrent(captureVersion, chatKey);
+    const referenceRetriever = captureSettings.preExtractReferenceEnabled
+      ? new ExistingMemoryContextRetriever(
+        baselineFacts,
+        this.vectorIndex,
+        captureSettings.graphEnabled ? new MemoryGraphRecallIndex(deriveMemoryGraphProjection(baselineFacts)) : undefined,
+      )
+      : null;
     const effectiveSelectedSourceGroups = resumeJob?.checkpoint.selectedSourceGroupIds ?? selectedSourceGroups;
     const allSources = selectSourceGroups(
       filterSourceBlocks(await this.collectSources(chatKey)),
@@ -1035,10 +1174,27 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     });
     const service = new MemoryIngestService({
       extractor: new LlmMemoryExtractor(),
+      loadExistingMemoryContext: async ({ sources: batchSources }) => {
+        if (!referenceRetriever) return [];
+        const context = await referenceRetriever.load({
+          chatKey,
+          sources: batchSources,
+          maxItems: captureSettings.preExtractReferenceItems,
+          maxChars: captureSettings.preExtractReferenceMaxChars,
+          mode: captureSettings.preExtractReferenceMode,
+          characterKeys: referenceScope?.characterKeys ?? [],
+          worldKeys: referenceScope?.worldKeys ?? [],
+          graphMaxHops: captureSettings.graphMaxHops,
+          graphMaxEdges: captureSettings.graphMaxEdges,
+        });
+        this.assertCaptureCurrent(captureVersion, chatKey);
+        return context;
+      },
       commit: (commit) => {
         this.assertCaptureCurrent(captureVersion, chatKey);
         return this.repository.commit(commit);
       },
+      graphLlmRelationEnabled: captureSettings.graphEnabled && captureSettings.graphLlmRelationEnabled,
     });
     let processedCount = resumeJob?.checkpoint.processedCount ?? 0;
     let checkpoint: MemoryJob['checkpoint'] = {
@@ -1253,6 +1409,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   private emitSettingsChanged(): void {
     this.settingsListeners.forEach((listener) => listener(this.getSettings()));
+  }
+
+  private scheduleGraph(chatKey: string): void {
+    if (!chatKey) return;
+    const effective = this.getEffectiveSettings();
+    this.graphService.schedule(chatKey, effective.enabled && effective.graphEnabled);
+    this.emitSettingsChanged();
   }
 
   private async resumePausedWork(): Promise<void> {

@@ -43,7 +43,7 @@ export const MEMORY_PLUGIN_DESCRIPTOR: PluginDescriptor<MemoryHostCapability> = 
 export function registerMemoryContributions(
   session: PluginSession<MemoryHostCapability>,
   controller: MemoryContributionController,
-  renderWorkbench: (container: HTMLElement, popupUi?: PopupUiContext) => void | (() => void),
+  renderWorkbench: (container: HTMLElement, actionId: string | undefined, popupUi?: PopupUiContext) => void | (() => void),
   statusSource: MemorySettingsStatusSource,
 ): { dispose(): void; publishUpdated: ReturnType<typeof registerMemoryServices>['publishUpdated'] } {
   const services = registerMemoryServices(session, controller);
@@ -56,7 +56,13 @@ export function registerMemoryContributions(
       ariaLabel: 'SS-Helper 记忆工作台',
       closeLabel: '关闭记忆工作台',
       presentation: 'workspace',
-      render: (container, _input, popupUi) => renderWorkbench(container, popupUi),
+      render: (container, input, popupUi) => {
+        const actionId = input && typeof input === 'object' && !Array.isArray(input)
+          && typeof (input as { actionId?: unknown }).actionId === 'string'
+          ? (input as { actionId: string }).actionId
+          : undefined;
+        return renderWorkbench(container, actionId, popupUi);
+      },
     }),
   ];
   return {

@@ -1,6 +1,14 @@
 import { filterSourceBlocks } from './source-blocks';
 import type { AutomaticIngestRejection, AutomaticProposalErrorCode } from '../../domain';
-import type { IngestCommit, IngestCommitter, MemoryExtractor, PreparedMemoryIngest, SourceBlock, ValidatedFactProposal } from './types';
+import type {
+  ExistingMemoryContextItem,
+  IngestCommit,
+  IngestCommitter,
+  MemoryExtractor,
+  PreparedMemoryIngest,
+  SourceBlock,
+  ValidatedFactProposal,
+} from './types';
 
 export interface MemoryIngestInput {
   chatKey: string;
@@ -24,6 +32,11 @@ export interface MemoryIngestResult {
   rejections: AutomaticIngestRejection[];
   skipped: boolean;
 }
+
+export type ExistingMemoryContextLoader = (input: {
+  chatKey: string;
+  sources: readonly SourceBlock[];
+}) => Promise<readonly ExistingMemoryContextItem[]>;
 
 function normalizeKey(value: string): string {
   return value.trim().toLocaleLowerCase().replace(/\s+/g, ' ');
@@ -109,15 +122,28 @@ function validateProposal(
 
 /** 冷启动、历史整理与增量总结共用的唯一写入服务。 */
 export class MemoryIngestService {
-  constructor(private readonly dependencies: { extractor: MemoryExtractor; commit: IngestCommitter['commit'] }) {}
+  constructor(private readonly dependencies: {
+    extractor: MemoryExtractor;
+    commit: IngestCommitter['commit'];
+    loadExistingMemoryContext?: ExistingMemoryContextLoader;
+    graphLlmRelationEnabled?: boolean;
+  }) {}
 
   async prepare(input: Pick<MemoryIngestInput, 'chatKey' | 'sources'>): Promise<PreparedMemoryIngest> {
     const sources = filterSourceBlocks(input.sources);
     if (sources.length === 0) return { sources: [], facts: [], rejections: [], skipped: true };
 
     const modelSources = sources.filter(source => source.kind !== 'state');
+    const existingMemoryContext = modelSources.length > 0 && this.dependencies.loadExistingMemoryContext
+      ? await this.dependencies.loadExistingMemoryContext({ chatKey: input.chatKey, sources: modelSources })
+      : [];
     const extraction = modelSources.length > 0
-      ? await this.dependencies.extractor.extract({ chatKey: input.chatKey, sources: modelSources })
+      ? await this.dependencies.extractor.extract({
+        chatKey: input.chatKey,
+        sources: modelSources,
+        existingMemoryContext,
+        ...(this.dependencies.graphLlmRelationEnabled === true ? { graphLlmRelationEnabled: true } : {}),
+      })
       : [];
     const raw = [
       ...(Array.isArray(extraction) ? extraction : extraction.facts).slice(0, 12),

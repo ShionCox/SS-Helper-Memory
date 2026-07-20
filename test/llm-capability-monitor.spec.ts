@@ -44,6 +44,21 @@ describe('Memory settings capability policy', () => {
     monitor.dispose();
   });
 
+  it('warns when only extraction-time old-memory reference must fall back to keywords', async () => {
+    const monitor = unavailableMonitor();
+    await expect(monitor.assess({
+      enabled: true,
+      autoOrganize: false,
+      recallMode: 'lexical',
+      rerankMode: 'off',
+      preExtractReferenceEnabled: true,
+      preExtractReferenceMode: 'auto',
+    }, disabled)).resolves.toMatchObject({
+      warnings: [{ code: 'MEMORY_PRE_EXTRACT_REFERENCE_DEGRADED', message: expect.stringContaining('关键词') }],
+    });
+    monitor.dispose();
+  });
+
   it('publishes live capability changes, hides internal resource IDs, and stops after disposal', async () => {
     let revision = 1;
     let model = 'embed-a';

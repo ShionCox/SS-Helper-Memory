@@ -34,11 +34,17 @@ import {
   MemoryFactVector,
   MemoryFactVectorCoverage,
   MemoryFactVectorTarget,
+  MemoryGraphEdge,
+  MemoryGraphNode,
+  MemoryGraphProjection,
   MemoryJob,
   MemoryJobBatchAudit,
   MemoryRecallLog,
   MemorySettingRecord,
   UpsertMemoryFactVectorInput,
+  deriveMemoryGraphProjection,
+  graphNodeId,
+  isGraphBackedFact,
 } from '../domain';
 import { float32ArrayToArrayBuffer, sha256Content } from './vector/vector-utils';
 
@@ -55,6 +61,8 @@ const COLLECTIONS = Object.freeze({
   'job-audits': ['chatKey', 'jobId', 'batchIndex', 'completedAt'],
   usage: ['chatKey', 'capturedAt'],
   'recall-logs': ['chatKey', 'createdAt'],
+  'graph-nodes': ['chatKey', 'entityKey', 'updatedAt'],
+  'graph-edges': ['chatKey', 'fromNodeId', 'toNodeId', 'backingFactId', 'predicateKey', 'updatedAt'],
 } as const);
 
 export interface MemoryWorkspaceHealth {
@@ -464,6 +472,93 @@ export class MemoryRepository implements IngestCommitter {
 
   list(chatKey: string, options: FactListOptions = {}): Promise<MemoryFact[]> {
     return this.listFacts(chatKey, options);
+  }
+
+  /**
+   * Graph records are a derived cache, but every read remains chat-scoped at
+   * the repository boundary.  Callers never receive another chat's nodes or
+   * edges even when they share the same character Workspace collection.
+   */
+  async listGraphNodes(chatKey: string): Promise<MemoryGraphNode[]> {
+    chatKey = this.requireChatKey(chatKey);
+    return (await this.listAllRows<MemoryGraphNode>('graph-nodes', { chatKey }))
+      .filter((node) => node.chatKey === chatKey && typeof node.id === 'string' && typeof node.entityKey === 'string')
+      .map((node) => structuredClone(node));
+  }
+
+  async listGraphEdges(chatKey: string): Promise<MemoryGraphEdge[]> {
+    chatKey = this.requireChatKey(chatKey);
+    return (await this.listAllRows<MemoryGraphEdge>('graph-edges', { chatKey }))
+      .filter((edge) => edge.chatKey === chatKey && typeof edge.id === 'string' && typeof edge.backingFactId === 'string')
+      .map((edge) => structuredClone(edge));
+  }
+
+  async getGraphProjection(chatKey: string): Promise<MemoryGraphProjection> {
+    const [nodes, edges] = await Promise.all([this.listGraphNodes(chatKey), this.listGraphEdges(chatKey)]);
+    return {
+      nodes: Object.freeze(nodes.sort((left, right) => left.id.localeCompare(right.id))),
+      edges: Object.freeze(edges.sort((left, right) => left.id.localeCompare(right.id))),
+    };
+  }
+
+  /**
+   * Reconcile only deterministic graph records.  Facts are intentionally read
+   * and committed elsewhere; this independent repair is safe to repeat after
+   * any fact transaction, rollback, or archive import.
+   */
+  async reconcileGraphProjection(
+    chatKey: string,
+    projection: MemoryGraphProjection,
+    retryAttempt = 0,
+  ): Promise<void> {
+    chatKey = this.requireChatKey(chatKey);
+    const workspaceId = this.requireWorkspaceId();
+    try {
+      const [currentNodes, currentEdges] = await Promise.all([
+        this.listAllRecordRows('graph-nodes', { chatKey }),
+        this.listAllRecordRows('graph-edges', { chatKey }),
+      ]);
+      const nodeById = new Map(currentNodes.map((record) => [record.recordId, record]));
+      const edgeById = new Map(currentEdges.map((record) => [record.recordId, record]));
+      const desiredNodes = projection.nodes.filter((node) => node.chatKey === chatKey);
+      const desiredEdges = projection.edges.filter((edge) => edge.chatKey === chatKey);
+      const upserts: WorkspaceTransactionOperation[] = [];
+      for (const node of desiredNodes) {
+        const current = nodeById.get(node.id);
+        if (current && samePlainData(current.value, node)) continue;
+        upserts.push({
+          action: 'upsert', collection: 'graph-nodes', recordId: node.id,
+          value: asPlain(node), expectedVersion: current?.version ?? 0,
+        });
+      }
+      for (const edge of desiredEdges) {
+        const current = edgeById.get(edge.id);
+        if (current && samePlainData(current.value, edge)) continue;
+        upserts.push({
+          action: 'upsert', collection: 'graph-edges', recordId: edge.id,
+          value: asPlain(edge), expectedVersion: current?.version ?? 0,
+        });
+      }
+      const desiredNodeIds = new Set(desiredNodes.map((node) => node.id));
+      const desiredEdgeIds = new Set(desiredEdges.map((edge) => edge.id));
+      const deletes: WorkspaceTransactionOperation[] = [
+        ...currentEdges
+          .filter((record) => !desiredEdgeIds.has(record.recordId))
+          .map((record) => ({ action: 'delete' as const, collection: 'graph-edges', recordId: record.recordId, expectedVersion: record.version })),
+        ...currentNodes
+          .filter((record) => !desiredNodeIds.has(record.recordId))
+          .map((record) => ({ action: 'delete' as const, collection: 'graph-nodes', recordId: record.recordId, expectedVersion: record.version })),
+      ];
+      // Write nodes/edges before deleting stale records. A partial retry can
+      // therefore only leave redundant cache records, never dangling desired
+      // edges; the next deterministic pass removes the redundant entries.
+      await this.transactInBatches(workspaceId, [...upserts, ...deletes]);
+    } catch (error) {
+      if (workspaceErrorCode(error) === 'WORKSPACE_CONFLICT' && retryAttempt < 1) {
+        return this.reconcileGraphProjection(chatKey, projection, retryAttempt + 1);
+      }
+      throw error;
+    }
   }
 
   async searchFacts(chatKey: string, query: string, limit = DEFAULT_SEARCH_LIMIT): Promise<MemoryFact[]> {
@@ -1283,14 +1378,16 @@ export class MemoryRepository implements IngestCommitter {
   async clearCurrentChatData(chatKey: string): Promise<void> {
     chatKey = this.requireChatKey(chatKey);
     const workspaceId = this.requireWorkspaceId();
-    const [evidenceRecords, jobRecords, auditRecords, usageRecords, logRecords, factRecords, slotRecords] = await Promise.all([
+    const [evidenceRecords, jobRecords, auditRecords, usageRecords, logRecords, factRecords, slotRecords, graphNodeRecords, graphEdgeRecords] = await Promise.all([
       this.listAllRecordRows('evidence', { chatKey }), this.listAllRecordRows('jobs', { chatKey }), this.listAllRecordRows('job-audits', { chatKey }),
       this.listAllRecordRows('usage', { chatKey }), this.listAllRecordRows('recall-logs', { chatKey }), this.listAllRecordRows('facts', { chatKey }),
       this.listAllRecordRows('fact-slots', { chatKey }),
+      this.listAllRecordRows('graph-nodes', { chatKey }), this.listAllRecordRows('graph-edges', { chatKey }),
     ]);
     const collections = [
       ['evidence', evidenceRecords], ['jobs', jobRecords], ['job-audits', auditRecords],
       ['usage', usageRecords], ['recall-logs', logRecords], ['facts', factRecords], ['fact-slots', slotRecords],
+      ['graph-edges', graphEdgeRecords], ['graph-nodes', graphNodeRecords],
     ] as const;
     const operations: WorkspaceTransactionOperation[] = collections.flatMap(([collection, records]) => records.map((record) => ({
       action: 'delete' as const, collection, recordId: record.recordId, expectedVersion: record.version,
@@ -1301,7 +1398,7 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async getChatKeys(): Promise<string[]> {
-    const values = await Promise.all(['facts', 'evidence', 'jobs', 'job-audits', 'usage', 'recall-logs'].map((collection) => this.listAllRecordRows(collection)));
+    const values = await Promise.all(['facts', 'evidence', 'jobs', 'job-audits', 'usage', 'recall-logs', 'graph-nodes', 'graph-edges'].map((collection) => this.listAllRecordRows(collection)));
     return [...new Set(values.flat().map((record) => (record.value as unknown as { chatKey?: string }).chatKey).filter((value): value is string => Boolean(value)))].sort();
   }
 
@@ -1386,8 +1483,15 @@ export class MemoryRepository implements IngestCommitter {
 
   async checkIntegrity(): Promise<{ ok: boolean; message: string }> {
     const sqlite = await this.workspace.integrity(); if (!sqlite.ok) return { ok: false, message: sqlite.messages.join('；') };
-    const [facts, evidence, slots, vectors] = await Promise.all([this.listAllRecordRows('facts'), this.listAllRows<MemoryEvidence>('evidence'), this.listAllRecordRows('fact-slots'), this.listAllVectors()]);
+    const [facts, evidence, slots, vectors, graphNodes, graphEdges] = await Promise.all([
+      this.listAllRecordRows('facts'), this.listAllRows<MemoryEvidence>('evidence'), this.listAllRecordRows('fact-slots'), this.listAllVectors(),
+      this.listAllRows<MemoryGraphNode>('graph-nodes'), this.listAllRows<MemoryGraphEdge>('graph-edges'),
+    ]);
     const factById = new Map(facts.map((item) => [item.recordId, item.value as unknown as MemoryFact]));
+    const expectedGraph = deriveMemoryGraphProjection([...factById.values()]);
+    const expectedNodes = new Map(expectedGraph.nodes.map((node) => [node.id, node]));
+    const expectedEdges = new Map(expectedGraph.edges.map((edge) => [edge.id, edge]));
+    const graphNodeById = new Map(graphNodes.map((node) => [node.id, node]));
     const problems = [
       ...facts.flatMap((item) => {
         const fact = item.value as unknown as MemoryFact;
@@ -1421,6 +1525,24 @@ export class MemoryRepository implements IngestCommitter {
         if (!metadata?.chatKey) return [`向量 ${item.recordId} 缺少聊天标识，已停止参与召回`];
         return metadata.chatKey === fact.chatKey ? [] : [`向量 ${item.recordId} 与事实属于不同聊天，已停止参与召回`];
       }),
+      ...graphNodes.flatMap((node) => {
+        if (!node.chatKey?.trim()) return [`图节点 ${node.id} 缺少聊天标识`];
+        if (node.id !== graphNodeId(node.chatKey, node.entityKey)) return [`图节点 ${node.id} 的确定性 ID 不正确`];
+        const expected = expectedNodes.get(node.id);
+        return expected && samePlainData(node, expected) ? [] : [`图节点 ${node.id} 未由当前有效事实派生`];
+      }),
+      ...graphEdges.flatMap((edge) => {
+        const fact = factById.get(edge.backingFactId);
+        if (!edge.chatKey?.trim()) return [`图边 ${edge.id} 缺少聊天标识`];
+        if (!fact || fact.chatKey !== edge.chatKey || !isGraphBackedFact(fact)) return [`图边 ${edge.id} 缺少有效背书事实 ${edge.backingFactId}`];
+        const from = graphNodeById.get(edge.fromNodeId);
+        const to = graphNodeById.get(edge.toNodeId);
+        if (!from || !to || from.chatKey !== edge.chatKey || to.chatKey !== edge.chatKey) return [`图边 ${edge.id} 指向缺失或跨聊天节点`];
+        const expected = expectedEdges.get(edge.id);
+        return expected && samePlainData(edge, expected) ? [] : [`图边 ${edge.id} 未与 backing fact 保持同步`];
+      }),
+      ...[...expectedNodes.keys()].filter((id) => !graphNodeById.has(id)).map((id) => `图节点 ${id} 尚未回填`),
+      ...[...expectedEdges.keys()].filter((id) => !graphEdges.some((edge) => edge.id === id)).map((id) => `图边 ${id} 尚未回填`),
     ];
     return { ok: problems.length === 0, message: problems.length ? problems.join('；') : 'SQLite 与 Memory workspace 完整性检查通过。' };
   }

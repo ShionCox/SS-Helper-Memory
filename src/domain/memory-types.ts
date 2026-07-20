@@ -274,8 +274,10 @@ export interface RecallCandidateLog {
   omittedReason?: string;
   lexicalScore?: number;
   vectorScore?: number;
+  graphScore?: number;
   lexicalRank?: number;
   vectorRank?: number;
+  graphRank?: number;
   fusionScore?: number;
   rerankScore?: number;
 }
@@ -289,6 +291,11 @@ export interface MemoryRecallDiagnosticsLog {
   resolvedMode?: string;
   lexicalCandidateCount?: number;
   vectorCandidateCount?: number;
+  graphCandidateCount?: number;
+  graphHitCount?: number;
+  graphSeedNodeCount?: number;
+  graphLatencyMs?: number;
+  graphDegradedReason?: string;
   fusedCandidateCount?: number;
   degradedReason?: string;
   embedding?: unknown;

@@ -3,6 +3,8 @@ import type {
   MainChatUsage,
   ManualFactInput,
   MemoryFact,
+  MemoryGraphPreview,
+  MemoryGraphStatus,
   MemoryRecallLog,
 } from './domain';
 import type { RecallQuery, RecallResult } from './application/recall';
@@ -46,6 +48,12 @@ export interface MemoryPluginApi {
   recall: {
     preview(input: Omit<RecallQuery, 'chatKey'> & { query: string }): Promise<RecallResult>;
   };
+  graph: {
+    /** Returns an empty graph when chatKey is not the currently bound chat. */
+    preview(input: { chatKey: string; query: string; limit?: number }): Promise<MemoryGraphPreview>;
+    getStatus(): MemoryGraphStatus;
+    rebuild(): Promise<void>;
+  };
   backup: {
     export(): Promise<Blob>;
     import(file: File): Promise<void>;
@@ -68,5 +76,6 @@ export interface MemoryPluginApi {
 
 export * from './domain';
 export * from './application/recall';
+export * from './application/graph';
 export * from './application/prompt';
 export type { SourceBlock, ExtractedFactProposal } from './application/ingest/types';
