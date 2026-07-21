@@ -41,3 +41,9 @@
 - 严格能力模式无法满足、workspace 事务失败等情况必须阻止保存，让 SDK 回滚控件，并显示一次 error Toast；自动召回或自适应重排发生非显然降级时允许保存并显示 warning Toast。
 - 当前聊天不可用等禁用原因必须同时保留在设置字段的内联说明中；后台能力轮询、启动恢复和聊天切换只刷新状态，不弹 Toast。
 - Toast 文案不得包含聊天正文、Prompt、凭据、数据库记录或其他敏感 payload；`code` 使用稳定且不含用户数据的安全标识。
+
+## 图标
+
+- Memory 只能使用 SDK Core 注册的 `<ss-helper-icon name="...">`，名称不带 `fa-` 前缀并且必须存在于 SDK Solid 图标清单。
+- 禁止加载或复制 Font Awesome CSS/字体、使用全局 `fa-*` class、内联 SVG 或 Emoji 替代现有统一图标；Three.js 图谱几何与着色器不属于 UI 图标。
+- 带可见文本或位于已有 `aria-label` 按钮内的图标必须使用 `decorative`；独立表达状态的图标必须提供 `label`，图标按钮的可访问名称由按钮自身承担。

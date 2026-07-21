@@ -18,6 +18,7 @@ export interface RelationshipGraphViewState {
   visibleEdgeIds: ReadonlySet<string>;
   selectedNodeId: string;
   selectedEdgeId: string;
+  selectedEventEdgeId: string;
   reduceMotion?: boolean;
 }
 
@@ -29,12 +30,56 @@ export interface RelationshipGraphRendererOptions extends RelationshipGraphViewS
 
 export interface RelationshipGraphRenderer {
   update(state: RelationshipGraphViewState): void;
+  clearSelection(): void;
+  focusEdge(edgeId: string): void;
+  focusNode(nodeId: string): void;
   command(command: RelationshipGraphCommand): void;
   dispose(): void;
 }
 
 const CAMERA_FOV = 60;
-const BLOOM_SETTINGS = Object.freeze({ strength: .66, radius: 1.35, threshold: .2, vignette: .18 });
+const NODE_LABEL_GAP_PX = 8;
+const MAX_GRAPH_PIXEL_RATIO = 1.5;
+const BLOOM_SETTINGS = Object.freeze({ strength: .58, radius: .9, threshold: .23, vignette: .18 });
+
+/** Internal render invalidation used to keep DOM label work off idle frames. */
+export class RelationshipGraphInvalidation {
+  private selectionDirty = true;
+  private labelsDirty = true;
+  private rectsDirty = true;
+
+  invalidateSelection(): void {
+    this.selectionDirty = true;
+    this.labelsDirty = true;
+  }
+
+  invalidateLabels(): void {
+    this.labelsDirty = true;
+  }
+
+  invalidateRects(): void {
+    this.rectsDirty = true;
+    this.labelsDirty = true;
+  }
+
+  takeSelection(): boolean {
+    const dirty = this.selectionDirty;
+    this.selectionDirty = false;
+    return dirty;
+  }
+
+  takeLabels(): boolean {
+    const dirty = this.labelsDirty;
+    this.labelsDirty = false;
+    return dirty;
+  }
+
+  takeRects(): boolean {
+    const dirty = this.rectsDirty;
+    this.rectsDirty = false;
+    return dirty;
+  }
+}
 
 const VIGNETTE_SHADER = {
   uniforms: {
@@ -60,7 +105,7 @@ const VIGNETTE_SHADER = {
 };
 
 function noOpRenderer(): RelationshipGraphRenderer {
-  return { update: () => undefined, command: () => undefined, dispose: () => undefined };
+  return { update: () => undefined, clearSelection: () => undefined, focusEdge: () => undefined, focusNode: () => undefined, command: () => undefined, dispose: () => undefined };
 }
 
 function disposeMaterial(material: THREE.Material | THREE.Material[], disposed: Set<THREE.Material>): void {
@@ -113,12 +158,12 @@ function makeLabel(text: string, className: string): CSS2DObject {
   return new CSS2DObject(element);
 }
 
-function edgeCurvePositions(edge: GraphLayoutEdge): number[] {
+function edgeCurveControlPoints(edge: GraphLayoutEdge): THREE.Vector3[] {
   const source = new THREE.Vector3(edge.source.x, edge.source.y, edge.source.z);
   const target = new THREE.Vector3(edge.target.x, edge.target.y, edge.target.z);
   const direction = target.clone().sub(source);
   const length = direction.length();
-  if (length < .001) return [source.x, source.y, source.z, target.x, target.y, target.z];
+  if (length < .001) return [source, target];
   direction.multiplyScalar(1 / length);
   const referenceAxis = Math.abs(direction.y) < .78 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
   const normal = new THREE.Vector3().crossVectors(direction, referenceAxis).normalize();
@@ -133,7 +178,15 @@ function edgeCurvePositions(edge: GraphLayoutEdge): number[] {
   const midpoint = source.clone().lerp(target, .5)
     .addScaledVector(normal, Math.cos(phase) * bend)
     .addScaledVector(binormal, Math.sin(phase) * bend);
-  return [source.x, source.y, source.z, midpoint.x, midpoint.y, midpoint.z, target.x, target.y, target.z];
+  return [source, midpoint, target];
+}
+
+function edgeCurve(edge: GraphLayoutEdge): THREE.CatmullRomCurve3 {
+  return new THREE.CatmullRomCurve3(edgeCurveControlPoints(edge));
+}
+
+function edgeCurvePositions(edge: GraphLayoutEdge): number[] {
+  return edgeCurve(edge).getPoints(32).flatMap((point) => [point.x, point.y, point.z]);
 }
 
 function makeEdgeGeometry(edge: GraphLayoutEdge): LineGeometry {
@@ -186,9 +239,7 @@ function createNodeMaterial(): THREE.ShaderMaterial {
 }
 
 function createEnergyMesh(edge: GraphLayoutEdge): THREE.Mesh {
-  const source = new THREE.Vector3(edge.source.x, edge.source.y, edge.source.z);
-  const target = new THREE.Vector3(edge.target.x, edge.target.y, edge.target.z);
-  const curve = new THREE.CatmullRomCurve3([source, target]);
+  const curve = edgeCurve(edge);
   const geometry = new THREE.TubeGeometry(curve, 32, Math.max(.06, (.2 + edge.weight * .1) * .2), 6, false);
   const material = new THREE.ShaderMaterial({
     transparent: true,
@@ -227,7 +278,7 @@ function makeUnsupportedState(host: HTMLElement, reason: string): RelationshipGr
   const message = document.createElement('div');
   message.className = 'stx-memory-graph-webgl-unavailable';
   message.setAttribute('role', 'status');
-  message.innerHTML = `<i class="fa-solid fa-cubes-stacked" aria-hidden="true"></i><strong>三维画布暂不可用</strong><span>${reason}</span>`;
+  message.innerHTML = `<ss-helper-icon name="cubes-stacked" decorative></ss-helper-icon><strong>三维画布暂不可用</strong><span>${reason}</span>`;
   host.append(message);
   return noOpRenderer();
 }
@@ -244,7 +295,7 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
   } catch {
     return makeUnsupportedState(host, '当前浏览器没有可用的 WebGL 支持；请使用关系列表查看已验证事实。');
   }
-  webgl.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  webgl.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_GRAPH_PIXEL_RATIO));
   webgl.setSize(Math.max(1, host.clientWidth), Math.max(1, host.clientHeight), false);
   webgl.outputColorSpace = THREE.SRGBColorSpace;
   webgl.toneMapping = THREE.ACESFilmicToneMapping;
@@ -308,7 +359,7 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
   scene.add(stars);
 
   const composer = new EffectComposer(webgl);
-  composer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  composer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_GRAPH_PIXEL_RATIO));
   composer.setSize(Math.max(1, host.clientWidth), Math.max(1, host.clientHeight));
   const renderPass = new RenderPass(scene, camera);
   const bloomPass = new UnrealBloomPass(new THREE.Vector2(Math.max(1, host.clientWidth), Math.max(1, host.clientHeight)), BLOOM_SETTINGS.strength, BLOOM_SETTINGS.radius, BLOOM_SETTINGS.threshold);
@@ -328,8 +379,11 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
   const edgeLines = new Map<string, Line2>();
   const edgeEnergy = new Map<string, THREE.Mesh>();
   const edgeMeta = new Map<string, GraphLayoutEdge>();
-  const clusterMeshes = new Map<string, THREE.Mesh>();
+  const nodeNeighbors = new Map<string, Set<string>>();
+  const clusterMeshes = new Map<string, THREE.LineSegments>();
   const clusterLabels = new Map<string, CSS2DObject>();
+  const toolbar = host.closest('.stx-memory-graph-stage-panel')?.querySelector<HTMLElement>('.stx-memory-graph-toolbar');
+  const invalidation = new RelationshipGraphInvalidation();
   const raycaster = new THREE.Raycaster();
   raycaster.params.Line.threshold = 3.4;
   const pointer = new THREE.Vector2();
@@ -353,6 +407,21 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
   let graphSize = 200;
   let graphOrbitDistance = 200;
   let currentLayoutKey = '';
+  let labelCandidates: GraphLayoutNode[] = [];
+  let cachedHostRect: DOMRect | undefined;
+  let cachedToolbarRect: DOMRect | undefined;
+  let labelsNeedRender = true;
+  const eventEndpointIds = new Set<string>();
+  const eventRelatedNodeIds = new Set<string>();
+  const eventRelatedEdgeIds = new Set<string>();
+  let focusAnimation: {
+    startedAt: number;
+    duration: number;
+    cameraFrom: THREE.Vector3;
+    cameraTo: THREE.Vector3;
+    targetFrom: THREE.Vector3;
+    targetTo: THREE.Vector3;
+  } | undefined;
 
   const stateChange = (): void => initial.onRendererStateChange?.({ autoOrbit, webglAvailable: true });
   const stopAutoOrbit = (): void => {
@@ -360,11 +429,32 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
     autoOrbit = false;
     stateChange();
   };
-  controls.addEventListener('start', stopAutoOrbit);
+  const onControlsChange = (): void => invalidation.invalidateLabels();
+  const onControlsStart = (): void => {
+    focusAnimation = undefined;
+    stopAutoOrbit();
+  };
+  controls.addEventListener('start', onControlsStart);
+  controls.addEventListener('change', onControlsChange);
 
   const layoutKey = (state: RelationshipGraphViewState): string => `${state.graph.edges.map((edge) => edge.id).join(',')}|${[...state.visibleEdgeIds].sort().join(',')}`;
   const edgeConnectedToNode = (edge: GraphLayoutEdge, nodeId: string): boolean => edge.source.id === nodeId || edge.target.id === nodeId;
   const selectedClusterId = (): string => layout.nodes.find((node) => node.id === current.selectedNodeId)?.clusterId ?? '';
+  const refreshEventSelection = (): void => {
+    eventEndpointIds.clear();
+    eventRelatedNodeIds.clear();
+    eventRelatedEdgeIds.clear();
+    const eventEdge = edgeMeta.get(current.selectedEventEdgeId);
+    if (!eventEdge) return;
+    eventEndpointIds.add(eventEdge.source.id);
+    eventEndpointIds.add(eventEdge.target.id);
+    for (const edge of layout.edges) {
+      if (!eventEndpointIds.has(edge.source.id) && !eventEndpointIds.has(edge.target.id)) continue;
+      eventRelatedEdgeIds.add(edge.id);
+      eventRelatedNodeIds.add(edge.source.id);
+      eventRelatedNodeIds.add(edge.target.id);
+    }
+  };
 
   const clearGraphRoot = (): void => {
     for (const label of [...nodeLabels.values(), ...clusterLabels.values()]) {
@@ -377,6 +467,8 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
     edgeLines.clear();
     edgeEnergy.clear();
     edgeMeta.clear();
+    nodeNeighbors.clear();
+    labelCandidates = [];
     clusterMeshes.clear();
     while (graphRoot.children.length) {
       const child = graphRoot.children.pop();
@@ -415,11 +507,74 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
     controls.update();
   };
 
-  const createBoundary = (cluster: GraphCluster): THREE.Mesh => {
+  const focusSelectedEdge = (edgeId = current.selectedEdgeId): void => {
+    const edge = edgeMeta.get(edgeId);
+    if (!edge) return;
+    stopAutoOrbit();
+    const target = new THREE.Vector3(
+      (edge.source.x + edge.target.x) / 2,
+      (edge.source.y + edge.target.y) / 2,
+      (edge.source.z + edge.target.z) / 2,
+    );
+    const edgeSpan = Math.hypot(edge.target.x - edge.source.x, edge.target.y - edge.source.y, edge.target.z - edge.source.z);
+    const distance = THREE.MathUtils.clamp(Math.max(72, edgeSpan * 2.2), 72, Math.max(120, graphOrbitDistance * .72));
+    const direction = camera.position.clone().sub(controls.target);
+    if (direction.lengthSq() < .001) direction.set(1, .72, 1);
+    direction.normalize();
+    const cameraTo = target.clone().addScaledVector(direction, distance);
+    if (reduceMotion) {
+      controls.target.copy(target);
+      camera.position.copy(cameraTo);
+      camera.lookAt(target);
+      controls.update();
+      invalidation.invalidateLabels();
+      return;
+    }
+    focusAnimation = {
+      startedAt: performance.now(),
+      duration: 420,
+      cameraFrom: camera.position.clone(),
+      cameraTo,
+      targetFrom: controls.target.clone(),
+      targetTo: target,
+    };
+  };
+
+  const focusSelectedNode = (nodeId = current.selectedNodeId): void => {
+    const node = layout.nodes.find((item) => item.id === nodeId);
+    if (!node) return;
+    stopAutoOrbit();
+    const target = new THREE.Vector3(node.x, node.y, node.z);
+    const distance = THREE.MathUtils.clamp(Math.max(84, graphOrbitDistance * .42), 84, Math.max(130, graphOrbitDistance * .68));
+    const direction = camera.position.clone().sub(controls.target);
+    if (direction.lengthSq() < .001) direction.set(1, .72, 1);
+    direction.normalize();
+    const cameraTo = target.clone().addScaledVector(direction, distance);
+    if (reduceMotion) {
+      controls.target.copy(target);
+      camera.position.copy(cameraTo);
+      camera.lookAt(target);
+      controls.update();
+      invalidation.invalidateLabels();
+      return;
+    }
+    focusAnimation = {
+      startedAt: performance.now(),
+      duration: 360,
+      cameraFrom: camera.position.clone(),
+      cameraTo,
+      targetFrom: controls.target.clone(),
+      targetTo: target,
+    };
+  };
+
+  const createBoundary = (cluster: GraphCluster): THREE.LineSegments => {
     const [width, height, depth] = cluster.bounds.size;
-    const geometry = new THREE.BoxGeometry(width, height, depth);
-    const material = new THREE.MeshBasicMaterial({ color: cluster.color, transparent: true, opacity: .15, wireframe: true, depthTest: false, depthWrite: false });
-    const mesh = new THREE.Mesh(geometry, material);
+    const box = new THREE.BoxGeometry(width, height, depth);
+    const geometry = new THREE.EdgesGeometry(box);
+    box.dispose();
+    const material = new THREE.LineBasicMaterial({ color: cluster.color, transparent: true, opacity: .15, depthTest: false, depthWrite: false });
+    const mesh = new THREE.LineSegments(geometry, material);
     const [x, y, z] = cluster.bounds.center;
     mesh.position.set(x, y, z);
     mesh.renderOrder = 999;
@@ -441,10 +596,8 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
     edgeEnergy.delete(edgeId);
   };
   const syncEnergyEdges = (): void => {
-    const weights = layout.edges.map((edge) => edge.weight).sort((left, right) => left - right);
-    const threshold = weights[Math.min(weights.length - 1, Math.max(0, Math.floor(weights.length * .9)))];
     const needed = new Set(layout.edges
-      .filter((edge) => (threshold !== undefined && edge.weight >= threshold) || edge.id === current.selectedEdgeId || Boolean(current.selectedNodeId && edgeConnectedToNode(edge, current.selectedNodeId)))
+      .filter((edge) => edge.id === current.selectedEdgeId || eventRelatedEdgeIds.has(edge.id) || Boolean(current.selectedNodeId && edgeConnectedToNode(edge, current.selectedNodeId)))
       .map((edge) => edge.id));
     for (const edgeId of [...edgeEnergy.keys()]) if (!needed.has(edgeId)) removeEnergy(edgeId);
     for (const edge of layout.edges) if (needed.has(edge.id)) makeEnergy(edge);
@@ -478,7 +631,10 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
       scene.add(label);
       clusterLabels.set(cluster.id, label);
     }
+    for (const node of layout.nodes) nodeNeighbors.set(node.id, new Set());
     for (const edge of layout.edges) {
+      nodeNeighbors.get(edge.source.id)?.add(edge.target.id);
+      nodeNeighbors.get(edge.target.id)?.add(edge.source.id);
       const material = new LineMaterial({ color: '#8fa4bb', transparent: true, opacity: .72, depthWrite: false });
       material.resolution.set(Math.max(1, host.clientWidth), Math.max(1, host.clientHeight));
       material.uniforms.linewidth.value = edgeLineWidth(edge);
@@ -501,99 +657,140 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
       graphRoot.add(mesh);
       nodeMeshes.set(node.id, mesh);
       const label = makeLabel(node.label, 'stx-memory-graph-node-label');
-      label.position.set(0, displaySize + 3, 0);
-      mesh.add(label);
+      mesh.getWorldPosition(label.position);
+      scene.add(label);
       nodeLabels.set(node.id, label);
     }
+    refreshEventSelection();
     syncEnergyEdges();
     fitCamera();
+    invalidation.invalidateSelection();
+    invalidation.invalidateRects();
   };
 
-  const updateHighlights = (time: number): void => {
+  const displayScaleFor = (nodeId: string, mesh: THREE.Mesh): number => {
+    const selectedNode = current.selectedNodeId;
+    const selectedEdge = edgeMeta.get(current.selectedEdgeId);
+    const active = nodeId === selectedNode || selectedEdge?.source.id === nodeId || selectedEdge?.target.id === nodeId || eventEndpointIds.has(nodeId);
+    const connected = eventRelatedNodeIds.has(nodeId) || Boolean(selectedNode && nodeNeighbors.get(selectedNode)?.has(nodeId));
+    const focused = active || Boolean(selectedNode && nodeNeighbors.get(selectedNode)?.has(nodeId));
+    return (mesh.userData.baseSize as number) * (focused ? 1.58 : connected ? 1.25 : 1);
+  };
+
+  const updateSelectionStyles = (): void => {
     const selectedNode = current.selectedNodeId;
     const selectedEdge = current.selectedEdgeId;
+    const selectedEvent = current.selectedEventEdgeId;
+    const selectedEdgeMeta = edgeMeta.get(selectedEdge);
+    const selectedEdgeNodeIds = new Set(selectedEdgeMeta ? [selectedEdgeMeta.source.id, selectedEdgeMeta.target.id] : []);
     const selectedCluster = selectedClusterId();
-    // drei's Text labels in graphrag-workbench are world-space text. CSS2D
-    // labels are intentionally kept to the strongest factual anchors when
-    // nothing is selected, otherwise a small graph turns into a flat label
-    // cloud.  Selecting a node expands its local factual neighborhood.
+    const neighbors = selectedNode ? nodeNeighbors.get(selectedNode) : undefined;
     const overviewLabelIds = new Set([...layout.nodes]
       .sort((left, right) => right.degree - left.degree || right.frequency - left.frequency || left.id.localeCompare(right.id))
       .slice(0, Math.max(4, Math.min(9, Math.ceil(layout.nodes.length * .35))))
       .map((node) => node.id));
-    const labelCandidates = [...layout.nodes]
-      .filter((node) => selectedNode ? (node.id === selectedNode || edgeMeta.size > 0 && layout.edges.some((edge) => edgeConnectedToNode(edge, selectedNode) && edgeConnectedToNode(edge, node.id)) || node.clusterId === selectedCluster) : overviewLabelIds.has(node.id))
-      .sort((left, right) => Number(right.id === selectedNode) - Number(left.id === selectedNode) || right.degree - left.degree || right.frequency - left.frequency || left.id.localeCompare(right.id));
+    labelCandidates = [...layout.nodes]
+      .filter((node) => selectedEvent ? eventRelatedNodeIds.has(node.id) : selectedEdge ? selectedEdgeNodeIds.has(node.id) : selectedNode ? (node.id === selectedNode || neighbors?.has(node.id)) : overviewLabelIds.has(node.id))
+      .sort((left, right) => Number(eventEndpointIds.has(right.id) || selectedEdgeNodeIds.has(right.id) || right.id === selectedNode) - Number(eventEndpointIds.has(left.id) || selectedEdgeNodeIds.has(left.id) || left.id === selectedNode) || right.degree - left.degree || right.frequency - left.frequency || left.id.localeCompare(right.id));
+
+    for (const node of layout.nodes) {
+      const mesh = nodeMeshes.get(node.id);
+      if (!mesh) continue;
+      const active = node.id === selectedNode || selectedEdgeNodeIds.has(node.id) || eventEndpointIds.has(node.id);
+      const eventRelated = eventRelatedNodeIds.has(node.id);
+      const relatedToSelectedNode = Boolean(selectedNode && (node.id === selectedNode || neighbors?.has(node.id)));
+      const focused = active || relatedToSelectedNode;
+      mesh.scale.setScalar(displayScaleFor(node.id, mesh));
+      const material = mesh.material as THREE.ShaderMaterial;
+      material.uniforms.opacity.value = selectedEvent
+        ? (active ? .96 : eventRelated ? .78 : .3)
+        : selectedEdge
+          ? (active ? .96 : .3)
+          : selectedNode
+            ? (focused ? .96 : .3)
+            : .85;
+      (material.uniforms.colorCore.value as THREE.Color).set(focused ? '#fff2b4' : '#7de1ff');
+      const label = nodeLabels.get(node.id);
+      label?.element.classList.toggle('is-selected', focused);
+      label?.element.classList.toggle('is-muted', Boolean(selectedEvent ? !eventRelated : selectedEdge ? !active : selectedNode ? !focused : false));
+    }
+    for (const edge of layout.edges) {
+      const line = edgeLines.get(edge.id);
+      if (!line) continue;
+      const active = edge.id === selectedEdge;
+      const connected = eventRelatedEdgeIds.has(edge.id) || Boolean(selectedNode && edgeConnectedToNode(edge, selectedNode));
+      const insideSelectedCluster = !selectedCluster || (edge.source.clusterId === selectedCluster && edge.target.clusterId === selectedCluster);
+      const material = line.material;
+      material.color.set(active || connected ? '#ffffff' : selectedEdge || selectedEvent ? '#35404d' : '#8893a2');
+      material.opacity = active || connected ? .98 : selectedEdge || selectedEvent ? .2 : selectedNode ? .2 : .7;
+      material.uniforms.linewidth.value = (line.userData.baseWidth as number) * (active || connected ? 1.65 : 1);
+    }
+    for (const cluster of layout.clusters) {
+      const mesh = clusterMeshes.get(cluster.id);
+      if (!mesh) continue;
+      const selectedByEdge = Boolean(selectedEdgeMeta && (selectedEdgeMeta.source.clusterId === cluster.id || selectedEdgeMeta.target.clusterId === cluster.id));
+      const selectedByEvent = layout.nodes.some((node) => eventEndpointIds.has(node.id) && node.clusterId === cluster.id);
+      const active = Boolean(selectedCluster && cluster.id === selectedCluster) || selectedByEdge || selectedByEvent;
+      const material = mesh.material as THREE.LineBasicMaterial;
+      material.color.set(active ? '#ffaa00' : cluster.color);
+      material.opacity = selectedEdge || selectedEvent ? (active ? .2 : .07) : selectedCluster && !active ? .08 : active ? .25 : .15;
+      clusterLabels.get(cluster.id)?.element.classList.toggle('is-selected', active);
+    }
+    for (const mesh of edgeEnergy.values()) {
+      const edgeId = String(mesh.userData.edgeId);
+      const edge = edgeMeta.get(edgeId);
+      mesh.visible = selectedEvent ? eventRelatedEdgeIds.has(edgeId) : selectedEdge ? edgeId === selectedEdge : !selectedNode || Boolean(edge && edgeConnectedToNode(edge, selectedNode));
+    }
+  };
+
+  const updateLabelLayout = (): void => {
+    if (invalidation.takeRects() || !cachedHostRect) {
+      cachedHostRect = host.getBoundingClientRect();
+      cachedToolbarRect = toolbar?.getBoundingClientRect();
+    }
     const visibleLabelIds = new Set<string>();
     const occupiedLabels: Array<{ x: number; y: number }> = [];
     const projection = new THREE.Vector3();
+    const cameraSpace = new THREE.Vector3();
     const labelWidth = Math.max(1, host.clientWidth);
     const labelHeight = Math.max(1, host.clientHeight);
-    const toolbar = host.closest('.stx-memory-graph-stage-panel')?.querySelector<HTMLElement>('.stx-memory-graph-toolbar');
-    const toolbarRect = toolbar?.getBoundingClientRect();
-    const hostRect = host.getBoundingClientRect();
+    camera.updateMatrixWorld();
+    const screenUp = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+    const positionLabel = (mesh: THREE.Mesh, scale: number, target: THREE.Vector3): THREE.Vector3 => {
+      mesh.getWorldPosition(target);
+      cameraSpace.copy(target).applyMatrix4(camera.matrixWorldInverse);
+      const depth = Math.max(camera.near, -cameraSpace.z);
+      const worldPerPixel = 2 * depth * Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV) / 2) / labelHeight;
+      return target.addScaledVector(screenUp, scale + NODE_LABEL_GAP_PX * worldPerPixel);
+    };
     for (const node of labelCandidates) {
       const mesh = nodeMeshes.get(node.id);
       if (!mesh) continue;
-      mesh.getWorldPosition(projection);
-      projection.y += (mesh.userData.baseSize as number) + 3;
+      positionLabel(mesh, displayScaleFor(node.id, mesh), projection);
       projection.project(camera);
       const x = (projection.x * .5 + .5) * labelWidth;
       const y = (-projection.y * .5 + .5) * labelHeight;
       const behindCamera = projection.z < -1 || projection.z > 1;
-      const underToolbar = Boolean(toolbarRect && x + hostRect.left > toolbarRect.left - 18 && x + hostRect.left < toolbarRect.right + 18 && y + hostRect.top > toolbarRect.top - 18 && y + hostRect.top < toolbarRect.bottom + 18);
-      const collides = occupiedLabels.some((occupied) => Math.hypot(occupied.x - x, occupied.y - y) < (selectedNode ? 27 : 31));
+      const underToolbar = Boolean(cachedToolbarRect && cachedHostRect && x + cachedHostRect.left > cachedToolbarRect.left - 18 && x + cachedHostRect.left < cachedToolbarRect.right + 18 && y + cachedHostRect.top > cachedToolbarRect.top - 18 && y + cachedHostRect.top < cachedToolbarRect.bottom + 18);
+      const collides = occupiedLabels.some((occupied) => Math.hypot(occupied.x - x, occupied.y - y) < (current.selectedNodeId ? 27 : 31));
       if (behindCamera || underToolbar || collides) continue;
       occupiedLabels.push({ x, y });
       visibleLabelIds.add(node.id);
     }
     for (const node of layout.nodes) {
       const mesh = nodeMeshes.get(node.id);
-      if (!mesh) continue;
-      const active = node.id === selectedNode;
-      const connected = Boolean(selectedNode && layout.edges.some((edge) => edgeConnectedToNode(edge, selectedNode) && edgeConnectedToNode(edge, node.id)));
-      const inSelectedCluster = !selectedCluster || node.clusterId === selectedCluster;
-      const scale = (mesh.userData.baseSize as number) * (active ? 1.5 : connected ? 1.25 : 1);
-      mesh.scale.setScalar(scale);
-      const material = mesh.material as THREE.ShaderMaterial;
-      const opacity = selectedNode && !inSelectedCluster ? .25 : .85;
-      material.uniforms.opacity.value = opacity;
-      (material.uniforms.colorCore.value as THREE.Color).set(active ? '#b6f3ff' : '#7de1ff');
-      material.uniforms.time.value = reduceMotion ? 0 : time * .001;
       const label = nodeLabels.get(node.id);
-      if (label) {
-        const visible = visibleLabelIds.has(node.id);
-        label.visible = visible;
-        label.element.classList.toggle('is-selected', active);
-        label.element.classList.toggle('is-muted', Boolean(selectedNode && !inSelectedCluster));
-      }
+      if (!mesh || !label) continue;
+      positionLabel(mesh, displayScaleFor(node.id, mesh), label.position);
+      label.visible = visibleLabelIds.has(node.id);
     }
-    for (const edge of layout.edges) {
-      const line = edgeLines.get(edge.id);
-      if (!line) continue;
-      const active = edge.id === selectedEdge;
-      const connected = Boolean(selectedNode && edgeConnectedToNode(edge, selectedNode));
-      const insideSelectedCluster = !selectedCluster || (edge.source.clusterId === selectedCluster && edge.target.clusterId === selectedCluster);
-      const material = line.material;
-      material.color.set(active || connected ? '#ffffff' : '#8893a2');
-      material.opacity = active || connected ? .95 : selectedNode && !insideSelectedCluster ? .25 : .7;
-      material.uniforms.linewidth.value = (line.userData.baseWidth as number) * (active || connected ? 1.65 : 1);
-    }
-    for (const cluster of layout.clusters) {
-      const mesh = clusterMeshes.get(cluster.id);
-      if (!mesh) continue;
-      const active = Boolean(selectedCluster && cluster.id === selectedCluster);
-      const material = mesh.material as THREE.MeshBasicMaterial;
-      material.color.set(active ? '#ffaa00' : cluster.color);
-      material.opacity = selectedCluster && !active ? .06 : active ? .25 : .15;
-      clusterLabels.get(cluster.id)?.element.classList.toggle('is-selected', active);
-    }
-    for (const mesh of edgeEnergy.values()) {
-      const material = mesh.material as THREE.ShaderMaterial;
-      material.uniforms.time.value = reduceMotion ? 0 : time * .001;
-      const edgeId = String(mesh.userData.edgeId);
-      mesh.visible = !selectedNode || edgeConnectedToNode(edgeMeta.get(edgeId)!, selectedNode) || edgeId === selectedEdge;
-    }
+    labelsNeedRender = true;
+  };
+
+  const updateAnimatedUniforms = (time: number): void => {
+    const shaderTime = reduceMotion ? 0 : time * .001;
+    for (const mesh of nodeMeshes.values()) (mesh.material as THREE.ShaderMaterial).uniforms.time.value = shaderTime;
+    for (const mesh of edgeEnergy.values()) (mesh.material as THREE.ShaderMaterial).uniforms.time.value = shaderTime;
   };
 
   const setPointer = (event: PointerEvent): void => {
@@ -639,6 +836,7 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
     dragNode.z = dragPoint.z;
     dragMesh.position.copy(dragPoint);
     for (const edge of layout.edges) if (edgeConnectedToNode(edge, dragNode.id)) updateEdgeGeometry(edge);
+    invalidation.invalidateLabels();
   };
   const onPointerUp = (event: PointerEvent): void => {
     if (event.pointerId !== pointerId) return;
@@ -652,6 +850,14 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
     if (wasDragged) return;
     if (picked.nodeId) initial.onSelectNode(picked.nodeId);
     else if (picked.edgeId) initial.onSelectEdge(picked.edgeId);
+  };
+  const onDoubleClick = (event: MouseEvent): void => {
+    if (event.button !== 0) return;
+    const picked = pick(event as unknown as PointerEvent);
+    if (!picked.nodeId) return;
+    stopAutoOrbit();
+    initial.onSelectNode(picked.nodeId);
+    focusSelectedNode(picked.nodeId);
   };
   const onKeyDown = (event: KeyboardEvent): void => {
     if (event.key === 'Escape') {
@@ -679,21 +885,25 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
     composer.setSize(width, height);
     labels.setSize(width, height);
     for (const line of edgeLines.values()) line.material.resolution.set(width, height);
+    invalidation.invalidateRects();
   };
 
   webgl.domElement.addEventListener('pointerdown', onPointerDown);
   webgl.domElement.addEventListener('pointermove', onPointerMove);
   webgl.domElement.addEventListener('pointerup', onPointerUp);
   webgl.domElement.addEventListener('pointercancel', onPointerUp);
+  webgl.domElement.addEventListener('dblclick', onDoubleClick);
   webgl.domElement.addEventListener('keydown', onKeyDown);
   webgl.domElement.addEventListener('webglcontextlost', onContextLost);
   const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(onResize) : undefined;
+  const toolbarResizeObserver = typeof ResizeObserver === 'function' && toolbar ? new ResizeObserver(() => invalidation.invalidateRects()) : undefined;
   resizeObserver?.observe(host);
+  if (toolbar && toolbarResizeObserver) toolbarResizeObserver.observe(toolbar);
   window.addEventListener('resize', onResize);
 
   function update(state: RelationshipGraphViewState): void {
     if (disposed) return;
-    const selectionChanged = state.selectedNodeId !== current.selectedNodeId || state.selectedEdgeId !== current.selectedEdgeId;
+    const selectionChanged = state.selectedNodeId !== current.selectedNodeId || state.selectedEdgeId !== current.selectedEdgeId || state.selectedEventEdgeId !== current.selectedEventEdgeId;
     current = { ...state };
     reduceMotion = Boolean(state.reduceMotion);
     if (autoOrbit && reduceMotion) {
@@ -701,8 +911,19 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
       stateChange();
     }
     if (layoutKey(state) !== currentLayoutKey) rebuildScene(state);
-    if (selectionChanged) syncEnergyEdges();
-    updateHighlights(performance.now());
+    if (selectionChanged) {
+      refreshEventSelection();
+      syncEnergyEdges();
+      invalidation.invalidateSelection();
+      if (state.selectedEdgeId) focusSelectedEdge();
+      else if (state.selectedEventEdgeId) focusSelectedEdge(state.selectedEventEdgeId);
+    }
+  }
+  function clearSelection(): void {
+    if (disposed) return;
+    focusAnimation = undefined;
+    if (!current.selectedNodeId && !current.selectedEdgeId && !current.selectedEventEdgeId) return;
+    update({ ...current, selectedNodeId: '', selectedEdgeId: '', selectedEventEdgeId: '' });
   }
   function command(value: RelationshipGraphCommand): void {
     if (disposed) return;
@@ -724,24 +945,39 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
       return;
     }
     autoOrbit = !autoOrbit && !reduceMotion;
+    invalidation.invalidateLabels();
     stateChange();
   }
   function animate(now: number): void {
     if (disposed) return;
     const delta = Math.min(80, now - lastFrame);
     lastFrame = now;
-    if (!reduceMotion && autoOrbit) {
+    if (focusAnimation) {
+      const progress = Math.min(1, Math.max(0, (now - focusAnimation.startedAt) / focusAnimation.duration));
+      const eased = 1 - (1 - progress) ** 3;
+      camera.position.lerpVectors(focusAnimation.cameraFrom, focusAnimation.cameraTo, eased);
+      controls.target.lerpVectors(focusAnimation.targetFrom, focusAnimation.targetTo, eased);
+      camera.lookAt(controls.target);
+      invalidation.invalidateLabels();
+      if (progress >= 1) focusAnimation = undefined;
+    } else if (!reduceMotion && autoOrbit) {
       const radius = Math.max(graphOrbitDistance, graphSize * .98, 170);
       const angle = now * .00005;
       controls.target.copy(graphCenter);
       camera.position.set(graphCenter.x + Math.cos(angle) * radius * .93, graphCenter.y + radius * .38, graphCenter.z + Math.sin(angle) * radius * .93);
       camera.lookAt(graphCenter);
       stars.rotation.y += delta * .000005;
+      invalidation.invalidateLabels();
     }
     controls.update();
-    updateHighlights(now);
+    if (invalidation.takeSelection()) updateSelectionStyles();
+    if (invalidation.takeLabels()) updateLabelLayout();
+    updateAnimatedUniforms(now);
     composer.render();
-    labels.render(scene, camera);
+    if (labelsNeedRender) {
+      labels.render(scene, camera);
+      labelsNeedRender = false;
+    }
     frame = window.requestAnimationFrame(animate);
   }
 
@@ -750,18 +986,24 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
   frame = window.requestAnimationFrame(animate);
   return {
     update,
+    clearSelection,
+    focusEdge: focusSelectedEdge,
+    focusNode: focusSelectedNode,
     command,
     dispose: () => {
       if (disposed) return;
       disposed = true;
       window.cancelAnimationFrame(frame);
       resizeObserver?.disconnect();
+      toolbarResizeObserver?.disconnect();
       window.removeEventListener('resize', onResize);
-      controls.removeEventListener('start', stopAutoOrbit);
+      controls.removeEventListener('start', onControlsStart);
+      controls.removeEventListener('change', onControlsChange);
       webgl.domElement.removeEventListener('pointerdown', onPointerDown);
       webgl.domElement.removeEventListener('pointermove', onPointerMove);
       webgl.domElement.removeEventListener('pointerup', onPointerUp);
       webgl.domElement.removeEventListener('pointercancel', onPointerUp);
+      webgl.domElement.removeEventListener('dblclick', onDoubleClick);
       webgl.domElement.removeEventListener('keydown', onKeyDown);
       webgl.domElement.removeEventListener('contextmenu', onContextMenu);
       webgl.domElement.removeEventListener('webglcontextlost', onContextLost);

@@ -38,6 +38,7 @@ describe('relationship graph layout', () => {
     expect(selectGraphView(graph, '港口城').edges.map((edge) => edge.id)).toEqual(['e2', 'e3']);
     expect(selectGraphView(graph, '', 'location').edges.map((edge) => edge.id)).toEqual(['e2', 'e3']);
     expect(selectGraphView(graph, '', '', '', 'a', true).edges.map((edge) => edge.id)).toEqual(['e1', 'e2']);
+    expect(selectGraphView(graph, '', '', '', '', true, 'e2').edges.map((edge) => edge.id)).toEqual(['e1', 'e2', 'e3']);
   });
 
   it('does not leave the retired canvas renderer or command bus in the graph UI', () => {

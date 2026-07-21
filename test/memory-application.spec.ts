@@ -319,6 +319,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
 
     await app.saveSettings({ ...app.getSettings(), enabled: false, chatMode: 'enabled' });
     expect(app.getCurrentChatInfo()).toMatchObject({ name: 'Alice', key: 'chat-a', mode: 'enabled', effectiveEnabled: true });
+    expect(app.isChatEnabled('character:c1', 'chat-a')).toBe(true);
     await expect(app.getOverview()).resolves.toMatchObject({ status: 'ready', bound: true });
     expect(repository.settings.get('chatOverrides')).toEqual({ '["character:c1","chat-a"]': true });
 
@@ -327,6 +328,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     expect(app.getCurrentChatInfo()).toMatchObject({ name: 'Bob', key: 'chat-b', mode: 'inherit', effectiveEnabled: false });
     await expect(app.getOverview()).resolves.toMatchObject({ status: 'disabled', bound: true });
     await app.saveSettings({ ...app.getSettings(), chatMode: 'disabled' });
+    expect(app.isChatEnabled('character:c1', 'chat-b')).toBe(false);
     expect(repository.settings.get('chatOverrides')).toEqual({
       '["character:c1","chat-a"]': true,
       '["character:c1","chat-b"]': false,

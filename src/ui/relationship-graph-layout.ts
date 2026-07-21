@@ -235,6 +235,7 @@ export function selectGraphView(
   status = '',
   focusNodeId = '',
   focusNeighbors = false,
+  focusEdgeId = '',
 ): GraphViewSelection {
   const needle = query.normalize('NFKC').trim().toLocaleLowerCase();
   const nodeMap = new Map(graph.nodes.map((node) => [node.id, node] as const));
@@ -246,7 +247,15 @@ export function selectGraphView(
     const to = nodeMap.get(edge.to)?.label ?? '';
     return [from, to, edge.predicate, edge.kind].some((value) => value.normalize('NFKC').toLocaleLowerCase().includes(needle));
   });
-  if (focusNeighbors && focusNodeId) edges = edges.filter((edge) => edge.from === focusNodeId || edge.to === focusNodeId);
+  if (focusNeighbors && focusNodeId) {
+    edges = edges.filter((edge) => edge.from === focusNodeId || edge.to === focusNodeId);
+  } else if (focusNeighbors && focusEdgeId) {
+    const focusedEdge = graph.edges.find((edge) => edge.id === focusEdgeId);
+    if (focusedEdge) {
+      const focusedNodeIds = new Set([focusedEdge.from, focusedEdge.to]);
+      edges = edges.filter((edge) => focusedNodeIds.has(edge.from) || focusedNodeIds.has(edge.to));
+    }
+  }
   const nodeIds = new Set(edges.flatMap((edge) => [edge.from, edge.to]));
   return {
     edges: [...edges].sort((left, right) => right.confidence - left.confidence || left.id.localeCompare(right.id)),

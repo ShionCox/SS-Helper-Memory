@@ -228,10 +228,14 @@ describe('Memory UI 展示适配', () => {
 
     expect(container.textContent).toContain('关系图谱');
     expect(container.textContent).toContain('艾琳 — 害怕 → 雷暴');
+    expect(container.textContent).toContain('选择一个节点或关系');
+    expect(container.querySelector('[data-graph-edge-list] [aria-selected="true"]')).toBeNull();
+    (container.querySelector('[data-action="select-graph-edge"]') as HTMLButtonElement).click();
     expect(container.textContent).toContain('当前状态稳定');
     expect(container.textContent).toContain('证据摘录');
     expect(container.textContent).toContain('视觉聚类只用于浏览');
     expect(container.querySelector('[data-action="rebuild-graph"]')?.getAttribute('data-ss-helper-control')).toBe('button');
+    expect(container.querySelector('[data-action="rebuild-graph"]')?.getAttribute('aria-label')).toBe('重建关系图谱');
     (container.querySelector('[data-action="rebuild-graph"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(rebuildGraph).toHaveBeenCalledOnce();
@@ -254,13 +258,171 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).toContain('边列表');
     expect(container.querySelector('[data-action="graph-command"][data-graph-command="fit"]')?.getAttribute('data-ss-helper-control')).toBe('button');
     const focus = container.querySelector('[data-action="toggle-graph-neighbor-focus"]') as HTMLButtonElement;
+    expect(focus.disabled).toBe(true);
+    (container.querySelector('[data-action="select-graph-edge"]') as HTMLButtonElement).click();
     expect(focus.disabled).toBe(false);
     focus.click();
     expect(container.querySelector('[data-action="toggle-graph-neighbor-focus"]')?.getAttribute('aria-pressed')).toBe('true');
-    expect(container.textContent).toContain('显示全部关系');
+    expect(container.querySelector('[data-action="toggle-graph-neighbor-focus"]')?.getAttribute('aria-label')).toBe('显示全部关系');
     expect(container.querySelector('[data-action="create-graph-edge"]')).toBeNull();
     expect(container.querySelector('[data-action="edit-graph-edge"]')).toBeNull();
     dispose();
+  });
+
+  it('在边列表与事件列表间切换，并让事件选择联动全部直接关系', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const eventFact: MemoryUiFact = { id: 'fact-event', kind: 'event', status: 'active', content: '艾琳在雷暴中抵达港口', confidence: .94, sourceRefs: ['message:2'], evidence: [{ sourceRef: 'message:2', excerpt: '事件证据' }], updatedAt: 20 };
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listFacts: async () => [eventFact],
+      getGraphStatus: () => ({ chatKey: 'chat:1', enabled: true, phase: 'ready' as const, nodeCount: 4, edgeCount: 3, updatedAt: 20, lastRebuiltAt: 20 }),
+      getRelationshipGraph: async () => ({
+        nodes: [{ id: 'node-a', label: '艾琳' }, { id: 'node-b', label: '雷暴' }, { id: 'node-c', label: '港口' }, { id: 'node-d', label: '北区' }],
+        edges: [
+          { id: 'edge-event', from: 'node-a', to: 'node-b', predicate: '遭遇', kind: 'event' as const, status: 'active' as const, confidence: .94, backingFactId: 'fact-event' },
+          { id: 'edge-a', from: 'node-a', to: 'node-c', predicate: '抵达', kind: 'location' as const, status: 'active' as const, confidence: .9, backingFactId: 'fact-event' },
+          { id: 'edge-b', from: 'node-b', to: 'node-d', predicate: '发生于', kind: 'location' as const, status: 'active' as const, confidence: .88, backingFactId: 'fact-event' },
+        ],
+      }),
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="graph"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const inspector = container.querySelector('[data-relationship-graph-inspector]');
+    const statusPanel = container.querySelector('.stx-memory-graph-status-panel');
+    const detail = container.querySelector('[data-graph-inspector-detail]');
+    const edgePane = container.querySelector<HTMLElement>('[data-graph-edge-list][data-graph-list-mode="edges"]');
+    const eventPane = container.querySelector<HTMLElement>('[data-graph-edge-list][data-graph-list-mode="events"]');
+    const edgeTab = container.querySelector('[data-action="set-graph-list-mode"][data-graph-list-mode="edges"]') as HTMLButtonElement;
+    const eventTab = container.querySelector('[data-action="set-graph-list-mode"][data-graph-list-mode="events"]') as HTMLButtonElement;
+    expect(edgePane?.hidden).toBe(false);
+    expect(eventPane?.hidden).toBe(true);
+    expect(edgeTab.getAttribute('aria-selected')).toBe('true');
+    expect(eventTab.getAttribute('aria-selected')).toBe('false');
+    eventTab.click();
+    expect(container.querySelector('[data-relationship-graph-inspector]')).toBe(inspector);
+    expect(container.querySelector('.stx-memory-graph-status-panel')).toBe(statusPanel);
+    expect(container.querySelector('[data-graph-inspector-detail]')).toBe(detail);
+    expect(container.querySelector('[data-graph-edge-list][data-graph-list-mode="edges"]')).toBe(edgePane);
+    expect(container.querySelector('[data-graph-edge-list][data-graph-list-mode="events"]')).toBe(eventPane);
+    expect(edgePane?.hidden).toBe(true);
+    expect(eventPane?.hidden).toBe(false);
+    expect(edgeTab.getAttribute('aria-selected')).toBe('false');
+    expect(eventTab.getAttribute('aria-selected')).toBe('true');
+    expect(container.querySelectorAll('[data-action="select-graph-event"]')).toHaveLength(1);
+    expect(container.textContent).toContain('艾琳在雷暴中抵达港口');
+    expect(container.textContent).toContain('关联 3 条关系');
+
+    const eventRow = container.querySelector('[data-action="select-graph-event"]') as HTMLButtonElement;
+    eventRow.click();
+    expect(eventRow.getAttribute('aria-selected')).toBe('true');
+    expect(container.textContent).toContain('事件两端的全部直接关系会在画布中同步高亮');
+    expect((container.querySelector('[data-action="toggle-graph-neighbor-focus"]') as HTMLButtonElement).disabled).toBe(false);
+    eventTab.click();
+    expect(eventRow.getAttribute('aria-selected')).toBe('true');
+    edgeTab.click();
+    expect(eventRow.getAttribute('aria-selected')).toBe('false');
+    expect(detail?.textContent).toContain('选择一个节点或关系');
+    expect((container.querySelector('[data-action="toggle-graph-neighbor-focus"]') as HTMLButtonElement).disabled).toBe(true);
+    dispose();
+  });
+
+  it('选择关系时保留边列表 DOM，只局部更新选中态与详情', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getGraphStatus: () => ({ chatKey: 'chat:1', enabled: true, phase: 'ready' as const, nodeCount: 3, edgeCount: 2, updatedAt: 10, lastRebuiltAt: 10 }),
+      getRelationshipGraph: async () => ({
+        nodes: [{ id: 'node-a', label: '艾琳' }, { id: 'node-b', label: '雷暴' }, { id: 'node-c', label: '月光' }],
+        edges: [
+          { id: 'edge-a', from: 'node-a', to: 'node-b', predicate: '害怕', kind: 'relationship' as const, status: 'active' as const, confidence: .9, backingFactId: 'fact-1' },
+          { id: 'edge-b', from: 'node-a', to: 'node-c', predicate: '信任', kind: 'relationship' as const, status: 'active' as const, confidence: .8, backingFactId: 'fact-1' },
+        ],
+      }),
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="graph"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const inspector = container.querySelector('[data-relationship-graph-inspector]');
+    const edgeList = container.querySelector('[data-graph-edge-list]');
+    const detail = container.querySelector('[data-graph-inspector-detail]');
+    const secondEdge = container.querySelector('[data-graph-edge-list] [data-edge-id="edge-b"]') as HTMLButtonElement;
+    secondEdge.click();
+
+    expect(container.querySelector('[data-relationship-graph-inspector]')).toBe(inspector);
+    expect(container.querySelector('[data-graph-edge-list]')).toBe(edgeList);
+    expect(container.querySelector('[data-graph-inspector-detail]')).toBe(detail);
+    expect(secondEdge.getAttribute('aria-selected')).toBe('true');
+    expect(container.querySelector('[data-edge-id="edge-a"]')?.getAttribute('aria-selected')).toBe('false');
+    expect(detail?.textContent).toContain('艾琳 — 信任 → 月光');
+    dispose();
+  });
+
+  it('关系搜索等待 120ms 后才刷新边列表', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(container, workbenchController());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="graph"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const input = container.querySelector('[data-filter="graph-query"]') as HTMLInputElement;
+    vi.useFakeTimers();
+    try {
+      input.value = '不存在的关系';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      expect(container.querySelectorAll('[data-graph-edge-list] [data-edge-id]')).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(119);
+      expect(container.querySelectorAll('[data-graph-edge-list] [data-edge-id]')).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(container.querySelectorAll('[data-graph-edge-list] [data-edge-id]')).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+      dispose();
+    }
+  });
+
+  it('只给真实溢出的关系标题启用横向滚动', async () => {
+    const scrollWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollWidth');
+    const clientWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
+    const getBoundingClientRect = HTMLElement.prototype.getBoundingClientRect;
+    Object.defineProperty(HTMLElement.prototype, 'scrollWidth', { configurable: true, get() { return this.textContent?.includes('非常长的关系标题') ? 360 : 80; } });
+    Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, get() { return this.matches?.('[data-graph-marquee]') ? 500 : 0; } });
+    HTMLElement.prototype.getBoundingClientRect = function () {
+      const width = this.matches('.stx-memory-graph-edge-top') ? 210
+        : this.matches('.stx-memory-graph-edge-top > span:last-child') ? 70
+          : this.matches('[data-graph-marquee] > span') ? this.scrollWidth : 0;
+      return { x: 0, y: 0, top: 0, right: width, bottom: 20, left: 0, width, height: 20, toJSON: () => ({}) };
+    };
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getGraphStatus: () => ({ chatKey: 'chat:1', enabled: true, phase: 'ready' as const, nodeCount: 4, edgeCount: 2, updatedAt: 10, lastRebuiltAt: 10 }),
+      getRelationshipGraph: async () => ({
+        nodes: [{ id: 'node-a', label: '甲' }, { id: 'node-b', label: '乙' }, { id: 'node-c', label: '这是一个非常长的关系标题起点' }, { id: 'node-d', label: '这是一个非常长的关系标题终点' }],
+        edges: [
+          { id: 'edge-short', from: 'node-a', to: 'node-b', predicate: '是', kind: 'relationship' as const, status: 'active' as const, confidence: .9, backingFactId: 'fact-1' },
+          { id: 'edge-long', from: 'node-c', to: 'node-d', predicate: '连接到', kind: 'relationship' as const, status: 'active' as const, confidence: .8, backingFactId: 'fact-1' },
+        ],
+      }),
+    }));
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      (container.querySelector('[data-page="graph"]') as HTMLButtonElement).click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const shortTitle = container.querySelector('[data-edge-id="edge-short"] [data-graph-marquee]');
+      const longTitle = container.querySelector('[data-edge-id="edge-long"] [data-graph-marquee]');
+      expect(shortTitle?.getAttribute('data-overflow')).toBe('false');
+      expect(longTitle?.getAttribute('data-overflow')).toBe('true');
+      expect(Number.parseFloat(longTitle?.getAttribute('style')?.match(/distance:\s*([\d.]+)/u)?.[1] ?? '0')).toBeGreaterThan(0);
+      expect((longTitle as HTMLElement | null)?.style.width).toBe('140px');
+    } finally {
+      dispose();
+      if (scrollWidth) Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scrollWidth);
+      if (clientWidth) Object.defineProperty(HTMLElement.prototype, 'clientWidth', clientWidth);
+      HTMLElement.prototype.getBoundingClientRect = getBoundingClientRect;
+    }
   });
 
   it('从设置页的重建操作打开关系图谱并立即执行当前聊天的重建', async () => {
@@ -347,7 +509,7 @@ describe('Memory UI 展示适配', () => {
     expect(container.querySelectorAll('.stx-memory-maintenance-icon')).toHaveLength(3);
     expect(container.querySelectorAll('.stx-memory-maintenance-chevron')).toHaveLength(3);
     expect(container.querySelectorAll('.stx-memory-danger-action-icon')).toHaveLength(2);
-    expect(container.querySelector('[data-action="clear-current"] .fa-eraser')).not.toBeNull();
+    expect(container.querySelector('[data-action="clear-current"] ss-helper-icon[name="eraser"]')).not.toBeNull();
     expect(container.querySelector('.stx-memory-chat-storage')?.textContent).toContain('25%');
     expect(container.querySelector('[data-action="import-file"]')?.parentElement?.getAttribute('data-ss-helper-control')).toBe('file-trigger');
     expect(container.querySelector('[data-action="clear-all"]')?.getAttribute('data-ss-helper-tone')).toBe('danger');

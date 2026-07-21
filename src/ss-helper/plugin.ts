@@ -12,9 +12,12 @@ import {
 import { createMemorySettingsAdapter, MEMORY_SETTINGS_SCHEMA, MEMORY_WORKBENCH_POPUP, type MemorySettingsController, type MemorySettingsStatusSource } from './settings';
 import { registerMemoryServices, type MemoryRecallController } from './services';
 import { renderMemoryWorkspaceRecovery, type MemoryWorkspaceRecoveryController } from '../ui/workspace-recovery-ui';
+import { registerMemoryChatIndicator } from './chat-indicator';
 import config from '../../plugin.config.json' with { type: 'json' };
 
-export interface MemoryContributionController extends MemorySettingsController, MemoryRecallController {}
+export interface MemoryContributionController extends MemorySettingsController, MemoryRecallController {
+  isChatEnabled(workspaceId: string, chatKey: string): boolean;
+}
 
 export const MEMORY_HOST_CAPABILITIES = Object.freeze([
   'tavern.context.read',
@@ -22,6 +25,7 @@ export const MEMORY_HOST_CAPABILITIES = Object.freeze([
   'tavern.character.read',
   'tavern.persona.read',
   'tavern.chat.read',
+  'tavern.chat.navigate',
   'tavern.chat.events',
   'tavern.worldbooks.read',
   'tavern.prompt.contribute',
@@ -64,6 +68,7 @@ export function registerMemoryContributions(
   const services = registerMemoryServices(session, controller);
   const disposers = [
     services.dispose,
+    registerMemoryChatIndicator(session, controller),
     session.registerSettings(MEMORY_SETTINGS_SCHEMA, createMemorySettingsAdapter(controller, statusSource, (notification) => session.ui.showToast(notification))),
     session.registerPopup({
       token: MEMORY_WORKBENCH_POPUP,

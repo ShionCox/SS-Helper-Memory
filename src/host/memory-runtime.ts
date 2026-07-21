@@ -10,6 +10,7 @@ import { configureMemoryLlmApi } from '../application/ingest/llm-extractor';
 import { createMemoryLlmApi } from '../ss-helper/llm-adapter';
 import { MemoryRepository } from '../infrastructure/memory-repository';
 import { MemoryLlmCapabilityMonitor } from '../ss-helper/llm-capability-monitor';
+import { mountMemoryHostUi } from './memory-host-ui';
 
 const SEND_WINDOW_MS = 45_000;
 const MEMORY_PROMPT_ID = 'ss-helper.memory.recall.v1';
@@ -85,11 +86,14 @@ export class MemoryRuntime {
           (notification) => this.session.ui.showToast(notification),
           popupUi,
           actionId,
+          (target) => this.context.navigateToMessage(target),
         ),
         capabilityMonitor,
         { repair: () => this.session.workspace.repair({ confirm: true }) },
       );
       this.disposers.push(() => contributions.dispose());
+      const hostUi = mountMemoryHostUi(this.session);
+      this.disposers.push(() => hostUi.dispose());
       this.assertActive();
       this.bindHostEvents(capabilityMonitor);
       traceMemoryStartup('runtime:contributions-registered');

@@ -1,5 +1,6 @@
 import type {
   HostCharacterSnapshot,
+  ChatNavigationTarget,
   HostPersonaSnapshot,
   PluginSession,
   WorldbookSnapshot,
@@ -20,6 +21,7 @@ export interface MemoryHostContext {
   getChatName?(): string;
   collectSources(chatKey: string): Promise<SourceBlock[]>;
   getRecallContext?(): Promise<{ characterKeys: string[]; worldKeys: string[] }>;
+  navigateToMessage?(target: ChatNavigationTarget): Promise<void>;
 }
 
 export class SdkMemoryHostContext implements MemoryHostContext, MemorySourceReader {
@@ -60,6 +62,7 @@ export class SdkMemoryHostContext implements MemoryHostContext, MemorySourceRead
   }
 
   readMessages() { return this.session.host.chat.readMessages(); }
+  navigateToMessage(target: ChatNavigationTarget): Promise<void> { return this.session.host.chat.navigate(target); }
   readCharacter(): Promise<HostCharacterSnapshot | null> { return this.session.host.character.read(); }
   readPersona(): Promise<HostPersonaSnapshot | null> { return this.session.host.persona.read(); }
   readActiveWorldbooks(): Promise<readonly WorldbookSnapshot[]> { return this.session.host.worldbooks.active(); }

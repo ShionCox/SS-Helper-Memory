@@ -318,6 +318,14 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return workspaceId && chatKey ? JSON.stringify([workspaceId, chatKey]) : '';
   }
 
+  isChatEnabled(workspaceId: string, chatKey: string): boolean {
+    const normalizedWorkspaceId = workspaceId.trim();
+    const normalizedChatKey = chatKey.trim();
+    if (!normalizedWorkspaceId || !normalizedChatKey) return false;
+    const override = this.chatOverrides[JSON.stringify([normalizedWorkspaceId, normalizedChatKey])];
+    return override ?? this.settings.enabled;
+  }
+
   getCurrentChatInfo(): { available: boolean; name: string; key: string; mode: MemoryUiSettings['chatMode']; effectiveEnabled: boolean } {
     const key = this.getChatKey();
     const scopeKey = this.getCurrentScopeKey();
@@ -328,7 +336,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       name: this.hostContext?.getChatName?.() || key,
       key,
       mode,
-      effectiveEnabled: Boolean(scopeKey) && (override ?? this.settings.enabled),
+      effectiveEnabled: Boolean(scopeKey) && this.isChatEnabled(this.hostContext?.getWorkspaceId() ?? '', key),
     };
   }
 
