@@ -24,6 +24,7 @@ import {
   readMemoryLlmApi,
   readMemoryLlmRouteDiagnostic,
   readMemoryRecallRouteDiagnostics,
+  type MemoryLlmRouteDiagnostic,
 } from './ingest/llm-extractor';
 import { MemoryIngestService } from './ingest/memory-ingest-service';
 import { ExistingMemoryContextRetriever } from './ingest/existing-memory-context';
@@ -58,6 +59,7 @@ import type {
   MemoryUiSettings,
 } from '../ui/memory-ui';
 import type { MemoryHostContext } from '../host/sdk-host-context';
+import { traceMemoryStartup } from '../host/runtime-feedback';
 import { describeMemoryError, type MemoryErrorDiagnostic } from '../diagnostics/memory-error';
 
 type MemoryGlobalSettings = Omit<MemoryUiSettings, 'chatMode'>;
@@ -84,6 +86,7 @@ const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   graphMaxHops: 1,
   graphMaxEdges: 12,
 });
+const MAX_MEMORY_BACKUP_BYTES = 64 * 1024 * 1024;
 
 function createId(prefix: string): string {
   return `${prefix}:${crypto.randomUUID()}`;
@@ -202,6 +205,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   private cancelRequested = false;
   private sqliteAvailable = false;
   private hostContext: MemoryHostContext | null = null;
+  private llmRouteDiagnostic: MemoryLlmRouteDiagnostic | undefined;
+  private llmRouteDiagnosticPending: Promise<void> | undefined;
 
   private readonly settingsListeners = new Set<(settings: MemoryUiSettings) => void>();
 
@@ -253,6 +258,20 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   bindStorageScope(workspaceId: string, sourceChatKey: string): void { this.repository.bind?.(workspaceId, sourceChatKey); }
 
+  private currentLlmRouteDiagnostic(): MemoryLlmRouteDiagnostic {
+    if (this.llmRouteDiagnosticPending === undefined) {
+      const pending = readMemoryLlmRouteDiagnostic()
+        .then((diagnostic) => { this.llmRouteDiagnostic = diagnostic; })
+        .catch(() => { this.llmRouteDiagnostic = { available: false, blockedReason: '暂时无法读取 LLM 资源状态' }; })
+        .finally(() => {
+          if (this.llmRouteDiagnosticPending === pending) this.llmRouteDiagnosticPending = undefined;
+          if (!this.stopped) this.emitSettingsChanged();
+        });
+      this.llmRouteDiagnosticPending = pending;
+    }
+    return this.llmRouteDiagnostic ?? { available: readMemoryLlmApi() !== null, blockedReason: 'LLM 路由状态正在加载' };
+  }
+
   async start(): Promise<void> {
     this.stopped = false;
     try {
@@ -284,6 +303,14 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   getChatKey(): string {
     return this.hostContext?.getChatKey() ?? '';
   }
+
+  /**
+   * Startup already probes and opens the workspace.  The host runtime uses
+   * this snapshot to avoid a second health request during SillyTavern's own
+   * APP_READY turn; detailed counters are refreshed only when a UI asks for
+   * them later.
+   */
+  isSqliteAvailable(): boolean { return this.sqliteAvailable; }
 
   private getCurrentScopeKey(): string {
     const workspaceId = this.hostContext?.getWorkspaceId() ?? '';
@@ -524,6 +551,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   async getOverview(): Promise<MemoryUiOverview> {
+    traceMemoryStartup('application:overview-begin');
     const chatKey = this.getChatKey();
     const storage = this.repository.getHealthSnapshot();
     const currentChatSizeBytes = storage?.currentChatSizeBytes ?? 0;
@@ -549,26 +577,32 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       errorDiagnostic: diagnostic,
     });
     };
-    if (!this.sqliteAvailable) return degraded();
+    if (!this.sqliteAvailable) {
+      traceMemoryStartup('application:overview-degraded');
+      return degraded();
+    }
     let facts: MemoryFact[] = [];
     let jobs: MemoryJob[] = [];
     if (chatKey) {
       try {
         [facts, jobs] = await Promise.all([this.repository.listFacts(chatKey), this.repository.listJobs(chatKey)]);
+        traceMemoryStartup('application:overview-records-ready');
       } catch (error) {
         this.recallIndex.replace([]);
         this.setRuntimeError(error, 'MEMORY_CHAT_READ_FAILED', 'chat-bind');
+        traceMemoryStartup('application:overview-records-failed');
         return degraded(this.error);
       }
     }
     const latestCompletedAt = jobs
       .filter((job) => job.status === 'completed')
       .reduce<number | null>((latest, job) => latest === null ? job.updatedAt : Math.max(latest, job.updatedAt), null);
-    const llmRoute = await readMemoryLlmRouteDiagnostic();
+    const llmRoute = this.currentLlmRouteDiagnostic();
+    traceMemoryStartup('application:overview-route-cached');
     const errorCode = this.errorDiagnostic?.code;
     const currentChat = this.getCurrentChatInfo();
     const bound = Boolean(chatKey && this.boundChatKey === chatKey);
-    return {
+    const overview: MemoryUiOverview = {
       status: this.status === 'error' ? 'error' : !currentChat.available ? 'unselected' : currentChat.effectiveEnabled ? this.status : 'disabled',
       bound,
       ...(chatKey ? { chatKey } : {}),
@@ -585,6 +619,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ...(this.error ? { error: this.error } : {}),
       ...(this.errorDiagnostic ? { errorDiagnostic: this.errorDiagnostic } : {}),
     };
+    traceMemoryStartup('application:overview-ready');
+    return overview;
   }
 
   async getInitializationSources(): Promise<MemoryInitializationSourceOption[]> {
@@ -732,12 +768,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   async listFacts(query = ''): Promise<MemoryUiFact[]> {
+    traceMemoryStartup('application:list-facts-begin');
     const chatKey = this.requireChatKey();
     const [facts, audits] = await Promise.all([
       query.trim() ? this.repository.searchFacts(chatKey, query) : this.repository.listFacts(chatKey),
       this.repository.listJobBatchAudits(chatKey),
     ]);
-    return Promise.all(facts.map(async (fact) => asUiFact(
+    const result = await Promise.all(facts.map(async (fact) => asUiFact(
       fact,
       (await this.repository.listEvidence(chatKey, fact.id)).map((item) => ({ sourceRef: item.sourceRef, excerpt: item.excerpt })),
       audits
@@ -752,6 +789,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           };
         }),
     )));
+    traceMemoryStartup('application:list-facts-ready');
+    return result;
   }
 
   onSettingsChanged(listener: (settings: MemoryUiSettings) => void): () => void {
@@ -812,10 +851,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   async getSqliteStatus(): Promise<MemorySqliteStatus> {
     try {
+      traceMemoryStartup('application:sqlite-status-begin');
       const health = await this.repository.refreshHealth(this.getChatKey());
+      traceMemoryStartup('application:sqlite-status-health-ready');
       const wasAvailable = this.sqliteAvailable;
       this.sqliteAvailable = health.connected;
       if (health.connected && (!wasAvailable || this.status === 'error') && !this.stopped) {
+        traceMemoryStartup('application:sqlite-status-rebind');
         this.vectorIndex.start();
         if (!wasAvailable) await this.loadSettings();
         await this.bindCurrentChat();
@@ -892,6 +934,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   async importSqliteBackup(file: File): Promise<void> {
     if (!this.sqliteAvailable) throw new Error('Memory workspace 不可用，无法恢复备份。');
+    if (!Number.isFinite(file.size) || file.size < 1 || file.size > MAX_MEMORY_BACKUP_BYTES) {
+      const error = new Error('Memory 备份文件过大或无效。') as Error & { code?: string };
+      error.code = 'BACKUP_TOO_LARGE';
+      throw error;
+    }
     await this.cancelCapture();
     await this.repository.importBackup(file);
     await this.loadSettings();

@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
-import { LlmMemoryExtractor, MEMORY_EXTRACT_MAX_TOKENS, MemoryLlmTaskError, type MemoryLlmApi } from '../src/application/ingest/llm-extractor';
+import {
+  configureMemoryLlmApi,
+  LlmMemoryExtractor,
+  MEMORY_EXTRACT_MAX_TOKENS,
+  MEMORY_LLM_ROUTE_DIAGNOSTIC_TIMEOUT_MS,
+  MemoryLlmTaskError,
+  readMemoryLlmRouteDiagnostic,
+  type MemoryLlmApi,
+} from '../src/application/ingest/llm-extractor';
 
 describe('Memory LLMHub 三任务契约', () => {
   it('每次 extract 只调用一次 LLM 并限制 3072 tokens', async () => {
@@ -62,5 +70,20 @@ describe('Memory LLMHub 三任务契约', () => {
     expect((error as Error).message).toContain('错误码=auth_failed');
     expect((error as Error).message).toContain('资源=deepseek-main');
     expect((error as Error).message).not.toMatch(/api[_ -]?key|bearer/i);
+  });
+
+  it('对卡住的 LLM 路由诊断在有界时间内降级，不阻塞 Memory 工作台', async () => {
+    vi.useFakeTimers();
+    try {
+      configureMemoryLlmApi({
+        inspect: { previewRoute: () => new Promise(() => undefined) },
+      } as unknown as MemoryLlmApi);
+      const result = readMemoryLlmRouteDiagnostic();
+      await vi.advanceTimersByTimeAsync(MEMORY_LLM_ROUTE_DIAGNOSTIC_TIMEOUT_MS);
+      await expect(result).resolves.toEqual({ available: false, blockedReason: '暂时无法读取 LLM 资源状态' });
+    } finally {
+      configureMemoryLlmApi(null);
+      vi.useRealTimers();
+    }
   });
 });

@@ -47,11 +47,13 @@ import {
   isGraphBackedFact,
 } from '../domain';
 import { float32ArrayToArrayBuffer, sha256Content } from './vector/vector-utils';
+import { traceMemoryStartup } from '../host/runtime-feedback';
 
 const DEFAULT_SEARCH_LIMIT = 50;
 const MAX_SEARCH_LIMIT = 500;
 const QUERY_PAGE_SIZE = 1_000;
 const TRANSACTION_BATCH_SIZE = 500;
+const MAX_MEMORY_BACKUP_BYTES = 64 * 1024 * 1024;
 const SETTINGS_WORKSPACE_ID = 'settings:global';
 const COLLECTIONS = Object.freeze({
   facts: ['status', 'kind', 'slotKey', 'chatKey', 'updatedAt'],
@@ -93,6 +95,12 @@ function workspaceErrorCode(error: unknown): string | undefined {
   const causeCode = 'cause' in error ? workspaceErrorCode((error as { cause?: unknown }).cause) : undefined;
   if (causeCode) return causeCode;
   return 'code' in error ? String((error as { code?: unknown }).code) : undefined;
+}
+
+function paginationStalledError(scope: string): Error & { code: string } {
+  return Object.assign(new Error(`Memory ${scope} 分页游标未推进，已停止读取以避免界面持续等待。`), {
+    code: 'WORKSPACE_PAGINATION_STALLED',
+  });
 }
 
 function slotRepairError(stage: 'read' | 'write' | 'cleanup', error: unknown): Error & { code: string; details: { reasonCode?: string; stage: string } } {
@@ -308,7 +316,9 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async refreshHealth(_chatKey?: string): Promise<MemoryWorkspaceHealth> {
+    traceMemoryStartup('repository:health-begin');
     const health = await this.workspace.health();
+    traceMemoryStartup(`repository:health-${health.ready ? 'ready' : 'degraded'}`);
     const tableCounts: Record<string, number> = {};
     const tableBytes: Record<string, number | null> = {};
     const chatKey = _chatKey?.trim() || this.sourceChatKey;
@@ -318,7 +328,9 @@ export class MemoryRepository implements IngestCommitter {
       // A chat/identity switch can introduce a workspace after Memory startup.
       // Always make its schema available before querying health counters.
       await this.ensureCollections(this.workspaceId);
+      traceMemoryStartup('repository:health-collections-ready');
       for (const name of Object.keys(COLLECTIONS)) {
+        traceMemoryStartup(`repository:health-list-${name}`);
         const records = await this.listAllRecordRows(name);
         const tableName = name.replaceAll('-', '_');
         const size = records.reduce((total, record) => total + recordPayloadBytes(record), 0);
@@ -329,6 +341,7 @@ export class MemoryRepository implements IngestCommitter {
           .filter((record) => dataChatKey(record.value) === chatKey)
           .reduce((total, record) => total + recordPayloadBytes(record), 0);
       }
+      traceMemoryStartup('repository:health-list-vectors');
       const vectors = await this.listAllVectors();
       const vectorSize = vectors.reduce((total, vector) => total + vectorPayloadBytes(vector), 0);
       tableCounts.fact_vectors = vectors.length;
@@ -338,6 +351,7 @@ export class MemoryRepository implements IngestCommitter {
         .filter((vector) => dataChatKey(vector.metadata) === chatKey)
         .reduce((total, vector) => total + vectorPayloadBytes(vector), 0);
     }
+    traceMemoryStartup('repository:health-snapshot');
     this.healthSnapshot = {
       connected: health.ready,
       serverVersion: 'SS-Helper Core',
@@ -432,9 +446,14 @@ export class MemoryRepository implements IngestCommitter {
 
   private async listAllRecordRows(collection: string, filter: Record<string, PlainData> = {}, orderBy?: { field: string; direction: 'asc' | 'desc' }, workspaceId = this.requireWorkspaceId()): Promise<WorkspaceRecord[]> {
     const records: WorkspaceRecord[] = []; let cursor: string | undefined;
+    const seenCursors = new Set<string>();
     do {
       const page = await this.workspace.query({ workspaceId, collection, filter, ...(orderBy ? { orderBy } : {}), ...(cursor ? { cursor } : {}), limit: QUERY_PAGE_SIZE });
-      records.push(...page.records); cursor = page.nextCursor ?? undefined;
+      records.push(...page.records);
+      const nextCursor = page.nextCursor ?? undefined;
+      if (nextCursor !== undefined && seenCursors.has(nextCursor)) throw paginationStalledError(`记录集合 ${collection}`);
+      if (nextCursor !== undefined) seenCursors.add(nextCursor);
+      cursor = nextCursor;
     } while (cursor);
     return records;
   }
@@ -449,6 +468,7 @@ export class MemoryRepository implements IngestCommitter {
 
   private async listAllVectors(chatKey?: string) {
     const vectors = []; let cursor: string | undefined;
+    const seenCursors = new Set<string>();
     do {
       const page = await this.workspace.vectorList({
         workspaceId: this.requireWorkspaceId(),
@@ -457,7 +477,11 @@ export class MemoryRepository implements IngestCommitter {
         ...(cursor ? { cursor } : {}),
         limit: QUERY_PAGE_SIZE,
       });
-      vectors.push(...page.vectors); cursor = page.nextCursor ?? undefined;
+      vectors.push(...page.vectors);
+      const nextCursor = page.nextCursor ?? undefined;
+      if (nextCursor !== undefined && seenCursors.has(nextCursor)) throw paginationStalledError('向量集合');
+      if (nextCursor !== undefined) seenCursors.add(nextCursor);
+      cursor = nextCursor;
     } while (cursor);
     return vectors;
   }
@@ -1474,6 +1498,11 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async importBackup(file: File): Promise<void> {
+    if (!Number.isFinite(file.size) || file.size < 1 || file.size > MAX_MEMORY_BACKUP_BYTES) {
+      const error = new Error('Memory 备份文件过大或无效。') as Error & { code?: string };
+      error.code = 'BACKUP_TOO_LARGE';
+      throw error;
+    }
     const value = JSON.parse(await file.text()) as { format?: string; version?: number; archive?: unknown; sha256?: string };
     if (value.format !== 'ss-helper-memory' || value.version !== 1 || !value.archive || typeof value.sha256 !== 'string') throw new Error('Memory 备份格式无效。');
     await this.workspace.importAll({ archive: value.archive as never, sha256: value.sha256 });

@@ -65,9 +65,11 @@ export class MemoryGraphService implements GraphRecallCandidateProvider {
   getStatus(chatKey: string, enabled = true): MemoryGraphStatus {
     const current = this.statuses.get(chatKey);
     if (!enabled) {
-      const disabled = { ...(current ?? emptyStatus(chatKey, false)), enabled: false, phase: 'disabled' as const, updatedAt: Date.now() };
-      this.setStatus(chatKey, disabled);
-      return structuredClone(disabled);
+      // This is a read path used synchronously by settings status/field-state
+      // adapters. Publishing from it re-enters those adapters through the
+      // status listener and can spin the renderer before a chat is selected.
+      // State transitions are published by schedule()/rebuild(), never reads.
+      return structuredClone({ ...(current ?? emptyStatus(chatKey, false)), enabled: false, phase: 'disabled' as const });
     }
     return structuredClone(current ?? emptyStatus(chatKey, true));
   }

@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { PluginSession } from '@ss-helper/sdk';
-import { MemoryLlmCapabilityMonitor, type MemoryCapabilitySettings } from '../src/ss-helper/llm-capability-monitor';
+import {
+  MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS,
+  MemoryLlmCapabilityMonitor,
+  type MemoryCapabilitySettings,
+} from '../src/ss-helper/llm-capability-monitor';
 
 const disabled: MemoryCapabilitySettings = { enabled: false, autoOrganize: false, recallMode: 'lexical', rerankMode: 'off' };
 
@@ -126,5 +130,28 @@ describe('Memory settings capability policy', () => {
       rerankStatus: { value: '未配置', tone: 'neutral' },
     });
     monitor.dispose();
+  });
+
+  it('bounds a stalled LLM capability probe and publishes a safe unavailable state', async () => {
+    vi.useFakeTimers();
+    try {
+      const monitor = new MemoryLlmCapabilityMonitor({
+        services: { call: vi.fn(() => new Promise(() => {})) },
+        events: { subscribe: vi.fn(() => () => {}) },
+        host: { events: { subscribe: vi.fn(() => () => {}) } },
+      } as unknown as PluginSession, () => disabled);
+
+      const started = monitor.start();
+      await vi.advanceTimersByTimeAsync(MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS);
+      await expect(started).resolves.toBeUndefined();
+      expect(monitor.getStatus()).toMatchObject({
+        generationStatus: { value: '不可用', tone: 'error' },
+        embeddingStatus: { value: '未配置', tone: 'neutral' },
+        rerankStatus: { value: '未配置', tone: 'neutral' },
+      });
+      monitor.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

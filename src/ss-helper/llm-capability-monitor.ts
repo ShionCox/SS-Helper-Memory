@@ -21,6 +21,12 @@ export interface MemorySettingsAssessment { readonly blocked?: MemorySettingsNot
 type WorkspaceStatusReader = () => SettingsStatusSnapshot | Promise<SettingsStatusSnapshot>;
 
 const TARGET = Object.freeze({ pluginId: 'ss-helper.llm', tabId: 'resources', fieldId: 'resourceWizard' });
+/**
+ * LLM capability state is advisory for Memory.  A missing or wedged provider
+ * must therefore degrade the status card instead of holding the whole Memory
+ * activation chain open.
+ */
+export const MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS = 3_000;
 const reasonText: Record<string, string> = {
   llm_disabled: 'LLM 已停用。',
   no_resource: '尚未配置匹配的资源。',
@@ -34,6 +40,21 @@ const reasonText: Record<string, string> = {
 const neutral = (value: string, description?: string): SettingsStatusSnapshot => ({ value, tone: 'neutral', ...(description ? { description } : {}) });
 const success = (value: string, description?: string): SettingsStatusSnapshot => ({ value, tone: 'success', ...(description ? { description } : {}) });
 const action = (value: string, tone: 'warning' | 'error', description: string): SettingsStatusSnapshot => ({ value, tone, description });
+
+function readStatusWithDeadline<T>(operation: Promise<T>, timeoutMs = MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS): Promise<T | undefined> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (value: T | undefined): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      resolve(value);
+    };
+    timer = setTimeout(() => finish(undefined), timeoutMs);
+    void operation.then((value) => finish(value), () => finish(undefined));
+  });
+}
 
 export class MemoryLlmCapabilityMonitor {
   private readonly listeners = new Set<(status: MemoryCapabilityStatusMap) => void>();
@@ -137,13 +158,13 @@ export class MemoryLlmCapabilityMonitor {
     const settings = this.readSettings();
     let response: LlmCapabilityStatusResponse | undefined;
     try {
-      response = await this.session.services.call(LLM_CAPABILITY_STATUS_V1, {
+      response = await readStatusWithDeadline(this.session.services.call(LLM_CAPABILITY_STATUS_V1, {
         checks: [
           { id: 'generation', taskKey: 'memory_extract', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] },
           { id: 'embedding', taskKey: 'memory_embed', taskKind: 'embedding', requiredCapabilities: ['embeddings'] },
           { id: 'rerank', taskKey: 'memory_rerank', taskKind: 'rerank', requiredCapabilities: ['rerank'] },
         ],
-      });
+      }, { timeoutMs: MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS }));
     } catch {
       response = undefined;
     }
@@ -186,7 +207,9 @@ export class MemoryLlmCapabilityMonitor {
           ? action('降级为基础排序', 'warning', `${reasonText[rerank?.reason ?? 'status_unavailable'] ?? '重排序模型不可用'} 将保留基础排序结果；如需模型重排，请先在 LLM 中配置。`)
           : action('不可用', 'error', `${reasonText[rerank?.reason ?? 'status_unavailable'] ?? '当前重排策略需要重排序模型。'} 请先在 LLM 中配置。`);
     this.status = Object.freeze(next);
-    this.listeners.forEach((listener) => listener(this.status));
+    this.listeners.forEach((listener) => {
+      try { listener(this.status); } catch { /* Settings listeners are isolated from background refresh. */ }
+    });
   }
 
   private scheduleRefresh(): void {

@@ -17,3 +17,9 @@ export const logger = Object.freeze({
   warn: (message: string, detail?: unknown) => write('warn', message, detail),
   error: (message: string, detail?: unknown) => write('error', message, detail),
 });
+
+/** Test-only, opt-in startup breadcrumbs. Never includes host data or settings. */
+export function traceMemoryStartup(stage: string): void {
+  const traceEnabled = (globalThis as typeof globalThis & { __SSHelperMemoryStartupTrace?: unknown }).__SSHelperMemoryStartupTrace === true;
+  if (traceEnabled) logger.info(`启动检查点：${stage}`);
+}

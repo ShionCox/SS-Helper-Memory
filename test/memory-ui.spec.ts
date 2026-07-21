@@ -230,11 +230,36 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).toContain('艾琳 — 害怕 → 雷暴');
     expect(container.textContent).toContain('当前状态稳定');
     expect(container.textContent).toContain('证据摘录');
-    expect(container.textContent).toContain('不会把语义相似度当作实体关系');
+    expect(container.textContent).toContain('视觉聚类只用于浏览');
     expect(container.querySelector('[data-action="rebuild-graph"]')?.getAttribute('data-ss-helper-control')).toBe('button');
     (container.querySelector('[data-action="rebuild-graph"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(rebuildGraph).toHaveBeenCalledOnce();
+    dispose();
+  });
+
+  it('关系图谱提供可操作画布工作区、视图控制与邻接聚焦，且不暴露编辑图边操作', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(container, workbenchController());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="graph"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.querySelector('[data-relationship-graph-three-host]')).not.toBeNull();
+    expect(container.querySelector('.stx-memory-graph-shell')).not.toBeNull();
+    expect(container.querySelector('[data-action="graph-command"][data-graph-command="fit"]')).not.toBeNull();
+    expect(container.textContent).toContain('拖动旋转');
+    expect(container.textContent).toContain('类型');
+    expect(container.textContent).toContain('边列表');
+    expect(container.querySelector('[data-action="graph-command"][data-graph-command="fit"]')?.getAttribute('data-ss-helper-control')).toBe('button');
+    const focus = container.querySelector('[data-action="toggle-graph-neighbor-focus"]') as HTMLButtonElement;
+    expect(focus.disabled).toBe(false);
+    focus.click();
+    expect(container.querySelector('[data-action="toggle-graph-neighbor-focus"]')?.getAttribute('aria-pressed')).toBe('true');
+    expect(container.textContent).toContain('显示全部关系');
+    expect(container.querySelector('[data-action="create-graph-edge"]')).toBeNull();
+    expect(container.querySelector('[data-action="edit-graph-edge"]')).toBeNull();
     dispose();
   });
 
@@ -272,7 +297,7 @@ describe('Memory UI 展示适配', () => {
         listFacts: async () => facts,
       }),
       () => undefined,
-      { refreshControls: (root) => { if (root) refreshed.push(root); } },
+      { close: () => undefined, refreshControls: (root) => { if (root) refreshed.push(root); } },
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
 

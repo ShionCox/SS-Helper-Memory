@@ -1,9 +1,9 @@
 import type { PluginSession, SettingsStatusSnapshot } from '@ss-helper/sdk';
 import { MemoryApplication } from '../application/memory-application';
-import { registerMemoryContributions, type MemoryHostCapability } from '../ss-helper/plugin';
+import { MEMORY_WORKSPACE_RECOVERY_POPUP, registerMemoryContributions, type MemoryHostCapability } from '../ss-helper/plugin';
 import { renderMemoryWorkbench } from '../ui/memory-ui';
 import { buildMemoryPromptContribution } from './prompt-injection';
-import { logger } from './runtime-feedback';
+import { logger, traceMemoryStartup } from './runtime-feedback';
 import { captureMainChatUsage } from './main-chat-usage';
 import { SdkMemoryHostContext } from './sdk-host-context';
 import { configureMemoryLlmApi } from '../application/ingest/llm-extractor';
@@ -13,6 +13,8 @@ import { MemoryLlmCapabilityMonitor } from '../ss-helper/llm-capability-monitor'
 
 const SEND_WINDOW_MS = 45_000;
 const MEMORY_PROMPT_ID = 'ss-helper.memory.recall.v1';
+const MAX_REBINDS_PER_TURN = 3;
+const REBIND_RETRY_DELAY_MS = 250;
 
 export function memoryWorkspaceStatus(application: Pick<MemoryApplication, 'getCurrentChatInfo'>): SettingsStatusSnapshot {
   const chat = application.getCurrentChatInfo();
@@ -30,7 +32,11 @@ export class MemoryRuntime {
   private rebindPromise: Promise<void> = Promise.resolve();
   private rebindPending = false;
   private rebindRequested = false;
+  private rebindRefreshRequested = false;
+  private rebindRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private recoveryPrompted = false;
   private stopped = false;
+  private started = false;
   private readonly abortController = new AbortController();
 
   constructor(
@@ -43,40 +49,74 @@ export class MemoryRuntime {
   }
 
   async start(): Promise<boolean> {
+    traceMemoryStartup('runtime:start');
+    if (this.started) return this.application.isSqliteAvailable();
+    this.started = true;
     this.stopped = false;
-    configureMemoryLlmApi(createMemoryLlmApi(this.session, this.abortController.signal));
-    await this.context.refresh();
-    this.application.bindStorageScope(this.context.getWorkspaceId(), this.context.getChatKey());
-    await this.application.start();
-    const capabilityMonitor = new MemoryLlmCapabilityMonitor(
-      this.session,
-      // LLM resource status is global.  Current-chat activation is reported by
-      // currentChatEffective/workspaceStatus and must not make a healthy LLM
-      // look like it is disabled merely because no chat is selected yet.
-      () => this.application.getSettings(),
-      (listener) => this.application.onSettingsChanged(() => listener()),
-      () => memoryWorkspaceStatus(this.application),
-    );
-    await capabilityMonitor.start();
-    this.disposers.push(() => capabilityMonitor.dispose());
-    const contributions = registerMemoryContributions(
-      this.session,
-      this.application,
-      (container, actionId, popupUi) => renderMemoryWorkbench(
-        container,
+    this.recoveryPrompted = false;
+    try {
+      configureMemoryLlmApi(createMemoryLlmApi(this.session, this.abortController.signal));
+      await this.context.refresh();
+      this.assertActive();
+      traceMemoryStartup('runtime:context-ready');
+      this.application.bindStorageScope(this.context.getWorkspaceId(), this.context.getChatKey());
+      await this.application.start();
+      this.assertActive();
+      traceMemoryStartup('runtime:application-started');
+      const capabilityMonitor = new MemoryLlmCapabilityMonitor(
+        this.session,
+        // LLM resource status is global.  Current-chat activation is reported by
+        // currentChatEffective/workspaceStatus and must not make a healthy LLM
+        // look like it is disabled merely because no chat is selected yet.
+        () => this.application.getSettings(),
+        (listener) => this.application.onSettingsChanged(() => listener()),
+        () => memoryWorkspaceStatus(this.application),
+      );
+      this.disposers.push(() => capabilityMonitor.dispose());
+      await capabilityMonitor.start();
+      this.assertActive();
+      traceMemoryStartup('runtime:capabilities-ready');
+      const contributions = registerMemoryContributions(
+        this.session,
         this.application,
-        (notification) => this.session.ui.showToast(notification),
-        popupUi,
-        actionId,
-      ),
-      capabilityMonitor,
-    );
-    this.disposers.push(() => contributions.dispose());
-    this.bindHostEvents(capabilityMonitor);
-    const storage = await this.application.getSqliteStatus();
-    if (storage.connected) logger.success('Memory workspace 已启动。');
-    else logger.error('Memory workspace 不可用，记忆功能已安全停用。', storage.lastError);
-    return storage.connected;
+        (container, actionId, popupUi) => renderMemoryWorkbench(
+          container,
+          this.application,
+          (notification) => this.session.ui.showToast(notification),
+          popupUi,
+          actionId,
+        ),
+        capabilityMonitor,
+        { repair: () => this.session.workspace.repair({ confirm: true }) },
+      );
+      this.disposers.push(() => contributions.dispose());
+      this.assertActive();
+      this.bindHostEvents(capabilityMonitor);
+      traceMemoryStartup('runtime:contributions-registered');
+      // MemoryApplication.start() already ran the first workspace health/open
+      // sequence. A second health request here raced the host APP_READY turn in
+      // fresh SillyTavern and could leave the renderer unresponsive.
+      const connected = this.application.isSqliteAvailable();
+      traceMemoryStartup(`runtime:storage-${connected ? 'connected' : 'degraded'}`);
+      if (connected) logger.success('Memory workspace 已启动。');
+      else {
+        logger.error('Memory workspace 不可用，记忆功能已安全停用。');
+        void this.offerWorkspaceRecovery().catch((error) => logger.warn('Memory workspace 恢复状态检查失败。', error));
+      }
+      return connected;
+    } catch (error) {
+      if (!this.stopped) this.stop();
+      if (this.abortController.signal.aborted) return false;
+      throw error;
+    }
+  }
+
+  private assertActive(): void {
+    if (this.stopped || this.abortController.signal.aborted) {
+      const error = new Error('Memory runtime was stopped during startup') as Error & { code?: string };
+      error.code = 'MEMORY_START_CANCELLED';
+      throw error;
+    }
   }
 
   stop(): void {
@@ -87,7 +127,11 @@ export class MemoryRuntime {
     void this.session.host.prompt.remove(MEMORY_PROMPT_ID).catch(() => undefined);
     this.rebindPending = false;
     this.rebindRequested = false;
+    this.rebindRefreshRequested = false;
+    if (this.rebindRetryTimer !== undefined) clearTimeout(this.rebindRetryTimer);
+    this.rebindRetryTimer = undefined;
     this.rebindPromise = Promise.resolve();
+    this.recoveryPrompted = false;
     this.application.stop();
     configureMemoryLlmApi(null);
     logger.info('Memory 已停止。');
@@ -119,11 +163,21 @@ export class MemoryRuntime {
       this.scheduleRebind(true);
     }));
     this.disposers.push(events.subscribe('generation-ended', (event) => {
-      void this.onGenerationEnded(event.generation);
+      void this.onGenerationEnded(event.generation).catch((error) => logger.warn('Memory generation-end 处理失败。', error));
     }));
     this.disposers.push(events.subscribe('prompt-ready', (event) => {
-      void this.onPromptReady(event.prompt.messages);
+      void this.onPromptReady(event.prompt.messages).catch((error) => logger.warn('Memory Prompt 处理失败。', error));
     }));
+  }
+
+  private async offerWorkspaceRecovery(): Promise<void> {
+    if (this.stopped || this.recoveryPrompted) return;
+    const health = await this.session.workspace.health();
+    if (this.stopped || health.ready || health.recoverable !== true) return;
+    this.recoveryPrompted = true;
+    this.session.ui.openPopup(MEMORY_WORKSPACE_RECOVERY_POPUP, {
+      errorCode: health.errorCode ?? 'WORKSPACE_UNAVAILABLE',
+    });
   }
 
   private async onGenerationEnded(generation: { readonly provider?: string; readonly model?: string; readonly usage?: unknown }): Promise<void> {
@@ -168,18 +222,35 @@ export class MemoryRuntime {
   private scheduleRebind(refreshContext: boolean): void {
     if (this.stopped) return;
     this.rebindRequested = true;
+    this.rebindRefreshRequested ||= refreshContext;
     if (this.rebindPending) return;
     this.rebindPending = true;
     this.rebindPromise = this.rebindPromise
       .catch(() => undefined)
       .then(async () => {
-        while (this.rebindRequested && !this.stopped) {
+        let rounds = 0;
+        while (this.rebindRequested && !this.stopped && rounds < MAX_REBINDS_PER_TURN) {
+          const shouldRefreshContext = this.rebindRefreshRequested;
           this.rebindRequested = false;
-          if (refreshContext) await this.context.refresh();
+          this.rebindRefreshRequested = false;
+          if (shouldRefreshContext) await this.context.refresh();
+          if (this.stopped) return;
           await this.application.bindCurrentChat();
+          rounds += 1;
         }
       })
       .catch((error) => logger.warn('Memory 当前聊天重绑失败。', error))
-      .finally(() => { this.rebindPending = false; });
+      .finally(() => {
+        this.rebindPending = false;
+        if (this.rebindRequested && !this.stopped) this.deferRebind();
+      });
+  }
+
+  private deferRebind(): void {
+    if (this.rebindRetryTimer !== undefined || this.stopped) return;
+    this.rebindRetryTimer = setTimeout(() => {
+      this.rebindRetryTimer = undefined;
+      this.scheduleRebind(false);
+    }, REBIND_RETRY_DELAY_MS);
   }
 }

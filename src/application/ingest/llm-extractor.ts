@@ -111,6 +111,7 @@ export interface MemoryLlmApi {
 }
 
 let configuredLlmApi: MemoryLlmApi | null = null;
+export const MEMORY_LLM_ROUTE_DIAGNOSTIC_TIMEOUT_MS = 3_000;
 
 export function configureMemoryLlmApi(api: MemoryLlmApi | null): void { configuredLlmApi = api; }
 
@@ -206,6 +207,27 @@ export function readMemoryLlmApi(): MemoryLlmApi | null {
   return configuredLlmApi;
 }
 
+/**
+ * Route preview is advisory UI metadata. A late or unhealthy LLM plugin must
+ * never leave Memory startup or the workbench waiting forever for it.
+ */
+async function readRouteWithDeadline<T>(operation: () => Promise<T> | T): Promise<T | undefined> {
+  return await new Promise<T | undefined>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (value: T | undefined): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      resolve(value);
+    };
+    timer = setTimeout(() => finish(undefined), MEMORY_LLM_ROUTE_DIAGNOSTIC_TIMEOUT_MS);
+    void Promise.resolve()
+      .then(operation)
+      .then((value) => finish(value), () => finish(undefined));
+  });
+}
+
 async function readRouteDiagnostic(
   taskKey: string,
   taskKind: MemoryLlmTaskKind,
@@ -214,13 +236,14 @@ async function readRouteDiagnostic(
   const llm = readMemoryLlmApi();
   if (!llm) return { available: false, blockedReason: 'LLMHub 未加载或版本过旧' };
   if (!llm.inspect?.previewRoute) return { available: false, blockedReason: '当前 LLM 不支持资源状态检查，请更新 LLM 插件' };
-  try {
-    const route = await llm.inspect.previewRoute({
+  const route = await readRouteWithDeadline(() => llm.inspect!.previewRoute({
       consumer: MEMORY_PLUGIN_ID,
       taskKey,
       taskKind,
       requiredCapabilities,
-    });
+    }));
+  if (!route || typeof route !== 'object') return { available: false, blockedReason: '暂时无法读取 LLM 资源状态' };
+  try {
     const available = route.available === true
       || (route.available === undefined && !route.blockedReason && Boolean(route.resourceId || route.model));
     return {

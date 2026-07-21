@@ -10,10 +10,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ss-helper/sdk": "file:vendor/ss-helper-sdk-2.1.0.tgz"
+    "@ss-helper/sdk": "file:vendor/ss-helper-sdk-2.2.0.tgz",
+    "d3-force-3d": "^3.0.6",
+    "three": "^0.179.1"
   },
   "devDependencies": {
     "@types/node": "^25.3.3",
+    "@types/three": "^0.179.0",
     "jsdom": "^26.1.0",
     "typescript": "^5.9.3",
     "vite": "^7.3.6",

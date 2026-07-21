@@ -178,6 +178,14 @@ describe('MemoryRepository workspace concurrency', () => {
     expect(query).toHaveBeenNthCalledWith(2, expect.objectContaining({ cursor: 'next' }));
   });
 
+  it('fails closed when a workspace query repeats its pagination cursor', async () => {
+    const query = vi.fn(async () => ({ records: [], nextCursor: 'stalled-cursor' }));
+    const repository = new MemoryRepository(workspace({ query })); repository.bind('character:c1', 'chat-a');
+
+    await expect(repository.listJobBatchAudits('chat-a')).rejects.toMatchObject({ code: 'WORKSPACE_PAGINATION_STALLED' });
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
   it('uses workspace revisions and replays a committed job batch idempotently', async () => {
     const slotKey = createFactSlotKey('仓库', '储备');
     const previous = {

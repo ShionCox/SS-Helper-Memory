@@ -204,12 +204,12 @@ export class SemanticRecallService {
         const rerankStartedAt = Date.now();
         try {
           const route = llm.inspect?.previewRoute
-            ? await llm.inspect.previewRoute({
+            ? await withTimeout(Promise.resolve(llm.inspect.previewRoute({
                 consumer: MEMORY_PLUGIN_ID,
                 taskKey: MEMORY_RERANK_TASK,
                 taskKind: 'rerank',
                 requiredCapabilities: ['rerank'],
-              })
+              })), timeoutMs, 'memory_rerank_route')
             : null;
           if (route?.blockedReason) {
             degradedReason = degradedReason || route.blockedReason;

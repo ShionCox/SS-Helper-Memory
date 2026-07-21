@@ -115,4 +115,16 @@ describe('事实关系图谱', () => {
     await vi.waitFor(() => expect(reconcileGraphProjection).toHaveBeenCalledOnce());
     expect(service.getStatus('chat-a')).toMatchObject({ phase: 'ready' });
   });
+
+  it('读取未选择聊天的禁用状态不会通知观察者或重入设置订阅', () => {
+    const service = new MemoryGraphService({
+      listFacts: async () => [],
+      reconcileGraphProjection: async () => undefined,
+    } as never);
+    const listener = vi.fn();
+    service.onStatusChanged(listener);
+
+    expect(service.getStatus('', false)).toMatchObject({ chatKey: '', enabled: false, phase: 'disabled' });
+    expect(listener).not.toHaveBeenCalled();
+  });
 });

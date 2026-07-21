@@ -7,9 +7,11 @@ import {
   type PopupUiContext,
   type PluginDescriptor,
   type PluginSession,
+  type WorkspaceRecoveryRepairResult,
 } from '@ss-helper/sdk';
 import { createMemorySettingsAdapter, MEMORY_SETTINGS_SCHEMA, MEMORY_WORKBENCH_POPUP, type MemorySettingsController, type MemorySettingsStatusSource } from './settings';
 import { registerMemoryServices, type MemoryRecallController } from './services';
+import { renderMemoryWorkspaceRecovery, type MemoryWorkspaceRecoveryController } from '../ui/workspace-recovery-ui';
 import config from '../../plugin.config.json' with { type: 'json' };
 
 export interface MemoryContributionController extends MemorySettingsController, MemoryRecallController {}
@@ -25,9 +27,21 @@ export const MEMORY_HOST_CAPABILITIES = Object.freeze([
   'tavern.prompt.contribute',
   'tavern.plugin.request',
   'tavern.plugin.binary-request.v1',
+  'workspace.recovery',
 ] as const satisfies readonly HostCapability[]);
 
 export type MemoryHostCapability = (typeof MEMORY_HOST_CAPABILITIES)[number];
+
+export const MEMORY_WORKSPACE_RECOVERY_POPUP = Object.freeze({
+  kind: 'popup' as const,
+  provider: MEMORY_PLUGIN_ID,
+  name: 'workspace-recovery',
+  version: 1,
+});
+
+export interface MemoryRecoveryController extends MemoryWorkspaceRecoveryController {
+  repair(): Promise<WorkspaceRecoveryRepairResult>;
+}
 
 export const MEMORY_PLUGIN_DESCRIPTOR: PluginDescriptor<MemoryHostCapability> = Object.freeze({
   id: MEMORY_PLUGIN_ID,
@@ -45,6 +59,7 @@ export function registerMemoryContributions(
   controller: MemoryContributionController,
   renderWorkbench: (container: HTMLElement, actionId: string | undefined, popupUi?: PopupUiContext) => void | (() => void),
   statusSource: MemorySettingsStatusSource,
+  recovery: MemoryRecoveryController,
 ): { dispose(): void; publishUpdated: ReturnType<typeof registerMemoryServices>['publishUpdated'] } {
   const services = registerMemoryServices(session, controller);
   const disposers = [
@@ -63,6 +78,25 @@ export function registerMemoryContributions(
           : undefined;
         return renderWorkbench(container, actionId, popupUi);
       },
+    }),
+    session.registerPopup({
+      token: MEMORY_WORKSPACE_RECOVERY_POPUP,
+      title: 'Memory 工作区恢复',
+      ariaLabel: 'SS-Helper Memory 工作区恢复',
+      closeLabel: '稍后处理 Memory 工作区恢复',
+      presentation: 'workspace',
+      render: (container, input, popupUi) => renderMemoryWorkspaceRecovery(
+        container,
+        {
+          errorCode: input && typeof input === 'object' && !Array.isArray(input)
+            && typeof (input as Record<string, unknown>).errorCode === 'string'
+            ? (input as Record<string, string>).errorCode
+            : undefined,
+        },
+        recovery,
+        (notification) => session.ui.showToast(notification),
+        popupUi,
+      ),
     }),
   ];
   return {
