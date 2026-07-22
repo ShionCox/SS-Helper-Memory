@@ -72,10 +72,26 @@ export interface MemoryPluginApi {
   getSqliteStatus(): Promise<MemorySqliteStatus>;
   clearCurrentChatData(): Promise<void>;
   clearAllMemoryData(): Promise<void>;
+  captureActors?(): Promise<import('./application/actors').MultiActorCaptureResult>;
+  recallActors?(input: import('./domain').ActorRecallRequest): Promise<import('./domain').ActorRecallResponse>;
+  updateActorProfile?(ownerId: string): Promise<readonly import('./domain').ProfileClaim[]>;
+  enqueueActorDream?(ownerId: string, traceIds?: readonly string[]): Promise<import('./domain').DreamJob>;
+  runActorDream?(jobId: string, options?: { readonly dryRun?: boolean; readonly narrative?: boolean }): Promise<import('./application/dream').DreamAudit>;
+  auditActorOutput?(output: string): import('./application/recall').KnowledgeLeakageAudit | null;
+  listActors?(): Promise<readonly import('./domain').MemoryOwner[]>;
+  listSceneCasts?(): Promise<readonly import('./domain').SceneCast[]>;
+  listActorTraces?(ownerId?: string): Promise<readonly import('./domain').ActorMemoryTrace[]>;
+  listActorProfiles?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
+  listActorDreams?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
+  rollbackActorDream?(auditId: string): Promise<void>;
 }
 
 export * from './domain';
 export * from './application/recall';
 export * from './application/graph';
 export * from './application/prompt';
+export * from './application/actors';
+export * from './application/profile';
+export * from './application/dream';
+export * from './application/evaluation/multi-actor-offline-evaluator';
 export type { SourceBlock, ExtractedFactProposal } from './application/ingest/types';

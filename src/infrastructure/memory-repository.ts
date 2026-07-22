@@ -1,13 +1,4 @@
 import type { IngestCommit, IngestCommitter } from '../application/ingest/types';
-import { summarizeInitializationRoutes } from '../application/ingest/initialization-finalizer';
-import type {
-  InitializationFinalizationStats,
-  InitializationReducedFact,
-  InitializationReduction,
-  InitializationResolutionStaging,
-  InitializationRouteSummary,
-  InitializationStagingBatch,
-} from '../application/ingest/initialization-finalizer';
 import type {
   PlainData,
   WorkspacePort,
@@ -19,6 +10,7 @@ import { SDK_PACKAGE_VERSION } from '@ss-helper/sdk';
 import {
   ACTIVE_CONFIDENCE_THRESHOLD,
   MAX_FACT_CONTENT_LENGTH,
+  MIN_FACT_CONTENT_LENGTH,
   createCanonicalKey,
   createFactSlotKey,
   decideFactReconciliation,
@@ -29,7 +21,6 @@ import {
   FactListOptions,
   MainChatUsage,
   ManualFactInput,
-  MemoryBatchSnapshot,
   MemoryEvidence,
   MemoryFact,
   MemoryFactVector,
@@ -54,18 +45,32 @@ const DEFAULT_SEARCH_LIMIT = 50;
 const MAX_SEARCH_LIMIT = 500;
 const QUERY_PAGE_SIZE = 1_000;
 const TRANSACTION_BATCH_SIZE = 500;
-const MAX_MEMORY_BACKUP_BYTES = 64 * 1024 * 1024;
 const SETTINGS_WORKSPACE_ID = 'settings:global';
 const COLLECTIONS = Object.freeze({
-  facts: ['status', 'kind', 'slotKey', 'chatKey', 'updatedAt'],
-  'fact-slots': ['factId', 'chatKey', 'slotKey'],
-  evidence: ['factId', 'chatKey', 'occurredAt'],
-  jobs: ['chatKey', 'status', 'type', 'updatedAt'],
-  'job-audits': ['chatKey', 'jobId', 'batchIndex', 'completedAt'],
+  actors: ['workspaceId', 'kind', 'canonicalName', 'status', 'updatedAt'],
+  'actor-aliases': ['workspaceId', 'ownerId', 'normalizedValue', 'status', 'updatedAt'],
+  episodes: ['workspaceId', 'chatKey', 'floorStart', 'occurredAt', 'createdAt'],
+  observations: ['workspaceId', 'episodeId', 'sourceRef', 'speakerOwnerId', 'occurredAt'],
+  facts: ['workspaceId', 'chatKey', 'status', 'kind', 'updatedAt'],
+  evidence: ['workspaceId', 'chatKey', 'factId', 'occurredAt'],
+  'fact-heads': ['workspaceId', 'chatKey', 'slotKey', 'factId'],
+  'memory-traces': ['workspaceId', 'chatKey', 'ownerId', 'factId', 'updatedAt'],
+  'scene-casts': ['workspaceId', 'chatKey', 'floor', 'createdAt'],
+  'capture-jobs': ['workspaceId', 'chatKey', 'status', 'updatedAt'],
+  'change-audits': ['workspaceId', 'chatKey', 'createdAt'],
+  'memory-details': ['workspaceId', 'ownerId', 'traceId'],
+  'memory-links': ['workspaceId', 'ownerId', 'updatedAt'],
+  profiles: ['workspaceId', 'ownerId', 'updatedAt'],
+  'profile-claims': ['workspaceId', 'ownerId', 'level', 'updatedAt'],
+  'relationship-claims': ['workspaceId', 'fromOwnerId', 'toOwnerId', 'updatedAt'],
+  'recall-exposures': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
+  'dream-jobs': ['workspaceId', 'chatKey', 'ownerId', 'status', 'updatedAt'],
+  'dream-audits': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
+  'dream-narratives': ['workspaceId', 'ownerId', 'createdAt'],
   usage: ['chatKey', 'capturedAt'],
   'recall-logs': ['chatKey', 'createdAt'],
-  'graph-nodes': ['chatKey', 'entityKey', 'updatedAt'],
-  'graph-edges': ['chatKey', 'fromNodeId', 'toNodeId', 'backingFactId', 'predicateKey', 'updatedAt'],
+  'graph-nodes': ['workspaceId', 'chatKey', 'entityKey', 'updatedAt'],
+  'graph-edges': ['workspaceId', 'chatKey', 'fromNodeId', 'toNodeId', 'backingFactId', 'updatedAt'],
 } as const);
 
 export interface MemoryWorkspaceHealth {
@@ -104,16 +109,6 @@ function paginationStalledError(scope: string): Error & { code: string } {
   });
 }
 
-function slotRepairError(stage: 'read' | 'write' | 'cleanup', error: unknown): Error & { code: string; details: { reasonCode?: string; stage: string } } {
-  const reasonCode = workspaceErrorCode(error);
-  const labels = { read: '读取旧槽位', write: '写入聊天级槽位', cleanup: '清理旧槽位' } as const;
-  return Object.assign(new Error(`${labels[stage]}失败${reasonCode ? `（底层错误码：${reasonCode}）` : ''}。`), {
-    code: `MEMORY_SLOT_MIGRATION_${stage.toUpperCase()}_FAILED`,
-    details: { ...(reasonCode ? { reasonCode } : {}), stage },
-    cause: error,
-  });
-}
-
 function clampLimit(limit: number | undefined): number {
   return Math.min(MAX_SEARCH_LIMIT, Math.max(1, Math.trunc(limit ?? DEFAULT_SEARCH_LIMIT)));
 }
@@ -137,7 +132,7 @@ function normalizedChatKey(chatKey: string): string {
 }
 
 function factSlotRecordId(chatKey: string, slotKey: string): string {
-  return `fact-slot:${encodeURIComponent(normalizedChatKey(chatKey))}:${encodeURIComponent(slotKey)}`;
+  return `fact-head:${encodeURIComponent(normalizedChatKey(chatKey))}:${encodeURIComponent(slotKey)}`;
 }
 
 function factBelongsToChat(fact: MemoryFact | undefined, chatKey: string): fact is MemoryFact {
@@ -201,7 +196,7 @@ function undoEntryBelongsToChat(entry: UndoLogEntry, chatKey: string): boolean {
 }
 
 interface UndoLogEntry {
-  collection: 'facts' | 'evidence' | 'fact-slots';
+  collection: 'facts' | 'evidence' | 'fact-heads';
   recordId: string;
   before?: PlainData;
   after?: PlainData;
@@ -268,8 +263,6 @@ export class MemoryRepository implements IngestCommitter {
   private healthSnapshot: MemoryWorkspaceHealth | null = null;
   private workspaceId = '';
   private sourceChatKey = '';
-  private readonly repairedWorkspaces = new Set<string>();
-  private readonly repairPromises = new Map<string, Promise<void>>();
 
   constructor(readonly workspace: WorkspacePort) {}
 
@@ -292,7 +285,7 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   private async ensureCollections(workspaceId: string): Promise<void> {
-    await this.workspace.open({ workspaceId, create: true, metadata: { kind: workspaceId.startsWith('group:') ? 'group' : workspaceId === SETTINGS_WORKSPACE_ID ? 'settings' : 'character' } });
+    await this.workspace.open({ workspaceId, create: true, metadata: { kind: workspaceId.startsWith('group:') ? 'group' : workspaceId === SETTINGS_WORKSPACE_ID ? 'settings' : 'host_card' } });
     if (workspaceId === SETTINGS_WORKSPACE_ID) {
       await this.workspace.defineCollection({ workspaceId, name: 'settings', indexes: ['key'] });
       return;
@@ -384,64 +377,15 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   private ensureChatIsolation(): Promise<void> {
-    const workspaceId = this.requireWorkspaceId();
-    if (this.repairedWorkspaces.has(workspaceId)) return Promise.resolve();
-    const existing = this.repairPromises.get(workspaceId);
-    if (existing) return existing;
-    const repair = this.rebuildSlots()
-      .then(() => { this.repairedWorkspaces.add(workspaceId); })
-      .finally(() => { this.repairPromises.delete(workspaceId); });
-    this.repairPromises.set(workspaceId, repair);
-    return repair;
+    // Chat ownership is encoded directly on every v0 fact/evidence/head row;
+    // there is no repair or migration pass at startup.
+    this.requireWorkspaceId();
+    return Promise.resolve();
   }
 
   private async transactInBatches(workspaceId: string, operations: readonly WorkspaceTransactionOperation[]): Promise<void> {
     for (let offset = 0; offset < operations.length; offset += TRANSACTION_BATCH_SIZE) {
       await this.workspace.transaction({ workspaceId, operations: operations.slice(offset, offset + TRANSACTION_BATCH_SIZE) });
-    }
-  }
-
-  /**
-   * Repair writes deliberately use the smallest public Workspace operations.
-   * This keeps the one-time legacy migration compatible with older Core builds
-   * whose transaction boundary rejected newly indexed slot payloads.  All new
-   * chat-scoped slots are written before any legacy slot is removed.
-   */
-  private async writeSlotRepairs(
-    workspaceId: string,
-    upserts: readonly Extract<WorkspaceTransactionOperation, { action: 'upsert' }>[],
-    deletes: readonly Extract<WorkspaceTransactionOperation, { action: 'delete' }>[],
-  ): Promise<void> {
-    try {
-      for (let offset = 0; offset < upserts.length; offset += TRANSACTION_BATCH_SIZE) {
-        for (const operation of upserts.slice(offset, offset + TRANSACTION_BATCH_SIZE)) {
-          await this.workspace.upsert({
-            workspaceId,
-            collection: operation.collection,
-            recordId: operation.recordId,
-            value: operation.value,
-            ...(operation.expectedVersion === undefined ? {} : { expectedVersion: operation.expectedVersion }),
-            ...(operation.expectedRevision === undefined ? {} : { expectedRevision: operation.expectedRevision }),
-          });
-        }
-      }
-    } catch (error) {
-      throw slotRepairError('write', error);
-    }
-    try {
-      for (let offset = 0; offset < deletes.length; offset += TRANSACTION_BATCH_SIZE) {
-        for (const operation of deletes.slice(offset, offset + TRANSACTION_BATCH_SIZE)) {
-          await this.workspace.delete({
-            workspaceId,
-            collection: operation.collection,
-            recordId: operation.recordId,
-            ...(operation.expectedVersion === undefined ? {} : { expectedVersion: operation.expectedVersion }),
-            ...(operation.expectedRevision === undefined ? {} : { expectedRevision: operation.expectedRevision }),
-          });
-        }
-      }
-    } catch (error) {
-      throw slotRepairError('cleanup', error);
     }
   }
 
@@ -605,8 +549,8 @@ export class MemoryRepository implements IngestCommitter {
   async upsertManualFact(chatKey: string, input: ManualFactInput): Promise<MemoryFact> {
     chatKey = this.requireChatKey(chatKey);
     const content = normalizeFactContent(input.content);
-    if (!content || Array.from(content).length > MAX_FACT_CONTENT_LENGTH) {
-      throw new Error(`手动记忆正文必须为 1–${MAX_FACT_CONTENT_LENGTH} 字。`);
+    if (Array.from(content).length < MIN_FACT_CONTENT_LENGTH || Array.from(content).length > MAX_FACT_CONTENT_LENGTH) {
+      throw new Error(`手动记忆正文必须为 ${MIN_FACT_CONTENT_LENGTH}–${MAX_FACT_CONTENT_LENGTH} 字。`);
     }
     const confidence = input.confidence ?? 1;
     if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
@@ -689,7 +633,7 @@ export class MemoryRepository implements IngestCommitter {
     }] : [];
     const workspaceId = this.requireWorkspaceId();
     const slotRecordId = factSlotRecordId(chatKey, slotKey);
-    const slotRecord = await this.workspace.get({ workspaceId, collection: 'fact-slots', recordId: slotRecordId });
+    const slotRecord = await this.workspace.get({ workspaceId, collection: 'fact-heads', recordId: slotRecordId });
     const currentSlot = slotRecord?.value;
     if (slotRecord && (!isFactSlotValue(currentSlot)
       || currentSlot.chatKey !== chatKey
@@ -705,7 +649,7 @@ export class MemoryRepository implements IngestCommitter {
       const record = await this.workspace.get({ workspaceId, collection: 'facts', recordId: related.id });
       operations.push({ action: 'upsert', collection: 'facts', recordId: related.id, value: asPlain(related), expectedVersion: record?.version ?? 0 });
     }
-    if (status === 'active' || status === 'pending') operations.push({ action: 'upsert', collection: 'fact-slots', recordId: slotRecordId, value: asPlain(slotValue(chatKey, slotKey, fact.id)), expectedVersion: slotRecord?.version ?? 0 });
+    if (status === 'active' || status === 'pending') operations.push({ action: 'upsert', collection: 'fact-heads', recordId: slotRecordId, value: asPlain(slotValue(chatKey, slotKey, fact.id)), expectedVersion: slotRecord?.version ?? 0 });
     this.requireChatKey(chatKey);
     await this.workspace.transaction({ workspaceId, operations });
     return fact;
@@ -736,12 +680,12 @@ export class MemoryRepository implements IngestCommitter {
     for (const record of evidence) operations.push({ action: 'delete', collection: 'evidence', recordId: record.recordId, expectedVersion: record.version });
     if (target.slotKey) {
       const slotRecordId = factSlotRecordId(chatKey, target.slotKey);
-      const slot = await this.workspace.get({ workspaceId, collection: 'fact-slots', recordId: slotRecordId });
+      const slot = await this.workspace.get({ workspaceId, collection: 'fact-heads', recordId: slotRecordId });
       if (slot) {
         const replacement = selectedSlotFact(relatedRecords.map((record) => record!.value as unknown as MemoryFact));
         operations.push(replacement
-          ? { action: 'upsert', collection: 'fact-slots', recordId: slotRecordId, value: asPlain(slotValue(chatKey, target.slotKey, replacement.id)), expectedVersion: slot.version }
-          : { action: 'delete', collection: 'fact-slots', recordId: slotRecordId, expectedVersion: slot.version });
+          ? { action: 'upsert', collection: 'fact-heads', recordId: slotRecordId, value: asPlain(slotValue(chatKey, target.slotKey, replacement.id)), expectedVersion: slot.version }
+          : { action: 'delete', collection: 'fact-heads', recordId: slotRecordId, expectedVersion: slot.version });
       }
     }
     this.requireChatKey(chatKey);
@@ -763,7 +707,7 @@ export class MemoryRepository implements IngestCommitter {
     const startedAt = Date.now();
     const batchIndex = input.checkpoint.batchIndex ?? 1;
     const undoLogId = `undo-v2:${input.jobId}:${batchIndex}`;
-    const existingUndo = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'job-audits', recordId: undoLogId });
+    const existingUndo = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'change-audits', recordId: undoLogId });
     if (existingUndo) {
       const log = existingUndo.value as unknown as UndoLogV2;
       if (log.kind !== 'undo-log-v0' || log.chatKey !== chatKey || !log.result) {
@@ -969,7 +913,7 @@ export class MemoryRepository implements IngestCommitter {
       }
       for (const slotKey of touchedSlots) {
         const slotRecordId = factSlotRecordId(chatKey, slotKey);
-        const slotRecord = await this.workspace.get({ workspaceId, collection: 'fact-slots', recordId: slotRecordId });
+        const slotRecord = await this.workspace.get({ workspaceId, collection: 'fact-heads', recordId: slotRecordId });
         const currentSlot = slotRecord?.value;
         if (slotRecord && (!isFactSlotValue(currentSlot)
           || currentSlot.chatKey !== chatKey
@@ -979,21 +923,21 @@ export class MemoryRepository implements IngestCommitter {
         if (selected) {
           const after = asPlain(slotValue(chatKey, slotKey, selected.id));
           const beforeRevision = slotRecord?.revision ?? slotRecord?.version ?? 0;
-          operations.push({ action: 'upsert', collection: 'fact-slots', recordId: slotRecordId, value: after, expectedRevision: beforeRevision });
-          undoEntries.push({ collection: 'fact-slots', recordId: slotRecordId, ...(slotRecord == null ? {} : { before: asPlain(slotRecord.value) }), after, beforeRevision, afterRevision: beforeRevision + 1 });
+          operations.push({ action: 'upsert', collection: 'fact-heads', recordId: slotRecordId, value: after, expectedRevision: beforeRevision });
+          undoEntries.push({ collection: 'fact-heads', recordId: slotRecordId, ...(slotRecord == null ? {} : { before: asPlain(slotRecord.value) }), after, beforeRevision, afterRevision: beforeRevision + 1 });
         } else {
           const beforeRevision = slotRecord?.revision ?? slotRecord?.version ?? 0;
           if (slotRecord) {
-            operations.push({ action: 'delete', collection: 'fact-slots', recordId: slotRecordId, expectedRevision: beforeRevision });
-            undoEntries.push({ collection: 'fact-slots', recordId: slotRecordId, before: asPlain(slotRecord.value), beforeRevision });
+            operations.push({ action: 'delete', collection: 'fact-heads', recordId: slotRecordId, expectedRevision: beforeRevision });
+            undoEntries.push({ collection: 'fact-heads', recordId: slotRecordId, before: asPlain(slotRecord.value), beforeRevision });
           }
         }
       }
-      const jobRecord = await this.workspace.get({ workspaceId, collection: 'jobs', recordId: job.id });
-      operations.push({ action: 'upsert', collection: 'jobs', recordId: job.id, value: asPlain(job), expectedVersion: jobRecord?.version ?? 0 });
-      operations.push({ action: 'upsert', collection: 'job-audits', recordId: audit.id, value: asPlain(audit) });
+      const jobRecord = await this.workspace.get({ workspaceId, collection: 'capture-jobs', recordId: job.id });
+      operations.push({ action: 'upsert', collection: 'capture-jobs', recordId: job.id, value: asPlain(job), expectedVersion: jobRecord?.version ?? 0 });
+      operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
       const undoLog: UndoLogV2 = { id: undoLogId, kind: 'undo-log-v0', chatKey, jobId: job.id, batchIndex, transactionId: input.audit?.requestId ?? undoLogId, committedSequence: nextCommittedSequence(), entries: undoEntries, result: structuredClone(result), createdAt: startedAt };
-      operations.push({ action: 'upsert', collection: 'job-audits', recordId: undoLog.id, value: asPlain(undoLog) });
+      operations.push({ action: 'upsert', collection: 'change-audits', recordId: undoLog.id, value: asPlain(undoLog) });
       this.requireChatKey(chatKey);
       await this.workspace.transaction({ workspaceId, idempotencyKey: undoLogId, operations });
       return result;
@@ -1009,256 +953,29 @@ export class MemoryRepository implements IngestCommitter {
 
   async putJob(job: MemoryJob): Promise<void> {
     this.requireChatKey(job.chatKey);
-    const workspaceId = this.requireWorkspaceId(); const current = await this.workspace.get({ workspaceId, collection: 'jobs', recordId: job.id });
-    await this.workspace.upsert({ workspaceId, collection: 'jobs', recordId: job.id, value: asPlain(job), expectedVersion: current?.version ?? 0 });
+    const workspaceId = this.requireWorkspaceId(); const current = await this.workspace.get({ workspaceId, collection: 'capture-jobs', recordId: job.id });
+    await this.workspace.upsert({ workspaceId, collection: 'capture-jobs', recordId: job.id, value: asPlain(job), expectedVersion: current?.version ?? 0 });
   }
 
   async listJobs(chatKey: string): Promise<MemoryJob[]> {
-    return this.listAllRows<MemoryJob>('jobs', { chatKey: this.requireChatKey(chatKey) });
+    return (await this.listAllRows<MemoryJob>('capture-jobs', { chatKey: this.requireChatKey(chatKey) }))
+      .filter((job) => (job.type === 'initialize' || job.type === 'incremental')
+        && Boolean(job.checkpoint && typeof job.checkpoint === 'object'));
   }
 
   async addJobBatchAudit(audit: MemoryJobBatchAudit): Promise<void> {
     this.requireChatKey(audit.chatKey);
-    await this.workspace.upsert({ workspaceId: this.requireWorkspaceId(), collection: 'job-audits', recordId: audit.id, value: asPlain(audit) });
+    await this.workspace.upsert({ workspaceId: this.requireWorkspaceId(), collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
   }
 
   async listJobBatchAudits(chatKey: string, jobId?: string): Promise<MemoryJobBatchAudit[]> {
-    return (await this.listAllRows<MemoryJobBatchAudit>('job-audits', { chatKey: this.requireChatKey(chatKey), ...(jobId ? { jobId } : {}) })).filter((audit) => !['undo-log-v0', 'snapshot', 'initialization-staging-v0'].includes(String((audit as { kind?: unknown }).kind ?? '')));
-  }
-
-  async putInitializationStagingBatch(batch: InitializationStagingBatch): Promise<void> {
-    const chatKey = this.requireChatKey(batch.chatKey);
-    const id = `initialization-staging:${batch.jobId}:${batch.batchIndex}`;
-    const workspaceId = this.requireWorkspaceId();
-    const current = await this.workspace.get({ workspaceId, collection: 'job-audits', recordId: id });
-    const value: InitializationStagingBatch = {
-      ...structuredClone(batch),
-      id,
-      chatKey,
-      kind: 'initialization-staging-v0',
-      updatedAt: Date.now(),
-    };
-    await this.workspace.upsert({ workspaceId, collection: 'job-audits', recordId: id, value: asPlain(value), expectedVersion: current?.version ?? 0 });
-  }
-
-  async listInitializationStagingBatches(chatKey: string, jobId: string): Promise<InitializationStagingBatch[]> {
-    const items = await this.listAllRows<InitializationStagingBatch>('job-audits', { chatKey: this.requireChatKey(chatKey), jobId });
-    return items
-      .filter((item) => item.kind === 'initialization-staging-v0')
-      .sort((left, right) => left.batchIndex - right.batchIndex);
-  }
-
-  async putInitializationResolution(input: InitializationResolutionStaging): Promise<void> {
-    const chatKey = this.requireChatKey(input.chatKey);
-    const id = `initialization-resolution:${input.jobId}`;
-    const workspaceId = this.requireWorkspaceId();
-    const current = await this.workspace.get({ workspaceId, collection: 'job-audits', recordId: id });
-    await this.workspace.upsert({
-      workspaceId,
-      collection: 'job-audits',
-      recordId: id,
-      value: asPlain({ ...structuredClone(input), id, chatKey, kind: 'initialization-resolution-v0', updatedAt: Date.now() }),
-      expectedVersion: current?.version ?? 0,
-    });
-  }
-
-  async getInitializationResolution(chatKey: string, jobId: string): Promise<InitializationResolutionStaging | undefined> {
-    const id = `initialization-resolution:${jobId}`;
-    const record = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'job-audits', recordId: id });
-    const value = record?.value as unknown as InitializationResolutionStaging | undefined;
-    if (!value || value.chatKey !== this.requireChatKey(chatKey) || value.kind !== 'initialization-resolution-v0') return undefined;
-    return structuredClone(value);
-  }
-
-  /**
-   * Converts all staged initialization output to facts in one idempotent
-   * transaction. Staging rows are deleted only after the final job and audit
-   * have been committed successfully.
-   */
-  async applyInitializationFinalization(input: {
-    chatKey: string;
-    job: MemoryJob;
-    batches: InitializationStagingBatch[];
-    reduction: InitializationReduction;
-  }, retryAttempt = 0): Promise<InitializationFinalizationStats> {
-    const chatKey = this.requireChatKey(input.chatKey);
-    const workspaceId = this.requireWorkspaceId();
-    const finalAuditId = `initialization-finalization:${input.job.id}`;
-    const undoLogId = `undo-v2:${input.job.id}:finalize`;
-    const existingFinal = await this.workspace.get({ workspaceId, collection: 'job-audits', recordId: finalAuditId });
-    if (existingFinal && (existingFinal.value as { kind?: unknown }).kind === 'initialization-finalization-v0') {
-      const existingStats = (existingFinal.value as { finalization?: InitializationFinalizationStats }).finalization;
-      if (existingStats) return structuredClone(existingStats);
-    }
-    const now = Date.now();
-    const [factRecords, evidenceRecords, slotRecords, jobRecord, stagingRecords] = await Promise.all([
-      this.listAllRecordRows('facts', { chatKey }),
-      this.listAllRecordRows('evidence', { chatKey }),
-      this.listAllRecordRows('fact-slots', { chatKey }),
-      this.workspace.get({ workspaceId, collection: 'jobs', recordId: input.job.id }),
-      this.listAllRecordRows('job-audits', { chatKey, jobId: input.job.id }),
-    ]);
-    const beforeFacts = factRecords.map((record) => record.value as unknown as MemoryFact);
-    const beforeFactById = new Map(factRecords.map((record) => [record.recordId, record]));
-    const beforeEvidenceById = new Map(evidenceRecords.map((record) => [record.recordId, record]));
-    const beforeSlots = new Map(slotRecords.map((record) => [record.recordId, record]));
-    const sourceById = new Map(input.batches.flatMap((batch) => batch.sources).map((source) => [source.id, source]));
-    const facts = structuredClone(input.reduction.facts);
-    const manualSlots = new Set(beforeFacts
-      .filter((fact) => fact.origin === 'manual' && (fact.status === 'active' || fact.status === 'pending') && fact.slotKey)
-      .map((fact) => fact.slotKey!));
-    for (const fact of facts) {
-      if (manualSlots.has(fact.slotKey) && fact.status === 'active') fact.status = 'pending';
-    }
-    const stats: InitializationFinalizationStats = {
-      ...input.reduction.stats,
-      pendingReviewCount: facts.filter((fact) => fact.status === 'pending').length,
-      qualityStatus: facts.some((fact) => fact.status === 'pending') ? 'needs_review' : 'ready',
-    };
-    const changedFacts = new Map<string, MemoryFact>();
-    const changedEvidence: MemoryEvidence[] = [];
-    for (const reduced of facts) {
-      const evidence = reduced.evidence.map((item) => {
-        const source = sourceById.get(item.sourceRef);
-        if (!source) throw Object.assign(new Error(`初始化暂存缺少来源 ${item.sourceRef}。`), { code: 'MEMORY_INITIALIZATION_STAGING_SOURCE_MISSING' });
-        return {
-          id: evidenceId(reduced.id, item.sourceRef, item.excerpt),
-          factId: reduced.id,
-          chatKey,
-          sourceRef: item.sourceRef,
-          sourceType: source.type,
-          excerpt: item.excerpt,
-          ...(source.floor === undefined ? {} : { floor: source.floor }),
-          occurredAt: source.occurredAt,
-          createdAt: now,
-        } satisfies MemoryEvidence;
-      });
-      const fact: MemoryFact = {
-        id: reduced.id,
-        chatKey,
-        kind: reduced.kind,
-        subjectKey: reduced.subjectKey,
-        predicateKey: reduced.predicateKey,
-        ...(reduced.objectKey ? { objectKey: reduced.objectKey } : {}),
-        canonicalKey: reduced.canonicalKey,
-        slotKey: reduced.slotKey,
-        content: reduced.content,
-        entityKeys: [...reduced.entityKeys],
-        confidence: reduced.confidence,
-        status: reduced.status,
-        sourceRefs: [...reduced.sourceRefs],
-        evidenceIds: evidence.map((item) => item.id),
-        freshestEvidenceAt: reduced.freshestEvidenceAt,
-        ...(reduced.validFrom === undefined ? {} : { validFrom: reduced.validFrom }),
-        ...(reduced.validTo === undefined ? {} : { validUntil: reduced.validTo }),
-        ...(reduced.stable === undefined ? {} : { stableAnchor: reduced.stable }),
-        ...(reduced.scope ? { scope: structuredClone(reduced.scope) } : {}),
-        origin: 'automatic',
-        revision: (beforeFactById.get(reduced.id)?.value as unknown as MemoryFact | undefined)?.revision ?? 1,
-        ...(reduced.supersedesRecordId ? { supersedesId: reduced.supersedesRecordId } : {}),
-        ...(reduced.supersededByRecordId ? { supersededById: reduced.supersededByRecordId } : {}),
-        createdAt: (beforeFactById.get(reduced.id)?.value as unknown as MemoryFact | undefined)?.createdAt ?? now,
-        updatedAt: now,
-      };
-      changedFacts.set(fact.id, fact);
-      changedEvidence.push(...evidence);
-    }
-    const workingFacts = new Map(beforeFacts.map((fact) => [fact.id, structuredClone(fact)]));
-    for (const fact of changedFacts.values()) workingFacts.set(fact.id, fact);
-    const touchedSlots = new Set([...changedFacts.values()].map((fact) => fact.slotKey).filter((value): value is string => Boolean(value)));
-    const operations: WorkspaceTransactionOperation[] = [];
-    const undoEntries: UndoLogEntry[] = [];
-    for (const fact of changedFacts.values()) {
-      const before = beforeFactById.get(fact.id);
-      const beforeRevision = before?.revision ?? before?.version ?? 0;
-      operations.push({ action: 'upsert', collection: 'facts', recordId: fact.id, value: asPlain(fact), expectedRevision: beforeRevision });
-      undoEntries.push({ collection: 'facts', recordId: fact.id, ...(before ? { before: asPlain(before.value) } : {}), after: asPlain(fact), beforeRevision, afterRevision: beforeRevision + 1 });
-    }
-    for (const evidence of changedEvidence) {
-      const before = beforeEvidenceById.get(evidence.id);
-      const beforeRevision = before?.revision ?? before?.version ?? 0;
-      operations.push({ action: 'upsert', collection: 'evidence', recordId: evidence.id, value: asPlain(evidence), expectedRevision: beforeRevision });
-      undoEntries.push({ collection: 'evidence', recordId: evidence.id, ...(before ? { before: asPlain(before.value) } : {}), after: asPlain(evidence), beforeRevision, afterRevision: beforeRevision + 1 });
-    }
-    for (const slotKey of touchedSlots) {
-      const id = factSlotRecordId(chatKey, slotKey);
-      const before = beforeSlots.get(id);
-      const candidates = [...workingFacts.values()].filter((fact) => fact.slotKey === slotKey);
-      const selected = selectedSlotFact(candidates);
-      const beforeRevision = before?.revision ?? before?.version ?? 0;
-      if (selected) {
-        const after = slotValue(chatKey, slotKey, selected.id);
-        operations.push({ action: 'upsert', collection: 'fact-slots', recordId: id, value: asPlain(after), expectedRevision: beforeRevision });
-        undoEntries.push({ collection: 'fact-slots', recordId: id, ...(before ? { before: asPlain(before.value) } : {}), after: asPlain(after), beforeRevision, afterRevision: beforeRevision + 1 });
-      }
-    }
-    const completedJob: MemoryJob = {
-      ...input.job,
-      status: 'completed',
-      checkpoint: {
-        ...input.job.checkpoint,
-        phase: 'apply',
-        stagedBatchCount: stats.stagedBatchCount,
-        mergedDuplicateCount: stats.mergedDuplicateCount,
-        supersededCount: stats.supersededCount,
-        conflictBucketCount: stats.conflictBucketCount,
-        ruleResolvedCount: stats.ruleResolvedCount,
-        llmResolvedCount: stats.llmResolvedCount,
-        pendingReviewCount: stats.pendingReviewCount,
-        qualityStatus: stats.qualityStatus,
-      },
-      updatedAt: now,
-    };
-    const routeSummary = summarizeInitializationRoutes(input.batches);
-    const finalAudit: MemoryJobBatchAudit & {
-      kind: 'initialization-finalization-v0';
-      finalization: InitializationFinalizationStats;
-      routeSummary: InitializationRouteSummary;
-    } = {
-      id: finalAuditId,
-      kind: 'initialization-finalization-v0',
-      finalization: stats,
-      routeSummary,
-      chatKey,
-      jobId: input.job.id,
-      batchIndex: input.job.checkpoint.totalBatches ?? input.job.checkpoint.batchIndex,
-      sourceRefs: uniqueStrings(input.batches.flatMap((batch) => batch.sources.map((source) => source.id))),
-      accepted: facts.filter((fact) => fact.status === 'active').length,
-      rejected: input.batches.reduce((total, batch) => total + batch.rejections.length, 0),
-      duplicated: stats.mergedDuplicateCount,
-      pending: stats.pendingReviewCount,
-      superseded: stats.supersededCount,
-      rejections: input.batches.flatMap((batch) => batch.rejections),
-      startedAt: input.job.createdAt,
-      completedAt: now,
-      usage: routeSummary.usage,
-      ...(routeSummary.resourceIds.length === 1 ? { resourceId: routeSummary.resourceIds[0] } : {}),
-      ...(routeSummary.models.length === 1 ? { model: routeSummary.models[0] } : {}),
-      ...(routeSummary.latencyMs === null ? {} : { latencyMs: routeSummary.latencyMs }),
-    };
-    operations.push({ action: 'upsert', collection: 'jobs', recordId: completedJob.id, value: asPlain(completedJob), expectedVersion: jobRecord?.version ?? 0 });
-    operations.push({ action: 'upsert', collection: 'job-audits', recordId: finalAudit.id, value: asPlain(finalAudit), expectedVersion: existingFinal?.version ?? 0 });
-    const result: AutomaticIngestResult = {
-      facts: [...changedFacts.values()],
-      accepted: finalAudit.accepted,
-      duplicated: stats.mergedDuplicateCount,
-      pending: stats.pendingReviewCount,
-      superseded: stats.supersededCount,
-      rejected: finalAudit.rejections,
-    };
-    const undoLog: UndoLogV2 = { id: undoLogId, kind: 'undo-log-v0', chatKey, jobId: input.job.id, batchIndex: finalAudit.batchIndex, transactionId: finalAuditId, committedSequence: nextCommittedSequence(), entries: undoEntries, result, createdAt: now };
-    operations.push({ action: 'upsert', collection: 'job-audits', recordId: undoLog.id, value: asPlain(undoLog) });
-    for (const record of stagingRecords.filter((record) => ['initialization-staging-v0', 'initialization-resolution-v0'].includes(String((record.value as { kind?: unknown }).kind ?? '')))) {
-      operations.push({ action: 'delete', collection: 'job-audits', recordId: record.recordId, expectedVersion: record.version });
-    }
-    try {
-      this.requireChatKey(chatKey);
-      await this.workspace.transaction({ workspaceId, idempotencyKey: finalAuditId, operations });
-      return stats;
-    } catch (error) {
-      if (workspaceErrorCode(error) === 'WORKSPACE_CONFLICT' && retryAttempt < 1) return this.applyInitializationFinalization(input, retryAttempt + 1);
-      throw error;
-    }
+    // `change-audits` is shared by the v0 batch facade and the multi-actor
+    // repository. Only the explicit batch-audit id shape belongs to this API;
+    // otherwise actor Capture/Dream/security audits would be rendered twice as
+    // legacy batch rows by the workbench.
+    return (await this.listAllRows<MemoryJobBatchAudit>('change-audits', { chatKey: this.requireChatKey(chatKey), ...(jobId ? { jobId } : {}) }))
+      .filter((audit) => String((audit as { kind?: unknown }).kind ?? '') !== 'undo-log-v0')
+      .filter((audit) => String((audit as { id?: unknown }).id ?? '').startsWith('batch-audit:'));
   }
 
   async addMainChatUsage(usage: MainChatUsage): Promise<void> {
@@ -1274,7 +991,7 @@ export class MemoryRepository implements IngestCommitter {
     const workspaceId = this.requireWorkspaceId();
     expectedChatKey = expectedChatKey ? this.requireChatKey(expectedChatKey) : undefined;
     const markerId = `rollback-v0:${jobId}:${batchIndex}`;
-    const existingMarker = await this.workspace.get({ workspaceId, collection: 'job-audits', recordId: markerId });
+    const existingMarker = await this.workspace.get({ workspaceId, collection: 'change-audits', recordId: markerId });
     if (existingMarker) {
       const marker = existingMarker.value as unknown as RollbackMarkerV2;
       if (marker.kind !== 'rollback-v0') throw Object.assign(new Error('回滚标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
@@ -1282,7 +999,7 @@ export class MemoryRepository implements IngestCommitter {
       await this.deleteRollbackVectors(workspaceId, marker);
       return [...marker.affectedFactIds];
     }
-    const allRows = await this.listAllRecordRows('job-audits');
+    const allRows = await this.listAllRecordRows('change-audits');
     const logRows = allRows.filter((row) => (row.value as { kind?: unknown }).kind === 'undo-log-v0');
     const allLogs = logRows.map((row) => ({ row, log: row.value as unknown as UndoLogV2 })).filter(({ log }) => !log.rolledBackBy).sort((left, right) => left.log.committedSequence - right.log.committedSequence);
     const target = allLogs.find(({ log }) => log.jobId === jobId && log.batchIndex === batchIndex);
@@ -1316,19 +1033,19 @@ export class MemoryRepository implements IngestCommitter {
       else operations.push({ action: 'upsert', collection: last.collection, recordId: last.recordId, value: first.before, expectedRevision: revision });
     }
     const rollbackAt = Date.now();
-    for (const { row, log } of included.values()) operations.push({ action: 'upsert', collection: 'job-audits', recordId: row.recordId, value: asPlain({ ...log, rolledBackAt: rollbackAt, rolledBackBy: markerId }), expectedRevision: row.revision ?? row.version });
+    for (const { row, log } of included.values()) operations.push({ action: 'upsert', collection: 'change-audits', recordId: row.recordId, value: asPlain({ ...log, rolledBackAt: rollbackAt, rolledBackBy: markerId }), expectedRevision: row.revision ?? row.version });
     const affectedJobs = new Map<string, number>();
     for (const { log } of included.values()) affectedJobs.set(log.jobId, Math.min(affectedJobs.get(log.jobId) ?? log.batchIndex, log.batchIndex));
     for (const [affectedJobId, firstBatch] of affectedJobs) {
-      const jobRecord = await this.workspace.get({ workspaceId, collection: 'jobs', recordId: affectedJobId });
-      if (jobRecord) { const value = jobRecord.value as unknown as MemoryJob; operations.push({ action: 'upsert', collection: 'jobs', recordId: affectedJobId, value: asPlain({ ...value, status: 'paused', checkpoint: { ...value.checkpoint, batchIndex: Math.max(0, firstBatch - 1) }, updatedAt: rollbackAt }), expectedRevision: jobRecord.revision ?? jobRecord.version }); }
+      const jobRecord = await this.workspace.get({ workspaceId, collection: 'capture-jobs', recordId: affectedJobId });
+      if (jobRecord) { const value = jobRecord.value as unknown as MemoryJob; operations.push({ action: 'upsert', collection: 'capture-jobs', recordId: affectedJobId, value: asPlain({ ...value, status: 'paused', checkpoint: { ...value.checkpoint, batchIndex: Math.max(0, firstBatch - 1) }, updatedAt: rollbackAt }), expectedRevision: jobRecord.revision ?? jobRecord.version }); }
     }
     for (const { log } of included.values()) {
       const auditRecord = allRows.find((row) => row.recordId === `batch-audit:${log.jobId}:${log.batchIndex}`);
-      if (auditRecord) operations.push({ action: 'upsert', collection: 'job-audits', recordId: auditRecord.recordId, value: asPlain({ ...(auditRecord.value as object), rolledBackAt: rollbackAt, rollbackId: markerId }), expectedRevision: auditRecord.revision ?? auditRecord.version });
+      if (auditRecord) operations.push({ action: 'upsert', collection: 'change-audits', recordId: auditRecord.recordId, value: asPlain({ ...(auditRecord.value as object), rolledBackAt: rollbackAt, rollbackId: markerId }), expectedRevision: auditRecord.revision ?? auditRecord.version });
     }
     const marker: RollbackMarkerV2 = { id: markerId, kind: 'rollback-v0', chatKey: target.log.chatKey, jobId, batchIndex, status: 'index-repair-pending', affectedLogIds: [...included.keys()], affectedFactIds: [...affectedFactIds], createdAt: rollbackAt };
-    operations.push({ action: 'upsert', collection: 'job-audits', recordId: markerId, value: asPlain(marker), expectedRevision: 0 });
+    operations.push({ action: 'upsert', collection: 'change-audits', recordId: markerId, value: asPlain(marker), expectedRevision: 0 });
     const result = await this.workspace.transaction({ workspaceId, idempotencyKey: markerId, operations });
     void result;
     await this.deleteRollbackVectors(workspaceId, marker);
@@ -1349,7 +1066,7 @@ export class MemoryRepository implements IngestCommitter {
   async completeRollbackIndexRepair(jobId: string, batchIndex: number): Promise<void> {
     const workspaceId = this.requireWorkspaceId();
     const markerId = `rollback-v0:${jobId}:${batchIndex}`;
-    const markerRecord = await this.workspace.get({ workspaceId, collection: 'job-audits', recordId: markerId });
+    const markerRecord = await this.workspace.get({ workspaceId, collection: 'change-audits', recordId: markerId });
     if (!markerRecord) throw Object.assign(new Error('回滚修复标识不存在。'), { code: 'WORKSPACE_CONFLICT' });
     const marker = markerRecord.value as unknown as RollbackMarkerV2;
     if (marker.kind !== 'rollback-v0') throw Object.assign(new Error('回滚标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
@@ -1366,7 +1083,7 @@ export class MemoryRepository implements IngestCommitter {
       throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
     }
     const completed: RollbackMarkerV2 = { ...marker, status: 'completed', completedAt: Date.now() };
-    await this.workspace.upsert({ workspaceId, collection: 'job-audits', recordId: marker.id, value: asPlain(completed), expectedRevision: markerRecord.revision ?? markerRecord.version });
+    await this.workspace.upsert({ workspaceId, collection: 'change-audits', recordId: marker.id, value: asPlain(completed), expectedRevision: markerRecord.revision ?? markerRecord.version });
   }
 
   async getSetting<T>(key: string): Promise<T | undefined> {
@@ -1404,14 +1121,14 @@ export class MemoryRepository implements IngestCommitter {
     chatKey = this.requireChatKey(chatKey);
     const workspaceId = this.requireWorkspaceId();
     const [evidenceRecords, jobRecords, auditRecords, usageRecords, logRecords, factRecords, slotRecords, graphNodeRecords, graphEdgeRecords] = await Promise.all([
-      this.listAllRecordRows('evidence', { chatKey }), this.listAllRecordRows('jobs', { chatKey }), this.listAllRecordRows('job-audits', { chatKey }),
+      this.listAllRecordRows('evidence', { chatKey }), this.listAllRecordRows('capture-jobs', { chatKey }), this.listAllRecordRows('change-audits', { chatKey }),
       this.listAllRecordRows('usage', { chatKey }), this.listAllRecordRows('recall-logs', { chatKey }), this.listAllRecordRows('facts', { chatKey }),
-      this.listAllRecordRows('fact-slots', { chatKey }),
+      this.listAllRecordRows('fact-heads', { chatKey }),
       this.listAllRecordRows('graph-nodes', { chatKey }), this.listAllRecordRows('graph-edges', { chatKey }),
     ]);
     const collections = [
-      ['evidence', evidenceRecords], ['jobs', jobRecords], ['job-audits', auditRecords],
-      ['usage', usageRecords], ['recall-logs', logRecords], ['facts', factRecords], ['fact-slots', slotRecords],
+      ['evidence', evidenceRecords], ['capture-jobs', jobRecords], ['change-audits', auditRecords],
+      ['usage', usageRecords], ['recall-logs', logRecords], ['facts', factRecords], ['fact-heads', slotRecords],
       ['graph-edges', graphEdgeRecords], ['graph-nodes', graphNodeRecords],
     ] as const;
     const operations: WorkspaceTransactionOperation[] = collections.flatMap(([collection, records]) => records.map((record) => ({
@@ -1423,7 +1140,7 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async getChatKeys(): Promise<string[]> {
-    const values = await Promise.all(['facts', 'evidence', 'jobs', 'job-audits', 'usage', 'recall-logs', 'graph-nodes', 'graph-edges'].map((collection) => this.listAllRecordRows(collection)));
+    const values = await Promise.all(['facts', 'evidence', 'capture-jobs', 'change-audits', 'usage', 'recall-logs', 'graph-nodes', 'graph-edges'].map((collection) => this.listAllRecordRows(collection)));
     return [...new Set(values.flat().map((record) => (record.value as unknown as { chatKey?: string }).chatKey).filter((value): value is string => Boolean(value)))].sort();
   }
 
@@ -1488,7 +1205,6 @@ export class MemoryRepository implements IngestCommitter {
 
   async clearAllMemory(): Promise<number> {
     const removed = await this.workspace.clearOwned({ preserveWorkspaceIds: [SETTINGS_WORKSPACE_ID], idempotencyKey: `memory-clear:${Date.now()}` });
-    this.repairedWorkspaces.clear();
     if (this.workspaceId) await this.ensureCollections(this.workspaceId);
     return removed;
   }
@@ -1499,22 +1215,16 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async importBackup(file: File): Promise<void> {
-    if (!Number.isFinite(file.size) || file.size < 1 || file.size > MAX_MEMORY_BACKUP_BYTES) {
-      const error = new Error('Memory 备份文件过大或无效。') as Error & { code?: string };
-      error.code = 'BACKUP_TOO_LARGE';
-      throw error;
-    }
-    const value = JSON.parse(await file.text()) as { format?: string; version?: number; archive?: unknown; sha256?: string };
-    if (value.format !== 'ss-helper-memory' || value.version !== 0 || !value.archive || typeof value.sha256 !== 'string') throw new Error('Memory 备份格式无效。');
-    await this.workspace.importAll({ archive: value.archive as never, sha256: value.sha256 });
-    this.repairedWorkspaces.clear();
-    await this.ensureCollections(SETTINGS_WORKSPACE_ID); if (this.workspaceId) await this.ensureCollections(this.workspaceId);
+    void file;
+    const error = new Error('v0 不接受旧 Memory 归档；请删除旧数据并从当前聊天重新捕获。') as Error & { code?: string };
+    error.code = 'MEMORY_ARCHIVE_IMPORT_DISABLED';
+    throw error;
   }
 
   async checkIntegrity(): Promise<{ ok: boolean; message: string }> {
     const sqlite = await this.workspace.integrity(); if (!sqlite.ok) return { ok: false, message: sqlite.messages.join('；') };
     const [facts, evidence, slots, vectors, graphNodes, graphEdges] = await Promise.all([
-      this.listAllRecordRows('facts'), this.listAllRows<MemoryEvidence>('evidence'), this.listAllRecordRows('fact-slots'), this.listAllVectors(),
+      this.listAllRecordRows('facts'), this.listAllRows<MemoryEvidence>('evidence'), this.listAllRecordRows('fact-heads'), this.listAllVectors(),
       this.listAllRows<MemoryGraphNode>('graph-nodes'), this.listAllRows<MemoryGraphEdge>('graph-edges'),
     ]);
     const factById = new Map(facts.map((item) => [item.recordId, item.value as unknown as MemoryFact]));
@@ -1541,12 +1251,12 @@ export class MemoryRepository implements IngestCommitter {
         return fact.chatKey === item.chatKey ? [] : [`证据 ${item.id} 与事实 ${item.factId} 属于不同聊天`];
       }),
       ...slots.flatMap((item) => {
-        if (!isFactSlotValue(item.value)) return [`槽位 ${item.recordId} 是未迁移或无效的旧式槽位`];
+        if (!isFactSlotValue(item.value)) return [`事实头 ${item.recordId} 无效`];
         const fact = factById.get(item.value.factId);
-        if (!fact) return [`槽位 ${item.recordId} 指向不存在的事实 ${item.value.factId}`];
-        if (fact.chatKey !== item.value.chatKey) return [`槽位 ${item.recordId} 与事实 ${item.value.factId} 属于不同聊天`];
-        if (fact.slotKey !== item.value.slotKey) return [`槽位 ${item.recordId} 的业务槽位与事实 ${item.value.factId} 不一致`];
-        return item.recordId === factSlotRecordId(item.value.chatKey, item.value.slotKey) ? [] : [`槽位 ${item.recordId} 的聊天级记录 ID 不正确`];
+        if (!fact) return [`事实头 ${item.recordId} 指向不存在的事实 ${item.value.factId}`];
+        if (fact.chatKey !== item.value.chatKey) return [`事实头 ${item.recordId} 与事实 ${item.value.factId} 属于不同聊天`];
+        if (fact.slotKey !== item.value.slotKey) return [`事实头 ${item.recordId} 的业务槽位与事实 ${item.value.factId} 不一致`];
+        return item.recordId === factSlotRecordId(item.value.chatKey, item.value.slotKey) ? [] : [`事实头 ${item.recordId} 的聊天级记录 ID 不正确`];
       }),
       ...vectors.flatMap((item) => {
         const fact = factById.get(item.recordId);
@@ -1577,46 +1287,6 @@ export class MemoryRepository implements IngestCommitter {
     return { ok: problems.length === 0, message: problems.length ? problems.join('；') : 'SQLite 与 Memory workspace 完整性检查通过。' };
   }
 
-  private async rebuildSlots(retryAttempt = 0): Promise<void> {
-    const workspaceId = this.requireWorkspaceId();
-    try {
-      let factRecords: WorkspaceRecord[];
-      let current: WorkspaceRecord[];
-      try {
-        [factRecords, current] = await Promise.all([this.listAllRecordRows('facts'), this.listAllRecordRows('fact-slots')]);
-      } catch (error) {
-        throw slotRepairError('read', error);
-      }
-      const groups = new Map<string, MemoryFact[]>();
-      for (const record of factRecords) {
-        const fact = record.value as unknown as MemoryFact;
-        if (!fact.chatKey?.trim() || !fact.slotKey || (fact.status !== 'active' && fact.status !== 'pending')) continue;
-        const recordId = factSlotRecordId(fact.chatKey, fact.slotKey);
-        const values = groups.get(recordId) ?? [];
-        values.push(fact);
-        groups.set(recordId, values);
-      }
-      const currentById = new Map(current.map((record) => [record.recordId, record]));
-      const desired = new Map<string, FactSlotValue>();
-      for (const [recordId, facts] of groups) {
-        const selected = selectedSlotFact(facts);
-        if (selected?.slotKey) desired.set(recordId, slotValue(selected.chatKey, selected.slotKey, selected.id));
-      }
-      const upserts: Extract<WorkspaceTransactionOperation, { action: 'upsert' }>[] = [];
-      for (const [recordId, value] of desired) {
-        const existing = currentById.get(recordId);
-        if (existing && samePlainData(existing.value, value)) continue;
-        upserts.push({ action: 'upsert', collection: 'fact-slots', recordId, value: asPlain(value), expectedVersion: existing?.version ?? 0 });
-      }
-      const obsolete: Extract<WorkspaceTransactionOperation, { action: 'delete' }>[] = current.filter((record) => !desired.has(record.recordId)).map((record) => ({
-        action: 'delete' as const, collection: 'fact-slots', recordId: record.recordId, expectedVersion: record.version,
-      }));
-      await this.writeSlotRepairs(workspaceId, upserts, obsolete);
-    } catch (error) {
-      if (workspaceErrorCode(error) === 'WORKSPACE_CONFLICT' && retryAttempt < 1) return this.rebuildSlots(retryAttempt + 1);
-      throw error;
-    }
-  }
 }
 
 function uniqueStrings(values: readonly string[]): string[] {

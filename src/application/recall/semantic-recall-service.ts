@@ -119,7 +119,10 @@ export class SemanticRecallService {
     const startedAt = Date.now();
     const deadline = startedAt + TOTAL_EXTRA_RECALL_BUDGET_MS;
     const maxItems = clampRequestedItems(query.maxItems);
-    const candidatePoolSize = Math.min(60, Math.max(12, maxItems * 2));
+    // Multi-actor recall may need one independent candidate budget per active
+    // owner. The final response is still capped by `maxItems`; this pool only
+    // prevents the highest-scoring actor from starving other partitions.
+    const candidatePoolSize = Math.min(120, Math.max(12, query.candidateLimit ?? maxItems * 2));
     let resolvedMode: 'lexical' | 'vector' | 'hybrid' = 'lexical';
     let vectorResult: VectorSearchResult | null = null;
     let degradedReason = '';

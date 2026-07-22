@@ -30,15 +30,15 @@ describe('Memory error diagnostics', () => {
     }));
   });
 
-  it('reports the exact chat-slot migration stage without exposing record contents', () => {
-    const error = Object.assign(new Error('写入聊天级槽位失败（底层错误码：PAYLOAD_INVALID）。'), {
-      code: 'MEMORY_SLOT_MIGRATION_WRITE_FAILED',
+  it('fails closed when retired Memory storage is detected', () => {
+    const error = Object.assign(new Error('检测到已退休的 Memory 存储集合：fact-slots。'), {
+      code: 'MEMORY_RETIRED_STORAGE_DETECTED',
     });
     expect(describeMemoryError(error, 'MEMORY_CHAT_BIND_FAILED', 'chat-bind')).toEqual(expect.objectContaining({
-      code: 'MEMORY_SLOT_MIGRATION_WRITE_FAILED',
-      title: '旧记忆槽位整理未完成',
-      reason: expect.stringContaining('底层错误码：PAYLOAD_INVALID'),
-      retryable: true,
+      code: 'MEMORY_RETIRED_STORAGE_DETECTED',
+      title: '检测到已退休的 Memory 数据',
+      reason: expect.stringContaining('不读取旧槽位'),
+      retryable: false,
     }));
   });
 });

@@ -21,6 +21,8 @@ export interface MemoryHostContext {
   getChatName?(): string;
   collectSources(chatKey: string): Promise<SourceBlock[]>;
   getRecallContext?(): Promise<{ characterKeys: string[]; worldKeys: string[] }>;
+  /** New semantics: host card/group metadata is a container, never an owner. */
+  getHostContainerContext?(): Promise<{ hostCardId?: string; hostCardName?: string; groupId?: string; worldKeys: string[] }>;
   navigateToMessage?(target: ChatNavigationTarget): Promise<void>;
 }
 
@@ -76,6 +78,16 @@ export class SdkMemoryHostContext implements MemoryHostContext, MemorySourceRead
     return {
       characterKeys: character ? [character.id, character.name].filter(Boolean) : [],
       worldKeys: books.flatMap((book) => [book.id, book.name]).filter(Boolean),
+    };
+  }
+
+  async getHostContainerContext(): Promise<{ hostCardId?: string; hostCardName?: string; groupId?: string; worldKeys: string[] }> {
+    const [context, character, books] = await Promise.all([this.session.host.context.read(), this.readCharacter(), this.readActiveWorldbooks()]);
+    const groupId = stableId(context.groupId);
+    return {
+      ...(groupId ? { groupId } : {}),
+      ...(!groupId && character ? { hostCardId: character.id, hostCardName: character.name } : {}),
+      worldKeys: books.flatMap(book => [book.id, book.name]).filter(Boolean),
     };
   }
 }

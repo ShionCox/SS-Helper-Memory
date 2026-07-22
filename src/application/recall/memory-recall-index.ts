@@ -1,6 +1,9 @@
+import { planRecallIntentByRules } from './recall-intent-planner'
+
 export type RecallFactStatus = 'active' | 'pending' | 'superseded' | 'invalid'
 
 export interface RecallScope {
+  readonly hostCardKeys?: readonly string[]
   readonly characterKeys?: readonly string[]
   readonly worldKeys?: readonly string[]
   readonly sceneKeys?: readonly string[]
@@ -39,10 +42,13 @@ export interface RecallQuery {
   readonly chatKey: string
   readonly query: string
   readonly entityKeys?: readonly string[]
+  readonly hostCardKeys?: readonly string[]
   readonly characterKeys?: readonly string[]
   readonly worldKeys?: readonly string[]
   readonly sceneKeys?: readonly string[]
   readonly maxItems?: number
+  /** Internal objective-candidate pool used by multi-owner recall. */
+  readonly candidateLimit?: number
   readonly now?: number
 }
 
@@ -130,7 +136,7 @@ export interface RecallExternalSignals {
   readonly vectorScores?: ReadonlyMap<string, number>
   /** Fact ids nominated by the fact-backed relation graph. */
   readonly graphScores?: ReadonlyMap<string, number>
-  /** 仅供混合召回编排扩大 rerank 候选池；公开设置仍受 4–30 条约束。 */
+  /** 仅供混合召回编排扩大候选池；公开结果仍受 4–30 条约束。 */
   readonly candidateLimit?: number
 }
 
@@ -157,35 +163,11 @@ const MAX_MAX_ITEMS = 30
 const MAX_STABLE_ANCHORS = 3
 const MIN_CONFIDENCE = 0.75
 const RECENCY_HALF_LIFE_MS = 1000 * 60 * 60 * 24 * 30
-const CRITICAL_KINDS = new Set(['identity', 'goal', 'commitment'])
+const CRITICAL_KINDS = new Set(['identity', 'goal', 'commitment', 'capability'])
 const TEMPORAL_SLOT_KINDS = new Set(['state', 'status', 'location'])
 const HISTORICAL_QUERY_PATTERN = /(?:曾经|当时|之前|历史|过程|最早|最初|一开始|中段|先后|一路|变化|如何发展|起初|后来)/u
 const CURRENT_STATE_QUERY_PATTERN = /(?:最新状态|最后确认|当前|现在|目前|还剩|剩余|还能|现有|最终确认)/u
 const STATE_HISTORY_TOPIC_PATTERN = /(?:状态|数量|多少|几次|次数|弹药|剩余|还剩|变化|一路|先后)/u
-
-const MULTI_TOPIC_FACETS = Object.freeze([
-  { id: 'water', query: /(?:饮水|饮用水|水源|纯净水|气泡水)/u, terms: ['饮用水', '纯净水', '气泡水', '水源'], preferOldest: true },
-  { id: 'food', query: /(?:食物|口粮|罐头|脱水蔬菜|高热量)/u, terms: ['食物', '口粮', '罐头', '脱水蔬菜', '高热量'], preferOldest: true },
-  { id: 'melee', query: /(?:近战|折叠刀|战术短刃|长矛|裂空之矛)/u, terms: ['近战', '折叠刀', '战术短刃', '长矛', '裂空之矛'], preferOldest: true },
-  { id: 'power', query: /(?:供能|能源|电源|电池|太阳能|燃料电池)/u, terms: ['能源', '电源', '电池', '太阳能', '燃料电池'], preferOldest: true },
-  { id: 'pool-final', query: /(?:泳池|沈夜|敌人最终|最终结局)/u, terms: ['沈夜', '碎裂', '死亡', '二段孵化', '排污阀'] },
-  { id: 'pool-core', query: /(?:危险核心|遗留核心|黯欲之种)/u, terms: ['黯欲之种', '危险核心', '紫黑', '精神污染'] },
-  { id: 'green-origin', query: /(?:绿色小女孩|人类幼体|来源|从何而来)/u, terms: ['紫罗', '分化', '人类幼体', '本体枯萎'] },
-  { id: 'building-radar', query: /(?:雷达|扫描整栋楼|三维热源)/u, terms: ['雷达', '扫描', '整栋楼', '三维热源'] },
-  { id: 'charged-gun', query: /(?:紫能高压手枪|紫色高压手枪|剩余次数|还能开几次)/u, terms: ['紫能高压手枪', '核心碎裂', '重新压入核心', '剩余', '击发'] },
-] as const)
-
-function requestedFacets(query: string): readonly (typeof MULTI_TOPIC_FACETS)[number][] {
-  return MULTI_TOPIC_FACETS.filter(facet => facet.query.test(query))
-}
-
-function facetMatchScore(item: RecallItem, terms: readonly string[]): number {
-  const text = [item.fact.content, item.fact.subjectKey, item.fact.predicateKey, item.fact.objectKey ?? '', ...item.fact.entityKeys]
-    .join(' ')
-    .normalize('NFKC')
-    .toLocaleLowerCase()
-  return terms.reduce((score, term) => score + (text.includes(term.toLocaleLowerCase()) ? 1 : 0), 0)
-}
 
 const CJK_STOP_CHARS = new Set([
   '的', '了', '在', '是', '和', '与', '及', '要', '什', '么', '怎', '样', '吗', '呢', '啊', '今', '天',
@@ -255,6 +237,19 @@ function explicitNamedTerms(value: string): string[] {
   return [...terms]
 }
 
+function genericQuerySegments(value: string): string[] {
+  return value.normalize('NFKC').split(/[、，,；;|/]|(?:\s+and\s+)|(?:和|及|与)/iu)
+    .map(segment => segment.replace(/(?:请问|请告诉我|查询|记忆|告诉我)/gu, '').trim())
+    .filter(segment => Array.from(segment).length >= 2)
+    .slice(0, 12)
+}
+
+function genericSegmentMatchScore(item: RecallItem, segment: string): number {
+  const text = [item.fact.content, item.fact.subjectKey, item.fact.predicateKey, item.fact.objectKey ?? '', ...item.fact.entityKeys].join(' ').normalize('NFKC').toLocaleLowerCase()
+  const tokens = tokenize(segment)
+  return tokens.reduce((score, token) => score + (text.includes(token) ? 1 : 0), 0)
+}
+
 function hasMinimumLexicalOverlap(queryTokens: readonly string[], documentTokens: ReadonlyMap<string, number>): boolean {
   let strongMatches = 0
   let singleHanMatches = 0
@@ -290,14 +285,20 @@ function overlapRatio(left: ReadonlySet<string>, right: ReadonlySet<string>): nu
 function scopeScore(fact: RecallFact, query: RecallQuery): number {
   if (!fact.scope) return 0
   const factCharacters = normalizedKeys(fact.scope.characterKeys)
+  const factHostCards = normalizedKeys(fact.scope.hostCardKeys)
   const factWorlds = normalizedKeys(fact.scope.worldKeys)
   const factScenes = normalizedKeys(fact.scope.sceneKeys)
   const queryCharacters = normalizedKeys(query.characterKeys)
+  const queryHostCards = normalizedKeys(query.hostCardKeys)
   const queryWorlds = normalizedKeys(query.worldKeys)
   const queryScenes = normalizedKeys(query.sceneKeys)
 
   let score = 0
   let dimensions = 0
+  if (factHostCards.size > 0) {
+    dimensions += 1
+    if (intersects(factHostCards, queryHostCards)) score += 1
+  }
   if (factCharacters.size > 0) {
     dimensions += 1
     if (intersects(factCharacters, queryCharacters)) score += 1
@@ -347,6 +348,7 @@ function temporalSlotKey(fact: RecallFact): string | null {
 
   const scope = fact.scope
   const scopeKey = [
+    ...(scope?.hostCardKeys ?? []),
     ...(scope?.characterKeys ?? []),
     ...(scope?.worldKeys ?? []),
     ...(scope?.sceneKeys ?? []),
@@ -405,7 +407,8 @@ function ineligibleReason(fact: RecallFact, query: RecallQuery, now: number): st
 
 function freezeFact(fact: RecallFact): RecallFact {
   const scope = fact.scope
-    ? Object.freeze({
+      ? Object.freeze({
+        hostCardKeys: Object.freeze([...(fact.scope.hostCardKeys ?? [])]),
         characterKeys: Object.freeze([...(fact.scope.characterKeys ?? [])]),
         worldKeys: Object.freeze([...(fact.scope.worldKeys ?? [])]),
         sceneKeys: Object.freeze([...(fact.scope.sceneKeys ?? [])]),
@@ -436,6 +439,7 @@ export class MemoryRecallIndex {
   private readonly postings = new Map<string, Set<string>>()
   private readonly chatIds = new Map<string, Set<string>>()
   private readonly entityIds = new Map<string, Set<string>>()
+  private readonly hostCardIds = new Map<string, Set<string>>()
   private readonly characterIds = new Map<string, Set<string>>()
   private readonly worldIds = new Map<string, Set<string>>()
   private readonly sceneIds = new Map<string, Set<string>>()
@@ -479,6 +483,7 @@ export class MemoryRecallIndex {
     for (const token of indexed.tokenCounts.keys()) this.addToIndex(this.postings, token, fact.id)
     this.addToIndex(this.chatIds, fact.chatKey, fact.id)
     for (const entityKey of normalizedKeys(fact.entityKeys)) this.addToIndex(this.entityIds, entityKey, fact.id)
+    for (const key of normalizedKeys(fact.scope?.hostCardKeys)) this.addToIndex(this.hostCardIds, key, fact.id)
     for (const key of normalizedKeys(fact.scope?.characterKeys)) this.addToIndex(this.characterIds, key, fact.id)
     for (const key of normalizedKeys(fact.scope?.worldKeys)) this.addToIndex(this.worldIds, key, fact.id)
     for (const key of normalizedKeys(fact.scope?.sceneKeys)) this.addToIndex(this.sceneIds, key, fact.id)
@@ -493,6 +498,7 @@ export class MemoryRecallIndex {
     for (const token of existing.tokenCounts.keys()) this.removeFromIndex(this.postings, token, factId)
     this.removeFromIndex(this.chatIds, existing.fact.chatKey, factId)
     for (const entityKey of normalizedKeys(existing.fact.entityKeys)) this.removeFromIndex(this.entityIds, entityKey, factId)
+    for (const key of normalizedKeys(existing.fact.scope?.hostCardKeys)) this.removeFromIndex(this.hostCardIds, key, factId)
     for (const key of normalizedKeys(existing.fact.scope?.characterKeys)) this.removeFromIndex(this.characterIds, key, factId)
     for (const key of normalizedKeys(existing.fact.scope?.worldKeys)) this.removeFromIndex(this.worldIds, key, factId)
     for (const key of normalizedKeys(existing.fact.scope?.sceneKeys)) this.removeFromIndex(this.sceneIds, key, factId)
@@ -504,6 +510,7 @@ export class MemoryRecallIndex {
     this.postings.clear()
     this.chatIds.clear()
     this.entityIds.clear()
+    this.hostCardIds.clear()
     this.characterIds.clear()
     this.worldIds.clear()
     this.sceneIds.clear()
@@ -513,17 +520,16 @@ export class MemoryRecallIndex {
 
   recall(query: RecallQuery, signals?: RecallExternalSignals): RecallResult {
     const createdAt = query.now ?? Date.now()
-    const maxItems = signals?.candidateLimit === undefined
+    const requestedCandidateLimit = signals?.candidateLimit ?? query.candidateLimit;
+    const maxItems = requestedCandidateLimit === undefined
       ? clampMaxItems(query.maxItems)
-      : Math.min(60, Math.max(1, Math.trunc(signals.candidateLimit)))
+      : Math.min(120, Math.max(1, Math.trunc(requestedCandidateLimit)))
     const mode = signals?.mode ?? 'lexical'
     const vectorScores = signals?.vectorScores ?? new Map<string, number>()
     const graphScores = signals?.graphScores ?? new Map<string, number>()
-    const facets = requestedFacets(query.query)
-    const queryTokens = [...new Set([
-      ...tokenize(query.query),
-      ...(facets.length >= 2 ? facets.flatMap(facet => facet.terms.flatMap(term => tokenize(term))) : []),
-    ])]
+    const intentPlan = planRecallIntentByRules(query.query)
+    const querySegments = genericQuerySegments(query.query)
+    const queryTokens = [...new Set([...tokenize(query.query), ...intentPlan.terms.flatMap(tokenize)])]
     const namedTerms = explicitNamedTerms(query.query)
     const queryEntities = normalizedKeys(query.entityKeys)
     const normalizedQueryTextForEntities = query.query.normalize('NFKC').toLocaleLowerCase()
@@ -539,6 +545,7 @@ export class MemoryRecallIndex {
       for (const factId of this.entityIds.get(entityKey) ?? []) lexicalCandidateIds.add(factId)
     }
     this.addScopeCandidates(lexicalCandidateIds, this.characterIds, query.characterKeys)
+    this.addScopeCandidates(lexicalCandidateIds, this.hostCardIds, query.hostCardKeys)
     this.addScopeCandidates(lexicalCandidateIds, this.worldIds, query.worldKeys)
     this.addScopeCandidates(lexicalCandidateIds, this.sceneIds, query.sceneKeys)
     const preserveHistoricalStates = HISTORICAL_QUERY_PATTERN.test(query.query)
@@ -758,18 +765,17 @@ export class MemoryRecallIndex {
         || left.fact.id.localeCompare(right.fact.id))
       .slice(0, temporalSafetyLimit)
     const temporalSafetyIds = new Set(temporalSafetyItems.map(item => item.fact.id))
-    const initialHistoryQuery = /(?:最早|最初|一开始|起初)/u.test(query.query)
     const diversifiedItems: RecallItem[] = []
-    if (facets.length >= 2) {
-      for (const facet of facets) {
+    if (HISTORICAL_QUERY_PATTERN.test(query.query) && querySegments.length >= 3) {
+      diversifiedItems.push(...[...relevantRegular].sort((left, right) => left.fact.updatedAt - right.fact.updatedAt || left.fact.id.localeCompare(right.fact.id)).slice(0, maxItems))
+    } else if (querySegments.length >= 2) {
+      for (const segment of querySegments) {
         const best = relevantRegular
           .filter(item => !diversifiedItems.some(selected => selected.fact.id === item.fact.id))
-          .map(item => ({ item, facetScore: facetMatchScore(item, facet.terms) }))
-          .filter(entry => entry.facetScore > 0)
-          .sort((left, right) => (initialHistoryQuery && 'preferOldest' in facet && facet.preferOldest
-            ? left.item.fact.updatedAt - right.item.fact.updatedAt
-            : 0)
-            || right.facetScore - left.facetScore
+          .map(item => ({ item, score: genericSegmentMatchScore(item, segment) }))
+          .filter(entry => entry.score > 0)
+          .sort((left, right) => (HISTORICAL_QUERY_PATTERN.test(query.query) ? left.item.fact.updatedAt - right.item.fact.updatedAt : 0)
+            || right.score - left.score
             || right.item.score - left.item.score
             || left.item.fact.id.localeCompare(right.item.fact.id))[0]?.item
         if (best) diversifiedItems.push(best)

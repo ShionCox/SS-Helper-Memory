@@ -1,6 +1,6 @@
 export const MEMORY_SETTINGS_NAMESPACE = 'stx_memory' as const;
 export const ACTIVE_CONFIDENCE_THRESHOLD = 0.75;
-export const MIN_FACT_CONTENT_LENGTH = 20;
+export const MIN_FACT_CONTENT_LENGTH = 6;
 export const MAX_FACT_CONTENT_LENGTH = 240;
 
 export type FactStatus = 'active' | 'pending' | 'superseded' | 'invalid';
@@ -14,13 +14,15 @@ export type MemoryFactKind =
   | 'goal'
   | 'commitment'
   | 'preference'
+  | 'capability'
   | 'event'
   | 'other';
 
 export type FactOrigin = 'automatic' | 'manual' | 'import';
 
 export interface FactScope {
-  characterKeys?: string[];
+  /** Applicability/canon scope only; never an owner/knowledge grant. */
+  hostCardKeys?: string[];
   worldKeys?: string[];
   sceneKeys?: string[];
 }
@@ -30,8 +32,11 @@ export interface MemoryFact {
   chatKey: string;
   kind: MemoryFactKind;
   subjectKey: string;
+  /** Canonical entity ids resolved by ActorRegistry/knowledge projection. */
+  subjectEntityId?: string;
   predicateKey: string;
   objectKey?: string;
+  objectEntityId?: string;
   /** Full normalized key. Used for exact duplicate detection. */
   canonicalKey: string;
   /** Subject/predicate slot. Used to detect mutually exclusive replacements. */
@@ -104,7 +109,7 @@ export interface MemoryFactVectorCoverage {
   orphanedFactIds: string[];
 }
 
-export type MemorySourceType = 'message' | 'state' | 'character' | 'persona' | 'worldbook' | 'manual';
+export type MemorySourceType = 'message' | 'state' | 'host_card' | 'persona' | 'worldbook' | 'manual';
 
 export interface MemorySourceBlock {
   id: string;
@@ -160,8 +165,7 @@ export interface MemoryEvidence {
 
 export type MemoryJobType = 'initialize' | 'incremental';
 export type MemoryJobStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed';
-export type MemoryInitializationPhase = 'extract' | 'reduce' | 'resolve' | 'apply';
-export type MemoryInitializationQualityStatus = 'ready' | 'needs_review';
+export type MemoryInitializationPhase = 'capture';
 
 export interface MemoryJobCheckpoint {
   batchIndex: number;
@@ -177,16 +181,7 @@ export interface MemoryJobCheckpoint {
   summaryStartFloor?: number;
   summaryEndFloor?: number;
   summaryEndMessageId?: string;
-  /** Initialization-only progress. Optional so existing persisted jobs remain readable. */
   phase?: MemoryInitializationPhase;
-  stagedBatchCount?: number;
-  mergedDuplicateCount?: number;
-  supersededCount?: number;
-  conflictBucketCount?: number;
-  ruleResolvedCount?: number;
-  llmResolvedCount?: number;
-  pendingReviewCount?: number;
-  qualityStatus?: MemoryInitializationQualityStatus;
 }
 
 export interface MemoryJob {
@@ -247,17 +242,6 @@ export interface MainChatUsage {
   provider?: string;
   model?: string;
   capturedAt: number;
-}
-
-/** 某整理批次执行前的完整聊天快照，用于恢复包括 supersede 链在内的状态。 */
-export interface MemoryBatchSnapshot {
-  id: string;
-  chatKey: string;
-  jobId: string;
-  batchIndex: number;
-  facts: MemoryFact[];
-  evidence: MemoryEvidence[];
-  createdAt: number;
 }
 
 export interface MemorySettingRecord {

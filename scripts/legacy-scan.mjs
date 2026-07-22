@@ -26,17 +26,7 @@ const forbidden = [
 
 const executableExtensions = new Set(['.ts', '.js', '.mjs', '.cjs', '.json', '.css']);
 
-// This baseline document preserves pre-migration facts. These phrases are evidence,
-// not live compatibility code, so exceptions remain limited to this one document.
-const historicalDocExceptions = new Map([
-  ['docs/sdk-migration-baseline.md', new Set([
-    '(?:\\.\\.\\/){2,}SDK\\/',
-    'window\\.STX',
-    '#extensions_settings',
-    'renderMemorySettings',
-    'registerConsumer\\s*\\(',
-  ])],
-]);
+const historicalDocExceptions = new Map();
 
 export function shouldScan(path) {
   if (path.startsWith('src/')) return executableExtensions.has(extname(path));

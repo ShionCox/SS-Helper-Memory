@@ -26,6 +26,10 @@ function text(value: unknown): string {
   return String(value ?? '').replace(/\r\n?/g, '\n').trim();
 }
 
+function textList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(item => text(item)).filter(Boolean) : typeof value === 'string' ? value.split(/[，,;；\n]/u).map(item => text(item)).filter(Boolean) : [];
+}
+
 function messageId(message: Record<string, unknown>, index: number): string {
   return text(message.mesid ?? message.mes_id ?? message.message_id ?? message.id) || `floor-${index}`;
 }
@@ -48,6 +52,23 @@ function contentHash(value: string): string {
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0).toString(36);
+}
+
+function sourceAuthor(message: Record<string, unknown>, messageType: ChatMessageType): SourceBlock['author'] {
+  const extra = message.extra && typeof message.extra === 'object' ? message.extra as Record<string, unknown> : undefined;
+  const typedAuthor = message.author && typeof message.author === 'object' ? message.author as Record<string, unknown> : undefined;
+  const originalAvatar = text(message.original_avatar ?? message.originalAvatar ?? typedAuthor?.originalAvatar ?? extra?.original_avatar);
+  const avatar = text(message.avatar ?? typedAuthor?.avatar ?? extra?.avatar);
+  const displayName = text(message.name ?? message.displayName ?? typedAuthor?.displayName);
+  const kind = messageType === 'narrator' || typedAuthor?.kind === 'narrator'
+    ? 'narrator'
+    : messageType === 'system' ? 'system' : message.is_user === true || message.role === 'user' ? 'user' : 'assistant';
+  return {
+    kind,
+    ...(displayName ? { displayName } : {}),
+    ...(avatar ? { avatar } : {}),
+    ...(originalAvatar ? { originalAvatar } : {}),
+  };
 }
 
 const SKIPPED_STATE_KEYS = new Set(['命运分支', 'schema', 'initialized_lorebooks', '__proto__', 'prototype', 'constructor']);
@@ -114,6 +135,8 @@ export function buildVisibleChatSourceBlocks(chatKey: string, rawMessages: reado
       ? 'tool'
       : message.messageType === 'reasoning' || message.is_reasoning === true
         ? 'reasoning'
+        : message.messageType === 'narrator' || message.role === 'narrator' || extra?.type === 'narrator' || message.is_narrator === true
+          ? 'narrator'
         : message.messageType === 'system' || message.is_system === true || message.role === 'system'
           ? 'system'
           : 'conversation';
@@ -126,6 +149,23 @@ export function buildVisibleChatSourceBlocks(chatKey: string, rawMessages: reado
       || message.hidden === true
       || Boolean(extra?.hidden === true);
     const hidden = messageType !== 'system' && (explicitHidden || message.visibleToAi === false || messageType === 'tool' || messageType === 'reasoning');
+    const actorRefs = textList(message.actorRefs ?? message.actor_refs ?? extra?.actorRefs ?? extra?.actor_refs);
+    const speakerOwnerRef = text(message.speakerActorId ?? message.speakerOwnerId ?? message.speakerName ?? extra?.speakerActorId ?? extra?.speakerOwnerId);
+    const viewpointOwnerRef = text(message.perspectiveActorId ?? message.viewpointOwnerId ?? extra?.perspectiveActorId ?? extra?.viewpointOwnerId);
+    const observerOwnerRefs = textList(message.observerActorIds ?? message.observerOwnerIds ?? extra?.observerActorIds ?? extra?.observerOwnerIds);
+    const mentionedOwnerRefs = textList(message.mentionedActorIds ?? message.mentionedOwnerIds ?? extra?.mentionedActorIds ?? extra?.mentionedOwnerIds);
+    const presentOwnerRefs = textList(message.presentActorIds ?? message.presentOwnerIds ?? extra?.presentActorIds ?? extra?.presentOwnerIds);
+    const perspective = speakerOwnerRef || viewpointOwnerRef || observerOwnerRefs.length > 0 || mentionedOwnerRefs.length > 0 || presentOwnerRefs.length > 0
+      ? {
+        ...(speakerOwnerRef ? { speakerOwnerRef } : {}),
+        ...(viewpointOwnerRef ? { viewpointOwnerRef } : {}),
+        ...(observerOwnerRefs.length > 0 ? { observerOwnerRefs } : {}),
+        ...(mentionedOwnerRefs.length > 0 ? { mentionedOwnerRefs } : {}),
+        ...(presentOwnerRefs.length > 0 ? { presentOwnerRefs } : {}),
+        confidence: 1,
+      }
+      : undefined;
+    const sceneRefs = textList(message.sceneRefs ?? message.sceneIds ?? extra?.sceneRefs ?? extra?.sceneIds);
     return [{
       id: `message:${messageId(message, index)}`,
       chatKey,
@@ -136,6 +176,11 @@ export function buildVisibleChatSourceBlocks(chatKey: string, rawMessages: reado
       floor: index,
       ...(messageType === 'conversation' ? {} : { messageType }),
       hidden,
+      author: sourceAuthor(message, messageType),
+      visibility: messageType === 'system' ? 'control' : hidden ? 'hidden' : 'visible',
+      ...(actorRefs.length > 0 ? { actorRefs } : {}),
+      ...(perspective ? { perspective } : {}),
+      ...(sceneRefs.length > 0 ? { sceneRefs } : {}),
     }];
   });
 }
@@ -147,10 +192,12 @@ function buildSdkCharacterBlock(chatKey: string, character: HostCharacterSnapsho
     ['场景', character.scenario], ['开场白', character.firstMessage],
   ].filter((item) => text(item[1])).map(([label, value]) => `${label}：${text(value)}`);
   if (fields.length === 0) return [];
-  return [{
-    id: `character:${character.id}:${contentHash(fields.join('\n'))}`, chatKey, kind: 'character', role: 'metadata',
+  const hostCard: SourceBlock = {
+    id: `host_card:${character.id}:${contentHash(fields.join('\n'))}`, chatKey, kind: 'host_card', role: 'metadata',
     content: fields.join('\n'), createdAt: Date.now(), entityKeys: [character.id, character.name].filter(Boolean),
-  }];
+    author: { kind: 'assistant', displayName: character.name, ...(character.avatar ? { avatar: character.avatar } : {}) },
+  };
+  return [hostCard];
 }
 
 function buildSdkPersonaBlock(chatKey: string, persona: HostPersonaSnapshot | null): SourceBlock[] {
@@ -183,7 +230,7 @@ function sourceGroupId(source: SourceBlock): string {
 function sourceGroupLabel(source: SourceBlock): string {
   if (source.kind === 'message') return '聊天消息';
   if (source.kind === 'state') return '最新变量状态';
-  if (source.kind === 'character') return '角色卡';
+  if (source.kind === 'host_card') return '角色卡世界容器';
   if (source.kind === 'persona') return '用户 Persona';
   const book = source.entityKeys?.[0]?.trim();
   return book ? `世界书：${book}` : '世界书';
@@ -193,6 +240,7 @@ function sourceGroupLabel(source: SourceBlock): string {
 export function summarizeSourceGroups(sources: readonly SourceBlock[]): MemorySourceGroup[] {
   const groups = new Map<string, MemorySourceGroup>();
   for (const source of sources) {
+    if (source.hidden && source.kind === 'host_card') continue;
     const id = sourceGroupId(source);
     const current = groups.get(id);
     if (current) {
@@ -211,7 +259,7 @@ export function summarizeSourceGroups(sources: readonly SourceBlock[]): MemorySo
   const order: Readonly<Record<SourceBlock['kind'], number>> = {
     message: 0,
     state: 1,
-    character: 2,
+    host_card: 2,
     persona: 3,
     worldbook: 4,
   };

@@ -1,8 +1,24 @@
 import type { AutomaticIngestRejection, MemoryTokenUsage } from '../../domain';
 
-export type SourceBlockKind = 'message' | 'state' | 'character' | 'persona' | 'worldbook';
+export type SourceBlockKind = 'message' | 'state' | 'host_card' | 'persona' | 'worldbook';
 export type SourceBlockRole = 'user' | 'assistant' | 'system' | 'tool' | 'metadata';
-export type SourceMessageType = 'conversation' | 'system' | 'tool' | 'reasoning';
+export type SourceMessageType = 'conversation' | 'narrator' | 'system' | 'tool' | 'reasoning';
+
+export interface SourceAuthor {
+  readonly kind: 'user' | 'assistant' | 'narrator' | 'system';
+  readonly displayName?: string;
+  readonly avatar?: string;
+  readonly originalAvatar?: string;
+}
+
+export interface SourcePerspective {
+  readonly viewpointOwnerRef?: string;
+  readonly speakerOwnerRef?: string;
+  readonly observerOwnerRefs?: readonly string[];
+  readonly mentionedOwnerRefs?: readonly string[];
+  readonly presentOwnerRefs?: readonly string[];
+  readonly confidence?: number;
+}
 
 export interface SourceBlock {
   id: string;
@@ -15,9 +31,16 @@ export interface SourceBlock {
   messageType?: SourceMessageType;
   hidden?: boolean;
   entityKeys?: string[];
+  /** Host author provenance; never treated as an in-world owner by itself. */
+  author?: SourceAuthor;
+  /** Prompt-local entity references discovered by ActorRegistry. */
+  actorRefs?: string[];
+  perspective?: SourcePerspective;
+  visibility?: 'visible' | 'hidden' | 'control';
+  sceneRefs?: string[];
 }
 
-export type FactKind = 'identity' | 'relationship' | 'location' | 'world_rule' | 'state' | 'goal' | 'commitment' | 'event' | 'preference';
+export type FactKind = 'identity' | 'relationship' | 'location' | 'world_rule' | 'state' | 'goal' | 'commitment' | 'event' | 'preference' | 'capability';
 
 export interface ExtractedFactProposal {
   kind: FactKind;
@@ -37,7 +60,11 @@ export interface ExtractedFactProposal {
 
 export interface ValidatedFactProposal extends ExtractedFactProposal {
   canonicalKey: string;
-  scope?: { characterKeys?: string[]; worldKeys?: string[]; sceneKeys?: string[] };
+  scope?: { worldKeys?: string[]; sceneKeys?: string[] };
+  ownerRefs?: string[];
+  observationRefs?: string[];
+  privacy?: 'public' | 'limited' | 'private' | 'secret';
+  knowledgeMode?: 'asserted' | 'self_reported' | 'heard' | 'experienced' | 'inferred' | 'believed' | 'suspected' | 'unknown';
 }
 
 export interface IngestCommit {
@@ -77,6 +104,23 @@ export interface MemoryExtractionAudit {
 
 export interface MemoryExtractionResult {
   facts: ExtractedFactProposal[];
+  audit?: MemoryExtractionAudit;
+}
+
+/** One-call structured capture output. All refs are local to the request. */
+export interface StructuredCaptureResult {
+  actorCandidates: Array<{
+    localId: string;
+    displayName: string;
+    aliases?: string[];
+    sourceRefs: string[];
+    evidenceExcerpts: string[];
+    confidence: number;
+    status?: 'confirmed' | 'pending' | 'unknown';
+  }>;
+  episodes: Array<Record<string, unknown>>;
+  observations: Array<Record<string, unknown>>;
+  facts: Array<Record<string, unknown>>;
   audit?: MemoryExtractionAudit;
 }
 

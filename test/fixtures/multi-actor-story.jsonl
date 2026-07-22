@@ -1,0 +1,8 @@
+{"id":"host-card","chatKey":"chat","kind":"host_card","role":"metadata","content":"角色：A。世界是冬季城。","createdAt":1}
+{"id":"worldbook:1","chatKey":"chat","kind":"worldbook","role":"metadata","content":"冬季城的门禁规则：日落后需要铜钥匙。","createdAt":1,"entityKeys":["世界","门禁"]}
+{"id":"m1","chatKey":"chat","kind":"message","role":"assistant","content":"A说：我找到了铜钥匙。","createdAt":2,"floor":1,"author":{"kind":"assistant","displayName":"A"}}
+{"id":"m2","chatKey":"chat","kind":"message","role":"assistant","content":"B站在门外，没有听见A的低声话。","createdAt":3,"floor":2,"author":{"kind":"assistant","displayName":"B"}}
+{"id":"m3","chatKey":"chat","kind":"message","role":"assistant","content":"A心想：不能让B知道秘密。","createdAt":4,"floor":3,"author":{"kind":"assistant","displayName":"A"}}
+{"id":"m4","chatKey":"chat","kind":"message","role":"assistant","content":"玩家在第五层遇见旁白：暴风雪封锁北门。","createdAt":5,"floor":4,"author":{"kind":"user","displayName":"玩家"},"actorRefs":["玩家","旁白"]}
+{"id":"m5","chatKey":"chat","kind":"message","role":"assistant","content":"B听说A已经背叛了城主，但这只是传闻。","createdAt":6,"floor":5,"author":{"kind":"assistant","displayName":"B"},"actorRefs":["B","A"]}
+{"id":"m6","chatKey":"chat","kind":"message","role":"assistant","content":"场景切换到南门；A缺席，B与玩家在场。","createdAt":7,"floor":6,"author":{"kind":"assistant","displayName":"旁白"},"actorRefs":["A","B","玩家"]}

@@ -139,7 +139,7 @@ function validateProposal(
   if (!proposal.subjectKey.trim() || !proposal.predicateKey.trim()) return { ok: false, code: 'invalid_shape', message: '事实缺少主语或谓词。' };
   const keyValidation = validateChineseExtractionKeys(proposal, source.content);
   if (!keyValidation.ok) return keyValidation;
-  if (contentLength < 20 || contentLength > 240) return { ok: false, code: 'content_length', message: '事实正文必须为 20–240 字。' };
+  if (contentLength < 6 || contentLength > 240) return { ok: false, code: 'content_length', message: '事实正文必须为 6–240 字。' };
   if (!Number.isFinite(proposal.confidence) || proposal.confidence < 0 || proposal.confidence > 1) return { ok: false, code: 'invalid_confidence', message: '置信度必须位于 0–1。' };
   if (!proposal.evidenceExcerpt.trim()) return { ok: false, code: 'empty_excerpt', message: '证据摘录不能为空。' };
   if (!source.content.includes(proposal.evidenceExcerpt)) return { ok: false, code: 'excerpt_mismatch', message: '证据摘录无法在来源正文中逐字匹配。' };
@@ -187,8 +187,8 @@ export class MemoryIngestService {
         .join('|');
       const sourceRef = normalizeSourceReference(proposal.sourceRef, sourceMap);
       const source = sourceMap.get(sourceRef);
-      const scope = proposal.stable === true && source?.kind === 'character'
-        ? { characterKeys: source.entityKeys?.length ? [...source.entityKeys] : [proposal.subjectKey] }
+      const scope = proposal.stable === true && source?.kind === 'host_card'
+        ? { worldKeys: source.entityKeys?.length ? [...source.entityKeys] : [proposal.subjectKey] }
         : proposal.stable === true && source?.kind === 'worldbook' && source.entityKeys?.[0]
           ? { worldKeys: [source.entityKeys[0]] }
           : undefined;

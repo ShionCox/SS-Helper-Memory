@@ -159,11 +159,7 @@ export interface MemoryCaptureProgress {
   processedCount: number;
   elapsedMs: number;
   error?: string;
-  phase?: 'extract' | 'reduce' | 'resolve' | 'apply';
-  stagedBatchCount?: number;
-  conflictBucketCount?: number;
-  pendingReviewCount?: number;
-  qualityStatus?: 'ready' | 'needs_review';
+  phase?: 'capture';
 }
 
 export interface MemoryInitializationAttempt {
@@ -181,14 +177,6 @@ export interface MemoryInitializationState {
   lastCompletedAt: number | null;
   selectedSourceKinds: string[];
   attempts: MemoryInitializationAttempt[];
-  qualityStatus?: 'ready' | 'needs_review';
-  pendingReviewCount?: number;
-  stagedBatchCount?: number;
-  mergedDuplicateCount?: number;
-  supersededCount?: number;
-  conflictBucketCount?: number;
-  ruleResolvedCount?: number;
-  llmResolvedCount?: number;
 }
 
 export interface MemoryAuditRecord {
@@ -204,18 +192,6 @@ export interface MemoryAuditRecord {
   resource?: string;
   resourceId?: string;
   kind?: string;
-  finalization?: {
-    stagedBatchCount?: number;
-    extractedFactCount?: number;
-    acceptedFactCount?: number;
-    mergedDuplicateCount?: number;
-    supersededCount?: number;
-    conflictBucketCount?: number;
-    ruleResolvedCount?: number;
-    llmResolvedCount?: number;
-    pendingReviewCount?: number;
-    qualityStatus?: 'ready' | 'needs_review';
-  };
   routeSummary?: {
     requestCount?: number;
     resourceIds?: string[];
@@ -227,6 +203,8 @@ export interface MemoryAuditRecord {
   createdAt?: number;
   [key: string]: unknown;
 }
+
+export interface ActorCorrectionReview { readonly id: string; readonly operation: 'correction' | 'merge' | 'split' | 'rename' | 'alias'; readonly status: 'pending' | 'applied' | 'undone'; readonly ownerIds: readonly string[]; readonly createdAt: number; readonly sourceRef?: string; }
 
 export interface MemoryUiController {
   getSettings(): MemoryUiSettings;
@@ -258,6 +236,24 @@ export interface MemoryUiController {
   exportSqliteBackup(): Promise<Blob>;
   importSqliteBackup(file: File): Promise<void>;
   checkSqliteIntegrity(): Promise<MemorySqliteIntegrityResult>;
+  /** Optional multi-actor workbench read models. */
+  listActors?(): Promise<readonly import('../domain').MemoryOwner[]>;
+  listSceneCasts?(): Promise<readonly import('../domain').SceneCast[]>;
+  listActorTraces?(ownerId?: string): Promise<readonly import('../domain').ActorMemoryTrace[]>;
+  listActorProfiles?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
+  listActorDreams?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
+  runActorDream?(jobId: string, options?: { readonly dryRun?: boolean; readonly narrative?: boolean }): Promise<import('../application/dream').DreamAudit>;
+  rollbackActorDream?(auditId: string): Promise<void>;
+  listActorCorrectionReviews?(): Promise<readonly ActorCorrectionReview[]>;
+  resolveActorCorrection?(auditId: string, action: 'confirm' | 'undo'): Promise<void>;
+  listPendingActorCandidates?(): Promise<readonly import('../domain').ActorCandidate[]>;
+  confirmActorCandidate?(candidateId: string, canonicalName?: string): Promise<void>;
+  mergeActors?(fromOwnerId: string, intoOwnerId: string): Promise<void>;
+  splitActor?(ownerId: string, aliasValue: string, displayName?: string): Promise<void>;
+  renameActor?(ownerId: string, displayName: string): Promise<void>;
+  updateActorMemoryTraits?(ownerId: string, traits: import('../domain').MemoryTraits): Promise<void>;
+  correctActorAlias?(aliasId: string, ownerId: string): Promise<void>;
+  rollbackActorCapture?(auditId: string): Promise<void>;
   clearCurrentChatData(): Promise<void>;
   clearAllMemoryData(): Promise<void>;
 }
@@ -277,7 +273,7 @@ export type MemoryInitializationEstimate = SummaryInitializationEstimate;
 
 const FACT_KIND_LABELS: Readonly<Record<string, string>> = Object.freeze({
   identity: '身份', relationship: '关系', location: '地点', world_rule: '世界规则', state: '状态',
-  goal: '目标', commitment: '承诺', event: '事件', preference: '偏好', other: '其他',
+  goal: '目标', commitment: '承诺', event: '事件', preference: '偏好', capability: '能力', other: '其他',
 });
 const FACT_STATUS_LABELS: Readonly<Record<string, string>> = Object.freeze({ active: '有效', pending: '待确认', superseded: '已替代', invalid: '无效' });
 const RECORD_STATUS_LABELS: Readonly<Record<string, string>> = Object.freeze({
@@ -347,7 +343,7 @@ export function formatSourceReference(value: string): string {
   if (message) return `聊天消息 #${message[1]}${suffix}`;
   const state = base.match(/^state:([^:]+)/u);
   if (state) return `聊天状态 · 消息 #${state[1]}${suffix}`;
-  if (base.startsWith('character:')) return `角色卡${suffix}`;
+  if (base.startsWith('host_card:')) return `角色卡世界容器${suffix}`;
   if (base.startsWith('persona:')) return `用户设定${suffix}`;
   const worldbook = base.match(/^worldbook:[^:]+:([^:]+)/u);
   if (worldbook) return `世界书条目 #${worldbook[1]}${suffix}`;
@@ -429,14 +425,22 @@ function safeInlineError(value: unknown, fallback: string): string {
   return status ? `HTTP ${status}` : fallback;
 }
 
-export type MemoryWorkbenchPage = 'library' | 'initialize' | 'recall' | 'graph' | 'audit' | 'data';
+export type MemoryWorkbenchPage = 'overview' | 'actors' | 'scenes' | 'library' | 'actor-memory' | 'profiles' | 'dreams' | 'recall' | 'audit' | 'initialize' | 'graph' | 'data';
 const PAGES: ReadonlyArray<{ id: MemoryWorkbenchPage; label: string; description: string; icon: string }> = [
+  { id: 'overview', label: '概览', description: '当前工作区与场景状态', icon: 'gauge-high' },
+  { id: 'actors', label: '人物与别名', description: '主体发现与待确认归属', icon: 'users' },
+  { id: 'scenes', label: '场景与事件', description: '在场、提及与事件来源', icon: 'timeline' },
   { id: 'library', label: '记忆库', description: '浏览与编辑事实', icon: 'book-open' },
-  { id: 'initialize', label: '初始化', description: '导入已有聊天来源', icon: 'wand-magic-sparkles' },
+  { id: 'actor-memory', label: '角色记忆', description: '按主体查看记忆痕迹', icon: 'brain' },
+  { id: 'profiles', label: '画像与关系', description: '来源支撑的增量画像', icon: 'address-card' },
+  { id: 'dreams', label: 'Dream', description: '逐主体巩固、审计与回滚', icon: 'moon' },
   { id: 'recall', label: '召回与索引', description: '检查检索链路', icon: 'magnifying-glass-chart' },
-  { id: 'graph', label: '关系图谱', description: '只读查看事实关系', icon: 'diagram-project' },
   { id: 'audit', label: '审计记录', description: '查看整理批次', icon: 'list-check' },
-  { id: 'data', label: '数据维护', description: '备份与健康检查', icon: 'database' },
+];
+const INTERNAL_PAGES: ReadonlyArray<{ id: MemoryWorkbenchPage; label: string; description: string; icon: string }> = [
+  { id: 'initialize', label: '初始化', description: '捕获当前聊天来源（场景页内）', icon: 'wand-magic-sparkles' },
+  { id: 'graph', label: '关系图谱', description: '召回诊断中的只读图谱', icon: 'diagram-project' },
+  { id: 'data', label: '数据维护', description: '审计页内的存储健康状态', icon: 'database' },
 ];
 
 interface WorkbenchState {
@@ -449,6 +453,13 @@ interface WorkbenchState {
   pageError?: MemoryErrorDiagnostic;
   actionError?: MemoryErrorDiagnostic;
   overview?: MemoryUiOverview;
+  actors: Array<import('../domain').MemoryOwner>;
+  pendingActors: Array<import('../domain').ActorCandidate>;
+  actorCorrectionReviews: ActorCorrectionReview[];
+  scenes: Array<import('../domain').SceneCast>;
+  actorTraces: Array<import('../domain').ActorMemoryTrace>;
+  profiles: Array<Record<string, unknown>>;
+  dreams: Array<Record<string, unknown>>;
   facts: MemoryUiFact[];
   query: string;
   selectedKinds: string[];
@@ -483,7 +494,6 @@ interface WorkbenchState {
   integrityText: string;
   confirmBatchKey: string;
   dangerConfirm: '' | 'current' | 'all';
-  pendingImport?: File;
 }
 
 function uiControl(kind: UiControlKind, tone?: UiControlTone): string {
@@ -545,7 +555,7 @@ export function renderMemoryWorkbench(
   let graphRenderer: RelationshipGraphRenderer | undefined;
   const requestedGraphPage = initialActionId === 'open-relationship-graph' || initialActionId === 'rebuild-relationship-graph';
   const state: WorkbenchState = {
-    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', facts: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
+    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', actors: [], pendingActors: [], actorCorrectionReviews: [], scenes: [], actorTraces: [], profiles: [], dreams: [], facts: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
     selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeInvisibleHistory: false, reinitializeOpen: false, audits: [], usages: [], integrityText: '尚未执行完整性检查。', confirmBatchKey: '', dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
   };
 
@@ -683,7 +693,34 @@ export function renderMemoryWorkbench(
     state.page = page; state.pageLoading = true; state.pageError = undefined; rerender();
     const isCurrent = (): boolean => !disposed && requestId === pageRequestId;
     try {
-      if (page === 'initialize') {
+      if (page === 'overview') {
+        state.overview = await controller.getOverview();
+      } else if (page === 'actors') {
+        const [actors, pending, reviews] = await Promise.all([
+          controller.listActors ? controller.listActors() : Promise.resolve([]),
+          controller.listPendingActorCandidates ? controller.listPendingActorCandidates() : Promise.resolve([]),
+          controller.listActorCorrectionReviews ? controller.listActorCorrectionReviews() : Promise.resolve([]),
+        ]);
+        state.actors = [...actors]; state.pendingActors = [...pending]; state.actorCorrectionReviews = [...reviews];
+      } else if (page === 'scenes') {
+        const [scenes, sources, initialization] = await Promise.all([
+          controller.listSceneCasts ? controller.listSceneCasts() : Promise.resolve([]),
+          controller.getInitializationSources({ includeInvisibleHistory: state.includeInvisibleHistory }),
+          controller.getInitializationState(),
+        ]);
+        state.scenes = [...scenes];
+        state.sources = sources;
+        state.initialization = initialization;
+        state.selectedSourceKinds = state.sources.filter((source) => source.selected).map((source) => source.kind);
+        state.estimate = await controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory });
+        state.progress = await controller.getCaptureProgress();
+      } else if (page === 'actor-memory') {
+        state.actorTraces = controller.listActorTraces ? [...await controller.listActorTraces()] : [];
+      } else if (page === 'profiles') {
+        state.profiles = controller.listActorProfiles ? [...await controller.listActorProfiles()] : [];
+      } else if (page === 'dreams') {
+        state.dreams = controller.listActorDreams ? [...await controller.listActorDreams()] : [];
+      } else if (page === 'initialize') {
         const [sources, initialization] = await Promise.all([
           controller.getInitializationSources({ includeInvisibleHistory: state.includeInvisibleHistory }),
           controller.getInitializationState(),
@@ -701,6 +738,19 @@ export function renderMemoryWorkbench(
         state.recall = await controller.getRecallStatus();
         if (!isCurrent()) return;
         state.diagnostics = state.overview?.bound === false ? null : await controller.getLastRecall();
+        if (state.overview?.bound === false) {
+          state.graph = { nodes: [], edges: [] };
+          state.graphStatus = controller.getGraphStatus();
+        } else {
+          const [graph, facts] = await Promise.all([
+            controller.getRelationshipGraph('', 50),
+            controller.listFacts(),
+          ]);
+          if (!isCurrent()) return;
+          state.graph = graph;
+          state.graphStatus = controller.getGraphStatus();
+          state.facts = facts;
+        }
       } else if (page === 'graph') {
         if (state.overview?.bound === false) {
           state.graph = { nodes: [], edges: [] };
@@ -727,6 +777,7 @@ export function renderMemoryWorkbench(
           if (!isCurrent()) return;
           state.usages = await controller.getMainChatUsage();
         }
+        state.sqlite = await controller.getSqliteStatus();
       } else if (page === 'data') {
         state.sqlite = await controller.getSqliteStatus();
         if (state.overview) state.overview = {
@@ -795,6 +846,31 @@ export function renderMemoryWorkbench(
     state.estimate = await controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory });
   };
 
+  const renderOverview = (): string => {
+    const overview = state.overview;
+    if (!overview) return renderEmpty('正在读取工作区概览');
+    return `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">当前工作区</span><h3>${escapeHtml(overview.chatName ?? overview.chatKey ?? '未选择聊天')}</h3></div>${renderStatusChip(overview.status === 'ready' ? '已就绪' : overview.status, overview.status === 'ready' ? 'success' : overview.status === 'error' ? 'error' : 'neutral')}</div><dl class="stx-memory-detail-grid"><div><dt>事实</dt><dd>${formatNumber(overview.factCount)}</dd></div><div><dt>待处理任务</dt><dd>${formatNumber(overview.pendingJobs)}</dd></div><div><dt>向量模型</dt><dd>${escapeHtml(overview.embedding?.model ?? '未配置')}</dd></div><div><dt>当前聊天</dt><dd>${escapeHtml(overview.bound ? '已绑定' : '未选择')}</dd></div></dl></section><section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">多主体链路</span><h3>角色认知状态</h3></div></div><p class="stx-memory-muted">人物、场景、角色记忆、画像和 Dream 均按主体独立保存；世界规范不会自动广播给人物。</p></section>`;
+  };
+
+  const renderActors = (): string => `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Actor Registry</span><h3>人物与别名</h3></div><span>${formatNumber(state.actors.length)} 个主体</span></div>${state.actors.length === 0 ? renderEmpty('尚未发现卡内人物', '进入聊天并完成一次 Capture 后，明确人物会出现在这里。') : `<div class="stx-memory-reference-list">${state.actors.map(actor => `<article class="stx-memory-evidence"><strong>${escapeHtml(actor.displayName)}</strong>${renderStatusChip(actor.kind === 'actor' ? actor.status : actor.kind, actor.status === 'confirmed' ? 'success' : 'warning')}<p>${escapeHtml(actor.aliases.join('、') || '无别名')}</p><small>owner_id：${escapeHtml(actor.id)} · 置信度 ${Math.round(actor.confidence * 100)}%</small></article>`).join('')}</div>`}</section>${state.pendingActors.length > 0 ? `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Pending</span><h3>待确认归属</h3></div><span>${formatNumber(state.pendingActors.length)} 条</span></div><div class="stx-memory-reference-list">${state.pendingActors.map(candidate => `<article class="stx-memory-evidence"><strong>${escapeHtml(candidate.displayName)}</strong><p>来源：${escapeHtml(candidate.sourceRefs.join('、') || '无')}；置信度 ${Math.round(candidate.confidence * 100)}%</p><button ${uiControl('button', 'primary')} type="button" data-action="confirm-actor" data-candidate-id="${escapeHtml(candidate.localId)}">确认归属</button></article>`).join('')}</div></section>` : ''}${state.actorCorrectionReviews.length > 0 ? `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Audit</span><h3>人物纠正审计</h3></div><span>${formatNumber(state.actorCorrectionReviews.length)} 条</span></div><div class="stx-memory-reference-list">${state.actorCorrectionReviews.map(review => `<article class="stx-memory-evidence"><strong>${escapeHtml(review.operation)}</strong>${renderStatusChip(review.status, review.status === 'undone' ? 'neutral' : 'success')}<small>${escapeHtml(review.id)}</small>${controller.resolveActorCorrection && review.status === 'applied' ? `<button ${uiControl('button', 'neutral')} type="button" data-action="undo-actor-correction" data-audit-id="${escapeHtml(review.id)}">撤销</button>` : ''}</article>`).join('')}</div></section>` : ''}`;
+
+  const renderScenes = (): string => `${state.scenes.length === 0
+    ? renderEmpty('暂无场景事件', '完成一次 Capture 后，这里显示参与者、在场者、提及者和来源楼层。')
+    : `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">SceneCast</span><h3>场景与事件</h3></div><span>${formatNumber(state.scenes.length)} 个场景</span></div><div class="stx-memory-reference-list">${state.scenes.map(scene => `<article class="stx-memory-evidence"><strong>第 ${scene.floor} 层 · ${escapeHtml(scene.chatKey)}</strong><p>发言：${escapeHtml(scene.speakerOwnerIds.join('、') || '无')}；在场：${escapeHtml(scene.presentOwnerIds.join('、') || '无')}；提及：${escapeHtml(scene.mentionedOwnerIds.join('、') || '无')}</p><small>视角：${escapeHtml(scene.viewpointOwnerId)}</small></article>`).join('')}</div></section>`}
+    <section class="stx-memory-panel stx-memory-capture-inline"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Capture</span><h3>初始化与重新捕获</h3></div></div><p class="stx-memory-muted">来源选择、进度与重新初始化操作已收口到本页；聊天原文不会被改写。</p></section>${renderInitialize()}`;
+
+  const renderActorMemory = (): string => state.actorTraces.length === 0
+    ? renderEmpty('暂无角色记忆痕迹', '只有有来源观察支撑的主体认知才会显示。')
+    : `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">ActorMemoryTrace</span><h3>角色记忆</h3></div><span>${formatNumber(state.actorTraces.length)} 条痕迹</span></div><div class="stx-memory-reference-list">${state.actorTraces.map(trace => `<article class="stx-memory-evidence"><strong>${escapeHtml(trace.ownerId)} · ${escapeHtml(trace.factId)}</strong>${renderStatusChip(trace.knowledgeMode, trace.privacy === 'private' || trace.privacy === 'secret' ? 'warning' : 'neutral')}<p>强度 ${Math.round(trace.strength)} · 清晰度 ${Math.round(trace.clarity)} · 置信度 ${Math.round(trace.beliefConfidence * 100)}%</p><small>观察来源：${escapeHtml(trace.sourceObservationIds.join('、') || '无')}</small></article>`).join('')}</div></section>`;
+
+  const renderProfiles = (): string => state.profiles.length === 0
+    ? renderEmpty('暂无画像增量', '画像必须满足证据重复门槛或高情绪显著度，并且每条声明都引用 Trace。')
+    : `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">L0–L5</span><h3>画像与关系</h3></div><span>${formatNumber(state.profiles.length)} 条声明</span></div><div class="stx-memory-reference-list">${state.profiles.map(profile => `<article class="stx-memory-evidence"><strong>${escapeHtml(String(profile.ownerId ?? profile.fromOwnerId ?? '主体'))}</strong><p>${escapeHtml(String(profile.claim ?? ''))}</p><small>引用：${escapeHtml(Array.isArray(profile.supportingTraceIds) ? profile.supportingTraceIds.join('、') : '无')}</small></article>`).join('')}</div></section>`;
+
+  const renderDreams = (): string => state.dreams.length === 0
+    ? renderEmpty('暂无 Dream 任务', 'Dream 默认按主体自动排队；也可以从后续操作入口手动 dry-run。')
+    : `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Dream Audit</span><h3>巩固任务</h3></div><span>${formatNumber(state.dreams.length)} 个任务</span></div><div class="stx-memory-reference-list">${state.dreams.map(job => `<article class="stx-memory-evidence"><strong>${escapeHtml(String(job.ownerId ?? '主体'))}</strong>${renderStatusChip(String(job.status ?? 'queued'), job.status === 'applied' ? 'success' : job.status === 'failed' ? 'error' : 'neutral')}<p>阶段：${escapeHtml(String(job.phase ?? 'gather'))}</p><small>任务：${escapeHtml(String(job.id ?? ''))}</small>${controller.runActorDream && job.id ? `<button ${uiControl('button', 'neutral')} type="button" data-action="dream-dry-run" data-job-id="${escapeHtml(String(job.id))}">dry-run 预览</button>` : ''}</article>`).join('')}</div></section>`;
+
   const renderLibrary = (): string => {
     const visibleFacts = filterAndSortFacts(state.facts, { kind: state.selectedKinds, status: state.selectedStatuses, sort: state.sort });
     const selected = visibleFacts.find((fact) => fact.id === state.selectedFactId) ?? visibleFacts[0];
@@ -810,7 +886,7 @@ export function renderMemoryWorkbench(
         ${editing ? `<label class="stx-memory-field-label" for="stx-memory-edit-content">编辑记忆内容</label><textarea id="stx-memory-edit-content" class="stx-memory-textarea-layout" ${uiControl('textarea')} data-edit-content>${escapeHtml(selected.content)}</textarea><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="save-fact" data-fact-id="${escapeHtml(selected.id)}" ${state.busyAction === 'save-fact' ? 'disabled' : ''}>保存</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-edit">取消</button></div>` : `<section class="stx-memory-content-card" aria-labelledby="stx-memory-content-label"><h4 id="stx-memory-content-label">记忆内容</h4><p class="stx-memory-fact-content">${escapeHtml(selected.content)}</p></section><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="edit-fact" data-fact-id="${escapeHtml(selected.id)}">编辑</button>${confirming ? `<span class="stx-memory-confirm-inline"><span>确认删除？</span><button ${uiControl('button', 'danger')} type="button" data-action="confirm-delete" data-fact-id="${escapeHtml(selected.id)}">确认</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-delete">取消</button></span>` : `<button ${uiControl('button', 'danger')} type="button" data-action="delete-fact" data-fact-id="${escapeHtml(selected.id)}">删除</button>`}</div>`}
         <section class="stx-memory-detail-section"><div class="stx-memory-section-heading"><div><h4>来源与证据</h4><p>核对记忆是否忠于聊天原文</p></div><span>${selected.evidence.length} 条</span></div><div class="stx-memory-evidence-list">${selected.evidence.length ? selected.evidence.map((item) => `<blockquote class="stx-memory-evidence"><p>${escapeHtml(item.excerpt)}</p><footer>${renderSourceReference(item.sourceRef, 'evidence')}</footer></blockquote>`).join('') : '<p class="stx-memory-muted">没有可展示的来源证据。</p>'}</div></section>
         <div class="stx-memory-detail-grid"><section><h4>来源引用</h4><div class="stx-memory-reference-list">${selected.sourceRefs.length ? selected.sourceRefs.map((item) => renderSourceReference(item)).join('') : '<span>无</span>'}</div></section><section><h4>版本关系</h4><p>${escapeHtml(replacement)}</p></section></div>
-        <section class="stx-memory-detail-section"><h4>整理记录</h4><div class="stx-memory-reference-list">${selected.auditBatches?.length ? selected.auditBatches.map((item) => { const batch = Math.max(1, Number(item.batchIndex) || 1); const label = item.kind === 'initialization-finalization-v0' ? `初始化整理 · 共 ${batch} 批` : item.kind?.startsWith('initialization') ? `初始化整理 · 第 ${batch} 批` : `第 ${batch} 批`; return `<span>${label} · ${escapeHtml(translateRecordStatus(item.status))}</span>`; }).join('') : '<span>暂无匹配批次</span>'}</div></section>`;
+        <section class="stx-memory-detail-section"><h4>捕获记录</h4><div class="stx-memory-reference-list">${selected.auditBatches?.length ? selected.auditBatches.map((item) => { const batch = Math.max(1, Number(item.batchIndex) || 1); return `<span>第 ${batch} 批 · ${escapeHtml(translateRecordStatus(item.status))}</span>`; }).join('') : '<span>暂无匹配批次</span>'}</div></section>`;
     })();
     const chatIdentity = formatChatIdentity(state.overview);
     const renderMultiFilter = (filter: 'kind' | 'status', allLabel: string, selectedValues: readonly string[], options: Readonly<Record<string, string>>): string => {
@@ -833,14 +909,14 @@ export function renderMemoryWorkbench(
     const { summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors } = summarySettings;
     const summaryNote = (summaryBatchMode === 'chars'
       ? `按每批最多 ${formatNumber(summaryBatchChars)} 字符拆分，批次间保留 ${formatNumber(summaryOverlapFloors)} 层前置上下文；自动触发仍按 ${formatNumber(summaryIntervalFloors)} 层间隔判断。`
-      : `按每批 ${formatNumber(summaryBatchFloors)} 层可见用户/助手消息拆分，批次间保留 ${formatNumber(summaryOverlapFloors)} 层前置上下文；自动触发间隔为 ${formatNumber(summaryIntervalFloors)} 层。`)
-      + ' 冲突整理仅在出现无法由规则确定的分歧时追加调用。';
-    const running = Boolean(progress && ['queued', 'running'].includes(progress.status));
+      : `按每批 ${formatNumber(summaryBatchFloors)} 层可见用户/助手消息拆分，批次间保留 ${formatNumber(summaryOverlapFloors)} 层前置上下文；自动触发间隔为 ${formatNumber(summaryIntervalFloors)} 层。`);
+    const storageUnavailable = state.overview?.status === 'error' || state.overview?.errorCode === 'SQLITE_SERVICE_UNAVAILABLE';
+    const running = !storageUnavailable && Boolean(progress && ['queued', 'running'].includes(progress.status));
+    const storageAlert = storageUnavailable
+      ? `<p class="stx-memory-inline-alert" role="alert">Memory workspace 当前不可用，已安全停用整理与召回。请先删除旧 SQLite 数据并重新启动酒馆；当前实现不会自动迁移或清空旧库。${state.overview?.errorCode ? `（错误码：${escapeHtml(safeInlineError(state.overview.errorCode, 'SQLITE_SERVICE_UNAVAILABLE'))}）` : ''}</p>`
+      : '';
     const submitting = ['initialize', 'reinitialize'].includes(state.busyAction);
-    const phaseLabel = progress?.phase === 'reduce' ? '整理归并'
-      : progress?.phase === 'resolve' ? '解决冲突'
-        : progress?.phase === 'apply' ? '写入记忆'
-          : '提取记忆';
+    const phaseLabel = '捕获记忆';
     const statusLabel = submitting && (!progress || progress.status === 'idle')
       ? '正在提交 LLM 请求'
       : progress
@@ -853,14 +929,11 @@ export function renderMemoryWorkbench(
         : '尚未读取';
     const feedback = submitting
       ? progress?.status === 'running'
-        ? !progress.phase || progress.phase === 'extract' ? 'LLM 正在提取结构化记忆，结果会先暂存，全部批次完成后统一整理。'
-          : progress.phase === 'reduce' ? '正在跨批次合并重复记忆并检查时间顺序。'
-            : progress.phase === 'resolve' ? '正在用规则优先处理冲突，仅疑难项才会请求 LLM 裁决。'
-              : '正在一次性写入已整理的事实与证据。'
+        ? '正在提取并写入结构化记忆，事件、观察、事实和主体痕迹在同一事务中提交。'
         : progress?.status === 'queued' ? '请求已进入 LLM 队列，等待模型反馈。'
           : '正在读取当前聊天来源并提交 LLM 请求…'
-      : progress?.status === 'completed' ? '初始化流程已完成，整理结果已统一写入数据库。'
-        : progress?.status === 'paused' ? '可重试错误已暂停当前阶段，已保留暂存结果，可直接继续。' : '';
+      : progress?.status === 'completed' ? '捕获流程已完成，结构化结果已写入数据库。'
+        : progress?.status === 'paused' ? '可重试错误已暂停当前捕获任务，可直接继续。' : '';
     const sourceLabel = (kind: string): string => state.sources.find((source) => source.kind === kind)?.label ?? kind;
     const selectedCount = state.selectedSourceKinds.length;
     const latestAttempt = initialization?.attempts[0];
@@ -880,20 +953,18 @@ export function renderMemoryWorkbench(
       return `<section class="stx-memory-invisible-history-option"><label><input ${uiControl('checkbox')} type="checkbox" data-option="include-invisible-history" ${state.includeInvisibleHistory ? 'checked' : ''} ${locked ? 'disabled' : ''}><span><strong>包含 AI 不可见历史正文（本次）</strong><small>当前 ${formatNumber(current)} / ${formatNumber(raw)} 条；默认安全范围为 ${formatNumber(defaultCount)} 条。</small></span></label>${state.includeInvisibleHistory ? `<p class="stx-memory-inline-alert" role="status">已纳入被酒馆标记为不可见的历史正文；仍会排除工具输出、隐藏推理和清洗后为空的控制块（当前仍排除 ${formatNumber(excluded)} 条）。</p>` : '<p class="stx-memory-muted">默认只处理 AI 可见的用户/助手消息。此选项只对本次初始化生效，暂停后继续会沿用任务断点。</p>'}</section>`;
     };
     const estimateMarkup = state.estimate ? `<dl class="stx-memory-estimate-grid"><div><dt>预计批次</dt><dd>${formatNumber(state.estimate.batchCount)}</dd></div><div><dt>Token 下限</dt><dd>${formatNumber(state.estimate.tokenLow)}</dd></div><div><dt>Token 上限</dt><dd>${formatNumber(state.estimate.tokenHigh)}</dd></div></dl>` : '';
-    const progressMarkup = `<section class="stx-memory-panel stx-memory-initialize-progress"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">正在初始化 · ${escapeHtml(phaseLabel)}</span><h3>${escapeHtml(statusLabel)}</h3></div>${progress?.jobId ? renderStatusChip('任务进行中', 'warning') : ''}</div>${feedback ? `<p class="stx-memory-capture-feedback" role="status" aria-live="polite"><ss-helper-icon name="sparkles" decorative></ss-helper-icon>${escapeHtml(feedback)}</p>` : ''}<div class="stx-memory-locked-sources"><span>已锁定来源</span><strong>${escapeHtml(state.selectedSourceKinds.map(sourceLabel).join('、') || '无')}</strong></div>${progress ? `<div class="stx-memory-progress-copy"><span>${progress.phase === 'extract' ? `当前批次 ${progress.batchIndex} / ${progress.totalBatches || 0}` : `${phaseLabel}阶段`}</span><span>${formatNumber(progress.processedCount)} 项 · ${Math.round(progress.elapsedMs / 1000)} 秒</span></div><progress ${uiControl('progress')} max="${Math.max(progress.totalBatches, 1)}" value="${progress.phase === 'extract' ? Math.min(progress.batchIndex, Math.max(progress.totalBatches, 1)) : Math.max(progress.totalBatches, 1)}">${progress.batchIndex}</progress>${progress.stagedBatchCount === undefined ? '' : `<p class="stx-memory-muted">已暂存 ${formatNumber(progress.stagedBatchCount)} 批${progress.conflictBucketCount === undefined ? '' : ` · 发现 ${formatNumber(progress.conflictBucketCount)} 组冲突`}${progress.pendingReviewCount === undefined ? '' : ` · ${formatNumber(progress.pendingReviewCount)} 项待审阅`}</p>`}${progress.error ? `<p class="stx-memory-inline-alert" role="alert">错误码：${escapeHtml(safeInlineError(progress.error, 'MEMORY_CAPTURE_FAILED'))}</p>` : ''}` : ''}<div class="stx-memory-actions"><button ${uiControl('button', 'danger')} type="button" data-action="initialize-cancel" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="stop" decorative></ss-helper-icon>取消任务</button></div></section>`;
+    const progressMarkup = `<section class="stx-memory-panel stx-memory-initialize-progress"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">正在捕获 · ${escapeHtml(phaseLabel)}</span><h3>${escapeHtml(statusLabel)}</h3></div>${progress?.jobId ? renderStatusChip('任务进行中', 'warning') : ''}</div>${feedback ? `<p class="stx-memory-capture-feedback" role="status" aria-live="polite"><ss-helper-icon name="sparkles" decorative></ss-helper-icon>${escapeHtml(feedback)}</p>` : ''}<div class="stx-memory-locked-sources"><span>已锁定来源</span><strong>${escapeHtml(state.selectedSourceKinds.map(sourceLabel).join('、') || '无')}</strong></div>${progress ? `<div class="stx-memory-progress-copy"><span>当前批次 ${progress.batchIndex} / ${progress.totalBatches || 0}</span><span>${formatNumber(progress.processedCount)} 项 · ${Math.round(progress.elapsedMs / 1000)} 秒</span></div><progress ${uiControl('progress')} max="${Math.max(progress.totalBatches, 1)}" value="${Math.min(progress.batchIndex, Math.max(progress.totalBatches, 1))}">${progress.batchIndex}</progress>${progress.error ? `<p class="stx-memory-inline-alert" role="alert">错误码：${escapeHtml(safeInlineError(progress.error, 'MEMORY_CAPTURE_FAILED'))}</p>` : ''}` : ''}<div class="stx-memory-actions"><button ${uiControl('button', 'danger')} type="button" data-action="initialize-cancel" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="stop" decorative></ss-helper-icon>取消任务</button></div></section>`;
     const activities = initialization?.attempts.length ? initialization.attempts.map((attempt) => {
       const tone = attempt.status === 'completed' ? 'success' : attempt.status === 'failed' ? 'error' : attempt.status === 'running' || attempt.status === 'queued' ? 'warning' : 'neutral';
       const icon = attempt.status === 'completed' ? 'circle-check' : attempt.status === 'failed' ? 'circle-xmark' : 'clock';
       const sourceNames = attempt.selectedSourceKinds.map(sourceLabel).join('、') || '全部可用来源';
       return `<article class="stx-memory-activity-item is-${escapeHtml(attempt.status)}"><ss-helper-icon name="${icon}" decorative></ss-helper-icon><div><div><strong>${escapeHtml(translateRecordStatus(attempt.status))}</strong>${renderStatusChip(`${formatNumber(attempt.totalBatches)} 批`, tone)}</div><time datetime="${new Date(attempt.updatedAt).toISOString()}">${escapeHtml(formatTime(attempt.updatedAt))}</time><p>${escapeHtml(sourceNames)} · ${attempt.includeInvisibleHistory ? '含不可见历史正文' : '仅 AI 可见消息'}</p>${attempt.error ? `<small title="${escapeHtml(attempt.error)}">${escapeHtml(safeInlineError(attempt.error, 'MEMORY_CAPTURE_FAILED'))}</small>` : ''}</div></article>`;
     }).join('') : renderEmpty('暂无初始化记录', '完成初始化后会在这里保留最近 5 次活动。');
-    const drawerDisabled = !selectedCount || !state.overview?.llmAvailable || running || Boolean(state.busyAction);
-    const drawer = !state.reinitializeOpen ? '' : `<div class="stx-memory-reinitialize-layer"><button class="stx-memory-drawer-backdrop" type="button" data-action="cancel-reinitialize" aria-label="关闭重新初始化确认"></button><aside class="stx-memory-reinitialize-drawer" role="alertdialog" aria-modal="true" aria-labelledby="stx-memory-reinitialize-title" aria-describedby="stx-memory-reinitialize-description"><header><div><span class="stx-memory-kicker">危险操作确认</span><h3 id="stx-memory-reinitialize-title">重新初始化当前聊天</h3></div><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-reinitialize" aria-label="关闭"><ss-helper-icon name="xmark" decorative></ss-helper-icon></button></header><div class="stx-memory-drawer-body"><p id="stx-memory-reinitialize-description" class="stx-memory-drawer-warning"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon><span><strong>这会清空当前聊天的全部 Memory 派生数据</strong><small>清空后立即按下方来源重新开始初始化；如果新任务失败，旧数据无法恢复。</small></span></p><section><div class="stx-memory-section-heading"><div><h4>选择重新整理的来源</h4><p>估算会随勾选结果实时更新</p></div><span>${selectedCount} / ${sourceTotal}</span></div>${renderSourceChoices(false)}</section>${renderInvisibleHistoryOption(false)}${estimateMarkup}<section class="stx-memory-clear-scope"><h4>将清理</h4><ul><li>事实、证据与事实槽位</li><li>任务、批次审计与 Usage</li><li>召回日志、向量索引与总结进度</li></ul></section><section class="stx-memory-safe-scope"><h4>不会影响</h4><ul><li>聊天原文与消息</li><li>角色卡、世界书和其他聊天</li></ul></section>${!state.overview?.llmAvailable ? '<p class="stx-memory-inline-alert" role="alert">大语言模型不可用，暂时不能重新初始化。</p>' : !selectedCount ? '<p class="stx-memory-inline-alert" role="alert">请至少选择一个来源。</p>' : ''}</div><footer><button id="stx-memory-reinitialize-cancel" ${uiControl('button', 'neutral')} type="button" data-action="cancel-reinitialize">取消</button><button ${uiControl('button', 'danger')} type="button" data-action="confirm-reinitialize" ${drawerDisabled ? 'disabled' : ''}><ss-helper-icon name="trash-can-arrow-up" decorative></ss-helper-icon>清空并重新初始化</button></footer></aside></div>`;
+    const drawerDisabled = storageUnavailable || !selectedCount || !state.overview?.llmAvailable || running || Boolean(state.busyAction);
+    const drawer = !state.reinitializeOpen ? '' : `<div class="stx-memory-reinitialize-layer"><button class="stx-memory-drawer-backdrop" type="button" data-action="cancel-reinitialize" aria-label="关闭重新初始化确认"></button><aside class="stx-memory-reinitialize-drawer" role="alertdialog" aria-modal="true" aria-labelledby="stx-memory-reinitialize-title" aria-describedby="stx-memory-reinitialize-description"><header><div><span class="stx-memory-kicker">危险操作确认</span><h3 id="stx-memory-reinitialize-title">重新初始化当前聊天</h3></div><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-reinitialize" aria-label="关闭"><ss-helper-icon name="xmark" decorative></ss-helper-icon></button></header><div class="stx-memory-drawer-body"><p id="stx-memory-reinitialize-description" class="stx-memory-drawer-warning"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon><span><strong>这会清空当前聊天的全部 Memory 派生数据</strong><small>清空后立即按下方来源重新开始初始化；如果新任务失败，旧数据无法恢复。</small></span></p><section><div class="stx-memory-section-heading"><div><h4>选择重新整理的来源</h4><p>估算会随勾选结果实时更新</p></div><span>${selectedCount} / ${sourceTotal}</span></div>${renderSourceChoices(false)}</section>${renderInvisibleHistoryOption(false)}${estimateMarkup}<section class="stx-memory-clear-scope"><h4>将清理</h4><ul><li>事实、证据、主体痕迹与派生索引</li><li>捕获任务、审计与 Usage</li><li>召回日志和总结进度</li></ul></section><section class="stx-memory-safe-scope"><h4>不会影响</h4><ul><li>聊天原文与消息</li><li>角色卡、世界书和其他聊天</li></ul></section>${!state.overview?.llmAvailable ? '<p class="stx-memory-inline-alert" role="alert">大语言模型不可用，暂时不能重新初始化。</p>' : !selectedCount ? '<p class="stx-memory-inline-alert" role="alert">请至少选择一个来源。</p>' : ''}</div><footer><button id="stx-memory-reinitialize-cancel" ${uiControl('button', 'neutral')} type="button" data-action="cancel-reinitialize">取消</button><button ${uiControl('button', 'danger')} type="button" data-action="confirm-reinitialize" ${drawerDisabled ? 'disabled' : ''}><ss-helper-icon name="trash-can-arrow-up" decorative></ss-helper-icon>清空并重新初始化</button></footer></aside></div>`;
     if (running || submitting) return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout is-running">${progressMarkup}<section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization?.attempts.length ?? 0} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div></div>`;
     if (initialization?.initialized) {
-      const reviewRequired = initialization.qualityStatus === 'needs_review' && (initialization.pendingReviewCount ?? 0) > 0;
-      const pipeline = initialization.stagedBatchCount === undefined ? '' : `<ol class="stx-memory-initialize-pipeline" aria-label="本次初始化处理阶段"><li><ss-helper-icon name="check" decorative></ss-helper-icon><span><strong>提取记忆</strong><small>已暂存 ${formatNumber(initialization.stagedBatchCount)} 批</small></span></li><li><ss-helper-icon name="check" decorative></ss-helper-icon><span><strong>整理归并</strong><small>合并 ${formatNumber(initialization.mergedDuplicateCount ?? 0)} 条重复</small></span></li><li><ss-helper-icon name="check" decorative></ss-helper-icon><span><strong>解决冲突</strong><small>${(initialization.conflictBucketCount ?? 0) === 0 ? '无待裁决冲突' : `规则 ${formatNumber(initialization.ruleResolvedCount ?? 0)} · 模型 ${formatNumber(initialization.llmResolvedCount ?? 0)}`}</small></span></li><li><ss-helper-icon name="check" decorative></ss-helper-icon><span><strong>写入记忆</strong><small>${reviewRequired ? `${formatNumber(initialization.pendingReviewCount ?? 0)} 项待审阅` : '统一写入完成'}</small></span></li></ol>`;
-      return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout"><section class="stx-memory-panel stx-memory-initialize-summary"><div class="stx-memory-initialize-success"><span><ss-helper-icon name="circle-check" decorative></ss-helper-icon></span><div><span class="stx-memory-kicker">初始化状态</span><h3>已初始化</h3><p>完成于 ${escapeHtml(formatTime(initialization.lastCompletedAt))}</p></div>${renderStatusChip(reviewRequired ? `有 ${formatNumber(initialization.pendingReviewCount ?? 0)} 项待审阅` : '召回可用', reviewRequired ? 'warning' : 'success')}</div><dl class="stx-memory-initialize-metrics"><div><dt>来源覆盖</dt><dd>${formatNumber(sourceCoverage)} / ${formatNumber(sourceTotal)}</dd></div><div><dt>记忆事实</dt><dd>${formatNumber(state.overview?.factCount ?? 0)}</dd></div><div><dt>占用空间</dt><dd>${escapeHtml(formatBytes(state.overview?.currentChatSizeBytes ?? 0))}</dd></div><div><dt>预计批次</dt><dd>${formatNumber(state.estimate?.batchCount ?? 0)}</dd></div></dl>${pipeline}<p class="stx-memory-initialize-note"><ss-helper-icon name="circle-info" decorative></ss-helper-icon><span>${reviewRequired ? '可靠记忆已可用于召回；存在无法自动裁决的冲突，已保留为待审阅状态。' : '当前聊天已经可以使用记忆召回。最近的失败任务只会记录在右侧，不会覆盖这次有效初始化。'}</span></p><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="view-library"><ss-helper-icon name="book-open" decorative></ss-helper-icon>查看记忆库</button><button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>重新初始化</button></div></section><section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization.attempts.length} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div>${drawer}</div>`;
+      return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout"><section class="stx-memory-panel stx-memory-initialize-summary">${storageAlert}<div class="stx-memory-initialize-success"><span><ss-helper-icon name="circle-check" decorative></ss-helper-icon></span><div><span class="stx-memory-kicker">初始化状态</span><h3>已初始化</h3><p>完成于 ${escapeHtml(formatTime(initialization.lastCompletedAt))}</p></div>${renderStatusChip('召回可用', 'success')}</div><dl class="stx-memory-initialize-metrics"><div><dt>来源覆盖</dt><dd>${formatNumber(sourceCoverage)} / ${formatNumber(sourceTotal)}</dd></div><div><dt>记忆事实</dt><dd>${formatNumber(state.overview?.factCount ?? 0)}</dd></div><div><dt>占用空间</dt><dd>${escapeHtml(formatBytes(state.overview?.currentChatSizeBytes ?? 0))}</dd></div><div><dt>预计批次</dt><dd>${formatNumber(state.estimate?.batchCount ?? 0)}</dd></div></dl><p class="stx-memory-initialize-note"><ss-helper-icon name="circle-info" decorative></ss-helper-icon><span>当前聊天已经可以使用记忆召回。最近的失败任务只会记录在右侧，不会覆盖这次有效初始化。</span></p><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="view-library"><ss-helper-icon name="book-open" decorative></ss-helper-icon>查看记忆库</button><button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${storageUnavailable || state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>重新初始化</button></div></section><section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization.attempts.length} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div>${drawer}</div>`;
     }
     const clearedAfterFailure = latestAttempt?.status === 'failed';
     const resumable = latestAttempt?.status === 'paused';
@@ -905,9 +976,9 @@ export function renderMemoryWorkbench(
         ? '<p class="stx-memory-inline-alert" role="alert">旧 Memory 数据已清空，上一次重新初始化失败。请选择来源后直接重试。</p>'
         : '<p class="stx-memory-muted">选择用于建立记忆的来源。初始化只读取内容，不会改写聊天原文、角色卡或世界书。</p>';
     const setupAction = resumable
-      ? `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-resume" ${state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>继续初始化</button>`
-      : `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-start" ${!selectedCount || !state.sources.length || state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>${clearedAfterFailure ? '重新尝试初始化' : '开始初始化'}</button>`;
-    return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout"><section class="stx-memory-panel stx-memory-initialize-setup"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">${setupKicker}</span><h3>${setupHeading}</h3></div>${state.estimate ? renderStatusChip(`${formatNumber(state.estimate.messageCount)} 条消息`, 'neutral') : ''}</div>${setupNotice}${resumable ? '' : `${renderSourceChoices(false)}${renderInvisibleHistoryOption(false)}${estimateMarkup}<p class="stx-memory-estimate-note">${escapeHtml(summaryNote)} 实际批次会随清洗和长消息拆分结果变化。</p>`}<div class="stx-memory-actions">${setupAction}</div></section><section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization?.attempts.length ?? 0} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div></div>`;
+      ? `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-resume" ${storageUnavailable || state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>继续初始化</button>`
+      : `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-start" ${storageUnavailable || !selectedCount || !state.sources.length || state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>${clearedAfterFailure ? '重新尝试初始化' : '开始初始化'}</button>`;
+    return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout"><section class="stx-memory-panel stx-memory-initialize-setup"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">${setupKicker}</span><h3>${setupHeading}</h3></div>${state.estimate ? renderStatusChip(`${formatNumber(state.estimate.messageCount)} 条消息`, 'neutral') : ''}</div>${storageAlert}${setupNotice}${resumable ? '' : `${renderSourceChoices(false)}${renderInvisibleHistoryOption(false)}${estimateMarkup}<p class="stx-memory-estimate-note">${escapeHtml(summaryNote)} 实际批次会随清洗和长消息拆分结果变化。</p>`}<div class="stx-memory-actions">${setupAction}</div></section><section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization?.attempts.length ?? 0} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div></div>`;
   };
   const renderRecall = (): string => {
     const recall = state.recall;
@@ -1028,7 +1099,7 @@ export function renderMemoryWorkbench(
     graphMarqueeResizeObserver.observe(inspector);
   };
   const syncGraphUi = (selectionOnly = false): void => {
-    if (disposed || state.page !== 'graph' || !state.graphStatus?.enabled || !state.graph) return;
+    if (disposed || !['graph', 'recall'].includes(state.page) || !state.graphStatus?.enabled || !state.graph) return;
     const view = graphView();
     const selectedEdgeId = state.selectedGraphNodeId ? '' : state.selectedGraphEdgeId && view.edges.some((edge) => edge.id === state.selectedGraphEdgeId) ? state.selectedGraphEdgeId : '';
     const selectedEventEdgeId = state.selectedGraphNodeId || selectedEdgeId ? '' : state.selectedGraphEventId && view.edges.some((edge) => edge.id === state.selectedGraphEventId && edge.kind === 'event') ? state.selectedGraphEventId : '';
@@ -1094,7 +1165,7 @@ export function renderMemoryWorkbench(
     graphListModeFrame = window.requestAnimationFrame(() => {
       graphListModeFrame = window.requestAnimationFrame(() => {
         graphListModeFrame = undefined;
-        if (disposed || state.page !== 'graph') return;
+        if (disposed || !['graph', 'recall'].includes(state.page)) return;
         if (hadSelection && !state.selectedGraphNodeId && !state.selectedGraphEdgeId && !state.selectedGraphEventId) graphRenderer?.clearSelection();
         if (activePane?.isConnected && !activePane.hidden) refreshGraphMarquees(activePane);
       });
@@ -1103,44 +1174,31 @@ export function renderMemoryWorkbench(
   const renderAudit = (): string => {
     const records = state.audits.length ? state.audits.map((record, index) => {
       const key = `${record.jobId ?? record.id ?? index}:${Number(record.batchIndex ?? index)}`;
-      const canRollback = Boolean(record.jobId && Number.isInteger(record.batchIndex));
+      const isActorCapture = record.kind === 'capture-change-set-v0';
+      const canRollback = isActorCapture
+        ? Boolean(record.id && controller.rollbackActorCapture)
+        : Boolean(record.jobId && Number.isInteger(record.batchIndex));
       const confirming = state.confirmBatchKey === key;
-      const isFinalization = record.kind === 'initialization-finalization-v0';
-      const finalization = record.finalization;
-      const routeSummary = record.routeSummary;
       const sourceCount = Array.isArray(record.sourceRefs) ? record.sourceRefs.length : 0;
       const rejectedCount = Array.isArray(record.rejected) ? record.rejected.length : 0;
-      const resource = isFinalization
-        ? formatAuditRoute(routeSummary?.resourceIds, '提供方未上报', formatAuditResource)
-        : formatAuditResource(record.resourceId ?? record.resource);
-      const model = isFinalization
-        ? formatAuditRoute(routeSummary?.models, '提供方未上报')
-        : String(record.model ?? '未记录');
-      const acceptedCount = Number(finalization?.acceptedFactCount ?? record.accepted ?? 0);
+      const acceptedCount = Number(record.accepted ?? record.factCount ?? 0);
       const batchNumber = Number.isInteger(record.batchIndex) ? Math.max(1, record.batchIndex!) : index + 1;
-      const metrics = isFinalization
-        ? [
-          ['整理范围', `汇总 ${formatNumber(finalization?.stagedBatchCount ?? 0)} 批 · ${formatNumber(sourceCount)} 项`],
-          ['提取候选', `${formatNumber(finalization?.extractedFactCount ?? acceptedCount)} 条`],
-          ['接纳', `${formatNumber(acceptedCount)} 条`],
-          ['拒绝', `${formatNumber(rejectedCount)} 项`],
-          ['资源', resource],
-          ['模型', model],
-        ]
-        : [
-          ['来源', `${formatNumber(sourceCount)} 项`],
-          ['拒绝', `${formatNumber(rejectedCount)} 项`],
-          ['资源', resource],
-          ['模型', model],
-        ];
+      const resource = formatAuditResource(record.resourceId ?? record.resource);
+      const model = String(record.model ?? '未记录');
+      const metrics = [
+        ['来源', `${formatNumber(sourceCount)} 项`],
+        ['事实', `${formatNumber(acceptedCount)} 条`],
+        ['拒绝', `${formatNumber(rejectedCount)} 项`],
+        ['资源', resource],
+        ['模型', model],
+      ];
       const rollback = !canRollback ? '' : confirming
-        ? `<div class="stx-memory-confirm-inline"><span>${isFinalization ? '确认撤销本次初始化？' : '确认回滚此批及后续批次？'}</span><button ${uiControl('button', 'danger')} type="button" data-action="confirm-rollback" data-job-id="${escapeHtml(record.jobId)}" data-batch-index="${Number(record.batchIndex)}">${isFinalization ? '确认撤销' : '确认回滚'}</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-rollback">取消</button></div>`
-        : `<button ${uiControl('button', 'danger')} type="button" data-action="rollback" data-rollback-key="${escapeHtml(key)}">${isFinalization ? '撤销本次初始化' : '回滚此批及后续批次'}</button>`;
-
-      const kicker = isFinalization ? '初始化最终写入' : record.type === 'recall' ? '召回' : `提取批次 ${batchNumber}`;
-      const heading = isFinalization ? '全局归约已完成' : translateRecordStatus(String(record.status ?? '已记录'));
-      return `<article class="stx-memory-audit-item ${isFinalization ? 'is-initialization-finalization' : ''}"><div class="stx-memory-audit-heading"><div><span class="stx-memory-kicker">${kicker}</span><h3>${escapeHtml(heading)}</h3></div>${renderStatusChip(`${formatNumber(acceptedCount)} 条已接纳`, 'neutral')}</div><dl class="stx-memory-audit-metrics">${metrics.map(([label, value]) => `<div title="${escapeHtml(value)}"><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>${isFinalization ? `<p class="stx-memory-muted">已完成跨批次归并、冲突裁决与统一写入；这不是额外的第 ${batchNumber} 个提取批次。</p>` : ''}<details class="stx-memory-audit-details"><summary>查看技术明细</summary><pre class="stx-memory-code">${escapeHtml(formatJson(record))}</pre></details>${rollback ? `<div class="stx-memory-audit-actions">${rollback}</div>` : ''}</article>`;
-    }).join('') : renderEmpty('暂无批次审计', '新整理完成后会在这里出现。');
+        ? `<div class="stx-memory-confirm-inline"><span>${isActorCapture ? '确认回滚本次多主体 Capture？' : '确认回滚此批及后续批次？'}</span><button ${uiControl('button', 'danger')} type="button" data-action="confirm-rollback" data-job-id="${escapeHtml(record.jobId ?? '')}" data-batch-index="${Number(record.batchIndex ?? 0)}" data-audit-id="${escapeHtml(record.id ?? '')}">确认回滚</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-rollback">取消</button></div>`
+        : `<button ${uiControl('button', 'danger')} type="button" data-action="rollback" data-rollback-key="${escapeHtml(key)}">${isActorCapture ? '回滚本次 Capture' : '回滚此批及后续批次'}</button>`;
+      const kicker = isActorCapture ? '多主体 Capture' : record.type === 'recall' ? '召回' : `捕获批次 ${batchNumber}`;
+      const heading = translateRecordStatus(String(record.status ?? '已记录'));
+      return `<article class="stx-memory-audit-item"><div class="stx-memory-audit-heading"><div><span class="stx-memory-kicker">${kicker}</span><h3>${escapeHtml(heading)}</h3></div>${renderStatusChip(`${formatNumber(acceptedCount)} 条事实`, 'neutral')}</div><dl class="stx-memory-audit-metrics">${metrics.map(([label, value]) => `<div title="${escapeHtml(value)}"><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl><details class="stx-memory-audit-details"><summary>查看技术明细</summary><pre class="stx-memory-code">${escapeHtml(formatJson(record))}</pre></details>${rollback ? `<div class="stx-memory-audit-actions">${rollback}</div>` : ''}</article>`;
+    }).join('') : renderEmpty('暂无捕获审计', '新 Capture 完成后会在这里出现。');
     return `<div class="stx-memory-page-actions"><p class="stx-memory-muted">审计记录只读展示已提交的整理结果。</p><button ${uiControl('button', 'neutral')} type="button" data-action="refresh-audit" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新审计</button></div><div class="stx-memory-audit-list">${records}</div><details class="stx-memory-panel stx-memory-usage"><summary>主聊天 Token / usage（${state.usages.length} 条）</summary><pre class="stx-memory-code">${escapeHtml(formatJson(state.usages))}</pre></details>`;
   };
   const renderData = (): string => {
@@ -1150,7 +1208,7 @@ export function renderMemoryWorkbench(
     const tableEntries = Object.entries(sqlite.tableCounts).sort(([left], [right]) => left.localeCompare(right));
     const chatUsageRatio = Math.max(0, Math.min(1, sqlite.currentChatUsageRatio));
     const databaseSize = sqlite.databaseSizeBytes > 0 ? formatBytes(sqlite.databaseSizeBytes) : '暂不可用';
-    return `<section class="stx-memory-panel stx-memory-storage-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">SQLite 唯一存储</span><h3>${sqlite.connected ? '已连接' : '不可用'}</h3></div>${renderStatusChip(sqlite.connected ? '服务正常' : '不可用', sqlite.connected ? 'success' : 'error')}</div><dl class="stx-memory-maintenance-grid"><div><dt>SDK / 协议 / Schema</dt><dd>${escapeHtml(sqlite.serverVersion)} / v${sqlite.protocolVersion} / v${sqlite.schemaVersion}</dd></div><div><dt>SQLite / WAL</dt><dd>${escapeHtml(sqlite.sqliteVersion)} / ${escapeHtml(sqlite.walMode)}</dd></div><div><dt>Node.js</dt><dd>${escapeHtml(sqlite.nodeVersion)}</dd></div><div><dt>数据库 / WAL 占用</dt><dd>${escapeHtml(databaseSize)}</dd></div></dl><div class="stx-memory-chat-storage"><div class="stx-memory-chat-storage-head"><span><span class="stx-memory-storage-icon" aria-hidden="true"><ss-helper-icon name="hard-drive" decorative></ss-helper-icon></span><span><small>本聊天记忆占用</small><strong>${escapeHtml(formatBytes(sqlite.currentChatSizeBytes))}</strong></span></span><strong>${escapeHtml(formatPercent(chatUsageRatio))}</strong></div><progress ${uiControl('progress')} max="1" value="${chatUsageRatio}">${escapeHtml(formatPercent(chatUsageRatio))}</progress><p>占当前角色全部 Memory 数据；统计包含事实、证据、批次、Usage、召回日志和向量。</p></div><p class="stx-memory-muted stx-memory-path">相对路径：${escapeHtml(sqlite.databasePath)}</p><div class="stx-memory-progress-copy"><span>向量覆盖率</span><strong>${formatPercent(sqlite.vectorCoverage.ratio)}</strong></div><progress ${uiControl('progress')} max="1" value="${Math.max(0, Math.min(1, sqlite.vectorCoverage.ratio))}">${formatPercent(sqlite.vectorCoverage.ratio)}</progress>${schemaMatches ? '' : '<p class="stx-memory-inline-alert" role="alert">Schema 版本不匹配，请重启酒馆并确认服务端插件已更新。</p>'}${sqlite.lastError ? `<p class="stx-memory-inline-alert" role="alert">最近事务错误：${escapeHtml(safeInlineError(sqlite.lastError, 'MEMORY_SQLITE_TRANSACTION_FAILED'))}</p>` : ''}<details class="stx-memory-table-details"><summary>各表记录数与估算占用</summary><div class="stx-memory-table-list">${tableEntries.length ? tableEntries.map(([name, count]) => `<div><span>${escapeHtml(name)}</span><strong>${formatNumber(count)}</strong><small>${sqlite.tableBytes[name] == null ? 'N/A' : escapeHtml(formatBytes(sqlite.tableBytes[name]!))}</small></div>`).join('') : '<p class="stx-memory-muted">暂无表统计。</p>'}</div></details></section><section class="stx-memory-panel stx-memory-maintenance-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">备份与恢复</span><h3>维护工具</h3></div></div><div class="stx-memory-maintenance-actions"><button class="stx-memory-maintenance-action" ${uiControl('button', 'neutral')} type="button" data-action="export"><span class="stx-memory-maintenance-icon" aria-hidden="true"><ss-helper-icon name="file-export" decorative></ss-helper-icon></span><span><strong>导出 Memory 归档</strong><small>下载完整数据快照</small></span><span class="stx-memory-maintenance-chevron" aria-hidden="true"><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></span></button><label class="stx-memory-file-label stx-memory-maintenance-action" ${uiControl('file-trigger', 'neutral')}><span class="stx-memory-maintenance-icon" aria-hidden="true"><ss-helper-icon name="file-import" decorative></ss-helper-icon></span><span><strong>恢复 Memory 归档</strong><small>从本地快照原子恢复</small></span><span class="stx-memory-maintenance-chevron" aria-hidden="true"><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></span><input type="file" accept="application/json,.json" data-action="import-file" /></label><button class="stx-memory-maintenance-action" ${uiControl('button', 'neutral')} type="button" data-action="integrity" ${state.busyAction ? 'disabled' : ''}><span class="stx-memory-maintenance-icon" aria-hidden="true"><ss-helper-icon name="shield-halved" decorative></ss-helper-icon></span><span><strong>完整性检查</strong><small>检查 SQLite 数据结构</small></span><span class="stx-memory-maintenance-chevron" aria-hidden="true"><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></span></button></div>${state.pendingImport ? `<div class="stx-memory-confirm-panel"><p>确认恢复 <strong>${escapeHtml(state.pendingImport.name)}</strong>？这会原子替换当前用户完整 Memory 数据库。</p><button ${uiControl('button', 'danger')} type="button" data-action="confirm-import">确认恢复</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-import">取消</button></div>` : ''}<div class="stx-memory-integrity-result" aria-live="polite"><span class="stx-memory-state-icon" aria-hidden="true"><ss-helper-icon name="circle-info" decorative></ss-helper-icon></span><span><strong>检查状态</strong><small>${escapeHtml(state.integrityText)}</small></span></div><section class="stx-memory-danger-zone"><div class="stx-memory-danger-heading"><span class="stx-memory-danger-icon" aria-hidden="true"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><span><strong>危险操作</strong><small>执行前需要再次确认，聊天原文不会被删除。</small></span></div><div class="stx-memory-danger-actions">${state.dangerConfirm === 'current' ? `<div class="stx-memory-confirm-panel"><p>确认清空当前聊天来源？其他聊天仍有证据支持的事实会保留。</p><button ${uiControl('button', 'danger')} type="button" data-action="confirm-clear-current">确认清空</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-danger">取消</button></div>` : `<button class="stx-memory-danger-action" ${uiControl('button', 'danger')} type="button" data-action="clear-current"><span class="stx-memory-danger-action-icon" aria-hidden="true"><ss-helper-icon name="eraser" decorative></ss-helper-icon></span><span class="stx-memory-danger-action-label">清空当前聊天来源</span></button>`}${state.dangerConfirm === 'all' ? `<div class="stx-memory-confirm-panel"><p>输入“清空全部记忆”后确认，此操作无法撤销。</p><input ${uiControl('input')} data-clear-all-text placeholder="清空全部记忆"><button ${uiControl('button', 'danger')} type="button" data-action="confirm-clear-all">确认清空全部</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-danger">取消</button></div>` : `<button class="stx-memory-danger-action" ${uiControl('button', 'danger')} type="button" data-action="clear-all"><span class="stx-memory-danger-action-icon" aria-hidden="true"><ss-helper-icon name="trash-can" decorative></ss-helper-icon></span><span class="stx-memory-danger-action-label">清空全部角色记忆</span></button>`}</div></section></section>`;
+    return `<section class="stx-memory-panel stx-memory-storage-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">SQLite 唯一存储</span><h3>${sqlite.connected ? '已连接' : '不可用'}</h3></div>${renderStatusChip(sqlite.connected ? '服务正常' : '不可用', sqlite.connected ? 'success' : 'error')}</div><dl class="stx-memory-maintenance-grid"><div><dt>SDK / 协议 / Schema</dt><dd>${escapeHtml(sqlite.serverVersion)} / v${sqlite.protocolVersion} / v${sqlite.schemaVersion}</dd></div><div><dt>SQLite / WAL</dt><dd>${escapeHtml(sqlite.sqliteVersion)} / ${escapeHtml(sqlite.walMode)}</dd></div><div><dt>Node.js</dt><dd>${escapeHtml(sqlite.nodeVersion)}</dd></div><div><dt>数据库 / WAL 占用</dt><dd>${escapeHtml(databaseSize)}</dd></div></dl><div class="stx-memory-chat-storage"><div class="stx-memory-chat-storage-head"><span><span class="stx-memory-storage-icon" aria-hidden="true"><ss-helper-icon name="hard-drive" decorative></ss-helper-icon></span><span><small>本聊天记忆占用</small><strong>${escapeHtml(formatBytes(sqlite.currentChatSizeBytes))}</strong></span></span><strong>${escapeHtml(formatPercent(chatUsageRatio))}</strong></div><progress ${uiControl('progress')} max="1" value="${chatUsageRatio}">${escapeHtml(formatPercent(chatUsageRatio))}</progress><p>占当前角色全部 Memory 数据；统计包含事实、证据、批次、Usage、召回日志和向量。</p></div><p class="stx-memory-muted stx-memory-path">相对路径：${escapeHtml(sqlite.databasePath)}</p><div class="stx-memory-progress-copy"><span>向量覆盖率</span><strong>${formatPercent(sqlite.vectorCoverage.ratio)}</strong></div><progress ${uiControl('progress')} max="1" value="${Math.max(0, Math.min(1, sqlite.vectorCoverage.ratio))}">${formatPercent(sqlite.vectorCoverage.ratio)}</progress>${schemaMatches ? '' : '<p class="stx-memory-inline-alert" role="alert">Schema 版本不匹配，请重启酒馆并确认服务端插件已更新。</p>'}${sqlite.lastError ? `<p class="stx-memory-inline-alert" role="alert">最近事务错误：${escapeHtml(safeInlineError(sqlite.lastError, 'MEMORY_SQLITE_TRANSACTION_FAILED'))}</p>` : ''}<details class="stx-memory-table-details"><summary>各表记录数与估算占用</summary><div class="stx-memory-table-list">${tableEntries.length ? tableEntries.map(([name, count]) => `<div><span>${escapeHtml(name)}</span><strong>${formatNumber(count)}</strong><small>${sqlite.tableBytes[name] == null ? 'N/A' : escapeHtml(formatBytes(sqlite.tableBytes[name]!))}</small></div>`).join('') : '<p class="stx-memory-muted">暂无表统计。</p>'}</div></details></section><section class="stx-memory-panel stx-memory-maintenance-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">备份与恢复</span><h3>维护工具</h3></div></div><div class="stx-memory-maintenance-actions"><button class="stx-memory-maintenance-action" ${uiControl('button', 'neutral')} type="button" data-action="export"><span class="stx-memory-maintenance-icon" aria-hidden="true"><ss-helper-icon name="file-export" decorative></ss-helper-icon></span><span><strong>导出 Memory 归档</strong><small>下载完整数据快照</small></span><span class="stx-memory-maintenance-chevron" aria-hidden="true"><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></span></button><button class="stx-memory-maintenance-action" ${uiControl('button', 'neutral')} type="button" data-action="integrity" ${state.busyAction ? 'disabled' : ''}><span class="stx-memory-maintenance-icon" aria-hidden="true"><ss-helper-icon name="shield-halved" decorative></ss-helper-icon></span><span><strong>完整性检查</strong><small>检查 SQLite 数据结构</small></span><span class="stx-memory-maintenance-chevron" aria-hidden="true"><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></span></button></div><div class="stx-memory-integrity-result" aria-live="polite"><span class="stx-memory-state-icon" aria-hidden="true"><ss-helper-icon name="circle-info" decorative></ss-helper-icon></span><span><strong>检查状态</strong><small>${escapeHtml(state.integrityText)}</small></span></div><section class="stx-memory-danger-zone"><div class="stx-memory-danger-heading"><span class="stx-memory-danger-icon" aria-hidden="true"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><span><strong>危险操作</strong><small>执行前需要再次确认，聊天原文不会被删除。</small></span></div><div class="stx-memory-danger-actions">${state.dangerConfirm === 'current' ? `<div class="stx-memory-confirm-panel"><p>确认清空当前聊天来源？其他聊天仍有证据支持的事实会保留。</p><button ${uiControl('button', 'danger')} type="button" data-action="confirm-clear-current">确认清空</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-danger">取消</button></div>` : `<button class="stx-memory-danger-action" ${uiControl('button', 'danger')} type="button" data-action="clear-current"><span class="stx-memory-danger-action-icon" aria-hidden="true"><ss-helper-icon name="eraser" decorative></ss-helper-icon></span><span class="stx-memory-danger-action-label">清空当前聊天来源</span></button>`}${state.dangerConfirm === 'all' ? `<div class="stx-memory-confirm-panel"><p>输入“清空全部记忆”后确认，此操作无法撤销。</p><input ${uiControl('input')} data-clear-all-text placeholder="清空全部记忆"><button ${uiControl('button', 'danger')} type="button" data-action="confirm-clear-all">确认清空全部</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-danger">取消</button></div>` : `<button class="stx-memory-danger-action" ${uiControl('button', 'danger')} type="button" data-action="clear-all"><span class="stx-memory-danger-action-icon" aria-hidden="true"><ss-helper-icon name="trash-can" decorative></ss-helper-icon></span><span class="stx-memory-danger-action-label">清空全部角色记忆</span></button>`}</div></section></section>`;
   };
   const renderPage = (): string => {
     if (state.loading) return renderLoading('正在读取记忆工作台…');
@@ -1158,17 +1216,24 @@ export function renderMemoryWorkbench(
     if (state.pageLoading) return renderLoading();
     if (state.pageError) return renderErrorDetails(state.pageError, 'retry-page');
     const actionError = state.actionError ? renderErrorDetails(state.actionError, 'dismiss-error') : '';
-    const content = state.page === 'library' ? renderLibrary()
-      : state.page === 'initialize' ? renderInitialize()
-        : state.page === 'recall' ? renderRecall()
-          : state.page === 'graph' ? renderGraph()
-            : state.page === 'audit' ? renderAudit() : renderData();
+    const content = state.page === 'overview' ? renderOverview()
+      : state.page === 'actors' ? renderActors()
+        : state.page === 'scenes' ? renderScenes()
+          : state.page === 'library' ? renderLibrary()
+            : state.page === 'actor-memory' ? renderActorMemory()
+              : state.page === 'profiles' ? renderProfiles()
+                : state.page === 'dreams' ? renderDreams()
+                  : state.page === 'initialize' ? renderInitialize()
+                    : state.page === 'recall' ? `${renderRecall()}<section class="stx-memory-panel stx-memory-graph-inline"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">关系图谱</span><h3>已验证事实关系</h3></div></div>${renderGraph()}</section>`
+                      : state.page === 'graph' ? renderGraph()
+                        : state.page === 'audit' ? `${renderAudit()}${renderData()}` : renderData();
     return `${actionError}${content}`;
   };
   const render = (): void => {
     traceMemoryStartup('workbench:render-begin');
     const overview = state.overview;
-    const currentPage = PAGES.find((page) => page.id === state.page)!;
+    const currentPage = PAGES.find((page) => page.id === state.page) ?? INTERNAL_PAGES.find((page) => page.id === state.page) ?? PAGES[0]!;
+    const currentPageIndex = PAGES.findIndex((page) => page.id === state.page);
     const statusTone = overview?.status === 'error' ? 'error' : overview?.status === 'working' ? 'warning' : overview?.status === 'ready' ? 'success' : 'neutral';
     const runtimeDiagnostic = !overview ? undefined : !overview.llmAvailable
       ? {
@@ -1185,7 +1250,7 @@ export function renderMemoryWorkbench(
     const chatIdentity = formatChatIdentity(overview);
     const chatStorageLabel = overview?.bound ? formatBytes(overview.currentChatSizeBytes ?? 0) : '—';
     const chatStorageRatio = overview?.bound ? formatPercent(overview.currentChatUsageRatio ?? 0) : '—';
-    root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${renderOverviewRouteStatus('向量模型', overview?.embedding)}${renderOverviewRouteStatus('重排序模型', overview?.rerank)}${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class="stx-memory-nav-meta">${overview?.lastOrganizedAt ? `最近整理<br>${escapeHtml(formatTime(overview.lastOrganizedAt))}` : '仅展示当前已实现能力'}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${currentPage.label}</h2><p>${currentPage.description}</p></div><span class="stx-memory-page-counter">${PAGES.findIndex((page) => page.id === state.page) + 1} / ${PAGES.length}</span></header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section></main></div>`;
+    root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${renderOverviewRouteStatus('向量模型', overview?.embedding)}${renderOverviewRouteStatus('重排序模型', overview?.rerank)}${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class="stx-memory-nav-meta">${overview?.lastOrganizedAt ? `最近整理<br>${escapeHtml(formatTime(overview.lastOrganizedAt))}` : '仅展示当前已实现能力'}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${currentPage.label}</h2><p>${currentPage.description}</p></div><span class="stx-memory-page-counter">${currentPageIndex >= 0 ? `${currentPageIndex + 1} / ${PAGES.length}` : '诊断内页'}</span></header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section><div class="stx-memory-internal-routes" hidden aria-hidden="true">${INTERNAL_PAGES.map((page) => `<button type="button" data-action="navigate-internal" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}">${page.label}</button>`).join('')}</div></main></div>`;
     traceMemoryStartup('workbench:dom-rendered');
     popupUi?.refreshControls(root);
     refreshGraphMarquees(root);
@@ -1240,6 +1305,25 @@ export function renderMemoryWorkbench(
     const action = actionNode.dataset.action;
     if (action === 'toggle-filter-menu') { const filter = actionNode.dataset.filterMenu as 'kind' | 'status'; state.openFilter = state.openFilter === filter ? '' : filter; rerender(`#stx-memory-${filter}-filter-trigger`); return; }
     if (action === 'navigate') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (PAGES.some((item) => item.id === page)) void loadPage(page); return; }
+    if (action === 'navigate-internal') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (INTERNAL_PAGES.some((item) => item.id === page)) void loadPage(page); return; }
+    if (action === 'dream-dry-run') {
+      const jobId = actionNode.dataset.jobId;
+      if (!jobId || !controller.runActorDream) return;
+      void runAction('dream-dry-run', () => controller.runActorDream!(jobId, { dryRun: true }).then(() => undefined), 'Dream 预览完成', '本次 dry-run 未写入巩固结果。', 'MEMORY_DREAM_DRY_RUN_COMPLETED', () => loadPage('dreams'));
+      return;
+    }
+    if (action === 'confirm-actor') {
+      const candidateId = actionNode.dataset.candidateId;
+      if (!candidateId || !controller.confirmActorCandidate) return;
+      void runAction('confirm-actor', () => controller.confirmActorCandidate!(candidateId), '人物归属已确认', '已写入人物注册表和审计记录。', 'MEMORY_ACTOR_CONFIRMED', () => loadPage('actors'));
+      return;
+    }
+    if (action === 'undo-actor-correction') {
+      const auditId = actionNode.dataset.auditId;
+      if (!auditId || !controller.resolveActorCorrection) return;
+      void runAction('undo-actor-correction', () => controller.resolveActorCorrection!(auditId, 'undo'), '人物纠正已撤销', '主体、别名和审计状态已恢复。', 'MEMORY_ACTOR_CORRECTION_UNDONE', () => loadPage('actors'));
+      return;
+    }
     if (action === 'refresh') { void refreshAll(); return; }
     if (action === 'retry-load') { void loadOverview(); return; }
     if (action === 'retry-page') { void loadPage(state.page); return; }
@@ -1317,14 +1401,23 @@ export function renderMemoryWorkbench(
     if (action === 'toggle-graph-neighbor-focus') { state.graphNeighborFocus = !state.graphNeighborFocus; syncGraphUi(); return; }
     if (action === 'select-graph-edge') { const edgeId = actionNode.dataset.edgeId ?? ''; const refocus = state.selectedGraphEdgeId === edgeId && !state.selectedGraphNodeId; state.selectedGraphEdgeId = edgeId; state.selectedGraphEventId = ''; state.selectedGraphNodeId = ''; syncGraphUi(true); if (refocus) graphRenderer?.focusEdge(edgeId); return; }
     if (action === 'select-graph-event') { const edgeId = actionNode.dataset.eventEdgeId ?? ''; const refocus = state.selectedGraphEventId === edgeId && !state.selectedGraphNodeId; state.selectedGraphEventId = edgeId; state.selectedGraphEdgeId = ''; state.selectedGraphNodeId = ''; syncGraphUi(true); if (refocus) graphRenderer?.focusEdge(edgeId); return; }
-    if (action === 'rebuild-graph') { void runAction('rebuild-graph', () => controller.rebuildGraph(), '关系图谱已重建', '已依据当前聊天的已验证事实重新协调节点和关系边。', 'MEMORY_GRAPH_REBUILT', async () => { await loadPage('graph'); }); return; }
+    if (action === 'rebuild-graph') { void runAction('rebuild-graph', () => controller.rebuildGraph(), '关系图谱已重建', '已依据当前聊天的已验证事实重新协调节点和关系边。', 'MEMORY_GRAPH_REBUILT', async () => { await loadPage(state.page === 'recall' ? 'recall' : 'graph'); }); return; }
     if (action === 'refresh-audit') { void loadPage('audit'); return; }
     if (action === 'rollback') { state.confirmBatchKey = actionNode.dataset.rollbackKey ?? ''; rerender(); return; }
     if (action === 'cancel-rollback') { state.confirmBatchKey = ''; rerender(); return; }
-    if (action === 'confirm-rollback') { const jobId = actionNode.dataset.jobId ?? ''; const batchIndex = Number(actionNode.dataset.batchIndex); if (!jobId || !Number.isInteger(batchIndex)) return; void runAction('rollback', () => controller.rollbackBatch(jobId, batchIndex), '批次已回滚', formatRollbackConfirmation(jobId, batchIndex), 'MEMORY_BATCH_ROLLED_BACK', async () => { state.confirmBatchKey = ''; await loadPage('audit'); await refreshFacts(); }); return; }
+    if (action === 'confirm-rollback') {
+      const auditId = actionNode.dataset.auditId ?? '';
+      if (auditId && controller.rollbackActorCapture) {
+        void runAction('rollback-actor-capture', () => controller.rollbackActorCapture!(auditId), 'Capture 已回滚', '多主体事实、观察、痕迹与派生记录已撤销。', 'MEMORY_ACTOR_CAPTURE_ROLLED_BACK', async () => { state.confirmBatchKey = ''; await loadPage('audit'); await refreshFacts(); });
+        return;
+      }
+      const jobId = actionNode.dataset.jobId ?? '';
+      const batchIndex = Number(actionNode.dataset.batchIndex);
+      if (!jobId || !Number.isInteger(batchIndex)) return;
+      void runAction('rollback', () => controller.rollbackBatch(jobId, batchIndex), '批次已回滚', formatRollbackConfirmation(jobId, batchIndex), 'MEMORY_BATCH_ROLLED_BACK', async () => { state.confirmBatchKey = ''; await loadPage('audit'); await refreshFacts(); });
+      return;
+    }
     if (action === 'export') { void controller.exportSqliteBackup().then(downloadSqlite).then(() => toast('success', '归档已导出', 'Memory 数据快照已下载。', 'MEMORY_ARCHIVE_EXPORTED')).catch((error) => toast('error', '导出失败', '无法生成 Memory 归档。', safeErrorCode(error, 'MEMORY_EXPORT_FAILED'))); return; }
-    if (action === 'confirm-import') { const file = state.pendingImport; if (!file) return; void runAction('import', () => controller.importSqliteBackup(file), '归档已恢复', 'Memory 数据已原子替换。', 'MEMORY_ARCHIVE_IMPORTED', async () => { state.pendingImport = undefined; state.dangerConfirm = ''; await loadOverview(); await loadPage('data'); }); return; }
-    if (action === 'cancel-import') { state.pendingImport = undefined; rerender(); return; }
     if (action === 'integrity') { state.integrityText = '正在执行 SQLite 完整性检查…'; rerender(); void controller.checkSqliteIntegrity().then((result) => { state.integrityText = `${result.ok ? '通过' : '失败'}：${result.message}`; if (result.ok) toast('success', '完整性检查通过', 'SQLite 数据结构正常。', 'MEMORY_INTEGRITY_OK'); else toast('warning', '完整性检查未通过', '请导出快照后检查服务端状态。', 'MEMORY_INTEGRITY_FAILED'); }).catch((error) => { state.integrityText = '检查失败，请稍后重试。'; toast('error', '完整性检查失败', '无法完成 SQLite 检查。', safeErrorCode(error, 'MEMORY_INTEGRITY_ERROR')); }).finally(() => rerender()); return; }
     if (action === 'clear-current') { state.dangerConfirm = 'current'; rerender(); return; }
     if (action === 'clear-all') { state.dangerConfirm = 'all'; rerender(); return; }
@@ -1386,7 +1479,6 @@ export function renderMemoryWorkbench(
       return;
     }
     if (input.dataset.sourceKind) { const selected = (input as HTMLInputElement).checked; state.selectedSourceKinds = selected ? [...new Set([...state.selectedSourceKinds, input.dataset.sourceKind])] : state.selectedSourceKinds.filter((kind) => kind !== input.dataset.sourceKind); void controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory }).then((estimate) => { if (!disposed) { state.estimate = estimate; rerender(); } }).catch((error) => toast('error', '估算失败', '无法更新初始化成本估算。', safeErrorCode(error, 'MEMORY_ESTIMATE_FAILED'))); return; }
-    if (input.dataset.action === 'import-file') { const file = (input as HTMLInputElement).files?.[0]; if (file) { state.pendingImport = file; rerender(); } }
   }, { signal: abortController.signal });
   root.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;

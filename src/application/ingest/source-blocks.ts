@@ -15,6 +15,7 @@ const CONTROL_ANALYSIS_CUE_PATTERN = /(?:\b(?:fate\s*branches?|option|prompt|ins
 const CONTROL_PATCH_PATH_PATTERN = /(?:^|\/)(?:命运分支|选项[^/]*|fate(?:_|\s|-)*branches?|options?|prompt|instruction|system|tool|debug|reasoning|analysis|nsfw)(?:\/|$)/iu;
 const UNSAFE_PATCH_PATH_PATTERN = /(?:^|\/)(?:__proto__|prototype|constructor)(?:\/|$)/u;
 const SENSITIVE_CONTROL_TAG_PATTERN = /<\/?(?:think|analysis|tool|debug|memory|UpdateVariable|JSONPatch|StatusPlaceHolderImpl)\b/iu;
+const OOC_INSTRUCTION_PATTERN = /(?:^|[\n(（\[])[ \t]*(?:ooc|out[- ]of[- ]character|幕后指令|系统指令)[ \t]*[:：]/imu;
 const MAX_PRESERVED_STATE_VALUE_CHARS = 1_000;
 
 const CONTROL_TAG_PATTERNS = [
@@ -141,6 +142,8 @@ export function filterSourceBlocks(blocks: readonly SourceBlock[], options: Sour
   return blocks.flatMap((block): SourceBlock[] => {
     if (
       block.hidden
+      || (block.visibility === 'control' && !(options.includeInvisibleHistory === true && (block.role === 'system' || block.messageType === 'system')))
+      || (block.visibility === 'hidden' && options.includeInvisibleHistory !== true)
       || block.messageType === 'tool'
       || block.messageType === 'reasoning'
       || block.role === 'tool'
@@ -148,6 +151,7 @@ export function filterSourceBlocks(blocks: readonly SourceBlock[], options: Sour
     ) return [];
     const content = sanitizeSourceContent(block.content);
     if (!content) return [];
+    if (block.kind === 'message' && OOC_INSTRUCTION_PATTERN.test(content)) return [];
     return [{ ...block, content }];
   });
 }

@@ -114,35 +114,34 @@ describe('Memory UI 展示适配', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const metrics = container.querySelector('.stx-memory-audit-metrics');
-    expect(metrics?.children).toHaveLength(4);
+    expect(metrics?.children).toHaveLength(5);
     expect(metrics?.querySelectorAll('dd')[0]?.textContent).toBe('6 项');
-    expect(metrics?.querySelectorAll('dd')[1]?.textContent).toBe('12 项');
-    expect(metrics?.querySelectorAll('dd')[2]?.textContent).toBe('酒馆内置');
+    expect(metrics?.querySelectorAll('dd')[1]?.textContent).toBe('0 条');
+    expect(metrics?.querySelectorAll('dd')[2]?.textContent).toBe('12 项');
+    expect(metrics?.querySelectorAll('dd')[3]?.textContent).toBe('酒馆内置');
     expect(container.textContent).toContain('查看技术明细');
     dispose();
   });
 
-  it('将初始化最终写入展示为全局整理，而不是虚假的额外提取批次', async () => {
+  it('将多主体 Capture 审计展示为可回滚的单次事务', async () => {
     const container = document.createElement('div');
     document.body.append(container);
     const dispose = renderMemoryWorkbench(container, workbenchController({
       listAuditRecords: async () => [{
-        id: 'initialization-finalization:job-a', kind: 'initialization-finalization-v0', jobId: 'job:a', batchIndex: 7, status: 'completed', accepted: 33,
+        id: 'change-audit:capture-a', kind: 'capture-change-set-v0', status: 'completed', accepted: 33,
         sourceRefs: Array.from({ length: 35 }, (_, index) => `message:${index}`), rejected: Array.from({ length: 29 }, () => ({})),
-        finalization: { stagedBatchCount: 7, extractedFactCount: 33, acceptedFactCount: 33, mergedDuplicateCount: 0, conflictBucketCount: 0 },
-        routeSummary: { requestCount: 7, resourceIds: ['__builtin_tavern__'], models: ['deepseek-chat'] },
+        factCount: 33, resource: '__builtin_tavern__',
       }],
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
     (container.querySelector('[data-page="audit"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(container.textContent).toContain('初始化最终写入');
-    expect(container.textContent).toContain('全局归约已完成');
-    expect(container.textContent).toContain('汇总 7 批 · 35 项');
-    expect(container.textContent).toContain('这不是额外的第 7 个提取批次');
-    expect(container.textContent).not.toContain('提取批次 8');
-    expect(container.querySelector('.stx-memory-audit-metrics')?.children).toHaveLength(6);
+    expect(container.textContent).toContain('多主体 Capture');
+    expect(container.textContent).toContain('33 条事实');
+    expect(container.textContent).toContain('酒馆内置');
+    expect(container.textContent).not.toContain('初始化最终写入');
+    expect(container.querySelector('.stx-memory-audit-metrics')?.children).toHaveLength(5);
     dispose();
   });
 
@@ -186,7 +185,7 @@ describe('Memory UI 展示适配', () => {
     expect(confirmation).toContain('之后批次的整理结果也会一并撤销');
   });
 
-  it('渲染六个工作台页面并支持内联事实编辑', async () => {
+  it('渲染多主体工作台页面并支持内联事实编辑', async () => {
     const container = document.createElement('div');
     document.body.append(container);
     const updates: string[] = [];
@@ -194,7 +193,7 @@ describe('Memory UI 展示适配', () => {
     const dispose = renderMemoryWorkbench(container, controller);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(container.querySelectorAll('[data-action="navigate"]')).toHaveLength(6);
+    expect(container.querySelectorAll('[data-action="navigate"]')).toHaveLength(9);
     expect(container.querySelector('[data-action="select-fact"]')).not.toBeNull();
     expect(container.querySelector('[data-action="select-fact"]')?.getAttribute('data-ss-helper-control')).toBe('button');
     expect(container.querySelector('[data-action="refresh"]')?.getAttribute('data-ss-helper-tone')).toBe('neutral');
@@ -507,13 +506,13 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).not.toContain('Schema 版本不匹配');
     expect(container.textContent).toContain('v22.17.0');
     expect(container.textContent).toContain('4.00 KB');
-    expect(container.querySelectorAll('.stx-memory-maintenance-action')).toHaveLength(3);
-    expect(container.querySelectorAll('.stx-memory-maintenance-icon')).toHaveLength(3);
-    expect(container.querySelectorAll('.stx-memory-maintenance-chevron')).toHaveLength(3);
+    expect(container.querySelectorAll('.stx-memory-maintenance-action')).toHaveLength(2);
+    expect(container.querySelectorAll('.stx-memory-maintenance-icon')).toHaveLength(2);
+    expect(container.querySelectorAll('.stx-memory-maintenance-chevron')).toHaveLength(2);
     expect(container.querySelectorAll('.stx-memory-danger-action-icon')).toHaveLength(2);
     expect(container.querySelector('[data-action="clear-current"] ss-helper-icon[name="eraser"]')).not.toBeNull();
     expect(container.querySelector('.stx-memory-chat-storage')?.textContent).toContain('25%');
-    expect(container.querySelector('[data-action="import-file"]')?.parentElement?.getAttribute('data-ss-helper-control')).toBe('file-trigger');
+    expect(container.querySelector('[data-action="import-file"]')).toBeNull();
     expect(container.querySelector('[data-action="clear-all"]')?.getAttribute('data-ss-helper-tone')).toBe('danger');
     dispose();
   });
@@ -694,7 +693,7 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).toMatch(/正在读取当前聊天来源并提交 LLM 请求|LLM 正在提取结构化记忆/u);
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(progressCalls).toBeGreaterThan(1);
-    expect(container.textContent).toContain('LLM 正在提取结构化记忆');
+    expect(container.textContent).toContain('正在提取并写入结构化记忆');
 
     release();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -734,7 +733,7 @@ describe('Memory UI 展示适配', () => {
     const dispose = renderMemoryWorkbench(container, workbenchController({
       getInitializationSources: async () => [
         { kind: 'message', label: '聊天消息', count: 8, rawCount: 10, defaultCount: 8, excludedCount: 2, selected: true },
-        { kind: 'character', label: '角色卡', count: 1, rawCount: 1, defaultCount: 1, excludedCount: 0, selected: false },
+        { kind: 'host_card', label: '角色卡世界容器', count: 1, rawCount: 1, defaultCount: 1, excludedCount: 0, selected: false },
       ],
       getInitializationEstimate: async (kinds) => {
         estimateKinds.push([...(kinds ?? [])]);
@@ -751,10 +750,10 @@ describe('Memory UI 展示适配', () => {
     expect(container.querySelector('[role="alertdialog"]')).not.toBeNull();
     expect(document.activeElement?.id).toBe('stx-memory-reinitialize-cancel');
     expect(container.textContent).toContain('聊天原文与消息');
-    const character = container.querySelector<HTMLInputElement>('[data-source-kind="character"]')!;
-    character.click();
+    const hostCard = container.querySelector<HTMLInputElement>('[data-source-kind="host_card"]')!;
+    hostCard.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(estimateKinds.at(-1)).toEqual(['message', 'character']);
+    expect(estimateKinds.at(-1)).toEqual(['message', 'host_card']);
 
     container.querySelector('.stx-memory-workbench')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 0));

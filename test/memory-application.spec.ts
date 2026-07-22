@@ -47,8 +47,6 @@ class FakeRepository {
   readonly facts: MemoryFact[] = [];
   readonly jobs: MemoryJob[] = [];
   readonly audits: Array<{ sourceRefs: string[] }> = [];
-  readonly staged: Array<Record<string, unknown>> = [];
-  resolution: Record<string, unknown> | undefined;
   recallLog: MemoryRecallLog | undefined;
   readonly putJob = vi.fn(async (job: MemoryJob) => {
     const index = this.jobs.findIndex((item) => item.id === job.id);
@@ -59,18 +57,6 @@ class FakeRepository {
   readonly importBackup = vi.fn(async () => undefined);
   readonly getChatKeys = vi.fn(async () => ['chat-a']);
   readonly reconcileGraphProjection = vi.fn(async () => undefined);
-  readonly putInitializationStagingBatch = vi.fn(async (batch: Record<string, unknown>) => {
-    const index = this.staged.findIndex((item) => item.id === batch.id || (item.jobId === batch.jobId && item.batchIndex === batch.batchIndex));
-    if (index >= 0) this.staged[index] = structuredClone(batch);
-    else this.staged.push(structuredClone(batch));
-  });
-  async listInitializationStagingBatches(_chatKey: string, jobId: string): Promise<any[]> { return this.staged.filter((item) => item.jobId === jobId).map((item) => structuredClone(item)); }
-  readonly putInitializationResolution = vi.fn(async (value: Record<string, unknown>) => { this.resolution = structuredClone(value); });
-  async getInitializationResolution(): Promise<undefined> { return undefined; }
-  readonly applyInitializationFinalization = vi.fn(async (input: { job: MemoryJob; reduction: { stats: Record<string, unknown> } }) => {
-    await this.putJob({ ...input.job, status: 'completed', checkpoint: { ...input.job.checkpoint, ...input.reduction.stats } });
-    return input.reduction.stats;
-  });
   readonly settings = new Map<string, unknown>();
   async open(): Promise<void> {}
   close(): void {}
@@ -152,17 +138,30 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     app.stop();
   });
 
-  it('导入归档后为当前工作区的聊天排队图谱回填', async () => {
+  it('v0 明确拒绝旧归档导入而不触发迁移或图谱回填', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const repository = new FakeRepository();
-    repository.getChatKeys.mockResolvedValue(['chat-a', 'chat-b']);
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    await app.start();
+    repository.reconcileGraphProjection.mockClear();
+
+    await expect(app.importSqliteBackup(new File(['{}'], 'memory-backup.json', { type: 'application/json' }))).rejects.toMatchObject({ code: 'MEMORY_ARCHIVE_IMPORT_DISABLED' });
+    expect(repository.importBackup).not.toHaveBeenCalled();
+    expect(repository.reconcileGraphProjection).not.toHaveBeenCalled();
+    app.stop();
+  });
+
+  it('工作区不可用时在进入 LLM Capture 前安全失败', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    repository.open = async () => { throw Object.assign(new Error('MEMORY_RETIRED_STORAGE_DETECTED'), { code: 'MEMORY_RETIRED_STORAGE_DETECTED' }); };
     const app = new MemoryApplication(repository as never);
     connectHost(app);
     await app.start();
 
-    await app.importSqliteBackup(new File(['{}'], 'memory-backup.json', { type: 'application/json' }));
-    await vi.waitFor(() => expect(repository.getChatKeys).toHaveBeenCalledOnce());
-    await vi.waitFor(() => expect(repository.reconcileGraphProjection).toHaveBeenCalled());
+    await expect(app.initialize(['message'])).rejects.toMatchObject({ code: 'MEMORY_RETIRED_STORAGE_DETECTED' });
+    expect(state.extractCalls).toBe(0);
     app.stop();
   });
 
@@ -262,27 +261,6 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     expect(repository.jobs.at(-1)).toMatchObject({ status: 'paused', checkpoint: { batchIndex: 0, totalBatches: 5, selectedSourceGroupIds: ['message'], includeInvisibleHistory: true } });
     expect(await app.getCaptureProgress()).toMatchObject({ status: 'cancelled', totalBatches: 5 });
     expect((await app.getInitializationState()).attempts[0]).toMatchObject({ status: 'cancelled', selectedSourceKinds: ['message'], includeInvisibleHistory: true });
-    app.stop();
-  });
-
-  it('初始化先暂存批次，再统一应用而不走增量逐批提交', async () => {
-    state.sources = [message(0), message(1)];
-    const { MemoryApplication } = await import('../src/application/memory-application');
-    const repository = new FakeRepository();
-    const app = new MemoryApplication(repository as never);
-    connectHost(app);
-    await app.start();
-
-    const initialize = app.initialize(['message']);
-    for (let index = 0; index < 20 && !state.release; index += 1) await Promise.resolve();
-    state.release?.();
-    await initialize;
-
-    expect(repository.commit).not.toHaveBeenCalled();
-    expect(repository.putInitializationStagingBatch).toHaveBeenCalledTimes(1);
-    expect(repository.applyInitializationFinalization).toHaveBeenCalledTimes(1);
-    expect(await app.getInitializationState()).toMatchObject({ initialized: true, qualityStatus: 'ready' });
-    expect(await app.getCaptureProgress()).toMatchObject({ status: 'completed', phase: 'apply', stagedBatchCount: 1 });
     app.stop();
   });
 
@@ -416,7 +394,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     repository.jobs.push(
       { id: 'init-ok', chatKey: 'chat-a', type: 'initialize', status: 'completed', checkpoint: { batchIndex: 3, totalBatches: 3, processedCount: 12, selectedSourceGroupIds: ['message'] }, createdAt: 10, updatedAt: 20 },
       { id: 'incremental-failed', chatKey: 'chat-a', type: 'incremental', status: 'failed', checkpoint: { batchIndex: 0, totalBatches: 1, processedCount: 0 }, error: 'later incremental failure', createdAt: 25, updatedAt: 30 },
-      { id: 'init-failed', chatKey: 'chat-a', type: 'initialize', status: 'failed', checkpoint: { batchIndex: 1, totalBatches: 2, processedCount: 3, selectedSourceGroupIds: ['message', 'character'] }, error: 'latest initialize failure', createdAt: 35, updatedAt: 40 },
+      { id: 'init-failed', chatKey: 'chat-a', type: 'initialize', status: 'failed', checkpoint: { batchIndex: 1, totalBatches: 2, processedCount: 3, selectedSourceGroupIds: ['message', 'host_card'] }, error: 'latest initialize failure', createdAt: 35, updatedAt: 40 },
     );
     const app = new MemoryApplication(repository as never);
     connectHost(app);
@@ -437,7 +415,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
   it('沿用最近成功初始化的来源，并把活动记录限制为最近 5 次', async () => {
     state.sources = [
       message(0),
-      { id: 'character:c1', chatKey: 'chat-a', kind: 'character', role: 'metadata', content: '角色卡正文', createdAt: 1 },
+      { id: 'host-card:c1', chatKey: 'chat-a', kind: 'host_card', role: 'metadata', content: '角色卡正文', createdAt: 1 },
     ];
     const { MemoryApplication } = await import('../src/application/memory-application');
     const repository = new FakeRepository();
@@ -446,7 +424,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       chatKey: 'chat-a',
       type: 'initialize',
       status: index === 4 ? 'completed' : 'failed',
-      checkpoint: { batchIndex: index + 1, totalBatches: index + 1, processedCount: index, selectedSourceGroupIds: index === 4 ? ['character'] : ['message'] },
+      checkpoint: { batchIndex: index + 1, totalBatches: index + 1, processedCount: index, selectedSourceGroupIds: index === 4 ? ['host_card'] : ['message'] },
       ...(index === 4 ? {} : { error: `failure-${index}` }),
       createdAt: index,
       updatedAt: index,
@@ -457,7 +435,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
 
     expect(await app.getInitializationSources()).toEqual([
       expect.objectContaining({ kind: 'message', selected: false }),
-      expect.objectContaining({ kind: 'character', selected: true }),
+      expect.objectContaining({ kind: 'host_card', selected: true }),
     ]);
     const initialization = await app.getInitializationState();
     expect(initialization.attempts).toHaveLength(5);
@@ -474,9 +452,9 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     vi.spyOn(app, 'clearCurrentChatData').mockImplementation(async () => { order.push('clear'); });
     vi.spyOn(app, 'initialize').mockImplementation(async (kinds) => { order.push(`initialize:${kinds?.join(',')}`); });
 
-    await app.reinitialize(['message', 'character']);
+    await app.reinitialize(['message', 'host_card']);
 
-    expect(order).toEqual(['cancel', 'clear', 'initialize:message,character']);
+    expect(order).toEqual(['cancel', 'clear', 'initialize:message,host_card']);
   });
 
   it('清空当前聊天时同时重置该聊天的总结进度并保留其他聊天', async () => {

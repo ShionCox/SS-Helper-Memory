@@ -24,7 +24,7 @@ describe('SDK Memory HostPort context', () => {
     expect(sources).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'message:m1', content: 'visible' }),
       expect.objectContaining({ kind: 'state', content: expect.stringContaining('核心储备') }),
-      expect.objectContaining({ kind: 'character' }),
+      expect.objectContaining({ kind: 'host_card' }),
       expect.objectContaining({ kind: 'persona', content: '用户名：用户\nPersona：当前 Persona 描述' }),
     ]));
   });

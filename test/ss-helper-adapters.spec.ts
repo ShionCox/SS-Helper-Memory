@@ -207,10 +207,12 @@ describe('SS-Helper Memory typed adapters', () => {
     } as unknown as PluginSession;
     const registration = registerMemoryServices(session, {
       getChatKey: () => 'chat-a',
-      recall: { preview: async () => ({
-        chatKey: 'chat-a', query: 'q', maxItems: 4, createdAt: 1, candidates: [], diagnostics: { candidateCount: 1, eligibleCount: 1, selectedCount: 1, llmCalls: 0 },
-        items: [{ fact: { id: 'fact-a', chatKey: 'chat-a', kind: 'identity', subjectKey: 'a', predicateKey: 'is', content: 'plain memory', entityKeys: [], confidence: 1, status: 'active', sourceRefs: ['source-a'], updatedAt: 1 }, score: 0.9, reason: { lexical: true, entity: false, context: false, stableAnchor: false } }],
-      }) },
+      recallActors: async (input) => ({
+        request: input,
+        world: { ownerId: 'owner:world', ownerName: '世界', packets: [] },
+        narrator: { ownerId: 'owner:narrator', ownerName: '旁白', packets: [] },
+        actors: [{ ownerId: 'owner:actor:a', ownerName: '艾琳', packets: [{ text: 'plain memory', effectiveStrength: 90 }] }],
+      }),
       graph: { preview: async () => ({
         nodes: [{ id: 'node-a', label: '艾琳' }, { id: 'node-b', label: '雷暴' }],
         edges: [{ id: 'edge-fact-a', from: 'node-a', to: 'node-b', predicate: '害怕', kind: 'relationship', confidence: 0.9, backingFactId: 'fact-a' }],
@@ -218,11 +220,22 @@ describe('SS-Helper Memory typed adapters', () => {
     });
     const context = { signal: new AbortController().signal };
     const handler = handlers.get(MEMORY_RECALL_V0);
-    await expect(handler?.({ query: 'q', chatKey: 'chat-b' }, context)).resolves.toEqual({ items: [] });
-    await expect(handler?.({ query: 'q', chatKey: 'chat-a', limit: 4 }, context)).resolves.toEqual({ items: [{ id: 'fact-a', text: 'plain memory', score: 0.9, source: 'source-a' }] });
+    const request = { query: 'q', chatKey: 'chat-a', sceneOwnerIds: ['owner:actor:a'], presentOwnerIds: ['owner:actor:a'], viewpointOwnerId: 'owner:actor:a', mode: 'multi_actor' as const, maxItems: 4 };
+    await expect(handler?.({ ...request, chatKey: 'chat-b' }, context)).resolves.toEqual({
+      mode: 'multi_actor',
+      world: { ownerId: 'owner:world', owner: '世界', memories: [] },
+      narrator: { ownerId: 'owner:narrator', owner: '旁白', memories: [] },
+      actors: [],
+    });
+    await expect(handler?.(request, context)).resolves.toEqual({
+      mode: 'multi_actor',
+      world: { ownerId: 'owner:world', owner: '世界', memories: [] },
+      narrator: { ownerId: 'owner:narrator', owner: '旁白', memories: [] },
+      actors: [{ ownerId: 'owner:actor:a', owner: '艾琳', memories: [{ text: 'plain memory', confidence: 0.9, strength: 90 }] }],
+    });
     const aborted = new AbortController();
     aborted.abort();
-    await expect(handler?.({ query: 'q', chatKey: 'chat-a' }, { signal: aborted.signal })).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(handler?.({ ...request, query: 'abort' }, { signal: aborted.signal })).rejects.toMatchObject({ name: 'AbortError' });
     const graphHandler = handlers.get(MEMORY_GRAPH_V0);
     await expect(graphHandler?.({ query: 'q', chatKey: 'chat-b' }, context)).resolves.toEqual({ nodes: [], edges: [] });
     await expect(graphHandler?.({ query: '雷暴', chatKey: 'chat-a', limit: 4 }, context)).resolves.toEqual({

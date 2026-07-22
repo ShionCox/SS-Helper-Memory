@@ -10,7 +10,6 @@ import { configureMemoryLlmApi } from '../application/ingest/llm-extractor';
 import { createMemoryLlmApi } from '../ss-helper/llm-adapter';
 import { MemoryRepository } from '../infrastructure/memory-repository';
 import { MemoryLlmCapabilityMonitor } from '../ss-helper/llm-capability-monitor';
-import { mountMemoryHostUi } from './memory-host-ui';
 
 const SEND_WINDOW_MS = 45_000;
 const MEMORY_PROMPT_ID = 'ss-helper.memory.recall.v0';
@@ -92,8 +91,6 @@ export class MemoryRuntime {
         { repair: () => this.session.workspace.repair({ confirm: true }) },
       );
       this.disposers.push(() => contributions.dispose());
-      const hostUi = mountMemoryHostUi(this.session);
-      this.disposers.push(() => hostUi.dispose());
       this.assertActive();
       this.bindHostEvents(capabilityMonitor);
       traceMemoryStartup('runtime:contributions-registered');
@@ -166,7 +163,11 @@ export class MemoryRuntime {
       this.lastUserMessageAt = Date.now();
       this.scheduleRebind(true);
     }));
+    this.disposers.push(events.subscribe('generation-started', () => {
+      this.application.setGenerationActive(true);
+    }));
     this.disposers.push(events.subscribe('generation-ended', (event) => {
+      this.application.setGenerationActive(false);
       void this.onGenerationEnded(event.generation).catch((error) => logger.warn('Memory generation-end 处理失败。', error));
     }));
     this.disposers.push(events.subscribe('prompt-ready', (event) => {
@@ -195,7 +196,11 @@ export class MemoryRuntime {
         ...(generation.model ? { model: generation.model } : {}),
       }).catch((error) => logger.warn('主聊天 Token usage 记录失败。', error));
     }
-    this.application.observeCompletedRound(latestText);
+    const leakage = this.application.auditActorOutput(latestText);
+    if (leakage && leakage.violationCount > 0) logger.warn('多角色记忆泄漏审计发现跨主体标记。', { violationCount: leakage.violationCount, outputHash: leakage.outputHash });
+    if (this.application.getEffectiveSettings().autoOrganize && this.application.captureActors) {
+      void this.application.captureActors().catch((error) => logger.warn('多角色 Capture 失败，已保留原有聊天。', error));
+    }
   }
 
   private async onPromptReady(messages: Parameters<typeof buildMemoryPromptContribution>[0]): Promise<void> {
@@ -206,6 +211,18 @@ export class MemoryRuntime {
       return;
     }
     try {
+      const latestUser = [...messages].reverse().find((message) => message.role === 'user');
+      const actorBuilder = (this.application as unknown as { buildActorMemoryPrompt?: (input: { query: string; maxItems?: number; maxChars?: number }) => Promise<{ prompt: string }> }).buildActorMemoryPrompt?.bind(this.application);
+      if (actorBuilder) {
+        if (typeof latestUser?.content !== 'string' || !latestUser.content.trim()) {
+          await this.session.host.prompt.remove(MEMORY_PROMPT_ID);
+          return;
+        }
+        const actorInjection = await actorBuilder({ query: latestUser.content.trim(), maxItems: settings.maxRecallItems, maxChars: settings.promptMaxChars });
+        if (actorInjection.prompt) await this.session.host.prompt.set({ id: MEMORY_PROMPT_ID, content: actorInjection.prompt, position: 0 });
+        else await this.session.host.prompt.remove(MEMORY_PROMPT_ID);
+        return;
+      }
       const injection = await buildMemoryPromptContribution(messages, this.application.recall, settings.maxRecallItems, {
         maxChars: settings.promptMaxChars,
         answerMode: settings.answerMode,

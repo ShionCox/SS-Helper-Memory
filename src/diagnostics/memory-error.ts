@@ -106,15 +106,14 @@ export function describeMemoryError(
         action: '可以重试一次；如果持续出现，请更换结构化输出能力更好的模型。',
         retryable: true,
       };
-    case 'MEMORY_SLOT_MIGRATION_READ_FAILED':
-    case 'MEMORY_SLOT_MIGRATION_WRITE_FAILED':
-    case 'MEMORY_SLOT_MIGRATION_CLEANUP_FAILED':
+    case 'MEMORY_RETIRED_STORAGE_DETECTED':
+    case 'MEMORY_ARCHIVE_IMPORT_DISABLED':
       return {
         code,
-        title: '旧记忆槽位整理未完成',
-        reason: error instanceof Error ? error.message : '聊天级槽位迁移在当前步骤失败，已有事实尚未被修改。',
-        action: '请点击“重新检查”；若仍失败，请保留此错误码及其底层错误码。',
-        retryable: true,
+        title: '检测到已退休的 Memory 数据',
+        reason: '当前 v0 模型不读取旧槽位、旧任务或旧归档；为避免误归属和自动迁移，Memory 已停止启动。',
+        action: '请按重构后的 v0 约定删除旧 Memory 数据目录，然后重新打开当前工作区。',
+        retryable: false,
       };
     case 'PROVIDER_UNAVAILABLE':
       return {

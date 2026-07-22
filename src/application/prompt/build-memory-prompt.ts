@@ -1,4 +1,5 @@
 import type { RecallItem, RecallResult } from '../recall/memory-recall-index'
+import type { ActorMemoryPartition, ActorRecallResponse, MemoryRecallPacket } from '../../domain'
 
 const ONGOING_KINDS = new Set([
   'commitment',
@@ -184,3 +185,123 @@ export function buildMemoryPrompt(result: RecallResult, options: MemoryPromptOpt
 export const memoryPromptLimits = Object.freeze({
   defaultMaxChars: DEFAULT_PROMPT_MAX_CHARS,
 })
+
+export interface ActorMemoryPromptOptions {
+  readonly maxChars?: number
+  readonly sceneLabel?: string
+  readonly currentViewpointOwnerId?: string
+  readonly rules?: readonly string[]
+}
+
+export interface ActorMemoryPromptResult {
+  readonly prompt: string
+  readonly includedTraceIds: readonly string[]
+  readonly omittedTraceIds: readonly string[]
+  readonly diagnostics: {
+    readonly maxChars: number
+    readonly usedChars: number
+    readonly partitionBudgets: Readonly<Record<string, number>>
+    readonly includedCount: number
+    readonly omittedCount: number
+    readonly mode: 'multi_actor' | 'strict_pov' | 'omniscient'
+  }
+}
+
+function packetLine(packet: MemoryRecallPacket): string {
+  const detail = packet.details.map(unit => xmlEscape(unit.text)).filter(Boolean).join('；')
+  const gist = xmlEscape(packet.gist)
+  return detail ? `- ${gist}（${detail}）` : `- ${gist}`
+}
+
+function xmlEscape(value: string): string {
+  return value.replace(/[&<>"']/gu, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]!)
+}
+
+function partitionLabel(partition: ActorMemoryPartition): string {
+  return partition.role === 'world' ? 'world_memory' : partition.role === 'narrator' ? 'narrator_memory' : 'actor_memory'
+}
+
+function partitionBudget(total: number, partition: ActorMemoryPartition, current: boolean, currentCount: number, otherCount: number, actorCount: number): number {
+  if (partition.role === 'world') return Math.floor(total * 0.2)
+  if (partition.role === 'narrator') return Math.floor(total * 0.1)
+  if (currentCount === 0) return Math.floor(total * (0.7 / Math.max(1, actorCount)))
+  return Math.floor(total * ((current ? 0.65 / currentCount : 0.35 / Math.max(1, otherCount))))
+}
+
+/** Builds the multi-owner XML envelope used by the single native Tavern call. */
+export function buildActorMemoryPromptResult(response: ActorRecallResponse, options: ActorMemoryPromptOptions = {}): ActorMemoryPromptResult {
+  const maxChars = normalizeMaxChars(options.maxChars)
+  const currentActorIds = new Set([response.request.scene.viewpointOwnerId, ...response.request.scene.speakerOwnerIds])
+  const actors = [...response.actors].sort((left, right) => Number(currentActorIds.has(right.ownerId)) - Number(currentActorIds.has(left.ownerId)) || left.ownerId.localeCompare(right.ownerId))
+  const partitions = [response.world, response.narrator, ...actors]
+  if (partitions.every(partition => partition.packets.length === 0)) {
+    return Object.freeze({ prompt: '', includedTraceIds: Object.freeze([]), omittedTraceIds: Object.freeze([]), diagnostics: Object.freeze({ maxChars, usedChars: 0, partitionBudgets: Object.freeze({}), includedCount: 0, omittedCount: 0, mode: response.request.mode ?? 'multi_actor' }) })
+  }
+  const actorCount = actors.length
+  const currentCount = actors.filter(partition => currentActorIds.has(partition.ownerId)).length
+  const otherCount = Math.max(0, actorCount - currentCount)
+  const budgets: Record<string, number> = {}
+  partitions.forEach((partition) => { budgets[partition.ownerId] = partitionBudget(maxChars, partition, currentActorIds.has(partition.ownerId), currentCount, otherCount, actorCount) })
+  const includedTraceIds: string[] = []
+  const omittedTraceIds: string[] = []
+  const mode = response.request.mode ?? 'multi_actor'
+  const sceneLabel = xmlEscape(options.sceneLabel ?? '')
+  const lines = [`<memory_context mode="${mode}" scene="${sceneLabel}">`]
+  const includedPacketLines: Array<{ line: string; traceId: string }> = []
+  const rules = [
+    '每个角色只能依据自己的 actor_memory 行动和发言。',
+    'world_memory 是世界规范参考，不代表任一角色自动知情。',
+    '不得补回模糊记忆中被省略的细节。',
+    '不得将私密思想、秘密或其他角色记忆转移给当前角色。',
+    ...(options.rules ?? []).map(rule => xmlEscape(rule)),
+  ]
+  const closingLines = (): string[] => ['<memory_rules>', ...rules, '</memory_rules>', '</memory_context>']
+  const serialized = (candidate: readonly string[]): number => candidate.concat(closingLines()).join('\n').length
+  const appendPartition = (partition: ActorMemoryPartition): void => {
+    const tag = partitionLabel(partition)
+    const ownerAttr = partition.role === 'world'
+      ? ' audience="narrator"'
+      : partition.role === 'narrator'
+        ? ''
+        : ` owner_id="${xmlEscape(partition.ownerId)}" owner="${xmlEscape(partition.ownerName)}"`
+    const start = `<${tag}${ownerAttr}>`
+    const end = `</${tag}>`
+    lines.push(start)
+    let sectionChars = start.length + end.length
+    for (const packet of partition.packets) {
+      const line = packetLine(packet)
+      if (sectionChars + line.length + 1 > (budgets[partition.ownerId] ?? maxChars)
+        || serialized([...lines, line, end]) > maxChars) {
+        omittedTraceIds.push(packet.traceId)
+        continue
+      }
+      lines.push(line)
+      sectionChars += line.length + 1
+      includedTraceIds.push(packet.traceId)
+      includedPacketLines.push({ line, traceId: packet.traceId })
+    }
+    lines.push(end)
+  }
+  for (const partition of partitions) appendPartition(partition)
+  if (maxChars < 256) {
+    omittedTraceIds.push(...includedTraceIds)
+    includedTraceIds.length = 0
+    includedPacketLines.length = 0
+  }
+  let prompt = maxChars < 256 ? '' : [...lines, ...closingLines()].join('\n')
+  while (prompt.length > maxChars && includedPacketLines.length > 0) {
+    const removed = includedPacketLines.pop()!
+    const lineIndex = [...lines].map((line, index) => ({ line, index })).reverse().find(item => item.line === removed.line)?.index
+    if (lineIndex !== undefined) lines.splice(lineIndex, 1)
+    const includedIndex = includedTraceIds.lastIndexOf(removed.traceId)
+    if (includedIndex >= 0) includedTraceIds.splice(includedIndex, 1)
+    omittedTraceIds.push(removed.traceId)
+    prompt = [...lines, ...closingLines()].join('\n')
+  }
+  if (prompt.length > maxChars) prompt = ''
+  return Object.freeze({ prompt, includedTraceIds: Object.freeze(includedTraceIds), omittedTraceIds: Object.freeze(omittedTraceIds), diagnostics: Object.freeze({ maxChars, usedChars: prompt.length, partitionBudgets: Object.freeze(budgets), includedCount: includedTraceIds.length, omittedCount: omittedTraceIds.length, mode: response.request.mode ?? 'multi_actor' }) })
+}
+
+export function buildActorMemoryPrompt(response: ActorRecallResponse, options: ActorMemoryPromptOptions = {}): string {
+  return buildActorMemoryPromptResult(response, options).prompt
+}

@@ -90,7 +90,9 @@ describe('MemoryRepository workspace concurrency', () => {
   });
 
   it('keeps the global enabled preference while SillyTavern has no selected character', async () => {
-    const application = new MemoryApplication(new MemoryRepository(workspace()));
+    const port = workspace();
+    const repository = new MemoryRepository(port);
+    const application = new MemoryApplication(repository);
     application.useHostContext({
       getChatKey: () => '',
       getWorkspaceId: () => '',
@@ -165,14 +167,14 @@ describe('MemoryRepository workspace concurrency', () => {
     const operations = transaction.mock.calls[0][0].operations;
     expect(operations).not.toEqual(expect.arrayContaining([expect.objectContaining({ collection: 'facts', recordId: otherChatFact.id })]));
     expect(operations).toEqual(expect.arrayContaining([
-      expect.objectContaining({ collection: 'fact-slots', recordId: `fact-slot:${encodeURIComponent('chat-a')}:${encodeURIComponent(slotKey)}` }),
+      expect.objectContaining({ collection: 'fact-heads', recordId: `fact-head:${encodeURIComponent('chat-a')}:${encodeURIComponent(slotKey)}` }),
     ]));
     expect(query).toHaveBeenCalledWith(expect.objectContaining({ collection: 'facts', filter: { chatKey: 'chat-a' } }));
   });
 
   it('uses cursor pagination for audit records', async () => {
-    const first = Array.from({ length: 1000 }, (_, index) => ({ recordId: `audit:${index}`, value: { id: `audit:${index}`, chatKey: 'chat-a' }, version: 1, updatedAt: index }));
-    const query = vi.fn().mockResolvedValueOnce({ records: first, nextCursor: 'next' }).mockResolvedValueOnce({ records: [{ recordId: 'audit:1000', value: { id: 'audit:1000', chatKey: 'chat-a' }, version: 1, updatedAt: 1000 }], nextCursor: null });
+    const first = Array.from({ length: 1000 }, (_, index) => ({ recordId: `batch-audit:job:${index}`, value: { id: `batch-audit:job:${index}`, chatKey: 'chat-a' }, version: 1, updatedAt: index }));
+    const query = vi.fn().mockResolvedValueOnce({ records: first, nextCursor: 'next' }).mockResolvedValueOnce({ records: [{ recordId: 'batch-audit:job:1000', value: { id: 'batch-audit:job:1000', chatKey: 'chat-a' }, version: 1, updatedAt: 1000 }], nextCursor: null });
     const repository = new MemoryRepository(workspace({ query })); repository.bind('character:c1', 'chat-a');
     await expect(repository.listJobBatchAudits('chat-a')).resolves.toHaveLength(1001);
     expect(query).toHaveBeenNthCalledWith(2, expect.objectContaining({ cursor: 'next' }));
@@ -194,11 +196,11 @@ describe('MemoryRepository workspace concurrency', () => {
       status: 'active' as const, sourceRefs: ['source-old'], evidenceIds: [], freshestEvidenceAt: 50, origin: 'automatic' as const,
       revision: 2, createdAt: 50, updatedAt: 50,
     };
-    const slotRecordId = `fact-slot:${encodeURIComponent('chat-a')}:${encodeURIComponent(slotKey)}`;
+    const slotRecordId = `fact-head:${encodeURIComponent('chat-a')}:${encodeURIComponent(slotKey)}`;
     let committedUndo: WorkspaceRecord | null = null;
     const get = vi.fn(async (request: { collection?: string; recordId: string }) => {
-      if (request.collection === 'job-audits' && request.recordId === 'undo-v2:job-a:1') return committedUndo;
-      if (request.collection === 'fact-slots') return { recordId: slotRecordId, value: { chatKey: 'chat-a', slotKey, factId: previous.id }, version: 2, revision: 5, updatedAt: 50 } as WorkspaceRecord;
+      if (request.collection === 'change-audits' && request.recordId === 'undo-v2:job-a:1') return committedUndo;
+      if (request.collection === 'fact-heads') return { recordId: slotRecordId, value: { chatKey: 'chat-a', slotKey, factId: previous.id }, version: 2, revision: 5, updatedAt: 50 } as WorkspaceRecord;
       return null;
     });
     const query = vi.fn(async (request: { collection?: string }) => ({
@@ -222,7 +224,7 @@ describe('MemoryRepository workspace concurrency', () => {
     expect(request.idempotencyKey).toBe('undo-v2:job-a:1');
     expect(request.operations).toEqual(expect.arrayContaining([
       expect.objectContaining({ collection: 'facts', recordId: previous.id, expectedRevision: 11 }),
-      expect.objectContaining({ collection: 'fact-slots', recordId: slotRecordId, expectedRevision: 5 }),
+      expect.objectContaining({ collection: 'fact-heads', recordId: slotRecordId, expectedRevision: 5 }),
     ]));
     const undoValue = request.operations.find((operation: { recordId: string }) => operation.recordId === 'undo-v2:job-a:1').value;
     expect(undoValue.entries).toEqual(expect.arrayContaining([expect.objectContaining({ collection: 'facts', recordId: previous.id, beforeRevision: 11, afterRevision: 12 })]));
@@ -238,10 +240,10 @@ describe('MemoryRepository workspace concurrency', () => {
     const get = vi.fn(async (request: { collection?: string; recordId: string }) => {
       if (request.recordId === 'rollback-v0:job-a:1') return null;
       if (request.collection === 'facts') return { recordId: 'fact-a', value: after, version: 3, revision: 3, updatedAt: 3 } as WorkspaceRecord;
-      if (request.collection === 'jobs') return { recordId: 'job-a', value: { id: 'job-a', chatKey: 'chat-a', type: 'incremental', status: 'completed', checkpoint: { batchIndex: 2, processedCount: 2 }, createdAt: 1, updatedAt: 2 }, version: 2, revision: 2, updatedAt: 2 } as WorkspaceRecord;
+      if (request.collection === 'capture-jobs') return { recordId: 'job-a', value: { id: 'job-a', chatKey: 'chat-a', type: 'incremental', status: 'completed', checkpoint: { batchIndex: 2, processedCount: 2 }, createdAt: 1, updatedAt: 2 }, version: 2, revision: 2, updatedAt: 2 } as WorkspaceRecord;
       return null;
     });
-    const query = vi.fn(async (request: { collection?: string }) => ({ records: request.collection === 'job-audits' ? rows : [], nextCursor: null }));
+    const query = vi.fn(async (request: { collection?: string }) => ({ records: request.collection === 'change-audits' ? rows : [], nextCursor: null }));
     const transaction = vi.fn(async (request) => ({ operationCount: request.operations.length, replayed: false, results: request.operations.map((operation: { collection?: string; recordId: string }) => ({ collection: operation.collection ?? 'default', recordId: operation.recordId, action: 'upsert' as const, version: 4, revision: 4 })) }));
     const vectorDelete = vi.fn(async () => true); const upsert = vi.fn(async (request) => ({ recordId: request.recordId, value: request.value!, version: 5, revision: 5, updatedAt: 5 }));
     const repository = new MemoryRepository(workspace({ get: get as never, query: query as never, transaction, vectorDelete, upsert })); repository.bind('character:c1', 'chat-a');
@@ -250,7 +252,7 @@ describe('MemoryRepository workspace concurrency', () => {
 
     const request = transaction.mock.calls[0][0];
     expect(request.operations.filter((operation: { collection?: string; recordId: string }) => operation.collection === 'facts' && operation.recordId === 'fact-a')).toEqual([{ action: 'upsert', collection: 'facts', recordId: 'fact-a', value: before, expectedRevision: 3 }]);
-    expect(request.operations).toEqual(expect.arrayContaining([expect.objectContaining({ recordId: 'rollback-v0:job-a:1', collection: 'job-audits' })]));
+    expect(request.operations).toEqual(expect.arrayContaining([expect.objectContaining({ recordId: 'rollback-v0:job-a:1', collection: 'change-audits' })]));
     expect(vectorDelete).toHaveBeenCalledWith(expect.objectContaining({ recordId: 'fact-a' }));
   });
 
@@ -298,38 +300,6 @@ describe('MemoryRepository workspace concurrency', () => {
     expect(query).toHaveBeenCalledWith(expect.objectContaining({ collection: 'evidence', filter: { chatKey: 'chat-a', factId: 'fact-a' } }));
   });
 
-  it('migrates legacy global slots into independent chat slots exactly once', async () => {
-    const chatA = fact('fact-a', 'chat-a');
-    const chatB = fact('fact-b', 'chat-b');
-    const legacySlot = { recordId: chatA.slotKey, value: { factId: chatA.id }, version: 3, updatedAt: 100 } as WorkspaceRecord;
-    const query = vi.fn(async (request: { collection?: string; filter?: Record<string, unknown> }) => {
-      if (request.collection === 'facts') {
-        const values = [chatA, chatB].filter(item => !request.filter?.chatKey || item.chatKey === request.filter.chatKey);
-        return { records: values.map(value => ({ recordId: value.id, value, version: 1, updatedAt: 100 })), nextCursor: null };
-      }
-      if (request.collection === 'fact-slots') return { records: [legacySlot], nextCursor: null };
-      return { records: [], nextCursor: null };
-    });
-    const writes: string[] = [];
-    const upsert = vi.fn(async (request) => {
-      writes.push(`upsert:${request.recordId}`);
-      return { recordId: request.recordId, value: request.value!, version: 1, updatedAt: 1 };
-    });
-    const remove = vi.fn(async (request) => { writes.push(`delete:${request.recordId}`); return true; });
-    const repository = new MemoryRepository(workspace({ query: query as never, upsert, delete: remove }));
-    repository.bind('character:c1', 'chat-a');
-
-    await repository.bootstrap('chat-a');
-    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ recordId: `fact-slot:${encodeURIComponent('chat-a')}:${encodeURIComponent(chatA.slotKey)}`, value: expect.objectContaining({ chatKey: 'chat-a', factId: 'fact-a' }) }));
-    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ recordId: `fact-slot:${encodeURIComponent('chat-b')}:${encodeURIComponent(chatB.slotKey)}`, value: expect.objectContaining({ chatKey: 'chat-b', factId: 'fact-b' }) }));
-    expect(remove).toHaveBeenCalledWith(expect.objectContaining({ recordId: chatA.slotKey, expectedVersion: 3 }));
-    expect(writes.slice(0, 2).every((entry) => entry.startsWith('upsert:'))).toBe(true);
-    expect(writes.at(-1)).toBe(`delete:${chatA.slotKey}`);
-    const firstRepairWriteCount = writes.length;
-    await repository.bootstrap('chat-a');
-    expect(writes).toHaveLength(firstRepairWriteCount);
-  });
-
   it('filters vector coverage, search and clearing by chat metadata', async () => {
     const chatA = fact('fact-a', 'chat-a');
     const query = vi.fn(async (request: { collection?: string; filter?: Record<string, unknown> }) => ({
@@ -360,7 +330,7 @@ describe('MemoryRepository workspace concurrency', () => {
     const slotB = { chatKey: 'chat-b', slotKey: chatB.slotKey, factId: chatB.id };
     const query = vi.fn(async (request: { collection?: string; filter?: Record<string, unknown> }) => {
       const source = request.collection === 'facts' ? [chatA, chatB]
-        : request.collection === 'fact-slots' ? [slotA, slotB]
+        : request.collection === 'fact-heads' ? [slotA, slotB]
           : [];
       const values = source.filter(item => !request.filter?.chatKey || item.chatKey === request.filter.chatKey);
       return { records: values.map((value, index) => ({ recordId: 'id' in value ? value.id : `slot-${value.chatKey}`, value, version: index + 1, updatedAt: 1 })), nextCursor: null };
@@ -375,12 +345,12 @@ describe('MemoryRepository workspace concurrency', () => {
     const deleted = transaction.mock.calls.flatMap(call => call[0].operations);
     expect(deleted).toEqual(expect.arrayContaining([
       expect.objectContaining({ collection: 'facts', recordId: 'fact-a' }),
-      expect.objectContaining({ collection: 'fact-slots', recordId: 'slot-chat-a' }),
+      expect.objectContaining({ collection: 'fact-heads', recordId: 'slot-chat-a' }),
     ]));
     expect(deleted).not.toEqual(expect.arrayContaining([expect.objectContaining({ recordId: 'fact-b' })]));
     expect(query).toHaveBeenCalledWith(expect.objectContaining({ collection: 'facts', filter: { chatKey: 'chat-a' } }));
     expect(new Set(query.mock.calls.map(call => call[0].collection))).toEqual(new Set([
-      'evidence', 'jobs', 'job-audits', 'usage', 'recall-logs', 'facts', 'fact-slots', 'graph-nodes', 'graph-edges',
+      'evidence', 'capture-jobs', 'change-audits', 'usage', 'recall-logs', 'facts', 'fact-heads', 'graph-nodes', 'graph-edges',
     ]));
     expect(vectorClear).toHaveBeenCalledWith(expect.objectContaining({ metadata: { chatKey: 'chat-a' } }));
   });
@@ -423,7 +393,7 @@ describe('MemoryRepository workspace concurrency', () => {
     const query = vi.fn(async (request: { collection?: string }) => {
       if (request.collection === 'facts') return { records: [{ recordId: chatA.id, value: chatA, version: 1, updatedAt: 1 }], nextCursor: null };
       if (request.collection === 'evidence') return { records: [{ recordId: 'evidence:bad', value: { id: 'evidence:bad', factId: chatA.id, chatKey: 'chat-b' }, version: 1, updatedAt: 1 }], nextCursor: null };
-      if (request.collection === 'fact-slots') return { records: [{ recordId: chatA.slotKey, value: { factId: chatA.id }, version: 1, updatedAt: 1 }], nextCursor: null };
+      if (request.collection === 'fact-heads') return { records: [{ recordId: chatA.slotKey, value: { factId: chatA.id }, version: 1, updatedAt: 1 }], nextCursor: null };
       return { records: [], nextCursor: null };
     });
     const repository = new MemoryRepository(workspace({ query: query as never }));
@@ -431,7 +401,7 @@ describe('MemoryRepository workspace concurrency', () => {
 
     await expect(repository.checkIntegrity()).resolves.toMatchObject({
       ok: false,
-      message: expect.stringMatching(/属于不同聊天.*旧式槽位/),
+      message: expect.stringMatching(/属于不同聊天.*事实头 .*无效/),
     });
   });
 });

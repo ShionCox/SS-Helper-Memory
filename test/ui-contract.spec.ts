@@ -21,7 +21,8 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(styles).toMatch(/\.stx-memory-maintenance-icon\s*\{[^}]*width:\s*34px[^}]*height:\s*34px[^}]*place-items:\s*center/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-danger-actions\s+\.stx-memory-danger-action\[data-ss-helper-control="button"\][^}]*grid-template-columns:\s*30px\s+minmax\(0,\s*1fr\)[^}]*text-align:\s*left/u);
     expect(source).toContain('<ss-helper-icon name="file-export" decorative>');
-    expect(source).toContain('<ss-helper-icon name="file-import" decorative>');
+    expect(source).not.toContain('<ss-helper-icon name="file-import" decorative>');
+    expect(source).not.toContain('import-file');
     expect(source).toContain('<ss-helper-icon name="eraser" decorative>');
     expect(source).not.toContain('fa-solid');
     expect(source).toContain('本聊天记忆占用');
