@@ -8,10 +8,12 @@
     font-family: var(--mainFontFamily, "Segoe UI", "Microsoft YaHei UI", sans-serif); font-size: .875rem;
   }
 
-  .stx-memory-statusbar { min-width: 0; display: grid; grid-template-columns: minmax(0, 1.35fr) repeat(4, minmax(0, 1fr)); gap: 1px; border-bottom: 1px solid var(--ss-theme-border); background: var(--ss-theme-border); }
+  .stx-memory-statusbar { min-width: 0; display: grid; grid-template-columns: minmax(0, 1.35fr) repeat(6, minmax(0, 1fr)); gap: 1px; border-bottom: 1px solid var(--ss-theme-border); background: var(--ss-theme-border); }
   .stx-memory-statusbar > div { min-width: 0; display: grid; align-content: center; gap: 3px; padding: 8px 11px; background: var(--ss-theme-surface-2); }
   .stx-memory-statusbar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .stx-memory-status-storage small { overflow: hidden; color: var(--ss-theme-muted); font-size: .61rem; text-overflow: ellipsis; white-space: nowrap; }
+  .stx-memory-status-route { min-width: 0; }
+  .stx-memory-status-route-detail { display: block; min-width: 0; overflow: hidden; color: var(--ss-theme-muted); font-size: .61rem; text-overflow: ellipsis; white-space: nowrap; }
   .stx-memory-statusbar [data-ss-helper-control="status"] { width: auto; max-width: 100%; justify-self: start; overflow: hidden; text-overflow: ellipsis; }
   .stx-memory-kicker { display: block; color: var(--ss-theme-muted); font-size: .68rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
   .stx-memory-alert { grid-column: 1 / -1; display: block !important; padding: 0 !important; background: var(--ss-theme-surface-2) !important; }
@@ -177,7 +179,7 @@
   .stx-memory-integrity-result > span { min-width: 0; display: grid; gap: 3px; }
   .stx-memory-integrity-result strong { font-size: .7rem; }
   .stx-memory-integrity-result small { color: var(--ss-theme-muted); font-size: .66rem; line-height: 1.4; overflow-wrap: anywhere; }
-  .stx-memory-estimate-note { margin: 7px 0 0; color: var(--ss-theme-muted); font-size: .68rem; line-height: 1.45; }
+  .stx-memory-estimate-note { color: var(--ss-theme-muted); font-size: .68rem; line-height: 1.45; }
   .stx-memory-metric-grid strong { display: block; margin-top: 5px; font-size: 1.05rem; }
   .stx-memory-progress-copy { margin: 16px 0 7px; color: var(--ss-theme-muted); font-size: .74rem; }
   .stx-memory-capture-feedback { display: flex; align-items: flex-start; gap: 7px; margin: 9px 0 0; padding: 8px 9px; border: 1px solid color-mix(in srgb, var(--ss-theme-accent) 38%, var(--ss-theme-border)); border-radius: 6px; background: color-mix(in srgb, var(--ss-theme-accent) 9%, var(--ss-theme-surface-2)); color: var(--ss-theme-text); font-size: .74rem; line-height: 1.4; }
@@ -970,6 +972,9 @@
   .stx-memory-workbench .stx-memory-graph-metric-grid > div { border-top: 1px solid var(--ss-theme-border); border-left: 0; }
   .stx-memory-workbench .stx-memory-graph-metric-grid > div:first-child { border-top: 0; }
 }
+
+/* SillyTavern's unlayered paragraph reset outranks the component layer. */
+.stx-memory-workbench .stx-memory-panel > p.stx-memory-estimate-note { margin: 14px 0 0; }
 
 @media (prefers-reduced-motion: reduce) {
   .stx-memory-workbench *, .stx-memory-workbench *::before, .stx-memory-workbench *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }

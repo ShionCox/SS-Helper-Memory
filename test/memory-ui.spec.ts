@@ -7,6 +7,7 @@ import {
   formatChatIdentity,
   formatSourceReference,
   formatRollbackConfirmation,
+  localizeLegacyGraphPreview,
   MEMORY_CAPABILITY_BOUNDARIES,
   readSafeLlmErrorDetails,
   translateChatBinding,
@@ -492,6 +493,7 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).toContain('初始化当前聊天');
     expect(container.textContent).toContain('按每批 5 层可见用户/助手消息拆分');
     expect(container.querySelector('[data-source-kind]')?.getAttribute('data-ss-helper-control')).toBe('checkbox');
+    expect(container.querySelector('[data-option="include-invisible-history"]')).toBeNull();
     expect(container.querySelector('.stx-memory-estimate-grid')).not.toBeNull();
     (container.querySelector('[data-page="recall"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -514,6 +516,87 @@ describe('Memory UI 展示适配', () => {
     expect(container.querySelector('[data-action="import-file"]')?.parentElement?.getAttribute('data-ss-helper-control')).toBe('file-trigger');
     expect(container.querySelector('[data-action="clear-all"]')?.getAttribute('data-ss-helper-tone')).toBe('danger');
     dispose();
+  });
+
+  it('不把遗留英文技术键直接显示在关系图谱中', async () => {
+    const graph = {
+      nodes: [{ id: 'node-a', label: '白夕小时' }, { id: 'node-b', label: 'tomorrow_outing_split' }],
+      edges: [{ id: 'edge-a', from: 'node-a', to: 'node-b', predicate: 'plans_to', kind: 'goal' as const, status: 'active' as const, confidence: 0.9, backingFactId: 'fact-1' }],
+    };
+    expect(localizeLegacyGraphPreview(graph)).toMatchObject({
+      nodes: [{ label: '白夕小时' }, { label: '相关对象' }],
+      edges: [{ predicate: '目标' }],
+    });
+
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(container, workbenchController({ getRelationshipGraph: async () => graph }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="graph"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.textContent).toContain('当前状态稳定');
+    expect(container.textContent).not.toContain('plans_to');
+    expect(container.textContent).not.toContain('tomorrow_outing_split');
+    dispose();
+  });
+
+  it('顶部状态栏显示大语言、向量和重排序模型状态', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getOverview: async () => ({
+        status: 'ready', bound: true, factCount: 1, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: true,
+        embedding: { available: true, resourceId: 'embed-route', model: 'Embed-Test' },
+        rerank: { available: false, blockedReason: 'LLMHub 未加载或版本过旧' },
+      }),
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.textContent).toContain('大语言模型');
+    expect(container.textContent).toContain('向量模型');
+    expect(container.textContent).toContain('重排序模型');
+    expect(container.textContent).toContain('Embed-Test');
+    expect(container.querySelectorAll('.stx-memory-statusbar > div')).toHaveLength(7);
+    const routeChips = container.querySelectorAll<HTMLElement>('.stx-memory-status-route [data-ss-helper-control="status"]');
+    expect(routeChips).toHaveLength(2);
+    expect(routeChips[0]?.textContent).toBe('可用');
+    expect(routeChips[0]?.getAttribute('data-ss-helper-tone')).toBe('success');
+    expect(routeChips[1]?.textContent).toBe('不可用');
+    expect(routeChips[1]?.getAttribute('data-ss-helper-tone')).toBe('error');
+    expect(container.querySelectorAll('.stx-memory-status-route-detail')).toHaveLength(2);
+    expect([...container.querySelectorAll('.stx-memory-status-route-detail')].some((node) => node.textContent?.includes('LLMHub 未加载或版本过旧'))).toBe(true);
+    dispose();
+  });
+
+  it('后台路由诊断完成后刷新顶部状态并清理订阅', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    let overviewCalls = 0;
+    let notifyOverviewChanged: (() => void) | undefined;
+    let unsubscribed = false;
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getOverview: async () => {
+        overviewCalls += 1;
+        return overviewCalls === 1
+          ? { status: 'ready', bound: true, factCount: 1, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: true }
+          : {
+            status: 'ready', bound: true, factCount: 1, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: true,
+            embedding: { available: true, model: 'Embed-Test' },
+            rerank: { available: false, blockedReason: '暂时无法读取 LLM 资源状态' },
+          };
+      },
+      onOverviewChanged: (listener) => { notifyOverviewChanged = listener; return () => { unsubscribed = true; }; },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(container.querySelectorAll('.stx-memory-status-route [data-ss-helper-control="status"]')[0]?.textContent).toBe('读取中');
+
+    notifyOverviewChanged?.();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(container.textContent).toContain('Embed-Test');
+    expect(container.textContent).toContain('暂时无法读取 LLM 资源状态');
+    dispose();
+    expect(unsubscribed).toBe(true);
   });
 
   it('初始化开关默认关闭、实时刷新计数，并把本次选项传给控制器', async () => {

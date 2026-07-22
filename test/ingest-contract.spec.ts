@@ -65,6 +65,37 @@ describe('Memory 写入主链', () => {
     ]);
   });
 
+  it('拒绝模型自造的英文技术键，同时允许来源原文中的英文专名作为实体', async () => {
+    const sources = [block('m1', 'OpenAI 与艾琳确认双方将共同制定下一阶段的行动计划。')];
+    const proposals: ExtractedFactProposal[] = [
+      {
+        kind: 'goal', subjectKey: '艾琳', predicateKey: 'plans_to', objectKey: 'next_stage_plan',
+        content: '艾琳已经确认将与 OpenAI 共同制定下一阶段的完整行动计划。', entityKeys: ['艾琳', 'next_stage_plan'],
+        confidence: 0.93, sourceRef: 'm1', evidenceExcerpt: '双方将共同制定下一阶段的行动计划', actionHint: 'upsert',
+      },
+      {
+        kind: 'relationship', subjectKey: 'OpenAI', predicateKey: '合作对象', objectKey: '艾琳',
+        content: 'OpenAI 已经确认与艾琳建立合作关系，双方将共同制定下一阶段的行动计划。', entityKeys: ['OpenAI', '艾琳'],
+        confidence: 0.94, sourceRef: 'm1', evidenceExcerpt: 'OpenAI 与艾琳确认双方将共同制定下一阶段的行动计划', actionHint: 'upsert',
+      },
+    ];
+    const commits: IngestCommit[] = [];
+    const service = new MemoryIngestService({
+      extractor: { extract: vi.fn(async () => proposals) },
+      commit: async (input) => void commits.push(input),
+    });
+
+    const result = await service.ingest({ chatKey: 'chat-a', jobId: 'job-chinese-keys', sources });
+
+    expect(result).toMatchObject({ accepted: 1, rejected: 1 });
+    expect(result.rejections).toEqual([
+      expect.objectContaining({ code: 'non_chinese_key', message: expect.stringContaining('必须使用中文') }),
+    ]);
+    expect(commits[0]?.facts).toEqual([
+      expect.objectContaining({ subjectKey: 'OpenAI', predicateKey: '合作对象', objectKey: '艾琳' }),
+    ]);
+  });
+
   it('将只读旧记忆单独传给提取器，不把它写入来源或证据链', async () => {
     const sources = [block('m1', '艾琳再次明确表示自己在雷雨天气会感到恐惧。')];
     const reference: ExistingMemoryContextItem = {

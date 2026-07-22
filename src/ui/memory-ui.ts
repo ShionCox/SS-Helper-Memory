@@ -124,6 +124,10 @@ export interface MemoryUiOverview {
   llmAvailable: boolean;
   llmResource?: string;
   llmModel?: string;
+  /** Current vector-model route status, when the LLM capability probe has completed. */
+  embedding?: MemoryRecallRouteStatus;
+  /** Current reranking-model route status, when the LLM capability probe has completed. */
+  rerank?: MemoryRecallRouteStatus;
   errorCode?: string;
   error?: string;
   errorDiagnostic?: MemoryErrorDiagnostic;
@@ -143,6 +147,8 @@ export interface MemoryInitializationSourceOption {
   defaultCount: number;
   /** Raw entries still excluded under the current mode. */
   excludedCount: number;
+  /** Entries that become eligible when the one-time invisible-history option is enabled. */
+  invisibleCount?: number;
   selected: boolean;
 }
 export interface MemoryCaptureProgress {
@@ -226,6 +232,8 @@ export interface MemoryUiController {
   getSettings(): MemoryUiSettings;
   saveSettings(settings: MemoryUiSettings): Promise<void>;
   getOverview(): Promise<MemoryUiOverview>;
+  /** Optional notification for background overview diagnostics finishing. */
+  onOverviewChanged?: (listener: () => void) => () => void;
   getInitializationEstimate(selectedKinds?: string[], options?: MemoryInitializationOptions): Promise<MemoryInitializationEstimate>;
   getInitializationSources(options?: MemoryInitializationOptions): Promise<MemoryInitializationSourceOption[]>;
   getInitializationState(): Promise<MemoryInitializationState>;
@@ -280,6 +288,26 @@ const RECALL_MODE_LABELS: Readonly<Record<MemoryRecallStatus['resolvedMode'], st
 
 export function translateFactKind(value: string): string { return FACT_KIND_LABELS[value] ?? value; }
 export function translateFactStatus(value: string): string { return FACT_STATUS_LABELS[value] ?? value; }
+const HAN_CHARACTER = /\p{Script=Han}/u;
+const LATIN_PREDICATE = /^[A-Za-z][A-Za-z0-9 _-]*$/u;
+const MACHINE_ENTITY_KEY = /^(?:[a-z][a-z0-9]*(?:[_-][a-z0-9]+)+|[a-z]+(?:[A-Z][A-Za-z0-9]*)+)$/u;
+
+function isNonChinesePredicate(value: string): boolean {
+  const key = value.trim();
+  return Boolean(key) && !HAN_CHARACTER.test(key) && LATIN_PREDICATE.test(key);
+}
+
+function isMachineEntityKey(value: string): boolean {
+  const key = value.trim();
+  return Boolean(key) && !HAN_CHARACTER.test(key) && MACHINE_ENTITY_KEY.test(key);
+}
+
+export function localizeLegacyGraphPreview(graph: MemoryGraphPreview): MemoryGraphPreview {
+  return {
+    nodes: graph.nodes.map((node) => ({ ...node, label: isMachineEntityKey(node.label) ? '相关对象' : node.label })),
+    edges: graph.edges.map((edge) => ({ ...edge, predicate: isNonChinesePredicate(edge.predicate) ? translateFactKind(edge.kind) : edge.predicate })),
+  };
+}
 function translateRecordStatus(value: string): string { return RECORD_STATUS_LABELS[value] ?? value; }
 export function formatAuditResource(value: unknown): string {
   const resource = String(value ?? '').trim();
@@ -476,6 +504,16 @@ function renderRoute(label: string, route: MemoryRecallRouteStatus): string {
   const detail = route.available ? route.resourceId ?? '已配置' : route.blockedReason ?? '尚未在 LLM 中配置';
   return `<div class="stx-memory-route"><div><strong>${escapeHtml(label)}</strong>${renderStatusChip(route.available ? '可用' : '不可用', tone)}</div><small>${escapeHtml(detail)}</small>${route.model ? `<small>模型：${escapeHtml(route.model)}</small>` : ''}</div>`;
 }
+function renderOverviewRouteStatus(label: string, route: MemoryRecallRouteStatus | undefined): string {
+  const status = route === undefined ? '读取中' : route.available ? '可用' : '不可用';
+  const tone = route === undefined ? 'neutral' : route.available ? 'success' : 'error';
+  const detail = route === undefined
+    ? ''
+    : route.available
+      ? route.model ?? route.resourceId ?? '已配置'
+      : route.blockedReason ?? '尚未在 LLM 中配置';
+  return `<div class="stx-memory-status-route"><span class="stx-memory-kicker">${escapeHtml(label)}</span>${renderStatusChip(status, tone)}${detail ? `<small class="stx-memory-status-route-detail" title="${escapeHtml(detail)}">${escapeHtml(detail)}</small>` : ''}</div>`;
+}
 
 export function renderMemoryWorkbench(
   container: HTMLElement,
@@ -496,6 +534,7 @@ export function renderMemoryWorkbench(
   let searchTimer: number | undefined;
   let graphSearchTimer: number | undefined;
   let progressTimer: number | undefined;
+  let removeOverviewChanged: (() => void) | undefined;
   let renderFrame: number | undefined;
   let graphMarqueeResizeFrame: number | undefined;
   let graphListModeFrame: number | undefined;
@@ -626,6 +665,15 @@ export function renderMemoryWorkbench(
       state.loading = false; state.errorCode = diagnostic.code; state.errorDiagnostic = diagnostic; rerender();
       toast('error', diagnostic.title, diagnostic.reason, diagnostic.code);
     }
+  };
+  const refreshOverviewSnapshot = async (): Promise<void> => {
+    if (disposed) return;
+    try {
+      const overview = await controller.getOverview();
+      if (disposed) return;
+      state.overview = overview;
+      rerender('', true);
+    } catch { /* background route diagnostics must not interrupt the workbench */ }
   };
   const loadPage = async (page: MemoryWorkbenchPage): Promise<void> => {
     if (disposed) return;
@@ -819,8 +867,12 @@ export function renderMemoryWorkbench(
     const sourceCoverage = initialization?.selectedSourceKinds.length || selectedCount;
     const sourceTotal = state.sources.length;
     const messageSource = state.sources.find((source) => source.kind === 'message');
+    const invisibleHistoryCount = messageSource?.invisibleCount
+      ?? Math.max(0, (messageSource?.rawCount ?? 0) - (messageSource?.defaultCount ?? 0));
+    const hasInvisibleHistory = Boolean(messageSource && invisibleHistoryCount > 0);
     const renderSourceChoices = (locked: boolean): string => `<div class="stx-memory-source-list">${state.sources.length ? state.sources.map((source) => `<label class="stx-memory-source-option ${state.selectedSourceKinds.includes(source.kind) ? 'is-selected' : ''}"><input ${uiControl('checkbox')} type="checkbox" data-source-kind="${escapeHtml(source.kind)}" ${state.selectedSourceKinds.includes(source.kind) ? 'checked' : ''} ${locked || source.count === 0 ? 'disabled' : ''}><span><strong>${escapeHtml(source.label)}</strong><small>${formatNumber(source.count)} / ${formatNumber(source.rawCount)} 项${source.excludedCount > 0 ? ` · 排除 ${formatNumber(source.excludedCount)}` : ''}</small></span></label>`).join('') : renderEmpty('当前没有可初始化来源', '请先选择角色或打开聊天。')}</div>`;
     const renderInvisibleHistoryOption = (locked: boolean): string => {
+      if (!hasInvisibleHistory) return '';
       const current = messageSource?.count ?? 0;
       const raw = messageSource?.rawCount ?? 0;
       const defaultCount = messageSource?.defaultCount ?? current;
@@ -869,13 +921,23 @@ export function renderMemoryWorkbench(
     return `<div class="stx-memory-card-grid"><section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">当前策略</span><h3>${escapeHtml(translateRecallMode(recall.resolvedMode))}</h3></div>${renderStatusChip(recall.rebuilding ? '重建中' : '运行正常', recall.rebuilding ? 'warning' : 'success')}</div><div class="stx-memory-route-grid">${renderRoute('向量模型', recall.embedding)}${renderRoute('重排序模型', recall.rerank)}</div><div class="stx-memory-metric-grid"><div><span>已建立索引</span><strong>${formatNumber(recall.indexedFacts)}</strong></div><div><span>可索引事实</span><strong>${formatNumber(recall.eligibleFacts)}</strong></div><div><span>待处理</span><strong>${formatNumber(recall.pendingFacts)}</strong></div></div><div class="stx-memory-progress-copy"><span>向量覆盖率</span><strong>${coverage}%</strong></div><progress ${uiControl('progress')} max="100" value="${coverage}">${coverage}%</progress>${recallError ? `<p class="stx-memory-inline-alert" role="alert">错误码：${escapeHtml(safeInlineError(recallError, 'MEMORY_RECALL_DEGRADED'))}</p>` : ''}<div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="rebuild-index" ${rebuildDisabled ? 'disabled' : ''}><ss-helper-icon name="arrows-rotate" decorative></ss-helper-icon>重建向量索引</button></div>${recall.embedding.available ? '' : '<p class="stx-memory-muted">请先在 LLM 中配置可用的向量模型，再重建索引。</p>'}</section><section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近召回</span><h3>诊断摘要</h3></div></div>${diagnostic}${recall.batches.length ? `<div class="stx-memory-batch-table"><div class="stx-memory-table-row stx-memory-table-head"><span>批次</span><span>输入</span><span>延迟</span><span>接受</span></div>${recall.batches.map((batch) => `<div class="stx-memory-table-row"><span>#${batch.batchIndex + 1}</span><span>${formatNumber(batch.inputCount)}</span><span>${formatNumber(batch.latencyMs)} 毫秒</span><span>${formatNumber(batch.accepted)} / ${formatNumber(batch.rejected)}</span></div>`).join('')}</div>` : '<p class="stx-memory-muted">暂无向量批次记录。</p>'}</section></div>`;
   };
   const graphView = (): ReturnType<typeof selectGraphView> => {
-    const graph = state.graph ?? { nodes: [], edges: [] };
+    const graph = localizeLegacyGraphPreview(state.graph ?? { nodes: [], edges: [] });
     return selectGraphView(graph, state.graphQuery, state.graphKind, state.graphStatusFilter, state.selectedGraphNodeId, state.graphNeighborFocus, state.selectedGraphEdgeId || state.selectedGraphEventId);
   };
-  const graphRelationLabel = (edge: MemoryGraphPreview['edges'][number], nodes: ReadonlyMap<string, MemoryGraphPreview['nodes'][number]>): string => `${nodes.get(edge.from)?.label ?? '未知节点'} — ${edge.predicate} → ${nodes.get(edge.to)?.label ?? '未知节点'}`;
+  const graphRelationLabel = (edge: MemoryGraphPreview['edges'][number], nodes: ReadonlyMap<string, MemoryGraphPreview['nodes'][number]>): string => {
+    const rawEdge = state.graph?.edges.find((item) => item.id === edge.id) ?? edge;
+    const rawNodes = new Map(state.graph?.nodes.map((node) => [node.id, node] as const) ?? []);
+    const rawFrom = rawNodes.get(rawEdge.from)?.label ?? '';
+    const rawTo = rawNodes.get(rawEdge.to)?.label ?? '';
+    if (isNonChinesePredicate(rawEdge.predicate) || isMachineEntityKey(rawFrom) || isMachineEntityKey(rawTo)) {
+      const fact = state.facts.find((item) => item.id === rawEdge.backingFactId);
+      if (fact?.content) return fact.content;
+    }
+    return `${nodes.get(edge.from)?.label ?? '未知节点'} — ${edge.predicate} → ${nodes.get(edge.to)?.label ?? '未知节点'}`;
+  };
   const resolveGraphInspectorSelection = () => {
-    const graph = state.graph;
-    if (!graph) return undefined;
+    if (!state.graph) return undefined;
+    const graph = localizeLegacyGraphPreview(state.graph);
     const view = graphView();
     const nodes = new Map(graph.nodes.map((node) => [node.id, node] as const));
     const selectedNode = state.selectedGraphNodeId ? nodes.get(state.selectedGraphNodeId) : undefined;
@@ -893,7 +955,7 @@ export function renderMemoryWorkbench(
     return `<div class="stx-memory-detail-head"><div><span class="stx-memory-kicker">${selectedEvent ? '事件事实' : '事实'}</span><h3 class="stx-memory-graph-marquee" data-graph-marquee title="${escapeHtml(graphRelationLabel(selected, nodes))}"><span>${escapeHtml(graphRelationLabel(selected, nodes))}</span></h3></div>${renderStatusChip(translateFactKind(selected.kind), 'neutral')}</div><div class="stx-memory-detail-summary">${renderStatusChip(translateFactStatus(selected.status), selected.status === 'active' ? 'success' : 'neutral')}<div><span>置信度</span><strong>${Math.round(selected.confidence * 100)}%</strong></div><div><span>${selectedEvent ? '关联高亮' : '相邻关系'}</span><strong>${formatNumber(relationNeighbors.length)}</strong></div></div><section class="stx-memory-detail-section"><div class="stx-memory-section-heading"><div><h4>关联事实</h4><p>${selectedEvent ? '事件两端的全部直接关系会在画布中同步高亮' : '图边不能脱离这条已验证事实独立存在'}</p></div></div>${fact ? `<p class="stx-memory-fact-content">${escapeHtml(fact.content)}</p><div class="stx-memory-evidence-list">${fact.evidence.length ? fact.evidence.map((evidence) => `<article class="stx-memory-evidence"><strong>${renderSourceReference(evidence.sourceRef)}</strong><blockquote>${escapeHtml(evidence.excerpt)}</blockquote></article>`).join('') : '<p class="stx-memory-muted">该事实没有可展示的证据。</p>'}</div>` : '<p class="stx-memory-inline-alert" role="alert">关联事实已变更或正在等待图谱协调；本页不会据此创建替代关系。</p>'}</section><section class="stx-memory-detail-section"><div class="stx-memory-section-heading"><div><h4>节点邻接</h4><p>仅展示同一聊天中由事实背书的相邻边</p></div><span>${formatNumber(relationNeighbors.length)} 条</span></div><div class="stx-memory-reference-list">${relationNeighbors.length ? relationNeighbors.map((edge) => `<button ${uiControl('button', 'neutral')} type="button" data-action="select-graph-edge" data-edge-id="${escapeHtml(edge.id)}">${escapeHtml(graphRelationLabel(edge, nodes))}</button>`).join('') : '<span>暂无其他相邻关系</span>'}</div></section>`;
   };
   const renderGraphInspector = (): string => {
-    const graph = state.graph;
+    const graph = state.graph ? localizeLegacyGraphPreview(state.graph) : undefined;
     const status = state.graphStatus;
     if (!graph || !status) return renderEmpty('正在读取关系图谱', '图谱只会展示当前聊天中由已验证事实派生的关系。');
     const selection = resolveGraphInspectorSelection();
@@ -921,7 +983,7 @@ export function renderMemoryWorkbench(
     return `<section class="stx-memory-panel stx-memory-graph-status-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">图谱状态</span><h3>当前聊天</h3></div><div class="stx-memory-graph-status-actions">${renderStatusChip(phaseLabel, phaseTone)}<button class="stx-memory-graph-icon-button" ${uiControl('button', 'neutral')} type="button" data-action="rebuild-graph" aria-label="重建关系图谱" title="重建关系图谱" ${state.busyAction || status.phase === 'rebuilding' ? 'disabled' : ''}><ss-helper-icon name="arrows-rotate" decorative></ss-helper-icon></button></div></div><p class="stx-memory-muted">仅以当前聊天中已验证事实为准；视觉聚类只用于浏览，不会写入记忆。</p><dl class="stx-memory-graph-metric-grid"><div><dt>节点</dt><dd>${formatNumber(graph.nodes.length)}</dd></div><div><dt>已载入关系</dt><dd>${formatNumber(graph.edges.length)} / ${formatNumber(status.edgeCount)}</dd></div><div><dt>最后协调</dt><dd>${escapeHtml(status.lastRebuiltAt ? formatTime(status.lastRebuiltAt) : '尚未完成')}</dd></div></dl>${status.lastError ? '<p class="stx-memory-inline-alert" role="alert">图谱暂时降级，普通整理和召回不受影响。</p>' : ''}<div class="stx-memory-graph-filter-row"><label>类型<select ${uiControl('select')} data-graph-filter="kind"><option value="">全部</option>${kinds.map((kind) => `<option value="${escapeHtml(kind)}" ${state.graphKind === kind ? 'selected' : ''}>${escapeHtml(translateFactKind(kind))}</option>`).join('')}</select></label><label>状态<select ${uiControl('select')} data-graph-filter="status"><option value="">全部</option>${statuses.map((value) => `<option value="${escapeHtml(value)}" ${state.graphStatusFilter === value ? 'selected' : ''}>${escapeHtml(translateFactStatus(value))}</option>`).join('')}</select></label></div></section><section class="stx-memory-panel stx-memory-graph-relations-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">已验证关系</span><h3 data-graph-list-heading>${listLabel}</h3></div><span data-graph-list-count>${formatNumber(listCount)} 条</span></div><div class="stx-memory-graph-list-switch" role="tablist" aria-label="已验证关系显示模式"><button ${uiControl('button', 'neutral')} type="button" role="tab" data-action="set-graph-list-mode" data-graph-list-mode="edges" aria-selected="${state.graphListMode === 'edges'}"><ss-helper-icon name="link" decorative></ss-helper-icon>边列表</button><button ${uiControl('button', 'neutral')} type="button" role="tab" data-action="set-graph-list-mode" data-graph-list-mode="events" aria-selected="${state.graphListMode === 'events'}"><ss-helper-icon name="bolt" decorative></ss-helper-icon>事件列表</button></div><div class="stx-memory-graph-list-stack"><div class="stx-memory-graph-edge-list" data-graph-edge-list data-graph-list-mode="edges" data-graph-list-count="${view.edges.length}" ${state.graphListMode === 'edges' ? '' : 'hidden'}>${relationRows}</div><div class="stx-memory-graph-edge-list" data-graph-edge-list data-graph-list-mode="events" data-graph-list-count="${eventEdges.length}" ${state.graphListMode === 'events' ? '' : 'hidden'}>${eventRows}</div></div></section><section class="stx-memory-panel stx-memory-graph-detail-panel" data-graph-inspector-detail>${detail}</section>`;
   };
   const renderGraph = (): string => {
-    const graph = state.graph;
+    const graph = state.graph ? localizeLegacyGraphPreview(state.graph) : undefined;
     const status = state.graphStatus;
     if (!graph || !status) return renderEmpty('正在读取关系图谱', '图谱只会展示当前聊天中由已验证事实派生的关系。');
     if (!status.enabled) return `<section class="stx-memory-panel">${renderEmpty('关系图谱已关闭', '可在“高级 → 关系图谱”中开启；关闭时不会影响普通整理或召回。')}</section>`;
@@ -1123,7 +1185,7 @@ export function renderMemoryWorkbench(
     const chatIdentity = formatChatIdentity(overview);
     const chatStorageLabel = overview?.bound ? formatBytes(overview.currentChatSizeBytes ?? 0) : '—';
     const chatStorageRatio = overview?.bound ? formatPercent(overview.currentChatUsageRatio ?? 0) : '—';
-    root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class="stx-memory-nav-meta">${overview?.lastOrganizedAt ? `最近整理<br>${escapeHtml(formatTime(overview.lastOrganizedAt))}` : '仅展示当前已实现能力'}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${currentPage.label}</h2><p>${currentPage.description}</p></div><span class="stx-memory-page-counter">${PAGES.findIndex((page) => page.id === state.page) + 1} / ${PAGES.length}</span></header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section></main></div>`;
+    root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${renderOverviewRouteStatus('向量模型', overview?.embedding)}${renderOverviewRouteStatus('重排序模型', overview?.rerank)}${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class="stx-memory-nav-meta">${overview?.lastOrganizedAt ? `最近整理<br>${escapeHtml(formatTime(overview.lastOrganizedAt))}` : '仅展示当前已实现能力'}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${currentPage.label}</h2><p>${currentPage.description}</p></div><span class="stx-memory-page-counter">${PAGES.findIndex((page) => page.id === state.page) + 1} / ${PAGES.length}</span></header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section></main></div>`;
     traceMemoryStartup('workbench:dom-rendered');
     popupUi?.refreshControls(root);
     refreshGraphMarquees(root);
@@ -1140,7 +1202,7 @@ export function renderMemoryWorkbench(
       const selectedEdgeId = state.selectedGraphNodeId ? '' : state.selectedGraphEdgeId && view.edges.some((edge) => edge.id === state.selectedGraphEdgeId) ? state.selectedGraphEdgeId : '';
       const selectedEventEdgeId = state.selectedGraphNodeId || selectedEdgeId ? '' : state.selectedGraphEventId && view.edges.some((edge) => edge.id === state.selectedGraphEventId && edge.kind === 'event') ? state.selectedGraphEventId : '';
       graphRenderer = mountRelationshipGraphThree(graphHost, {
-        graph: state.graph,
+        graph: localizeLegacyGraphPreview(state.graph),
         visibleEdgeIds: new Set(view.edges.map((edge) => edge.id)),
         selectedEdgeId,
         selectedEventEdgeId,
@@ -1348,6 +1410,7 @@ export function renderMemoryWorkbench(
     rerender();
   }, { signal: abortController.signal });
 
+  removeOverviewChanged = controller.onOverviewChanged?.(() => { void refreshOverviewSnapshot(); });
   render();
   void document.fonts?.ready.then(() => refreshGraphMarquees(root));
   traceMemoryStartup('workbench:initial-rendered');
@@ -1375,6 +1438,7 @@ export function renderMemoryWorkbench(
     if (renderFrame !== undefined) window.cancelAnimationFrame(renderFrame);
     if (graphMarqueeResizeFrame !== undefined) window.cancelAnimationFrame(graphMarqueeResizeFrame);
     if (graphListModeFrame !== undefined) window.cancelAnimationFrame(graphListModeFrame);
+    removeOverviewChanged?.();
     graphMarqueeResizeObserver?.disconnect();
     graphRenderer?.dispose();
     graphRenderer = undefined;

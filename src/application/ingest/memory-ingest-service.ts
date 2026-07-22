@@ -77,6 +77,30 @@ function recoverExactEvidenceExcerpt(sourceContent: string, value: string): stri
   return match?.[0] ?? excerpt;
 }
 
+const HAN_CHARACTER = /\p{Script=Han}/u;
+const LATIN_KEY = /^[A-Za-z][A-Za-z0-9 _-]*$/u;
+
+function isAllowedEntityKey(value: string, sourceContent: string): boolean {
+  const key = value.trim();
+  if (!key || HAN_CHARACTER.test(key) || !LATIN_KEY.test(key)) return true;
+  return sourceContent.includes(key);
+}
+
+function validateChineseExtractionKeys(
+  proposal: ValidatedFactProposal,
+  sourceContent: string,
+): { ok: true } | { ok: false; code: AutomaticProposalErrorCode; message: string } {
+  if (!HAN_CHARACTER.test(proposal.predicateKey)) {
+    return { ok: false, code: 'non_chinese_key', message: '自动提取的关系、动作和属性名称必须使用中文。' };
+  }
+  const entityKeys = [proposal.subjectKey, proposal.objectKey, ...proposal.entityKeys]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  if (entityKeys.some((value) => !isAllowedEntityKey(value, sourceContent))) {
+    return { ok: false, code: 'non_chinese_key', message: '自动提取的实体名称必须使用中文；英文专名仅可逐字取自来源原文。' };
+  }
+  return { ok: true };
+}
+
 function stateSnapshotProposals(sources: readonly SourceBlock[]): ValidatedFactProposal[] {
   return sources.filter(source => source.kind === 'state').flatMap((source) => source.content.split('\n').flatMap((line) => {
     const [marker, rawPath, ...valueParts] = line.split('\t');
@@ -113,6 +137,8 @@ function validateProposal(
   const contentLength = Array.from(proposal.content.trim()).length;
   if (!source) return { ok: false, code: 'missing_source', message: `来源 ${proposal.sourceRef || '(空)'} 不存在。` };
   if (!proposal.subjectKey.trim() || !proposal.predicateKey.trim()) return { ok: false, code: 'invalid_shape', message: '事实缺少主语或谓词。' };
+  const keyValidation = validateChineseExtractionKeys(proposal, source.content);
+  if (!keyValidation.ok) return keyValidation;
   if (contentLength < 20 || contentLength > 240) return { ok: false, code: 'content_length', message: '事实正文必须为 20–240 字。' };
   if (!Number.isFinite(proposal.confidence) || proposal.confidence < 0 || proposal.confidence > 1) return { ok: false, code: 'invalid_confidence', message: '置信度必须位于 0–1。' };
   if (!proposal.evidenceExcerpt.trim()) return { ok: false, code: 'empty_excerpt', message: '证据摘录不能为空。' };

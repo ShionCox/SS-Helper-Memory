@@ -351,6 +351,7 @@ export type AutomaticProposalErrorCode =
   | 'cross_chat_source'
   | 'empty_excerpt'
   | 'excerpt_mismatch'
+  | 'non_chinese_key'
   | 'duplicate_proposal';
 
 export type AutomaticProposalValidation =

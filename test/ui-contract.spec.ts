@@ -13,7 +13,9 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(source).toContain('popupUi?.refreshControls(root)');
     expect(styles).toContain('--ss-control-input-padding-inline-start: 34px');
     expect(styles).toMatch(/\.stx-memory-statusbar\s+\[data-ss-helper-control="status"\][^}]*justify-self:\s*start/u);
-    expect(styles).toMatch(/\.stx-memory-statusbar\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1\.35fr\)\s+repeat\(4,/u);
+    expect(styles).toMatch(/\.stx-memory-statusbar\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1\.35fr\)\s+repeat\(6,/u);
+    expect(styles).toMatch(/\.stx-memory-panel\s*>\s*p\.stx-memory-estimate-note\s*\{[^}]*margin:\s*14px\s+0\s+0/u);
+    expect(styles).toContain('.stx-memory-workbench .stx-memory-panel > p.stx-memory-estimate-note { margin: 14px 0 0; }');
     expect(styles).toMatch(/\.stx-memory-chat-storage\s*\{[^}]*border-radius:\s*7px/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-maintenance-action\[data-ss-helper-control="button"\][^}]*display:\s*grid[^}]*grid-template-columns:\s*34px\s+minmax\(0,\s*1fr\)\s+20px/u);
     expect(styles).toMatch(/\.stx-memory-maintenance-icon\s*\{[^}]*width:\s*34px[^}]*height:\s*34px[^}]*place-items:\s*center/u);

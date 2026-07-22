@@ -3,12 +3,19 @@ import type { MemoryFact, MemoryJob, MemoryRecallLog } from '../src/domain';
 import type { ExistingMemoryContextItem, SourceBlock } from '../src/application/ingest/types';
 import { MEMORY_DEFAULT_SETTINGS } from '../src/ss-helper/settings';
 
+type TestRecallRoutes = {
+  embedding: { available: boolean; resourceId?: string; model?: string; blockedReason?: string };
+  rerank: { available: boolean; resourceId?: string; model?: string; blockedReason?: string };
+};
+
 const state = vi.hoisted(() => ({
   sources: [] as SourceBlock[],
   release: null as null | (() => void),
   extractCalls: 0,
   lastExtractSources: [] as SourceBlock[],
   lastExtractExistingMemoryContext: [] as readonly ExistingMemoryContextItem[],
+  recallRoutePromise: null as Promise<TestRecallRoutes> | null,
+  recallRouteRelease: null as ((routes: TestRecallRoutes) => void) | null,
 }));
 
 vi.mock('../src/host/source-adapter', async () => {
@@ -19,7 +26,7 @@ vi.mock('../src/host/source-adapter', async () => {
 vi.mock('../src/application/ingest/llm-extractor', () => ({
   readMemoryLlmApi: () => ({}),
   readMemoryLlmRouteDiagnostic: async () => ({ available: true, resourceId: 'test-resource', model: 'test-model' }),
-  readMemoryRecallRouteDiagnostics: async () => ({
+  readMemoryRecallRouteDiagnostics: () => state.recallRoutePromise ?? Promise.resolve({
     embedding: { available: false, blockedReason: 'test route disabled' },
     rerank: { available: false, blockedReason: 'test route disabled' },
   }),
@@ -109,6 +116,8 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     state.extractCalls = 0;
     state.lastExtractSources = [];
     state.lastExtractExistingMemoryContext = [];
+    state.recallRoutePromise = null;
+    state.recallRouteRelease = null;
   });
 
   it('旧设置缺失时启用旧记忆参考默认值，并收敛损坏的持久化范围', async () => {
@@ -157,6 +166,40 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     app.stop();
   });
 
+  it('总览不等待召回路由探测，并在聊天读取失败后发布最终路由状态', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    vi.spyOn(repository, 'listFacts').mockRejectedValue(new Error('chat read failed'));
+    state.recallRoutePromise = new Promise<TestRecallRoutes>((resolve) => { state.recallRouteRelease = resolve; });
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    await app.start();
+    let overviewChanged = 0;
+    const removeOverviewListener = app.onOverviewChanged(() => { overviewChanged += 1; });
+
+    const overviewPromise = app.getOverview();
+    await expect(Promise.race([
+      overviewPromise.then(() => 'overview'),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 50)),
+    ])).resolves.toBe('overview');
+    const initialOverview = await overviewPromise;
+    expect(initialOverview).toMatchObject({ status: 'error' });
+    expect(initialOverview.embedding).toBeUndefined();
+    expect(initialOverview.rerank).toBeUndefined();
+
+    state.recallRouteRelease?.({
+      embedding: { available: true, resourceId: 'embed-route', model: 'Embed-Test' },
+      rerank: { available: false, blockedReason: 'LLMHub 未加载或版本过旧' },
+    });
+    await vi.waitFor(() => expect(overviewChanged).toBe(1));
+    await expect(app.getOverview()).resolves.toMatchObject({
+      embedding: { available: true, resourceId: 'embed-route' },
+      rerank: { available: false, blockedReason: 'LLMHub 未加载或版本过旧' },
+    });
+    removeOverviewListener();
+    app.stop();
+  });
+
   it('按来源组裁剪后实时重算初始化批次', async () => {
     state.sources = [
       ...Array.from({ length: 21 }, (_, index) => message(index)),
@@ -190,10 +233,10 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     await app.start();
 
     await expect(app.getInitializationSources()).resolves.toEqual([
-      expect.objectContaining({ kind: 'message', count: 1, rawCount: 3, defaultCount: 1, excludedCount: 2 }),
+      expect.objectContaining({ kind: 'message', count: 1, rawCount: 3, defaultCount: 1, excludedCount: 2, invisibleCount: 1 }),
     ]);
     await expect(app.getInitializationSources({ includeInvisibleHistory: true })).resolves.toEqual([
-      expect.objectContaining({ kind: 'message', count: 2, rawCount: 3, defaultCount: 1, excludedCount: 1 }),
+      expect.objectContaining({ kind: 'message', count: 2, rawCount: 3, defaultCount: 1, excludedCount: 1, invisibleCount: 1 }),
     ]);
     await expect(app.getInitializationEstimate()).resolves.toMatchObject({ messageCount: 1 });
     await expect(app.getInitializationEstimate(undefined, { includeInvisibleHistory: true })).resolves.toMatchObject({ messageCount: 2 });

@@ -25,6 +25,7 @@ import {
   readMemoryLlmRouteDiagnostic,
   readMemoryRecallRouteDiagnostics,
   type MemoryLlmRouteDiagnostic,
+  type MemoryRecallRouteDiagnostics,
 } from './ingest/llm-extractor';
 import { MemoryIngestService } from './ingest/memory-ingest-service';
 import { ExistingMemoryContextRetriever } from './ingest/existing-memory-context';
@@ -88,6 +89,7 @@ const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   graphMaxEdges: 12,
 });
 const MAX_MEMORY_BACKUP_BYTES = 64 * 1024 * 1024;
+const MEMORY_RECALL_ROUTE_CACHE_TTL_MS = 5_000;
 
 function createId(prefix: string): string {
   return `${prefix}:${crypto.randomUUID()}`;
@@ -208,8 +210,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   private hostContext: MemoryHostContext | null = null;
   private llmRouteDiagnostic: MemoryLlmRouteDiagnostic | undefined;
   private llmRouteDiagnosticPending: Promise<void> | undefined;
+  private recallRouteDiagnostic: MemoryRecallRouteDiagnostics | undefined;
+  private recallRouteDiagnosticAt = 0;
+  private recallRouteDiagnosticPending: Promise<void> | undefined;
+  private recallRouteProbeVersion = 0;
 
   private readonly settingsListeners = new Set<(settings: MemoryUiSettings) => void>();
+  private readonly overviewListeners = new Set<() => void>();
 
   constructor(readonly repository: MemoryRepository) {
     this.vectorIndex = new MemoryVectorIndexService(repository);
@@ -273,8 +280,44 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return this.llmRouteDiagnostic ?? { available: readMemoryLlmApi() !== null, blockedReason: 'LLM 路由状态正在加载' };
   }
 
+  private currentRecallRouteDiagnostics(): MemoryRecallRouteDiagnostics | undefined {
+    if (this.stopped) return this.recallRouteDiagnostic;
+    const now = Date.now();
+    const cacheFresh = this.recallRouteDiagnostic !== undefined
+      && now - this.recallRouteDiagnosticAt < MEMORY_RECALL_ROUTE_CACHE_TTL_MS;
+    if (!cacheFresh && this.recallRouteDiagnosticPending === undefined) {
+      const probeVersion = this.recallRouteProbeVersion;
+      const pending = readMemoryRecallRouteDiagnostics()
+        .then((diagnostic) => {
+          if (this.recallRouteProbeVersion !== probeVersion) return;
+          this.recallRouteDiagnostic = diagnostic;
+          this.recallRouteDiagnosticAt = Date.now();
+        })
+        .catch(() => {
+          if (this.recallRouteProbeVersion !== probeVersion) return;
+          this.recallRouteDiagnostic = {
+            embedding: { available: false, blockedReason: '暂时无法读取 LLM 资源状态' },
+            rerank: { available: false, blockedReason: '暂时无法读取 LLM 资源状态' },
+          };
+          this.recallRouteDiagnosticAt = Date.now();
+        })
+        .finally(() => {
+          if (this.recallRouteDiagnosticPending === pending) this.recallRouteDiagnosticPending = undefined;
+          if (!this.stopped && this.recallRouteProbeVersion === probeVersion) this.emitOverviewChanged();
+        });
+      this.recallRouteDiagnosticPending = pending;
+    }
+    return this.recallRouteDiagnostic;
+  }
+
   async start(): Promise<void> {
     this.stopped = false;
+    this.llmRouteDiagnostic = undefined;
+    this.llmRouteDiagnosticPending = undefined;
+    this.recallRouteProbeVersion += 1;
+    this.recallRouteDiagnostic = undefined;
+    this.recallRouteDiagnosticAt = 0;
+    this.recallRouteDiagnosticPending = undefined;
     try {
       await this.repository.open();
       this.sqliteAvailable = true;
@@ -293,6 +336,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   stop(): void {
     this.stopped = true;
+    this.recallRouteProbeVersion += 1;
     this.captureVersion += 1;
     this.bindVersion += 1;
     this.recallIndex.replace([]);
@@ -562,12 +606,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   async getOverview(): Promise<MemoryUiOverview> {
     traceMemoryStartup('application:overview-begin');
     const chatKey = this.getChatKey();
+    const recallRoutes = this.currentRecallRouteDiagnostics();
     const storage = this.repository.getHealthSnapshot();
     const currentChatSizeBytes = storage?.currentChatSizeBytes ?? 0;
     const currentChatUsageRatio = storage?.workspaceSizeBytes
       ? currentChatSizeBytes / storage.workspaceSizeBytes
       : 0;
-    const degraded = (message = this.error): MemoryUiOverview => {
+    const degraded = (message = this.error, recallRoutes?: MemoryRecallRouteDiagnostics): MemoryUiOverview => {
       const diagnostic = this.errorDiagnostic ?? describeMemoryError(message, 'SQLITE_SERVICE_UNAVAILABLE', 'health');
       const currentChat = this.getCurrentChatInfo();
       return ({
@@ -581,6 +626,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       lastOrganizedAt: this.lastOrganizedAt,
       pendingJobs: 0,
       llmAvailable: readMemoryLlmApi() !== null,
+      ...(recallRoutes ? { embedding: recallRoutes.embedding, rerank: recallRoutes.rerank } : {}),
       errorCode: diagnostic.code,
       error: diagnostic.reason,
       errorDiagnostic: diagnostic,
@@ -588,7 +634,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     };
     if (!this.sqliteAvailable) {
       traceMemoryStartup('application:overview-degraded');
-      return degraded();
+      return degraded(this.error, recallRoutes);
     }
     let facts: MemoryFact[] = [];
     let jobs: MemoryJob[] = [];
@@ -600,7 +646,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         this.recallIndex.replace([]);
         this.setRuntimeError(error, 'MEMORY_CHAT_READ_FAILED', 'chat-bind');
         traceMemoryStartup('application:overview-records-failed');
-        return degraded(this.error);
+        return degraded(this.error, recallRoutes);
       }
     }
     const latestCompletedAt = jobs
@@ -624,6 +670,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       llmAvailable: readMemoryLlmApi() !== null,
       ...(llmRoute.resourceId ? { llmResource: llmRoute.resourceId } : {}),
       ...(llmRoute.model ? { llmModel: llmRoute.model } : {}),
+      ...(recallRoutes ? { embedding: recallRoutes.embedding, rerank: recallRoutes.rerank } : {}),
       ...(errorCode ? { errorCode } : {}),
       ...(this.error ? { error: this.error } : {}),
       ...(this.errorDiagnostic ? { errorDiagnostic: this.errorDiagnostic } : {}),
@@ -640,17 +687,21 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         const rawGroups = summarizeSourceGroups(sources);
         const defaultGroups = summarizeSourceGroups(filterSourceBlocks(sources));
         const currentGroups = summarizeSourceGroups(filterSourceBlocks(sources, options));
+        const invisibleGroups = summarizeSourceGroups(filterSourceBlocks(sources, { includeInvisibleHistory: true }));
         const defaultById = new Map(defaultGroups.map((group) => [group.id, group]));
         const currentById = new Map(currentGroups.map((group) => [group.id, group]));
+        const invisibleById = new Map(invisibleGroups.map((group) => [group.id, group]));
         return rawGroups.map((group) => {
           const current = currentById.get(group.id);
           const safe = defaultById.get(group.id);
+          const invisible = invisibleById.get(group.id);
           return {
             ...group,
             count: current?.count ?? 0,
             rawCount: group.count,
             defaultCount: safe?.count ?? 0,
             excludedCount: Math.max(0, group.count - (current?.count ?? 0)),
+            invisibleCount: Math.max(0, (invisible?.count ?? 0) - (safe?.count ?? 0)),
           };
         });
       }),
@@ -666,6 +717,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       rawCount: group.rawCount,
       defaultCount: group.defaultCount,
       excludedCount: group.excludedCount,
+      ...(group.invisibleCount === undefined ? {} : { invisibleCount: group.invisibleCount }),
       selected: group.count > 0 && selectedKinds.has(group.id),
     }));
   }
@@ -828,6 +880,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   onSettingsChanged(listener: (settings: MemoryUiSettings) => void): () => void {
     this.settingsListeners.add(listener);
     return () => this.settingsListeners.delete(listener);
+  }
+
+  onOverviewChanged(listener: () => void): () => void {
+    this.overviewListeners.add(listener);
+    return () => this.overviewListeners.delete(listener);
   }
 
   async updateFact(id: string, content: string): Promise<void> {
@@ -1496,6 +1553,12 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   private emitSettingsChanged(): void {
     this.settingsListeners.forEach((listener) => listener(this.getSettings()));
+  }
+
+  private emitOverviewChanged(): void {
+    this.overviewListeners.forEach((listener) => {
+      try { listener(); } catch { /* a stale popup listener must not affect application state */ }
+    });
   }
 
   private scheduleGraph(chatKey: string): void {
