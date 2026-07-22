@@ -32,8 +32,8 @@ const COLLECTIONS = Object.freeze({
   'scene-casts': ['workspaceId', 'chatKey', 'floor', 'createdAt'],
   'capture-jobs': ['workspaceId', 'chatKey', 'status', 'updatedAt'],
   'change-audits': ['workspaceId', 'chatKey', 'createdAt'],
-  'memory-details': ['workspaceId', 'ownerId', 'traceId'],
-  'memory-links': ['workspaceId', 'ownerId', 'updatedAt'],
+  'memory-details': ['workspaceId', 'chatKey', 'ownerId', 'traceId'],
+  'memory-links': ['workspaceId', 'chatKey', 'ownerId', 'updatedAt'],
   'vector-index': ['workspaceId', 'chatKey', 'recordId', 'updatedAt'],
   'graph-nodes': ['workspaceId', 'chatKey', 'entityKey', 'updatedAt'],
   'graph-edges': ['workspaceId', 'chatKey', 'fromNodeId', 'toNodeId', 'backingFactId', 'updatedAt'],
@@ -43,7 +43,7 @@ const COLLECTIONS = Object.freeze({
   'recall-exposures': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
   'dream-jobs': ['workspaceId', 'chatKey', 'ownerId', 'status', 'updatedAt'],
   'dream-audits': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
-  'dream-narratives': ['workspaceId', 'ownerId', 'createdAt'],
+  'dream-narratives': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
 } as const);
 
 type Persistable = MemoryOwner | ActorAlias | MemoryEpisode | MemoryObservation | MemoryFact | ActorMemoryTrace | SceneCast | Record<string, unknown>;

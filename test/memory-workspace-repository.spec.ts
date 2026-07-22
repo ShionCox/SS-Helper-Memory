@@ -199,7 +199,7 @@ describe('MemoryRepository workspace concurrency', () => {
     const slotRecordId = `fact-head:${encodeURIComponent('chat-a')}:${encodeURIComponent(slotKey)}`;
     let committedUndo: WorkspaceRecord | null = null;
     const get = vi.fn(async (request: { collection?: string; recordId: string }) => {
-      if (request.collection === 'change-audits' && request.recordId === 'undo-v2:job-a:1') return committedUndo;
+      if (request.collection === 'change-audits' && request.recordId === 'undo-v0:job-a:1') return committedUndo;
       if (request.collection === 'fact-heads') return { recordId: slotRecordId, value: { chatKey: 'chat-a', slotKey, factId: previous.id }, version: 2, revision: 5, updatedAt: 50 } as WorkspaceRecord;
       return null;
     });
@@ -208,7 +208,7 @@ describe('MemoryRepository workspace concurrency', () => {
       nextCursor: null,
     }));
     const transaction = vi.fn(async (request) => {
-      const undo = request.operations.find((operation: { recordId: string }) => operation.recordId === 'undo-v2:job-a:1');
+      const undo = request.operations.find((operation: { recordId: string }) => operation.recordId === 'undo-v0:job-a:1');
       committedUndo = { recordId: undo.recordId, value: undo.value, version: 1, revision: 1, updatedAt: 100 } as WorkspaceRecord;
       return { operationCount: request.operations.length, replayed: false, results: [] };
     });
@@ -221,20 +221,20 @@ describe('MemoryRepository workspace concurrency', () => {
     expect(second).toEqual(first);
     expect(transaction).toHaveBeenCalledTimes(1);
     const request = transaction.mock.calls[0][0];
-    expect(request.idempotencyKey).toBe('undo-v2:job-a:1');
+    expect(request.idempotencyKey).toBe('undo-v0:job-a:1');
     expect(request.operations).toEqual(expect.arrayContaining([
       expect.objectContaining({ collection: 'facts', recordId: previous.id, expectedRevision: 11 }),
       expect.objectContaining({ collection: 'fact-heads', recordId: slotRecordId, expectedRevision: 5 }),
     ]));
-    const undoValue = request.operations.find((operation: { recordId: string }) => operation.recordId === 'undo-v2:job-a:1').value;
+    const undoValue = request.operations.find((operation: { recordId: string }) => operation.recordId === 'undo-v0:job-a:1').value;
     expect(undoValue.entries).toEqual(expect.arrayContaining([expect.objectContaining({ collection: 'facts', recordId: previous.id, beforeRevision: 11, afterRevision: 12 })]));
   });
 
-  it('collapses consecutive UndoLogV2 changes into one atomic inverse write', async () => {
+  it('collapses consecutive UndoLogV0 changes into one atomic inverse write', async () => {
     const before = { id: 'fact-a', chatKey: 'chat-a', content: 'A' }; const middle = { id: 'fact-a', chatKey: 'chat-a', content: 'B' }; const after = { id: 'fact-a', chatKey: 'chat-a', content: 'C' };
     const logs = [
-      { id: 'undo-v2:job-a:1', kind: 'undo-log-v0', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 1, transactionId: 'tx-1', committedSequence: 1, createdAt: 1, entries: [{ collection: 'facts', recordId: 'fact-a', before, after: middle, beforeRevision: 1, afterRevision: 2 }] },
-      { id: 'undo-v2:job-a:2', kind: 'undo-log-v0', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 2, transactionId: 'tx-2', committedSequence: 2, createdAt: 2, entries: [{ collection: 'facts', recordId: 'fact-a', before: middle, after, beforeRevision: 2, afterRevision: 3 }] },
+      { id: 'undo-v0:job-a:1', kind: 'undo-log-v0', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 1, transactionId: 'tx-1', committedSequence: 1, createdAt: 1, entries: [{ collection: 'facts', recordId: 'fact-a', before, after: middle, beforeRevision: 1, afterRevision: 2 }] },
+      { id: 'undo-v0:job-a:2', kind: 'undo-log-v0', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 2, transactionId: 'tx-2', committedSequence: 2, createdAt: 2, entries: [{ collection: 'facts', recordId: 'fact-a', before: middle, after, beforeRevision: 2, afterRevision: 3 }] },
     ];
     const rows = logs.map((value, index) => ({ recordId: value.id, value, version: 1, revision: 1, updatedAt: index + 1 }));
     const get = vi.fn(async (request: { collection?: string; recordId: string }) => {
@@ -256,9 +256,9 @@ describe('MemoryRepository workspace concurrency', () => {
     expect(vectorDelete).toHaveBeenCalledWith(expect.objectContaining({ recordId: 'fact-a' }));
   });
 
-  it('rejects UndoLogV2 rollback when the latest record revision changed', async () => {
+  it('rejects UndoLogV0 rollback when the latest record revision changed', async () => {
     const after = { id: 'fact-a', content: 'C' };
-    const log = { id: 'undo-v2:job-a:1', kind: 'undo-log-v0', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 1, transactionId: 'tx-1', committedSequence: 1, createdAt: 1, entries: [{ collection: 'facts', recordId: 'fact-a', before: { id: 'fact-a', content: 'A' }, after, beforeRevision: 1, afterRevision: 2 }] };
+    const log = { id: 'undo-v0:job-a:1', kind: 'undo-log-v0', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 1, transactionId: 'tx-1', committedSequence: 1, createdAt: 1, entries: [{ collection: 'facts', recordId: 'fact-a', before: { id: 'fact-a', content: 'A' }, after, beforeRevision: 1, afterRevision: 2 }] };
     const get = vi.fn(async (request: { recordId: string }) => request.recordId === 'rollback-v0:job-a:1' ? null : ({ recordId: 'fact-a', value: after, version: 3, revision: 3, updatedAt: 3 } as WorkspaceRecord));
     const query = vi.fn(async () => ({ records: [{ recordId: log.id, value: log, version: 1, revision: 1, updatedAt: 1 }], nextCursor: null }));
     const transaction = vi.fn(); const repository = new MemoryRepository(workspace({ get: get as never, query: query as never, transaction })); repository.bind('character:c1', 'chat-a');

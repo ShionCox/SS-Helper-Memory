@@ -182,7 +182,11 @@ export class ActorRegistry {
 
   private addAlias(owner: MemoryOwner, value: string, sourceRef: string, confidence: number, status: ActorAlias['status'] = 'confirmed', sourceType: ActorDiscoverySource = 'message'): ActorAlias {
     const normalizedValue = normalizeActorName(value);
-    const id = `actor-alias:${owner.id}:${normalizedValue}`;
+    // Workspace record IDs only accept the SDK v0 safe alphabet. Normalized
+    // aliases intentionally retain CJK and other Unicode characters for
+    // matching, so encode only the persistence key and keep the searchable
+    // normalized value unchanged in the record body.
+    const id = `actor-alias:${owner.id}:${encodeURIComponent(normalizedValue)}`;
     const timestamp = now();
     const alias: ActorAlias = {
       id,

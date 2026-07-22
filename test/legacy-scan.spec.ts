@@ -33,4 +33,19 @@ describe('legacy scan coverage', () => {
       readContents: async () => { throw new Error('EIO'); },
     })).resolves.toEqual(['src/entry.ts: unable to read tracked candidate: EIO']);
   });
+
+  it.each([
+    'interface UndoLogV2 {}',
+    'interface RollbackMarkerV3 {}',
+    "const id = 'undo-v2:job:1'",
+    "const id = 'rollback-v4:job:1'",
+    "const key = 'ss-helper.memory.settings.v2'",
+  ])('rejects retired version identity %s', async (contents) => {
+    const violations = await scanLegacyReferences({
+      listTrackedPaths: async () => ['src/entry.ts'],
+      checkAccess: async () => undefined,
+      readContents: async () => contents,
+    });
+    expect(violations).toHaveLength(1);
+  });
 });

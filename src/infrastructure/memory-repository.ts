@@ -58,15 +58,15 @@ const COLLECTIONS = Object.freeze({
   'scene-casts': ['workspaceId', 'chatKey', 'floor', 'createdAt'],
   'capture-jobs': ['workspaceId', 'chatKey', 'status', 'updatedAt'],
   'change-audits': ['workspaceId', 'chatKey', 'createdAt'],
-  'memory-details': ['workspaceId', 'ownerId', 'traceId'],
-  'memory-links': ['workspaceId', 'ownerId', 'updatedAt'],
+  'memory-details': ['workspaceId', 'chatKey', 'ownerId', 'traceId'],
+  'memory-links': ['workspaceId', 'chatKey', 'ownerId', 'updatedAt'],
   profiles: ['workspaceId', 'ownerId', 'updatedAt'],
   'profile-claims': ['workspaceId', 'ownerId', 'level', 'updatedAt'],
   'relationship-claims': ['workspaceId', 'fromOwnerId', 'toOwnerId', 'updatedAt'],
   'recall-exposures': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
   'dream-jobs': ['workspaceId', 'chatKey', 'ownerId', 'status', 'updatedAt'],
   'dream-audits': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
-  'dream-narratives': ['workspaceId', 'ownerId', 'createdAt'],
+  'dream-narratives': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
   usage: ['chatKey', 'capturedAt'],
   'recall-logs': ['chatKey', 'createdAt'],
   'graph-nodes': ['workspaceId', 'chatKey', 'entityKey', 'updatedAt'],
@@ -204,7 +204,7 @@ interface UndoLogEntry {
   afterRevision?: number;
 }
 
-interface UndoLogV2 {
+interface UndoLogV0 {
   id: string;
   kind: 'undo-log-v0';
   chatKey: string;
@@ -219,7 +219,7 @@ interface UndoLogV2 {
   rolledBackBy?: string;
 }
 
-interface RollbackMarkerV2 {
+interface RollbackMarkerV0 {
   id: string;
   kind: 'rollback-v0';
   chatKey: string;
@@ -706,10 +706,10 @@ export class MemoryRepository implements IngestCommitter {
     const chatKey = this.requireChatKey(input.chatKey);
     const startedAt = Date.now();
     const batchIndex = input.checkpoint.batchIndex ?? 1;
-    const undoLogId = `undo-v2:${input.jobId}:${batchIndex}`;
+    const undoLogId = `undo-v0:${input.jobId}:${batchIndex}`;
     const existingUndo = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'change-audits', recordId: undoLogId });
     if (existingUndo) {
-      const log = existingUndo.value as unknown as UndoLogV2;
+      const log = existingUndo.value as unknown as UndoLogV0;
       if (log.kind !== 'undo-log-v0' || log.chatKey !== chatKey || !log.result) {
         throw Object.assign(new Error('整理批次幂等标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
       }
@@ -936,7 +936,7 @@ export class MemoryRepository implements IngestCommitter {
       const jobRecord = await this.workspace.get({ workspaceId, collection: 'capture-jobs', recordId: job.id });
       operations.push({ action: 'upsert', collection: 'capture-jobs', recordId: job.id, value: asPlain(job), expectedVersion: jobRecord?.version ?? 0 });
       operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
-      const undoLog: UndoLogV2 = { id: undoLogId, kind: 'undo-log-v0', chatKey, jobId: job.id, batchIndex, transactionId: input.audit?.requestId ?? undoLogId, committedSequence: nextCommittedSequence(), entries: undoEntries, result: structuredClone(result), createdAt: startedAt };
+      const undoLog: UndoLogV0 = { id: undoLogId, kind: 'undo-log-v0', chatKey, jobId: job.id, batchIndex, transactionId: input.audit?.requestId ?? undoLogId, committedSequence: nextCommittedSequence(), entries: undoEntries, result: structuredClone(result), createdAt: startedAt };
       operations.push({ action: 'upsert', collection: 'change-audits', recordId: undoLog.id, value: asPlain(undoLog) });
       this.requireChatKey(chatKey);
       await this.workspace.transaction({ workspaceId, idempotencyKey: undoLogId, operations });
@@ -993,7 +993,7 @@ export class MemoryRepository implements IngestCommitter {
     const markerId = `rollback-v0:${jobId}:${batchIndex}`;
     const existingMarker = await this.workspace.get({ workspaceId, collection: 'change-audits', recordId: markerId });
     if (existingMarker) {
-      const marker = existingMarker.value as unknown as RollbackMarkerV2;
+      const marker = existingMarker.value as unknown as RollbackMarkerV0;
       if (marker.kind !== 'rollback-v0') throw Object.assign(new Error('回滚标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
       if (marker.status === 'completed') return [];
       await this.deleteRollbackVectors(workspaceId, marker);
@@ -1001,11 +1001,11 @@ export class MemoryRepository implements IngestCommitter {
     }
     const allRows = await this.listAllRecordRows('change-audits');
     const logRows = allRows.filter((row) => (row.value as { kind?: unknown }).kind === 'undo-log-v0');
-    const allLogs = logRows.map((row) => ({ row, log: row.value as unknown as UndoLogV2 })).filter(({ log }) => !log.rolledBackBy).sort((left, right) => left.log.committedSequence - right.log.committedSequence);
+    const allLogs = logRows.map((row) => ({ row, log: row.value as unknown as UndoLogV0 })).filter(({ log }) => !log.rolledBackBy).sort((left, right) => left.log.committedSequence - right.log.committedSequence);
     const target = allLogs.find(({ log }) => log.jobId === jobId && log.batchIndex === batchIndex);
-    if (!target) throw new Error('该整理批次没有可执行的 UndoLogV2；旧快照仅可查看，不能执行回滚。');
+    if (!target) throw new Error('该整理批次没有可执行的 UndoLogV0；旧快照仅可查看，不能执行回滚。');
     if (expectedChatKey && target.log.chatKey !== expectedChatKey) throw new Error('整理批次不属于当前聊天。');
-    const included = new Map<string, { row: WorkspaceRecord; log: UndoLogV2 }>();
+    const included = new Map<string, { row: WorkspaceRecord; log: UndoLogV0 }>();
     for (const item of allLogs) if (item.log.chatKey === target.log.chatKey && item.log.jobId === jobId && item.log.batchIndex >= batchIndex) included.set(item.log.id, item);
     const affectedKeys = new Set([...included.values()].flatMap(({ log }) => log.entries.map(undoRecordKey)));
     let changed = true;
@@ -1024,7 +1024,7 @@ export class MemoryRepository implements IngestCommitter {
     const operations: WorkspaceTransactionOperation[] = [];
     const affectedFactIds = new Set<string>();
     for (const chain of chains.values()) {
-      for (let index = 1; index < chain.length; index += 1) if (!samePlainData(chain[index - 1].after, chain[index].before)) throw Object.assign(new Error('UndoLogV2 修订链不连续，回滚已取消。'), { code: 'WORKSPACE_CONFLICT' });
+      for (let index = 1; index < chain.length; index += 1) if (!samePlainData(chain[index - 1].after, chain[index].before)) throw Object.assign(new Error('UndoLogV0 修订链不连续，回滚已取消。'), { code: 'WORKSPACE_CONFLICT' });
       const first = chain[0]; const last = chain.at(-1)!; const current = await this.workspace.get({ workspaceId, collection: last.collection, recordId: last.recordId });
       const revision = current?.revision ?? current?.version ?? 0;
       if (last.after === undefined ? current !== null : current === null || !samePlainData(current.value, last.after) || (last.afterRevision !== undefined && revision !== last.afterRevision)) throw Object.assign(new Error('记忆记录已被其他任务修改，回滚已安全取消。'), { code: 'WORKSPACE_CONFLICT' });
@@ -1044,7 +1044,7 @@ export class MemoryRepository implements IngestCommitter {
       const auditRecord = allRows.find((row) => row.recordId === `batch-audit:${log.jobId}:${log.batchIndex}`);
       if (auditRecord) operations.push({ action: 'upsert', collection: 'change-audits', recordId: auditRecord.recordId, value: asPlain({ ...(auditRecord.value as object), rolledBackAt: rollbackAt, rollbackId: markerId }), expectedRevision: auditRecord.revision ?? auditRecord.version });
     }
-    const marker: RollbackMarkerV2 = { id: markerId, kind: 'rollback-v0', chatKey: target.log.chatKey, jobId, batchIndex, status: 'index-repair-pending', affectedLogIds: [...included.keys()], affectedFactIds: [...affectedFactIds], createdAt: rollbackAt };
+    const marker: RollbackMarkerV0 = { id: markerId, kind: 'rollback-v0', chatKey: target.log.chatKey, jobId, batchIndex, status: 'index-repair-pending', affectedLogIds: [...included.keys()], affectedFactIds: [...affectedFactIds], createdAt: rollbackAt };
     operations.push({ action: 'upsert', collection: 'change-audits', recordId: markerId, value: asPlain(marker), expectedRevision: 0 });
     const result = await this.workspace.transaction({ workspaceId, idempotencyKey: markerId, operations });
     void result;
@@ -1052,7 +1052,7 @@ export class MemoryRepository implements IngestCommitter {
     return [...marker.affectedFactIds];
   }
 
-  private async deleteRollbackVectors(workspaceId: string, marker: RollbackMarkerV2): Promise<void> {
+  private async deleteRollbackVectors(workspaceId: string, marker: RollbackMarkerV0): Promise<void> {
     const failed: string[] = [];
     for (const recordId of marker.affectedFactIds) try {
       const factRecord = await this.workspace.get({ workspaceId, collection: 'facts', recordId });
@@ -1068,7 +1068,7 @@ export class MemoryRepository implements IngestCommitter {
     const markerId = `rollback-v0:${jobId}:${batchIndex}`;
     const markerRecord = await this.workspace.get({ workspaceId, collection: 'change-audits', recordId: markerId });
     if (!markerRecord) throw Object.assign(new Error('回滚修复标识不存在。'), { code: 'WORKSPACE_CONFLICT' });
-    const marker = markerRecord.value as unknown as RollbackMarkerV2;
+    const marker = markerRecord.value as unknown as RollbackMarkerV0;
     if (marker.kind !== 'rollback-v0') throw Object.assign(new Error('回滚标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
     if (marker.status === 'completed') return;
     this.requireChatKey(marker.chatKey);
@@ -1082,7 +1082,7 @@ export class MemoryRepository implements IngestCommitter {
     if ([...requiredVectorIds].some((recordId) => !vectorIds.has(recordId))) {
       throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
     }
-    const completed: RollbackMarkerV2 = { ...marker, status: 'completed', completedAt: Date.now() };
+    const completed: RollbackMarkerV0 = { ...marker, status: 'completed', completedAt: Date.now() };
     await this.workspace.upsert({ workspaceId, collection: 'change-audits', recordId: marker.id, value: asPlain(completed), expectedRevision: markerRecord.revision ?? markerRecord.version });
   }
 

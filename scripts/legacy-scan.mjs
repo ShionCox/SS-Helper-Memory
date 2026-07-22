@@ -22,6 +22,9 @@ const forbidden = [
   /--memory-/u,
   /\bstx-ui-/u,
   /\bstx-memory-(?:button|input|chip|select-wrap)\b/u,
+  /\b(?:UndoLog|RollbackMarker)V[1-9]\d*\b/u,
+  /\b(?:undo|rollback)-v[1-9]\d*:/u,
+  /\.settings\.v[1-9]\d*\b/u,
 ];
 
 const executableExtensions = new Set(['.ts', '.js', '.mjs', '.cjs', '.json', '.css']);

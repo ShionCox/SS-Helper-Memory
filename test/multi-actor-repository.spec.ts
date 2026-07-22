@@ -8,6 +8,7 @@ type TransactionRequest = { operations: readonly { action: 'delete' | 'upsert'; 
 
 function port(): WorkspacePort {
   const collections = new Map<string, Map<string, { value: unknown; version: number; updatedAt: number }>>();
+  const declaredIndexes = new Map<string, Set<string>>();
   const key = (collection: string, id: string) => `${collection}:${id}`;
   return {
     health: async () => ({ ready: true, database: 'memory', schemaVersion: 0 }),
@@ -16,7 +17,10 @@ function port(): WorkspacePort {
     list: async () => ({ workspaces: [], nextCursor: null }),
     removeWorkspace: async () => false,
     clearOwned: async () => 0,
-    defineCollection: async (request: { name: string }) => { collections.set(request.name, collections.get(request.name) ?? new Map()); },
+    defineCollection: async (request: { name: string; indexes?: readonly string[] }) => {
+      collections.set(request.name, collections.get(request.name) ?? new Map());
+      declaredIndexes.set(request.name, new Set(request.indexes ?? []));
+    },
     get: async (request: RecordRequest) => {
       const collection = request.collection ?? ''; const recordId = request.recordId ?? '';
       const record = collections.get(collection)?.get(key(collection, recordId));
@@ -31,6 +35,11 @@ function port(): WorkspacePort {
     delete: async (request: RecordRequest) => { const collection = request.collection ?? ''; const recordId = request.recordId ?? ''; return Boolean(collections.get(collection)?.delete(key(collection, recordId))); },
     query: async (request: QueryRequest) => {
       const collection = request.collection ?? '';
+      for (const field of Object.keys(request.filter ?? {})) {
+        if (!declaredIndexes.get(collection)?.has(field)) {
+          throw Object.assign(new Error(`Index ${field} must be declared first`), { code: 'WORKSPACE_INDEX_REQUIRED' });
+        }
+      }
       const bucket = collections.get(collection) ?? new Map();
       const records: WorkspaceRecord[] = [...bucket.entries()].map(([compound, value]) => ({ recordId: compound.slice(collection.length + 1), ...value } as WorkspaceRecord)).filter(record => Object.entries(request.filter ?? {}).every(([field, expected]) => (record.value as Record<string, unknown>)[field] === expected));
       return { records, nextCursor: null };

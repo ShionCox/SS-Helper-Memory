@@ -15,6 +15,27 @@ const SEND_WINDOW_MS = 45_000;
 const MEMORY_PROMPT_ID = 'ss-helper.memory.recall.v0';
 const MAX_REBINDS_PER_TURN = 3;
 const REBIND_RETRY_DELAY_MS = 250;
+const SQLITE_STARTUP_RETRY_DELAYS_MS = [250, 750, 2_000] as const;
+
+export async function retrySqliteAvailability(
+  isAvailable: () => boolean,
+  refresh: () => Promise<boolean>,
+  options: { readonly delaysMs?: readonly number[]; readonly shouldContinue?: () => boolean } = {},
+): Promise<boolean> {
+  if (isAvailable()) return true;
+  for (const delayMs of options.delaysMs ?? SQLITE_STARTUP_RETRY_DELAYS_MS) {
+    if (options.shouldContinue?.() === false) return false;
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    if (options.shouldContinue?.() === false) return false;
+    if (isAvailable()) return true;
+    try {
+      if (await refresh()) return true;
+    } catch {
+      // A transient bridge/database failure is retried by the next bounded attempt.
+    }
+  }
+  return isAvailable();
+}
 
 export function memoryWorkspaceStatus(application: Pick<MemoryApplication, 'getCurrentChatInfo'>): SettingsStatusSnapshot {
   const chat = application.getCurrentChatInfo();
@@ -61,6 +82,14 @@ export class MemoryRuntime {
       traceMemoryStartup('runtime:context-ready');
       this.application.bindStorageScope(this.context.getWorkspaceId(), this.context.getChatKey());
       await this.application.start();
+      // Do not add an unconditional second health call after a healthy start:
+      // that raced APP_READY in fresh SillyTavern. Retry only a failed first
+      // open, with bounded delays for the server plugin to finish initializing.
+      const connected = await retrySqliteAvailability(
+        () => this.application.isSqliteAvailable(),
+        async () => (await this.application.getSqliteStatus()).connected,
+        { shouldContinue: () => !this.stopped },
+      );
       this.assertActive();
       traceMemoryStartup('runtime:application-started');
       const capabilityMonitor = new MemoryLlmCapabilityMonitor(
@@ -94,10 +123,6 @@ export class MemoryRuntime {
       this.assertActive();
       this.bindHostEvents(capabilityMonitor);
       traceMemoryStartup('runtime:contributions-registered');
-      // MemoryApplication.start() already ran the first workspace health/open
-      // sequence. A second health request here raced the host APP_READY turn in
-      // fresh SillyTavern and could leave the renderer unresponsive.
-      const connected = this.application.isSqliteAvailable();
       traceMemoryStartup(`runtime:storage-${connected ? 'connected' : 'degraded'}`);
       if (connected) logger.success('Memory workspace 已启动。');
       else {

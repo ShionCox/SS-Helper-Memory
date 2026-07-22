@@ -217,6 +217,50 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).toBe('');
   });
 
+  it('以状态简报展示当前聊天、能力状态和现有工作台入口', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const getOverview = vi.fn(async () => ({
+      status: 'ready' as const,
+      bound: true,
+      chatName: 'Assistant',
+      chatKey: 'Assistant - 2026-07-18@03h29m55s201ms',
+      factCount: 4,
+      currentChatSizeBytes: 156_160,
+      currentChatUsageRatio: 0.85,
+      lastOrganizedAt: 10,
+      pendingJobs: 0,
+      llmAvailable: true,
+      llmModel: 'test-llm',
+      embedding: { available: false, blockedReason: '未配置向量资源' },
+      rerank: { available: false, blockedReason: '未配置重排资源' },
+    }));
+    const dispose = renderMemoryWorkbench(container, workbenchController({ getOverview }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-action="navigate"][data-page="overview"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const overview = container.querySelector('.stx-memory-overview');
+    expect(overview).not.toBeNull();
+    expect(overview?.textContent).toContain('状态简报');
+    expect(overview?.textContent).toContain('当前聊天已就绪');
+    expect(overview?.textContent).toContain('助手 · 2026年7月18日 03:29:55');
+    expect(overview?.textContent).toContain('4 条事实');
+    expect(overview?.textContent).toContain('152.5 KB');
+    expect(overview?.textContent).toContain('占角色记忆 85%');
+    expect(overview?.textContent).toContain('大语言模型（LLM）');
+    expect(overview?.textContent).toContain('未配置向量资源');
+    expect(overview?.querySelector('[data-action="view-library"]')).not.toBeNull();
+    expect(overview?.querySelector('[data-action="navigate"][data-page="scenes"]')).not.toBeNull();
+    expect(overview?.querySelector('[data-action="navigate"][data-page="recall"]')).not.toBeNull();
+    expect(overview?.querySelector('[data-action="refresh-health"]')).not.toBeNull();
+
+    (overview?.querySelector('[data-action="navigate"][data-page="scenes"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(container.querySelector('.stx-memory-page-heading h2')?.textContent).toBe('场景与事件');
+    dispose();
+  });
+
   it('以只读方式展示当前聊天的关系图谱、背书事实和重建入口', async () => {
     const container = document.createElement('div');
     document.body.append(container);
@@ -465,6 +509,7 @@ describe('Memory UI 展示适配', () => {
 
     expect(refreshed.length).toBeGreaterThan(1);
     (container.querySelector('[data-filter-menu="kind"]') as HTMLButtonElement).click();
+    const kindOptionCount = container.querySelectorAll('[data-filter-option="kind"]').length;
     const stateOption = container.querySelector<HTMLInputElement>('[data-filter-option="kind"][value="state"]')!;
     expect(stateOption.checked).toBe(true);
     stateOption.checked = false;
@@ -472,7 +517,7 @@ describe('Memory UI 展示适配', () => {
     expect(container.querySelectorAll('[data-action="select-fact"]')).toHaveLength(1);
     expect(container.textContent).toContain('事件事实');
     expect(container.textContent).not.toContain('状态事实');
-    expect(container.querySelector('[data-filter-menu="kind"]')?.textContent).toContain('已选 9 项');
+    expect(container.querySelector('[data-filter-menu="kind"]')?.textContent).toContain(`已选 ${kindOptionCount - 1} 项`);
     expect((container.querySelector('[data-filter-all="kind"]') as HTMLInputElement).indeterminate).toBe(true);
     const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
     container.querySelector('#stx-memory-kind-filter-trigger')?.dispatchEvent(escape);

@@ -2,6 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { ActorRegistry } from '../src/application/actors/actor-registry';
 
 describe('ActorRegistry correction and pending state', () => {
+  it('encodes Unicode aliases into SDK-safe workspace record IDs', () => {
+    const registry = new ActorRegistry('workspace:test');
+    registry.discover({ displayName: '苏九媚', sourceRef: 'message:unicode', sourceType: 'message', confidence: 0.95 });
+    const alias = registry.listAliases().find(item => item.value === '苏九媚');
+    expect(alias?.normalizedValue).toBe('苏九媚');
+    expect(alias?.id).toMatch(/^[A-Za-z0-9_.!~*'()%:-]+$/u);
+    expect(alias?.id).toContain(encodeURIComponent('苏九媚'));
+  });
+
   it('keeps low-confidence discoveries pending until explicit confirmation', () => {
     const registry = new ActorRegistry('workspace:test');
     const resolution = registry.discover({ displayName: '艾琳', sourceRef: 'message:1', sourceType: 'message', excerpt: '艾琳出现在门口。', confidence: 0.5 });
