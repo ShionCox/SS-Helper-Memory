@@ -24,7 +24,7 @@ function button(label: string, tone: 'neutral' | 'danger' | 'primary' = 'neutral
   const value = document.createElement('button');
   value.type = 'button';
   value.textContent = label;
-  value.className = `stx-ui-btn${tone === 'danger' ? ' danger' : ''}`;
+  value.className = 'ss-helper-memory-recovery-button';
   value.dataset.ssHelperControl = 'button';
   value.dataset.ssHelperTone = tone;
   return value;
@@ -55,7 +55,7 @@ export function renderMemoryWorkspaceRecovery(
     const detail = document.createElement('p');
     detail.textContent = `检测到可恢复的工作区故障（${input.errorCode ?? 'WORKSPACE_UNAVAILABLE'}）。记忆功能已安全停用，酒馆其余功能可以继续使用。`;
     const warning = document.createElement('p');
-    warning.textContent = '重新初始化会先完整备份当前 _ss-helper 目录（包括数据库、WAL/SHM 和密钥），随后创建新的工作区。加密凭据需要重新录入。';
+    warning.textContent = '重新初始化会先完整备份当前 _ss-helper-v0 目录（包括数据库、WAL/SHM 和密钥），随后创建新的工作区。加密凭据需要重新录入。';
     const controls = document.createElement('div');
     controls.className = 'ss-helper-memory-workspace-recovery__controls';
     const status = document.createElement('p');

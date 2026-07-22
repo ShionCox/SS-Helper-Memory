@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MEMORY_GRAPH_V1, MEMORY_RECALL_V1, MEMORY_UPDATED_V1, type PluginSession } from '@ss-helper/sdk';
+import { MEMORY_GRAPH_V0, MEMORY_RECALL_V0, MEMORY_UPDATED_V0, type PluginSession } from '@ss-helper/sdk';
 import { createMemorySettingsAdapter, MEMORY_DEFAULT_SETTINGS, MEMORY_SETTINGS_SCHEMA } from '../src/ss-helper/settings';
 import { registerMemoryServices } from '../src/ss-helper/services';
 
@@ -197,7 +197,7 @@ describe('SS-Helper Memory typed adapters', () => {
     expect(saveSettings).not.toHaveBeenCalled();
   });
 
-  it('exposes MEMORY_RECALL_V1 and MEMORY_GRAPH_V1 without leaking graph evidence', async () => {
+  it('exposes MEMORY_RECALL_V0 and MEMORY_GRAPH_V0 without leaking graph evidence', async () => {
     const handlers = new Map<object, (request: any, context: { signal: AbortSignal }) => Promise<any>>();
     const publish = vi.fn();
     const dispose = vi.fn();
@@ -217,20 +217,20 @@ describe('SS-Helper Memory typed adapters', () => {
       }) },
     });
     const context = { signal: new AbortController().signal };
-    const handler = handlers.get(MEMORY_RECALL_V1);
+    const handler = handlers.get(MEMORY_RECALL_V0);
     await expect(handler?.({ query: 'q', chatKey: 'chat-b' }, context)).resolves.toEqual({ items: [] });
     await expect(handler?.({ query: 'q', chatKey: 'chat-a', limit: 4 }, context)).resolves.toEqual({ items: [{ id: 'fact-a', text: 'plain memory', score: 0.9, source: 'source-a' }] });
     const aborted = new AbortController();
     aborted.abort();
     await expect(handler?.({ query: 'q', chatKey: 'chat-a' }, { signal: aborted.signal })).rejects.toMatchObject({ name: 'AbortError' });
-    const graphHandler = handlers.get(MEMORY_GRAPH_V1);
+    const graphHandler = handlers.get(MEMORY_GRAPH_V0);
     await expect(graphHandler?.({ query: 'q', chatKey: 'chat-b' }, context)).resolves.toEqual({ nodes: [], edges: [] });
     await expect(graphHandler?.({ query: '雷暴', chatKey: 'chat-a', limit: 4 }, context)).resolves.toEqual({
       nodes: [{ id: 'node-a', label: '艾琳' }, { id: 'node-b', label: '雷暴' }],
       edges: [{ id: 'edge-fact-a', from: 'node-a', to: 'node-b', predicate: '害怕', kind: 'relationship', confidence: 0.9, backingFactId: 'fact-a' }],
     });
     registration.publishUpdated({ chatKey: 'chat-a', operation: 'created', recordIds: ['fact-a'] });
-    expect(publish).toHaveBeenCalledWith(MEMORY_UPDATED_V1, { chatKey: 'chat-a', operation: 'created', recordIds: ['fact-a'] });
+    expect(publish).toHaveBeenCalledWith(MEMORY_UPDATED_V0, { chatKey: 'chat-a', operation: 'created', recordIds: ['fact-a'] });
     registration.dispose();
     expect(dispose).toHaveBeenCalledTimes(2);
   });

@@ -32,6 +32,10 @@ export interface SummaryInitializationEstimate {
   tokenHigh: number;
 }
 
+export interface SummaryBatchOptions {
+  includeSystemMessages?: boolean;
+}
+
 export const DEFAULT_SUMMARY_STRATEGY: Readonly<SummaryStrategy> = Object.freeze({
   batchMode: 'floors',
   batchFloors: 5,
@@ -59,14 +63,18 @@ function floorOf(source: SourceBlock, fallback: number): number {
 }
 
 /** 只将模型实际可见的用户/助手文本计为聊天楼层。 */
-export function visibleConversationMessages(blocks: readonly SourceBlock[]): SourceBlock[] {
-  return conversationFloorGroups(blocks).flat();
+export function visibleConversationMessages(blocks: readonly SourceBlock[], options: SummaryBatchOptions = {}): SourceBlock[] {
+  return conversationFloorGroups(blocks, options).flat();
 }
 
 /** 单条超长消息拆分后仍共用同一个 floor；这里把它们重新视作一个聊天楼层。 */
-export function conversationFloorGroups(blocks: readonly SourceBlock[]): SourceBlock[][] {
+export function conversationFloorGroups(blocks: readonly SourceBlock[], options: SummaryBatchOptions = {}): SourceBlock[][] {
+  const includeSystemMessages = options.includeSystemMessages === true;
   const messages = blocks
-    .filter((source) => source.kind === 'message' && !source.hidden && (source.role === 'user' || source.role === 'assistant'))
+    .filter((source) => source.kind === 'message' && !source.hidden && (
+      ((source.role === 'user' || source.role === 'assistant') && source.messageType !== 'system' && source.messageType !== 'tool' && source.messageType !== 'reasoning')
+      || (includeSystemMessages && (source.role === 'system' || source.messageType === 'system') && source.messageType !== 'tool' && source.messageType !== 'reasoning')
+    ))
     .sort((left, right) => floorOf(left, Number.MAX_SAFE_INTEGER) - floorOf(right, Number.MAX_SAFE_INTEGER) || left.createdAt - right.createdAt || left.id.localeCompare(right.id));
   const groups: SourceBlock[][] = [];
   for (const source of messages) {
@@ -112,12 +120,15 @@ function appendUnique(target: SourceBlock[], blocks: readonly SourceBlock[]): vo
  * 将初始化和自动窗口统一拆成稳定 LLM 批次。楼层模式按可见聊天楼层分组；
  * 字数模式只改变单次请求的拆分边界，仍保留指定数量的前置聊天上下文。
  */
-export function buildSummaryBatches(blocks: readonly SourceBlock[], strategyInput: Partial<SummaryStrategy>): SourceBlock[][] {
+export function buildSummaryBatches(blocks: readonly SourceBlock[], strategyInput: Partial<SummaryStrategy>, options: SummaryBatchOptions = {}): SourceBlock[][] {
   const strategy = normalizeSummaryStrategy(strategyInput);
-  const floorGroups = conversationFloorGroups(blocks);
+  const floorGroups = conversationFloorGroups(blocks, options);
   const messages = flattenedGroups(floorGroups);
   const messageIds = new Set(messages.map((source) => source.id));
-  const metadata = blocks.filter((source) => !messageIds.has(source.id));
+  // Message blocks that are not part of an eligible conversation floor
+  // (system in safe mode, tool output, hidden reasoning, or empty-control
+  // remnants) must never fall through as metadata into an LLM batch.
+  const metadata = blocks.filter((source) => source.kind !== 'message' && !messageIds.has(source.id));
   if (messages.length === 0) return metadata.length > 0 ? [metadata] : [];
 
   const groups: Array<{ start: number; end: number; blocks: SourceBlock[] }> = [];

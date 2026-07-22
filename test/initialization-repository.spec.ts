@@ -15,7 +15,7 @@ function memoryWorkspace(): { port: WorkspacePort; records: Map<string, Map<stri
     return created;
   };
   const port = {
-    health: async () => ({ ready: true, database: 'ss-helper.sqlite3', schemaVersion: 4 }),
+    health: async () => ({ ready: true, database: 'ss-helper.sqlite3', schemaVersion: 0 }),
     integrity: async () => ({ ok: true, messages: [] }),
     open: async () => ({ ownerPluginId: 'test', workspaceId: 'character:c1', created: false }),
     defineCollection: async () => undefined,
@@ -47,7 +47,7 @@ function memoryWorkspace(): { port: WorkspacePort; records: Map<string, Map<stri
 function staging(): InitializationStagingBatch {
   const excerpt = '盖乌斯确认训练成果已经达到当前阶段的要求。';
   return {
-    id: '', kind: 'initialization-staging-v1', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 1, totalBatches: 1, processedCount: 1,
+    id: '', kind: 'initialization-staging-v0', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 1, totalBatches: 1, processedCount: 1,
     sources: [{ id: 'message:1', type: 'message', occurredAt: 100 }],
     facts: [{
       kind: 'state', subjectKey: '盖乌斯', predicateKey: '训练评价', objectKey: '认可',
@@ -72,7 +72,7 @@ describe('initialization finalization repository transaction', () => {
     await repository.putInitializationStagingBatch(staged);
     const batches = await repository.listInitializationStagingBatches('chat-a', 'job-a');
     const reduction = reduceInitializationBatches('job-a', batches);
-    await repository.putInitializationResolution({ id: '', kind: 'initialization-resolution-v1', chatKey: 'chat-a', jobId: 'job-a', reduction, createdAt: 100, updatedAt: 100 });
+    await repository.putInitializationResolution({ id: '', kind: 'initialization-resolution-v0', chatKey: 'chat-a', jobId: 'job-a', reduction, createdAt: 100, updatedAt: 100 });
     const job: MemoryJob = { id: 'job-a', chatKey: 'chat-a', type: 'initialize', status: 'running', checkpoint: { batchIndex: 1, totalBatches: 1, processedCount: 1, phase: 'apply' }, createdAt: 100, updatedAt: 100 };
 
     await repository.applyInitializationFinalization({ chatKey: 'chat-a', job, batches, reduction });
@@ -82,10 +82,10 @@ describe('initialization finalization repository transaction', () => {
     expect(facts[0]!.value).toMatchObject({ status: 'active', origin: 'automatic' });
     expect(records.get('evidence')?.size).toBe(1);
     expect(records.get('fact-slots')?.size).toBe(1);
-    expect([...records.get('job-audits')!.values()].some((record) => (record.value as { kind?: string }).kind === 'initialization-staging-v1')).toBe(false);
+    expect([...records.get('job-audits')!.values()].some((record) => (record.value as { kind?: string }).kind === 'initialization-staging-v0')).toBe(false);
     expect(await repository.getInitializationResolution('chat-a', 'job-a')).toBeUndefined();
     expect(records.get('jobs')?.get('job-a')?.value).toMatchObject({ status: 'completed' });
-    const finalAudit = [...records.get('job-audits')!.values()].find((record) => (record.value as { kind?: string }).kind === 'initialization-finalization-v1');
+    const finalAudit = [...records.get('job-audits')!.values()].find((record) => (record.value as { kind?: string }).kind === 'initialization-finalization-v0');
     expect(finalAudit?.value).toMatchObject({
       routeSummary: {
         requestCount: 1,

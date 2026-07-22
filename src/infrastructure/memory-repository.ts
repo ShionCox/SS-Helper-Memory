@@ -15,6 +15,7 @@ import type {
   WorkspaceTransactionOperation,
   WorkspaceVectorInfo,
 } from '@ss-helper/sdk';
+import { SDK_PACKAGE_VERSION } from '@ss-helper/sdk';
 import {
   ACTIVE_CONFIDENCE_THRESHOLD,
   MAX_FACT_CONTENT_LENGTH,
@@ -210,7 +211,7 @@ interface UndoLogEntry {
 
 interface UndoLogV2 {
   id: string;
-  kind: 'undo-log-v2';
+  kind: 'undo-log-v0';
   chatKey: string;
   jobId: string;
   batchIndex: number;
@@ -225,7 +226,7 @@ interface UndoLogV2 {
 
 interface RollbackMarkerV2 {
   id: string;
-  kind: 'rollback-v2';
+  kind: 'rollback-v0';
   chatKey: string;
   jobId: string;
   batchIndex: number;
@@ -354,12 +355,12 @@ export class MemoryRepository implements IngestCommitter {
     traceMemoryStartup('repository:health-snapshot');
     this.healthSnapshot = {
       connected: health.ready,
-      serverVersion: 'SS-Helper Core',
+      serverVersion: SDK_PACKAGE_VERSION,
       nodeVersion: health.nodeVersion ?? 'N/A',
-      protocolVersion: 1,
+      protocolVersion: 0,
       sqliteVersion: health.sqliteVersion ?? 'N/A',
       schemaVersion: health.schemaVersion,
-      databasePath: `data/_ss-helper/${health.database}`,
+      databasePath: `data/_ss-helper-v0/${health.database}`,
       databaseSizeBytes: health.databaseSizeBytes ?? 0,
       workspaceSizeBytes,
       currentChatSizeBytes,
@@ -765,7 +766,7 @@ export class MemoryRepository implements IngestCommitter {
     const existingUndo = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'job-audits', recordId: undoLogId });
     if (existingUndo) {
       const log = existingUndo.value as unknown as UndoLogV2;
-      if (log.kind !== 'undo-log-v2' || log.chatKey !== chatKey || !log.result) {
+      if (log.kind !== 'undo-log-v0' || log.chatKey !== chatKey || !log.result) {
         throw Object.assign(new Error('整理批次幂等标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
       }
       return structuredClone(log.result);
@@ -991,7 +992,7 @@ export class MemoryRepository implements IngestCommitter {
       const jobRecord = await this.workspace.get({ workspaceId, collection: 'jobs', recordId: job.id });
       operations.push({ action: 'upsert', collection: 'jobs', recordId: job.id, value: asPlain(job), expectedVersion: jobRecord?.version ?? 0 });
       operations.push({ action: 'upsert', collection: 'job-audits', recordId: audit.id, value: asPlain(audit) });
-      const undoLog: UndoLogV2 = { id: undoLogId, kind: 'undo-log-v2', chatKey, jobId: job.id, batchIndex, transactionId: input.audit?.requestId ?? undoLogId, committedSequence: nextCommittedSequence(), entries: undoEntries, result: structuredClone(result), createdAt: startedAt };
+      const undoLog: UndoLogV2 = { id: undoLogId, kind: 'undo-log-v0', chatKey, jobId: job.id, batchIndex, transactionId: input.audit?.requestId ?? undoLogId, committedSequence: nextCommittedSequence(), entries: undoEntries, result: structuredClone(result), createdAt: startedAt };
       operations.push({ action: 'upsert', collection: 'job-audits', recordId: undoLog.id, value: asPlain(undoLog) });
       this.requireChatKey(chatKey);
       await this.workspace.transaction({ workspaceId, idempotencyKey: undoLogId, operations });
@@ -1022,7 +1023,7 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async listJobBatchAudits(chatKey: string, jobId?: string): Promise<MemoryJobBatchAudit[]> {
-    return (await this.listAllRows<MemoryJobBatchAudit>('job-audits', { chatKey: this.requireChatKey(chatKey), ...(jobId ? { jobId } : {}) })).filter((audit) => !['undo-log-v2', 'snapshot', 'initialization-staging-v1'].includes(String((audit as { kind?: unknown }).kind ?? '')));
+    return (await this.listAllRows<MemoryJobBatchAudit>('job-audits', { chatKey: this.requireChatKey(chatKey), ...(jobId ? { jobId } : {}) })).filter((audit) => !['undo-log-v0', 'snapshot', 'initialization-staging-v0'].includes(String((audit as { kind?: unknown }).kind ?? '')));
   }
 
   async putInitializationStagingBatch(batch: InitializationStagingBatch): Promise<void> {
@@ -1034,7 +1035,7 @@ export class MemoryRepository implements IngestCommitter {
       ...structuredClone(batch),
       id,
       chatKey,
-      kind: 'initialization-staging-v1',
+      kind: 'initialization-staging-v0',
       updatedAt: Date.now(),
     };
     await this.workspace.upsert({ workspaceId, collection: 'job-audits', recordId: id, value: asPlain(value), expectedVersion: current?.version ?? 0 });
@@ -1043,7 +1044,7 @@ export class MemoryRepository implements IngestCommitter {
   async listInitializationStagingBatches(chatKey: string, jobId: string): Promise<InitializationStagingBatch[]> {
     const items = await this.listAllRows<InitializationStagingBatch>('job-audits', { chatKey: this.requireChatKey(chatKey), jobId });
     return items
-      .filter((item) => item.kind === 'initialization-staging-v1')
+      .filter((item) => item.kind === 'initialization-staging-v0')
       .sort((left, right) => left.batchIndex - right.batchIndex);
   }
 
@@ -1056,7 +1057,7 @@ export class MemoryRepository implements IngestCommitter {
       workspaceId,
       collection: 'job-audits',
       recordId: id,
-      value: asPlain({ ...structuredClone(input), id, chatKey, kind: 'initialization-resolution-v1', updatedAt: Date.now() }),
+      value: asPlain({ ...structuredClone(input), id, chatKey, kind: 'initialization-resolution-v0', updatedAt: Date.now() }),
       expectedVersion: current?.version ?? 0,
     });
   }
@@ -1065,7 +1066,7 @@ export class MemoryRepository implements IngestCommitter {
     const id = `initialization-resolution:${jobId}`;
     const record = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'job-audits', recordId: id });
     const value = record?.value as unknown as InitializationResolutionStaging | undefined;
-    if (!value || value.chatKey !== this.requireChatKey(chatKey) || value.kind !== 'initialization-resolution-v1') return undefined;
+    if (!value || value.chatKey !== this.requireChatKey(chatKey) || value.kind !== 'initialization-resolution-v0') return undefined;
     return structuredClone(value);
   }
 
@@ -1085,7 +1086,7 @@ export class MemoryRepository implements IngestCommitter {
     const finalAuditId = `initialization-finalization:${input.job.id}`;
     const undoLogId = `undo-v2:${input.job.id}:finalize`;
     const existingFinal = await this.workspace.get({ workspaceId, collection: 'job-audits', recordId: finalAuditId });
-    if (existingFinal && (existingFinal.value as { kind?: unknown }).kind === 'initialization-finalization-v1') {
+    if (existingFinal && (existingFinal.value as { kind?: unknown }).kind === 'initialization-finalization-v0') {
       const existingStats = (existingFinal.value as { finalization?: InitializationFinalizationStats }).finalization;
       if (existingStats) return structuredClone(existingStats);
     }
@@ -1210,12 +1211,12 @@ export class MemoryRepository implements IngestCommitter {
     };
     const routeSummary = summarizeInitializationRoutes(input.batches);
     const finalAudit: MemoryJobBatchAudit & {
-      kind: 'initialization-finalization-v1';
+      kind: 'initialization-finalization-v0';
       finalization: InitializationFinalizationStats;
       routeSummary: InitializationRouteSummary;
     } = {
       id: finalAuditId,
-      kind: 'initialization-finalization-v1',
+      kind: 'initialization-finalization-v0',
       finalization: stats,
       routeSummary,
       chatKey,
@@ -1245,9 +1246,9 @@ export class MemoryRepository implements IngestCommitter {
       superseded: stats.supersededCount,
       rejected: finalAudit.rejections,
     };
-    const undoLog: UndoLogV2 = { id: undoLogId, kind: 'undo-log-v2', chatKey, jobId: input.job.id, batchIndex: finalAudit.batchIndex, transactionId: finalAuditId, committedSequence: nextCommittedSequence(), entries: undoEntries, result, createdAt: now };
+    const undoLog: UndoLogV2 = { id: undoLogId, kind: 'undo-log-v0', chatKey, jobId: input.job.id, batchIndex: finalAudit.batchIndex, transactionId: finalAuditId, committedSequence: nextCommittedSequence(), entries: undoEntries, result, createdAt: now };
     operations.push({ action: 'upsert', collection: 'job-audits', recordId: undoLog.id, value: asPlain(undoLog) });
-    for (const record of stagingRecords.filter((record) => ['initialization-staging-v1', 'initialization-resolution-v1'].includes(String((record.value as { kind?: unknown }).kind ?? '')))) {
+    for (const record of stagingRecords.filter((record) => ['initialization-staging-v0', 'initialization-resolution-v0'].includes(String((record.value as { kind?: unknown }).kind ?? '')))) {
       operations.push({ action: 'delete', collection: 'job-audits', recordId: record.recordId, expectedVersion: record.version });
     }
     try {
@@ -1272,17 +1273,17 @@ export class MemoryRepository implements IngestCommitter {
   async rollbackJobBatch(jobId: string, batchIndex: number, expectedChatKey?: string): Promise<string[]> {
     const workspaceId = this.requireWorkspaceId();
     expectedChatKey = expectedChatKey ? this.requireChatKey(expectedChatKey) : undefined;
-    const markerId = `rollback-v2:${jobId}:${batchIndex}`;
+    const markerId = `rollback-v0:${jobId}:${batchIndex}`;
     const existingMarker = await this.workspace.get({ workspaceId, collection: 'job-audits', recordId: markerId });
     if (existingMarker) {
       const marker = existingMarker.value as unknown as RollbackMarkerV2;
-      if (marker.kind !== 'rollback-v2') throw Object.assign(new Error('回滚标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
+      if (marker.kind !== 'rollback-v0') throw Object.assign(new Error('回滚标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
       if (marker.status === 'completed') return [];
       await this.deleteRollbackVectors(workspaceId, marker);
       return [...marker.affectedFactIds];
     }
     const allRows = await this.listAllRecordRows('job-audits');
-    const logRows = allRows.filter((row) => (row.value as { kind?: unknown }).kind === 'undo-log-v2');
+    const logRows = allRows.filter((row) => (row.value as { kind?: unknown }).kind === 'undo-log-v0');
     const allLogs = logRows.map((row) => ({ row, log: row.value as unknown as UndoLogV2 })).filter(({ log }) => !log.rolledBackBy).sort((left, right) => left.log.committedSequence - right.log.committedSequence);
     const target = allLogs.find(({ log }) => log.jobId === jobId && log.batchIndex === batchIndex);
     if (!target) throw new Error('该整理批次没有可执行的 UndoLogV2；旧快照仅可查看，不能执行回滚。');
@@ -1326,7 +1327,7 @@ export class MemoryRepository implements IngestCommitter {
       const auditRecord = allRows.find((row) => row.recordId === `batch-audit:${log.jobId}:${log.batchIndex}`);
       if (auditRecord) operations.push({ action: 'upsert', collection: 'job-audits', recordId: auditRecord.recordId, value: asPlain({ ...(auditRecord.value as object), rolledBackAt: rollbackAt, rollbackId: markerId }), expectedRevision: auditRecord.revision ?? auditRecord.version });
     }
-    const marker: RollbackMarkerV2 = { id: markerId, kind: 'rollback-v2', chatKey: target.log.chatKey, jobId, batchIndex, status: 'index-repair-pending', affectedLogIds: [...included.keys()], affectedFactIds: [...affectedFactIds], createdAt: rollbackAt };
+    const marker: RollbackMarkerV2 = { id: markerId, kind: 'rollback-v0', chatKey: target.log.chatKey, jobId, batchIndex, status: 'index-repair-pending', affectedLogIds: [...included.keys()], affectedFactIds: [...affectedFactIds], createdAt: rollbackAt };
     operations.push({ action: 'upsert', collection: 'job-audits', recordId: markerId, value: asPlain(marker), expectedRevision: 0 });
     const result = await this.workspace.transaction({ workspaceId, idempotencyKey: markerId, operations });
     void result;
@@ -1347,11 +1348,11 @@ export class MemoryRepository implements IngestCommitter {
 
   async completeRollbackIndexRepair(jobId: string, batchIndex: number): Promise<void> {
     const workspaceId = this.requireWorkspaceId();
-    const markerId = `rollback-v2:${jobId}:${batchIndex}`;
+    const markerId = `rollback-v0:${jobId}:${batchIndex}`;
     const markerRecord = await this.workspace.get({ workspaceId, collection: 'job-audits', recordId: markerId });
     if (!markerRecord) throw Object.assign(new Error('回滚修复标识不存在。'), { code: 'WORKSPACE_CONFLICT' });
     const marker = markerRecord.value as unknown as RollbackMarkerV2;
-    if (marker.kind !== 'rollback-v2') throw Object.assign(new Error('回滚标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
+    if (marker.kind !== 'rollback-v0') throw Object.assign(new Error('回滚标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
     if (marker.status === 'completed') return;
     this.requireChatKey(marker.chatKey);
     const requiredVectorIds = new Set<string>();
@@ -1494,7 +1495,7 @@ export class MemoryRepository implements IngestCommitter {
 
   async exportBackup(): Promise<Blob> {
     const backup = await this.workspace.exportAll();
-    return new Blob([JSON.stringify({ format: 'ss-helper-memory', version: 1, ...backup })], { type: 'application/vnd.ss-helper.workspace+json' });
+    return new Blob([JSON.stringify({ format: 'ss-helper-memory', version: 0, ...backup })], { type: 'application/vnd.ss-helper.workspace+json' });
   }
 
   async importBackup(file: File): Promise<void> {
@@ -1504,7 +1505,7 @@ export class MemoryRepository implements IngestCommitter {
       throw error;
     }
     const value = JSON.parse(await file.text()) as { format?: string; version?: number; archive?: unknown; sha256?: string };
-    if (value.format !== 'ss-helper-memory' || value.version !== 1 || !value.archive || typeof value.sha256 !== 'string') throw new Error('Memory 备份格式无效。');
+    if (value.format !== 'ss-helper-memory' || value.version !== 0 || !value.archive || typeof value.sha256 !== 'string') throw new Error('Memory 备份格式无效。');
     await this.workspace.importAll({ archive: value.archive as never, sha256: value.sha256 });
     this.repairedWorkspaces.clear();
     await this.ensureCollections(SETTINGS_WORKSPACE_ID); if (this.workspaceId) await this.ensureCollections(this.workspaceId);

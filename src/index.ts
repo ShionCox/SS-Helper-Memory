@@ -8,7 +8,7 @@ import type {
   MemoryRecallLog,
 } from './domain';
 import type { RecallQuery, RecallResult } from './application/recall';
-import type { MemoryCaptureProgress } from './ui/memory-ui';
+import type { MemoryCaptureProgress, MemoryInitializationOptions } from './ui/memory-ui';
 
 export interface MemorySqliteStatus {
   connected: boolean;
@@ -64,7 +64,7 @@ export interface MemoryPluginApi {
   };
   getCaptureProgress(): Promise<MemoryCaptureProgress>;
   getInitializationState(): Promise<import('./ui/memory-ui').MemoryInitializationState>;
-  reinitialize(selectedKinds?: string[]): Promise<void>;
+  reinitialize(selectedKinds?: string[], options?: MemoryInitializationOptions): Promise<void>;
   cancelCapture(): Promise<void>;
   listAuditRecords(): Promise<Array<Record<string, unknown>>>;
   getMainChatUsage(): Promise<MainChatUsage[]>;

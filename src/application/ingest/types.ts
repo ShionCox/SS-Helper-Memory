@@ -2,6 +2,7 @@ import type { AutomaticIngestRejection, MemoryTokenUsage } from '../../domain';
 
 export type SourceBlockKind = 'message' | 'state' | 'character' | 'persona' | 'worldbook';
 export type SourceBlockRole = 'user' | 'assistant' | 'system' | 'tool' | 'metadata';
+export type SourceMessageType = 'conversation' | 'system' | 'tool' | 'reasoning';
 
 export interface SourceBlock {
   id: string;
@@ -11,6 +12,7 @@ export interface SourceBlock {
   content: string;
   createdAt: number;
   floor?: number;
+  messageType?: SourceMessageType;
   hidden?: boolean;
   entityKeys?: string[];
 }

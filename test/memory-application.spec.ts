@@ -178,6 +178,28 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     app.stop();
   });
 
+  it('默认只统计 AI 可见消息，显式开启后纳入 system 历史正文但仍排除工具输出', async () => {
+    state.sources = [
+      message(0),
+      { id: 'message:system', chatKey: 'chat-a', kind: 'message', role: 'system', messageType: 'system', hidden: false, content: '历史系统正文', createdAt: 1, floor: 1 },
+      { id: 'message:tool', chatKey: 'chat-a', kind: 'message', role: 'tool', messageType: 'tool', hidden: true, content: '工具输出', createdAt: 2, floor: 2 },
+    ];
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    await app.start();
+
+    await expect(app.getInitializationSources()).resolves.toEqual([
+      expect.objectContaining({ kind: 'message', count: 1, rawCount: 3, defaultCount: 1, excludedCount: 2 }),
+    ]);
+    await expect(app.getInitializationSources({ includeInvisibleHistory: true })).resolves.toEqual([
+      expect.objectContaining({ kind: 'message', count: 2, rawCount: 3, defaultCount: 1, excludedCount: 1 }),
+    ]);
+    await expect(app.getInitializationEstimate()).resolves.toMatchObject({ messageCount: 1 });
+    await expect(app.getInitializationEstimate(undefined, { includeInvisibleHistory: true })).resolves.toMatchObject({ messageCount: 2 });
+    app.stop();
+  });
+
   it('显示批次进度，并在停止后保存 paused checkpoint', async () => {
     state.sources = Array.from({ length: 21 }, (_, index) => message(index));
     const { MemoryApplication } = await import('../src/application/memory-application');
@@ -185,7 +207,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     const app = new MemoryApplication(repository as never);
     connectHost(app);
     await app.start();
-    const initialize = app.initialize(['message']);
+    const initialize = app.initialize(['message'], { includeInvisibleHistory: true });
     for (let index = 0; index < 20 && !state.release; index += 1) await Promise.resolve();
 
     expect(await app.getCaptureProgress()).toMatchObject({ status: 'running', batchIndex: 1, totalBatches: 5 });
@@ -194,9 +216,9 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     await Promise.all([initialize, cancel]);
 
     expect(repository.commit).not.toHaveBeenCalled();
-    expect(repository.jobs.at(-1)).toMatchObject({ status: 'paused', checkpoint: { batchIndex: 0, totalBatches: 5, selectedSourceGroupIds: ['message'] } });
+    expect(repository.jobs.at(-1)).toMatchObject({ status: 'paused', checkpoint: { batchIndex: 0, totalBatches: 5, selectedSourceGroupIds: ['message'], includeInvisibleHistory: true } });
     expect(await app.getCaptureProgress()).toMatchObject({ status: 'cancelled', totalBatches: 5 });
-    expect((await app.getInitializationState()).attempts[0]).toMatchObject({ status: 'cancelled', selectedSourceKinds: ['message'] });
+    expect((await app.getInitializationState()).attempts[0]).toMatchObject({ status: 'cancelled', selectedSourceKinds: ['message'], includeInvisibleHistory: true });
     app.stop();
   });
 

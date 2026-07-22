@@ -13,7 +13,7 @@ import { MemoryLlmCapabilityMonitor } from '../ss-helper/llm-capability-monitor'
 import { mountMemoryHostUi } from './memory-host-ui';
 
 const SEND_WINDOW_MS = 45_000;
-const MEMORY_PROMPT_ID = 'ss-helper.memory.recall.v1';
+const MEMORY_PROMPT_ID = 'ss-helper.memory.recall.v0';
 const MAX_REBINDS_PER_TURN = 3;
 const REBIND_RETRY_DELAY_MS = 250;
 

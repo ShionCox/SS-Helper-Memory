@@ -8,22 +8,22 @@
 
 ## 版本规则（强制）
 
-- 前端插件发布版本的唯一来源是根目录 `plugin.config.json` 的 `manifest.version`，当前固定为裸 SemVer `0.0.3`；`manifest.json` 仅是构建产物。设置 UI 负责显示为 `v0.0.3`。
+- 前端插件发布版本的唯一来源是根目录 `plugin.config.json` 的 `manifest.version`，本次断代基线为裸 SemVer `0.0.1`；`manifest.json` 仅是构建产物。设置 UI 负责显示当前版本。
 - 根目录 `package.json` 不得增加 `version` 字段。
 - 公共前端 API、UI、日志、README、测试名称和测试数据标识不得再次硬编码插件发布版本。
 - `server/package.json` 的 `0.0.1` 仅是 SDK 内嵌 Memory 语义 worker 的内部协议版本；插件发布版本仍只来自 `plugin.config.json`。
 - 服务端运行时必须读取 `server/package.json` 的版本，不得再维护第二份硬编码服务端版本常量。
-- 禁止恢复旧标记，包括但不限于：`Memory 3.0`、`Memory v2`、`Memory v3`、`MemoryPluginApiV3`、`memory-v2` 和插件版本 `3.0.0`。
+- 禁止恢复旧标记，包括但不限于旧 MemoryOS/Memory v2/v3 命名、旧 `memory-v2` 数据键、旧 SS-Helper API 版本轴和插件版本 `3.0.0`。
 - 测试探针、示例 manifest 和其他辅助 package 不得新增独立的插件发布版本。
 
 ## 不属于插件发布版本的技术编号
 
-以下内容用于构建、运行或数据兼容，不得因为清理插件版本而删除或随意改写：
+以下内容用于构建、运行或数据兼容，不得因为清理插件版本而删除或随意改写；本次断代明确改写的 SS-Helper 自有协议/数据基线除外：
 
 - npm 依赖版本约束；
 - SillyTavern 与 Node.js 兼容要求；
-- API 路径中的协议编号；
-- SQLite schema、协议和迁移编号；
+- 第三方 API 路径中的协议编号；
+- SQLite schema、协议和迁移编号（当前 SS-Helper 自有基线为 v0）；
 - LLMHub 注册协议编号；
 - 模型 ID 中自带的版本片段；
 - 生命周期、并发代次、快照格式和导入聊天内容中的业务编号。

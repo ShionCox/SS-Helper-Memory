@@ -24,7 +24,7 @@ Memory 的 workspace 与 collection 约定属于 Memory 自己：
 
 `facts`、`fact-slots`、`evidence`、`jobs`、`job-audits`、`usage` 和 `recall-logs` 的含义、冲突规则、清理规则与召回策略都不属于 SDK 公共实现。
 
-SDK 只维护酒馆实例级的 `data/_ss-helper/ss-helper.sqlite3`，不按登录用户隔离。Memory 不包含 server plugin、SQLite Worker、专用 schema、专用 HTTP 协议或原始 SQLite 备份逻辑；旧 `/api/plugins/ss-helper-sdk/v1/memory/*` 返回 404 是预期行为。
+SDK 只维护酒馆实例级的 `data/_ss-helper-v0/ss-helper.sqlite3`，不按登录用户隔离。Memory 不包含 server plugin、SQLite Worker、专用 schema、专用 HTTP 协议或原始 SQLite 备份逻辑；所有 workspace 调用均通过当前 v0 internal bridge 完成。
 
 ## 故障边界
 

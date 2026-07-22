@@ -171,6 +171,8 @@ export interface MemoryJobCheckpoint {
   overlapSourceRefs?: string[];
   metadataSourceRefs?: string[];
   selectedSourceGroupIds?: string[];
+  /** Initialization-only; optional for backwards-compatible resume of old jobs. */
+  includeInvisibleHistory?: boolean;
   /** 总结窗口的聊天楼层边界；用于断点恢复和进度诊断。 */
   summaryStartFloor?: number;
   summaryEndFloor?: number;

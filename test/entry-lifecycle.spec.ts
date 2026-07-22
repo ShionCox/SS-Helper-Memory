@@ -18,10 +18,9 @@ vi.mock('@ss-helper/sdk', () => ({
     if (state.invokeSession) onSession(session);
     return { current: session, closed: new Promise(() => undefined), dispose: vi.fn() };
   },
-  API_MAJOR: 1,
-  API_MINOR: 0,
+  API_VERSION: '0.0.1',
   MEMORY_PLUGIN_ID: 'ss-helper.memory',
-  SDK_PACKAGE_VERSION: '1.0.0',
+  SDK_PACKAGE_VERSION: '0.0.1',
   ensureHostedCore: async () => undefined,
   waitForTavernReady: async () => undefined,
   SSHelperError: class extends Error {

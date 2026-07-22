@@ -32,7 +32,7 @@ export interface InitializationSourceSnapshot {
  */
 export interface InitializationStagingBatch {
   id: string;
-  kind: 'initialization-staging-v1';
+  kind: 'initialization-staging-v0';
   chatKey: string;
   jobId: string;
   batchIndex: number;
@@ -49,7 +49,7 @@ export interface InitializationStagingBatch {
 /** Persisted after reduction/resolution so an apply retry never asks the LLM again. */
 export interface InitializationResolutionStaging {
   id: string;
-  kind: 'initialization-resolution-v1';
+  kind: 'initialization-resolution-v0';
   chatKey: string;
   jobId: string;
   reduction: InitializationReduction;

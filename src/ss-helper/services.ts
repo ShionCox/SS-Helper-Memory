@@ -1,4 +1,4 @@
-import { MEMORY_GRAPH_V1, MEMORY_RECALL_V1, MEMORY_UPDATED_V1, type MemoryUpdatedPayload, type PluginSession } from '@ss-helper/sdk';
+import { MEMORY_GRAPH_V0, MEMORY_RECALL_V0, MEMORY_UPDATED_V0, type MemoryUpdatedPayload, type PluginSession } from '@ss-helper/sdk';
 
 interface MemoryRecallResult {
   readonly items: readonly {
@@ -26,7 +26,7 @@ export function registerMemoryServices(
   session: PluginSession,
   controller: MemoryRecallController,
 ): { dispose(): void; publishUpdated(payload: MemoryUpdatedPayload): void } {
-  const disposeRecall = session.services.expose(MEMORY_RECALL_V1, async (request, context) => {
+  const disposeRecall = session.services.expose(MEMORY_RECALL_V0, async (request, context) => {
     context.signal.throwIfAborted();
     if (request.chatKey !== controller.getChatKey()) return { items: [] };
     const result = await controller.recall.preview({ query: request.query, maxItems: request.limit });
@@ -40,7 +40,7 @@ export function registerMemoryServices(
       })),
     };
   });
-  const disposeGraph = session.services.expose(MEMORY_GRAPH_V1, async (request, context) => {
+  const disposeGraph = session.services.expose(MEMORY_GRAPH_V0, async (request, context) => {
     context.signal.throwIfAborted();
     if (request.chatKey !== controller.getChatKey()) return { nodes: [], edges: [] };
     if (!controller.graph) return { nodes: [], edges: [] };
@@ -63,6 +63,6 @@ export function registerMemoryServices(
   });
   return {
     dispose: () => { disposeGraph(); disposeRecall(); },
-    publishUpdated: (payload) => session.events.publish(MEMORY_UPDATED_V1, payload),
+    publishUpdated: (payload) => session.events.publish(MEMORY_UPDATED_V0, payload),
   };
 }

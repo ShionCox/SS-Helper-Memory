@@ -40,7 +40,7 @@ describe('Memory 工作区恢复界面', () => {
     const dispose = renderMemoryWorkspaceRecovery(
       container,
       { errorCode: 'WORKSPACE_DATABASE_UNAVAILABLE' },
-      { repair: async () => { throw { code: 'WORKSPACE_BACKUP_FAILED', message: 'G:\\SillyTavern\\data\\_ss-helper\\secrets.key' }; } },
+      { repair: async () => { throw { code: 'WORKSPACE_BACKUP_FAILED', message: 'G:\\SillyTavern\\data\\_ss-helper-v0\\secrets.key' }; } },
       notify,
     );
 

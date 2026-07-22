@@ -26,7 +26,7 @@ describe('SDK workspace architecture baseline', () => {
     expect(repository).toContain("'fact-slots'");
     expect(repository).toContain('this.workspace.transaction(');
     expect(repository).toContain('this.workspace.exportAll()');
-    expect(repository).not.toContain('/api/plugins/ss-helper-sdk/v1/memory');
+    expect(repository).not.toContain('/api/plugins/ss-helper-sdk/');
     expect(runtime).toContain('new MemoryRepository(session.workspace)');
     expect(host).toContain('getWorkspaceId(): string');
     expect(host).not.toContain('getBinaryRequestPort');

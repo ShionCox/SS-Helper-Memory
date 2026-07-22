@@ -1,8 +1,8 @@
 import {
-  LLM_CAPABILITY_STATUS_V1,
-  LLM_EMBEDDING_V1,
-  LLM_RERANK_V1,
-  LLM_STRUCTURED_TASK_V1,
+  LLM_CAPABILITY_STATUS_V0,
+  LLM_EMBEDDING_V0,
+  LLM_RERANK_V0,
+  LLM_STRUCTURED_TASK_V0,
   type PluginSession,
 } from '@ss-helper/sdk';
 import type { MemoryLlmApi, MemoryLlmUsage } from '../application/ingest/llm-extractor';
@@ -44,7 +44,7 @@ export function createMemoryLlmApi(session: PluginSession, signal?: AbortSignal)
     inspect: {
       async previewRoute(input) {
         const timeoutMs = 5_000;
-        const response = await session.services.call(LLM_CAPABILITY_STATUS_V1, {
+        const response = await session.services.call(LLM_CAPABILITY_STATUS_V0, {
           checks: [{
             id: input.taskKey,
             taskKey: input.taskKey,
@@ -64,7 +64,7 @@ export function createMemoryLlmApi(session: PluginSession, signal?: AbortSignal)
     },
     async runTask<T>(input: RunTaskInput) {
       try {
-        const response = await session.services.call(LLM_STRUCTURED_TASK_V1, {
+        const response = await session.services.call(LLM_STRUCTURED_TASK_V0, {
           task: input.taskKey,
           input: input.input,
           outputSchema: input.schema as Record<string, never>,
@@ -82,7 +82,7 @@ export function createMemoryLlmApi(session: PluginSession, signal?: AbortSignal)
     async embed(input) {
       try {
         const timeoutMs = input.budget?.maxLatencyMs ?? 30_000;
-        const response = await session.services.call(LLM_EMBEDDING_V1, {
+        const response = await session.services.call(LLM_EMBEDDING_V0, {
           input: input.texts,
           timeoutMs,
         }, { timeoutMs, signal });
@@ -94,7 +94,7 @@ export function createMemoryLlmApi(session: PluginSession, signal?: AbortSignal)
     async rerank(input) {
       try {
         const timeoutMs = input.budget?.maxLatencyMs ?? 30_000;
-        const response = await session.services.call(LLM_RERANK_V1, {
+        const response = await session.services.call(LLM_RERANK_V0, {
           query: input.query,
           documents: input.docs.map((text, index) => ({ id: String(index), text })),
           topN: input.topK,

@@ -27,7 +27,7 @@ function proposal(input: Partial<ValidatedFactProposal> = {}): ValidatedFactProp
 function batch(index: number, facts: ValidatedFactProposal[], occurredAt = index * 100): InitializationStagingBatch {
   return {
     id: `initialization-staging:job:${index}`,
-    kind: 'initialization-staging-v1',
+    kind: 'initialization-staging-v0',
     chatKey: 'chat-a',
     jobId: 'job',
     batchIndex: index,

@@ -1,6 +1,5 @@
 import {
-  API_MAJOR,
-  API_MINOR,
+  API_VERSION,
   MEMORY_PLUGIN_ID,
   SDK_PACKAGE_VERSION,
   type HostCapability,
@@ -21,7 +20,7 @@ export interface MemoryContributionController extends MemorySettingsController, 
 
 export const MEMORY_HOST_CAPABILITIES = Object.freeze([
   'tavern.context.read',
-  'core.ui.notification.v1',
+  'core.ui.notification.v0',
   'tavern.character.read',
   'tavern.persona.read',
   'tavern.chat.read',
@@ -30,7 +29,7 @@ export const MEMORY_HOST_CAPABILITIES = Object.freeze([
   'tavern.worldbooks.read',
   'tavern.prompt.contribute',
   'tavern.plugin.request',
-  'tavern.plugin.binary-request.v1',
+  'tavern.plugin.binary-request.v0',
   'workspace.recovery',
 ] as const satisfies readonly HostCapability[]);
 
@@ -40,7 +39,7 @@ export const MEMORY_WORKSPACE_RECOVERY_POPUP = Object.freeze({
   kind: 'popup' as const,
   provider: MEMORY_PLUGIN_ID,
   name: 'workspace-recovery',
-  version: 1,
+  version: 0,
 });
 
 export interface MemoryRecoveryController extends MemoryWorkspaceRecoveryController {
@@ -53,8 +52,8 @@ export const MEMORY_PLUGIN_DESCRIPTOR: PluginDescriptor<MemoryHostCapability> = 
   settingsDisplayName: config.settingsDisplayName,
   pluginVersion: config.manifest.version,
   sdkPackageVersion: SDK_PACKAGE_VERSION,
-  apiMajor: API_MAJOR,
-  minApiMinor: API_MINOR,
+  apiVersion: API_VERSION,
+  minApiVersion: API_VERSION,
   capabilities: MEMORY_HOST_CAPABILITIES,
 });
 

@@ -23,6 +23,18 @@ describe('Memory 总结策略', () => {
     expect(visibleConversationMessages(sources).map((source) => source.floor)).toEqual([1, 5]);
   });
 
+  it('显式开启时将 system 历史正文按原始 floor 纳入批次，但不纳入 tool/reasoning', () => {
+    const sources: SourceBlock[] = [
+      message(1),
+      { ...message(2), role: 'system', messageType: 'system', hidden: false },
+      { ...message(3), role: 'tool', messageType: 'tool', hidden: true },
+      { ...message(4), role: 'system', messageType: 'reasoning', hidden: true },
+      message(5),
+    ];
+    expect(visibleConversationMessages(sources, { includeSystemMessages: true }).map((source) => source.floor)).toEqual([1, 2, 5]);
+    expect(buildSummaryBatches(sources, { batchMode: 'floors', batchFloors: 10 }, { includeSystemMessages: true })[0]?.map((source) => source.floor)).toEqual([1, 2, 5]);
+  });
+
   it('60 -> 66 selects 58–65 and moves the target only to 65', () => {
     const messages = Array.from({ length: 66 }, (_, index) => message(index + 1));
     const window = selectAutomaticSummaryWindow(messages, {

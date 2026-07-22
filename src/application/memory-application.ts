@@ -51,6 +51,7 @@ import type { MemoryPluginApi, MemorySqliteStatus } from '../index';
 import type {
   MemoryCaptureProgress,
   MemoryInitializationEstimate,
+  MemoryInitializationOptions,
   MemoryInitializationState,
   MemoryInitializationSourceOption,
   MemoryUiController,
@@ -540,14 +541,14 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.emitSettingsChanged();
   }
 
-  async initialize(selectedKinds?: string[]): Promise<void> {
-    await this.flushCapture('initialize', undefined, selectedKinds);
+  async initialize(selectedKinds?: string[], options?: MemoryInitializationOptions): Promise<void> {
+    await this.flushCapture('initialize', undefined, selectedKinds, options);
   }
 
-  async reinitialize(selectedKinds?: string[]): Promise<void> {
+  async reinitialize(selectedKinds?: string[], options?: MemoryInitializationOptions): Promise<void> {
     await this.cancelCapture();
     await this.clearCurrentChatData();
-    await this.initialize(selectedKinds);
+    await this.initialize(selectedKinds, options);
   }
 
   async retry(): Promise<void> {
@@ -631,21 +632,41 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return overview;
   }
 
-  async getInitializationSources(): Promise<MemoryInitializationSourceOption[]> {
+  async getInitializationSources(options: MemoryInitializationOptions = {}): Promise<MemoryInitializationSourceOption[]> {
     const chatKey = this.getChatKey();
     if (!chatKey) return [];
     const [groups, initialization] = await Promise.all([
-      this.collectSources(chatKey).then((sources) => summarizeSourceGroups(filterSourceBlocks(sources))),
+      this.collectSources(chatKey).then((sources) => {
+        const rawGroups = summarizeSourceGroups(sources);
+        const defaultGroups = summarizeSourceGroups(filterSourceBlocks(sources));
+        const currentGroups = summarizeSourceGroups(filterSourceBlocks(sources, options));
+        const defaultById = new Map(defaultGroups.map((group) => [group.id, group]));
+        const currentById = new Map(currentGroups.map((group) => [group.id, group]));
+        return rawGroups.map((group) => {
+          const current = currentById.get(group.id);
+          const safe = defaultById.get(group.id);
+          return {
+            ...group,
+            count: current?.count ?? 0,
+            rawCount: group.count,
+            defaultCount: safe?.count ?? 0,
+            excludedCount: Math.max(0, group.count - (current?.count ?? 0)),
+          };
+        });
+      }),
       this.getInitializationState(),
     ]);
     const selectedKinds = initialization.selectedSourceKinds.length > 0
       ? new Set(initialization.selectedSourceKinds)
-      : new Set(groups.map((group) => group.id));
+      : new Set(groups.filter((group) => group.count > 0).map((group) => group.id));
     return groups.map((group) => ({
       kind: group.id,
       label: group.label,
       count: group.count,
-      selected: selectedKinds.has(group.id),
+      rawCount: group.rawCount,
+      defaultCount: group.defaultCount,
+      excludedCount: group.excludedCount,
+      selected: group.count > 0 && selectedKinds.has(group.id),
     }));
   }
 
@@ -676,17 +697,20 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         updatedAt: job.updatedAt,
         totalBatches: job.checkpoint.totalBatches ?? job.checkpoint.batchIndex,
         selectedSourceKinds: [...(job.checkpoint.selectedSourceGroupIds ?? [])],
+        ...(job.checkpoint.includeInvisibleHistory === undefined ? {} : { includeInvisibleHistory: job.checkpoint.includeInvisibleHistory }),
         ...(job.error ? { error: job.error } : {}),
       })),
     };
   }
 
-  async getInitializationEstimate(selectedKinds?: string[]): Promise<MemoryInitializationEstimate> {
+  async getInitializationEstimate(selectedKinds?: string[], options: MemoryInitializationOptions = {}): Promise<MemoryInitializationEstimate> {
     const chatKey = this.getChatKey();
     if (!chatKey) return estimateSummaryInitialization(0, []);
-    const sources = selectSourceGroups(filterSourceBlocks(await this.collectSources(chatKey)), selectedKinds);
+    const sources = selectSourceGroups(filterSourceBlocks(await this.collectSources(chatKey), options), selectedKinds);
     const messageCount = sources.filter((source) => source.kind === 'message').length;
-    return estimateSummaryInitialization(messageCount, buildSummaryBatches(sources, summaryStrategyFromSettings(this.settings)));
+    return estimateSummaryInitialization(messageCount, buildSummaryBatches(sources, summaryStrategyFromSettings(this.settings), {
+      includeSystemMessages: options.includeInvisibleHistory === true,
+    }));
   }
 
   async getCaptureProgress(): Promise<MemoryCaptureProgress> {
@@ -908,7 +932,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         protocolVersion: previous?.protocolVersion ?? 0,
         sqliteVersion: previous?.sqliteVersion ?? 'N/A',
         schemaVersion: previous?.schemaVersion ?? 0,
-        databasePath: previous?.databasePath ?? 'data/_ss-helper/ss-helper.sqlite3',
+        databasePath: previous?.databasePath ?? 'data/_ss-helper-v0/ss-helper.sqlite3',
         databaseSizeBytes: previous?.databaseSizeBytes ?? 0,
         workspaceSizeBytes: previous?.workspaceSizeBytes ?? 0,
         currentChatSizeBytes: previous?.currentChatSizeBytes ?? 0,
@@ -1129,9 +1153,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     mode: 'initialize' | 'incremental',
     resumeJob?: MemoryJob,
     selectedSourceGroups?: string[],
+    options?: MemoryInitializationOptions,
   ): Promise<void> {
     if (this.capturePromise) return this.capturePromise;
-    this.capturePromise = this.runCapture(mode, resumeJob, selectedSourceGroups).finally(() => { this.capturePromise = null; });
+    this.capturePromise = this.runCapture(mode, resumeJob, selectedSourceGroups, options).finally(() => { this.capturePromise = null; });
     return this.capturePromise;
   }
 
@@ -1139,6 +1164,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     mode: 'initialize' | 'incremental',
     resumeJob?: MemoryJob,
     selectedSourceGroups?: string[],
+    options?: MemoryInitializationOptions,
   ): Promise<void> {
     const captureSettings = this.getEffectiveSettings();
     if (!captureSettings.enabled) return;
@@ -1158,9 +1184,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         captureSettings.graphEnabled ? new MemoryGraphRecallIndex(deriveMemoryGraphProjection(baselineFacts)) : undefined,
       )
       : null;
+    const includeInvisibleHistory = mode === 'initialize'
+      && (resumeJob?.checkpoint.includeInvisibleHistory ?? options?.includeInvisibleHistory === true);
     const effectiveSelectedSourceGroups = resumeJob?.checkpoint.selectedSourceGroupIds ?? selectedSourceGroups;
     const allSources = selectSourceGroups(
-      filterSourceBlocks(await this.collectSources(chatKey)),
+      filterSourceBlocks(await this.collectSources(chatKey), { includeInvisibleHistory }),
       mode === 'incremental' ? undefined : effectiveSelectedSourceGroups,
     );
     this.assertCaptureCurrent(captureVersion, chatKey);
@@ -1177,7 +1205,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     if (sources.length === 0) {
       return;
     }
-    const messageSources = visibleConversationMessages(sources);
+    const summaryOptions = { includeSystemMessages: includeInvisibleHistory };
+    const messageSources = visibleConversationMessages(sources, summaryOptions);
     const target = automaticWindow
       ? { startFloor: automaticWindow.startFloor, endFloor: automaticWindow.endFloor, endMessageId: automaticWindow.endMessageId }
       : messageSources.length > 0
@@ -1187,7 +1216,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           endMessageId: messageSources.at(-1)?.id ?? '',
         }
         : undefined;
-    const allBatches = buildSummaryBatches(sources, summaryStrategyFromSettings(this.settings));
+    const allBatches = buildSummaryBatches(sources, summaryStrategyFromSettings(this.settings), summaryOptions);
     const initializationPhase = mode === 'initialize'
       ? (resumeJob?.checkpoint.phase ?? 'extract')
       : undefined;
@@ -1219,6 +1248,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         processedCount: resumeJob?.checkpoint.processedCount ?? 0,
         ...(resumeJob?.checkpoint.metadataSourceRefs === undefined ? {} : { metadataSourceRefs: resumeJob.checkpoint.metadataSourceRefs }),
         ...(effectiveSelectedSourceGroups === undefined ? {} : { selectedSourceGroupIds: effectiveSelectedSourceGroups }),
+        ...(mode === 'initialize' ? { includeInvisibleHistory } : {}),
         ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
         ...(initializationPhase ? {
           phase: initializationPhase,
@@ -1260,6 +1290,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ...(resumeJob?.checkpoint.overlapSourceRefs === undefined ? {} : { overlapSourceRefs: resumeJob.checkpoint.overlapSourceRefs }),
       ...(resumeJob?.checkpoint.metadataSourceRefs === undefined ? {} : { metadataSourceRefs: resumeJob.checkpoint.metadataSourceRefs }),
       ...(effectiveSelectedSourceGroups === undefined ? {} : { selectedSourceGroupIds: effectiveSelectedSourceGroups }),
+      ...(mode === 'initialize' ? { includeInvisibleHistory } : {}),
       ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
       ...(initializationPhase ? {
         phase: initializationPhase,
@@ -1291,7 +1322,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
             const prepared = await service.prepare({ chatKey, sources: batch });
             this.assertCaptureCurrent(captureVersion, chatKey);
             await this.repository.putInitializationStagingBatch({
-              id: '', kind: 'initialization-staging-v1', chatKey, jobId, batchIndex,
+              id: '', kind: 'initialization-staging-v0', chatKey, jobId, batchIndex,
               totalBatches: allBatches.length, processedCount,
               sources: snapshotsFromSources(prepared.sources), facts: prepared.facts,
               rejections: prepared.rejections, ...(prepared.audit ? { audit: prepared.audit } : {}),
@@ -1304,6 +1335,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
               overlapSourceRefs: batch.slice(-2).map((source) => source.id),
               metadataSourceRefs: [...processedMetadataRefs],
               ...(effectiveSelectedSourceGroups === undefined ? {} : { selectedSourceGroupIds: effectiveSelectedSourceGroups }),
+              ...(mode === 'initialize' ? { includeInvisibleHistory } : {}),
               ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
               phase: 'extract', stagedBatchCount: stagedBatchIndices.size,
             };
@@ -1335,7 +1367,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           const conflictResult = await resolveInitializationConflicts({ llm: readMemoryLlmApi(), buckets: reduced.conflictBuckets, facts: reduced.facts });
           finalized = applyInitializationConflictResolutions(reduced, conflictResult.resolutions);
           await this.repository.putInitializationResolution({
-            id: '', kind: 'initialization-resolution-v1', chatKey, jobId, reduction: finalized, createdAt: Date.now(), updatedAt: Date.now(),
+            id: '', kind: 'initialization-resolution-v0', chatKey, jobId, reduction: finalized, createdAt: Date.now(), updatedAt: Date.now(),
           });
         }
         this.assertCaptureCurrent(captureVersion, chatKey);

@@ -61,7 +61,7 @@ export const MEMORY_DEFAULT_SETTINGS: Readonly<MemorySettings> = Object.freeze({
 });
 
 export const MEMORY_WORKBENCH_POPUP = Object.freeze({
-  kind: 'popup', provider: 'ss-helper.memory', name: 'workbench', version: 1,
+  kind: 'popup', provider: 'ss-helper.memory', name: 'workbench', version: 0,
 } as const);
 
 export const MEMORY_SETTINGS_SCHEMA = Object.freeze({

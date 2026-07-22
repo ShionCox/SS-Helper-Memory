@@ -1,5 +1,6 @@
 import type {
   ChatMessageSnapshot,
+  ChatMessageType,
   HostCharacterSnapshot,
   HostPersonaSnapshot,
   WorldbookSnapshot,
@@ -108,15 +109,23 @@ export function buildVisibleChatSourceBlocks(chatKey: string, rawMessages: reado
     const message = value as Record<string, unknown>;
     const content = text(message.mes ?? message.content ?? message.text);
     if (!content) return [];
-    const role = message.is_system === true || message.role === 'system'
+    const extra = message.extra && typeof message.extra === 'object' ? message.extra as Record<string, unknown> : undefined;
+    const messageType: ChatMessageType = message.messageType === 'tool' || message.role === 'tool' || extra?.type === 'tool'
+      ? 'tool'
+      : message.messageType === 'reasoning' || message.is_reasoning === true
+        ? 'reasoning'
+        : message.messageType === 'system' || message.is_system === true || message.role === 'system'
+          ? 'system'
+          : 'conversation';
+    const role = messageType === 'system'
       ? 'system'
-      : message.role === 'tool' || message.extra && typeof message.extra === 'object' && (message.extra as Record<string, unknown>).type === 'tool'
+      : messageType === 'tool'
         ? 'tool'
         : message.is_user === true || message.role === 'user' ? 'user' : 'assistant';
-    const hidden = message.is_hidden === true
+    const explicitHidden = message.is_hidden === true
       || message.hidden === true
-      || message.is_reasoning === true
-      || Boolean(message.extra && typeof message.extra === 'object' && (message.extra as Record<string, unknown>).hidden === true);
+      || Boolean(extra?.hidden === true);
+    const hidden = messageType !== 'system' && (explicitHidden || message.visibleToAi === false || messageType === 'tool' || messageType === 'reasoning');
     return [{
       id: `message:${messageId(message, index)}`,
       chatKey,
@@ -125,6 +134,7 @@ export function buildVisibleChatSourceBlocks(chatKey: string, rawMessages: reado
       content,
       createdAt: messageCreatedAt(message, index),
       floor: index,
+      ...(messageType === 'conversation' ? {} : { messageType }),
       hidden,
     }];
   });
@@ -215,7 +225,7 @@ export function selectSourceGroups(sources: readonly SourceBlock[], selectedGrou
   return sources.filter((source) => selected.has(sourceGroupId(source)));
 }
 
-/** 读取当前角色、Persona、启用世界书与可见聊天历史。 */
+/** 读取当前角色、Persona、启用世界书与完整聊天历史；可见性由后续过滤选项决定。 */
 export async function collectCurrentChatSources(chatKey: string, reader: MemorySourceReader): Promise<SourceBlock[]> {
   const [messages, character, persona, books] = await Promise.all([
     reader.readMessages(), reader.readCharacter(), reader.readPersona(), reader.readActiveWorldbooks(),

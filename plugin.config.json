@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 0,
   "kind": "frontend-extension",
   "directoryName": "SS-Helper-Memory",
   "displayName": "SS-Helper [记忆]",
@@ -9,7 +9,7 @@
   "manifest": {
     "loading_order": -9,
     "author": "Shion",
-    "version": "0.0.3",
+    "version": "0.0.1",
     "auto_update": false,
     "homePage": "https://github.com/ShionCox/SillyTavern-SS-Helper",
     "minimum_client_version": "1.18.0"

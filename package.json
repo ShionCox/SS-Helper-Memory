@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ss-helper/sdk": "file:vendor/ss-helper-sdk-2.2.0.tgz",
+    "@ss-helper/sdk": "file:vendor/ss-helper-sdk-0.0.1.tgz",
     "d3-force-3d": "^3.0.6",
     "three": "^0.179.1"
   },

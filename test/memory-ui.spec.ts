@@ -16,7 +16,7 @@ import {
   translateRecallMode,
   renderMemoryWorkbench,
 } from '../src/ui/memory-ui';
-import type { MemoryUiController, MemoryUiFact } from '../src/ui/memory-ui';
+import type { MemoryInitializationOptions, MemoryUiController, MemoryUiFact } from '../src/ui/memory-ui';
 
 function workbenchController(overrides: Partial<MemoryUiController> = {}): MemoryUiController {
   const facts: MemoryUiFact[] = [{ id: 'fact-1', kind: 'state', status: 'active', content: '当前状态稳定', confidence: 0.9, sourceRefs: ['message:1'], evidence: [{ sourceRef: 'message:1', excerpt: '证据摘录' }], updatedAt: 10 }];
@@ -25,7 +25,7 @@ function workbenchController(overrides: Partial<MemoryUiController> = {}): Memor
     saveSettings: async () => undefined,
     getOverview: async () => ({ status: 'ready', bound: true, chatName: 'Assistant', chatKey: 'Assistant - 2026-07-18@03h29m55s201ms', factCount: facts.length, currentChatSizeBytes: 2048, currentChatUsageRatio: 0.25, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: true }),
     getInitializationEstimate: async () => ({ messageCount: 1, batchCount: 1, tokenLow: 10, tokenHigh: 20 }),
-    getInitializationSources: async () => [{ kind: 'message', label: '聊天记录', count: 1, selected: true }],
+    getInitializationSources: async () => [{ kind: 'message', label: '聊天记录', count: 1, rawCount: 1, defaultCount: 1, excludedCount: 0, selected: true }],
     getInitializationState: async () => ({ initialized: false, lastCompletedAt: null, selectedSourceKinds: [], attempts: [] }),
     initialize: async () => undefined,
     reinitialize: async () => undefined,
@@ -44,7 +44,7 @@ function workbenchController(overrides: Partial<MemoryUiController> = {}): Memor
     getRelationshipGraph: async () => ({ nodes: [{ id: 'node-a', label: '艾琳' }, { id: 'node-b', label: '雷暴' }], edges: [{ id: 'edge-a', from: 'node-a', to: 'node-b', predicate: '害怕', kind: 'relationship' as const, status: 'active' as const, confidence: 0.9, backingFactId: 'fact-1' }] }),
     rebuildGraph: async () => undefined,
     rollbackBatch: async () => undefined,
-    getSqliteStatus: async () => ({ connected: true, serverVersion: '1', nodeVersion: 'v22.17.0', protocolVersion: 1, sqliteVersion: '3', schemaVersion: 4, databasePath: 'memory.db', databaseSizeBytes: 4096, workspaceSizeBytes: 8192, currentChatSizeBytes: 2048, currentChatUsageRatio: 0.25, walMode: 'wal', tableCounts: {}, tableBytes: {}, vectorCoverage: { indexedFacts: 1, eligibleFacts: 1, ratio: 1 } }),
+    getSqliteStatus: async () => ({ connected: true, serverVersion: '0.0.1', nodeVersion: 'v22.17.0', protocolVersion: 0, sqliteVersion: '3', schemaVersion: 0, databasePath: 'memory.db', databaseSizeBytes: 4096, workspaceSizeBytes: 8192, currentChatSizeBytes: 2048, currentChatUsageRatio: 0.25, walMode: 'wal', tableCounts: {}, tableBytes: {}, vectorCoverage: { indexedFacts: 1, eligibleFacts: 1, ratio: 1 } }),
     exportSqliteBackup: async () => new Blob(['{}'], { type: 'application/json' }),
     importSqliteBackup: async () => undefined,
     checkSqliteIntegrity: async () => ({ ok: true, message: 'ok' }),
@@ -126,7 +126,7 @@ describe('Memory UI 展示适配', () => {
     document.body.append(container);
     const dispose = renderMemoryWorkbench(container, workbenchController({
       listAuditRecords: async () => [{
-        id: 'initialization-finalization:job-a', kind: 'initialization-finalization-v1', jobId: 'job:a', batchIndex: 7, status: 'completed', accepted: 33,
+        id: 'initialization-finalization:job-a', kind: 'initialization-finalization-v0', jobId: 'job:a', batchIndex: 7, status: 'completed', accepted: 33,
         sourceRefs: Array.from({ length: 35 }, (_, index) => `message:${index}`), rejected: Array.from({ length: 29 }, () => ({})),
         finalization: { stagedBatchCount: 7, extractedFactCount: 33, acceptedFactCount: 33, mergedDuplicateCount: 0, conflictBucketCount: 0 },
         routeSummary: { requestCount: 7, resourceIds: ['__builtin_tavern__'], models: ['deepseek-chat'] },
@@ -180,7 +180,7 @@ describe('Memory UI 展示适配', () => {
   it('明确 SQLite schema v4 与级联批次回滚语义', () => {
     const confirmation = formatRollbackConfirmation('job:test', 3);
 
-    expect(EXPECTED_SQLITE_SCHEMA_VERSION).toBe(4);
+    expect(EXPECTED_SQLITE_SCHEMA_VERSION).toBe(0);
     expect(confirmation).toContain('第 3 批及其后续批次');
     expect(confirmation).toContain('之后批次的整理结果也会一并撤销');
   });
@@ -501,7 +501,7 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).toContain('重排序模型');
     (container.querySelector('[data-page="data"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(container.textContent).toContain('/ v1 / v4');
+    expect(container.textContent).toContain('/ v0 / v0');
     expect(container.textContent).not.toContain('Schema 版本不匹配');
     expect(container.textContent).toContain('v22.17.0');
     expect(container.textContent).toContain('4.00 KB');
@@ -513,6 +513,44 @@ describe('Memory UI 展示适配', () => {
     expect(container.querySelector('.stx-memory-chat-storage')?.textContent).toContain('25%');
     expect(container.querySelector('[data-action="import-file"]')?.parentElement?.getAttribute('data-ss-helper-control')).toBe('file-trigger');
     expect(container.querySelector('[data-action="clear-all"]')?.getAttribute('data-ss-helper-tone')).toBe('danger');
+    dispose();
+  });
+
+  it('初始化开关默认关闭、实时刷新计数，并把本次选项传给控制器', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const sourceOptions: boolean[] = [];
+    const estimateOptions: boolean[] = [];
+    const initializeOptions: MemoryInitializationOptions[] = [];
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getInitializationSources: async (options) => {
+        const enabled = options?.includeInvisibleHistory === true;
+        sourceOptions.push(enabled);
+        return [{ kind: 'message', label: '聊天消息', count: enabled ? 2 : 1, rawCount: 3, defaultCount: 1, excludedCount: enabled ? 1 : 2, selected: true }];
+      },
+      getInitializationEstimate: async (_kinds, options) => {
+        const enabled = options?.includeInvisibleHistory === true;
+        estimateOptions.push(enabled);
+        return { messageCount: enabled ? 2 : 1, batchCount: 1, tokenLow: 10, tokenHigh: 20 };
+      },
+      initialize: async (_kinds, options) => { initializeOptions.push({ ...options }); },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const toggle = container.querySelector<HTMLInputElement>('[data-option="include-invisible-history"]')!;
+    expect(toggle.checked).toBe(false);
+    expect(container.textContent).toContain('1 / 3 条');
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event('change', { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sourceOptions.at(-1)).toBe(true);
+    expect(estimateOptions.at(-1)).toBe(true);
+    expect(container.textContent).toContain('2 / 3 条');
+    (container.querySelector('[data-action="initialize-start"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(initializeOptions).toEqual([{ includeInvisibleHistory: true }]);
     dispose();
   });
 
@@ -612,8 +650,8 @@ describe('Memory UI 展示适配', () => {
     const estimateKinds: string[][] = [];
     const dispose = renderMemoryWorkbench(container, workbenchController({
       getInitializationSources: async () => [
-        { kind: 'message', label: '聊天消息', count: 8, selected: true },
-        { kind: 'character', label: '角色卡', count: 1, selected: false },
+        { kind: 'message', label: '聊天消息', count: 8, rawCount: 10, defaultCount: 8, excludedCount: 2, selected: true },
+        { kind: 'character', label: '角色卡', count: 1, rawCount: 1, defaultCount: 1, excludedCount: 0, selected: false },
       ],
       getInitializationEstimate: async (kinds) => {
         estimateKinds.push([...(kinds ?? [])]);

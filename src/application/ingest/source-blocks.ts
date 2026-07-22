@@ -131,10 +131,21 @@ export function sanitizeSourceContent(value: string): string {
   return content.replace(/\n{3,}/g, '\n\n').trim();
 }
 
-/** 只保留用户授权且模型可见的来源块。 */
-export function filterSourceBlocks(blocks: readonly SourceBlock[]): SourceBlock[] {
+export interface SourceFilterOptions {
+  /** Allow Tavern's historical system messages, while retaining safety filters. */
+  includeInvisibleHistory?: boolean;
+}
+
+/** 只保留用户授权且模型可见的来源块；不可见历史正文仅在显式开启时保留。 */
+export function filterSourceBlocks(blocks: readonly SourceBlock[], options: SourceFilterOptions = {}): SourceBlock[] {
   return blocks.flatMap((block): SourceBlock[] => {
-    if (block.hidden || block.role === 'system' || block.role === 'tool') return [];
+    if (
+      block.hidden
+      || block.messageType === 'tool'
+      || block.messageType === 'reasoning'
+      || block.role === 'tool'
+      || ((block.role === 'system' || block.messageType === 'system') && options.includeInvisibleHistory !== true)
+    ) return [];
     const content = sanitizeSourceContent(block.content);
     if (!content) return [];
     return [{ ...block, content }];

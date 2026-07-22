@@ -17,7 +17,7 @@ function commitInput(): IngestCommit {
 
 function workspace(overrides: Partial<WorkspacePort> = {}): WorkspacePort {
   return {
-    health: vi.fn(async () => ({ ready: true, database: 'ss-helper.sqlite3', schemaVersion: 4 })),
+    health: vi.fn(async () => ({ ready: true, database: 'ss-helper.sqlite3', schemaVersion: 0 })),
     integrity: vi.fn(async () => ({ ok: true, messages: ['ok'] })),
     open: vi.fn(async (request) => ({ ownerPluginId: 'ss-helper.memory', workspaceId: request.workspaceId, created: false })),
     list: vi.fn(async () => ({ workspaces: [], nextCursor: null })),
@@ -67,7 +67,7 @@ describe('MemoryRepository workspace concurrency', () => {
       { recordId: 'fact-b', value: { chatKey: 'chat-b', content: '其他聊天记忆更长一些' }, version: 1, updatedAt: 1 },
     ];
     const port = workspace({
-      health: vi.fn(async () => ({ ready: true, database: 'ss-helper.sqlite3', schemaVersion: 4, nodeVersion: 'v22.17.0', databaseSizeBytes: 65_536 })),
+      health: vi.fn(async () => ({ ready: true, database: 'ss-helper.sqlite3', schemaVersion: 0, nodeVersion: 'v22.17.0', databaseSizeBytes: 65_536 })),
       query: vi.fn(async (request) => ({ records: request.collection === 'facts' ? records : [], nextCursor: null })) as never,
       vectorList: vi.fn(async () => ({
         vectors: [
@@ -106,7 +106,7 @@ describe('MemoryRepository workspace concurrency', () => {
 
   it('keeps SQLite failure ahead of the unselected-chat status', async () => {
     const application = new MemoryApplication(new MemoryRepository(workspace({
-      health: vi.fn(async () => ({ ready: false, database: 'ss-helper.sqlite3', schemaVersion: 4, error: 'database unavailable' })),
+      health: vi.fn(async () => ({ ready: false, database: 'ss-helper.sqlite3', schemaVersion: 0, error: 'database unavailable' })),
     })));
     application.useHostContext({ getChatKey: () => '', getWorkspaceId: () => '', collectSources: async () => [] });
     await application.start();
@@ -231,12 +231,12 @@ describe('MemoryRepository workspace concurrency', () => {
   it('collapses consecutive UndoLogV2 changes into one atomic inverse write', async () => {
     const before = { id: 'fact-a', chatKey: 'chat-a', content: 'A' }; const middle = { id: 'fact-a', chatKey: 'chat-a', content: 'B' }; const after = { id: 'fact-a', chatKey: 'chat-a', content: 'C' };
     const logs = [
-      { id: 'undo-v2:job-a:1', kind: 'undo-log-v2', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 1, transactionId: 'tx-1', committedSequence: 1, createdAt: 1, entries: [{ collection: 'facts', recordId: 'fact-a', before, after: middle, beforeRevision: 1, afterRevision: 2 }] },
-      { id: 'undo-v2:job-a:2', kind: 'undo-log-v2', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 2, transactionId: 'tx-2', committedSequence: 2, createdAt: 2, entries: [{ collection: 'facts', recordId: 'fact-a', before: middle, after, beforeRevision: 2, afterRevision: 3 }] },
+      { id: 'undo-v2:job-a:1', kind: 'undo-log-v0', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 1, transactionId: 'tx-1', committedSequence: 1, createdAt: 1, entries: [{ collection: 'facts', recordId: 'fact-a', before, after: middle, beforeRevision: 1, afterRevision: 2 }] },
+      { id: 'undo-v2:job-a:2', kind: 'undo-log-v0', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 2, transactionId: 'tx-2', committedSequence: 2, createdAt: 2, entries: [{ collection: 'facts', recordId: 'fact-a', before: middle, after, beforeRevision: 2, afterRevision: 3 }] },
     ];
     const rows = logs.map((value, index) => ({ recordId: value.id, value, version: 1, revision: 1, updatedAt: index + 1 }));
     const get = vi.fn(async (request: { collection?: string; recordId: string }) => {
-      if (request.recordId === 'rollback-v2:job-a:1') return null;
+      if (request.recordId === 'rollback-v0:job-a:1') return null;
       if (request.collection === 'facts') return { recordId: 'fact-a', value: after, version: 3, revision: 3, updatedAt: 3 } as WorkspaceRecord;
       if (request.collection === 'jobs') return { recordId: 'job-a', value: { id: 'job-a', chatKey: 'chat-a', type: 'incremental', status: 'completed', checkpoint: { batchIndex: 2, processedCount: 2 }, createdAt: 1, updatedAt: 2 }, version: 2, revision: 2, updatedAt: 2 } as WorkspaceRecord;
       return null;
@@ -250,14 +250,14 @@ describe('MemoryRepository workspace concurrency', () => {
 
     const request = transaction.mock.calls[0][0];
     expect(request.operations.filter((operation: { collection?: string; recordId: string }) => operation.collection === 'facts' && operation.recordId === 'fact-a')).toEqual([{ action: 'upsert', collection: 'facts', recordId: 'fact-a', value: before, expectedRevision: 3 }]);
-    expect(request.operations).toEqual(expect.arrayContaining([expect.objectContaining({ recordId: 'rollback-v2:job-a:1', collection: 'job-audits' })]));
+    expect(request.operations).toEqual(expect.arrayContaining([expect.objectContaining({ recordId: 'rollback-v0:job-a:1', collection: 'job-audits' })]));
     expect(vectorDelete).toHaveBeenCalledWith(expect.objectContaining({ recordId: 'fact-a' }));
   });
 
   it('rejects UndoLogV2 rollback when the latest record revision changed', async () => {
     const after = { id: 'fact-a', content: 'C' };
-    const log = { id: 'undo-v2:job-a:1', kind: 'undo-log-v2', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 1, transactionId: 'tx-1', committedSequence: 1, createdAt: 1, entries: [{ collection: 'facts', recordId: 'fact-a', before: { id: 'fact-a', content: 'A' }, after, beforeRevision: 1, afterRevision: 2 }] };
-    const get = vi.fn(async (request: { recordId: string }) => request.recordId === 'rollback-v2:job-a:1' ? null : ({ recordId: 'fact-a', value: after, version: 3, revision: 3, updatedAt: 3 } as WorkspaceRecord));
+    const log = { id: 'undo-v2:job-a:1', kind: 'undo-log-v0', chatKey: 'chat-a', jobId: 'job-a', batchIndex: 1, transactionId: 'tx-1', committedSequence: 1, createdAt: 1, entries: [{ collection: 'facts', recordId: 'fact-a', before: { id: 'fact-a', content: 'A' }, after, beforeRevision: 1, afterRevision: 2 }] };
+    const get = vi.fn(async (request: { recordId: string }) => request.recordId === 'rollback-v0:job-a:1' ? null : ({ recordId: 'fact-a', value: after, version: 3, revision: 3, updatedAt: 3 } as WorkspaceRecord));
     const query = vi.fn(async () => ({ records: [{ recordId: log.id, value: log, version: 1, revision: 1, updatedAt: 1 }], nextCursor: null }));
     const transaction = vi.fn(); const repository = new MemoryRepository(workspace({ get: get as never, query: query as never, transaction })); repository.bind('character:c1', 'chat-a');
     await expect(repository.rollbackJobBatch('job-a', 1, 'chat-a')).rejects.toMatchObject({ code: 'WORKSPACE_CONFLICT' });
