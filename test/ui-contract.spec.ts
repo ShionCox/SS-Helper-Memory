@@ -3,10 +3,12 @@ import { describe, expect, it } from 'vitest';
 
 describe('Memory 工作台公共 UI 契约门禁', () => {
   it('只消费 SDK 公共标记和主题变量，不恢复内部类或基础控件副本', async () => {
-    const [source, styles] = await Promise.all([
+    const [memoryUiSource, librarySource, styles] = await Promise.all([
       readFile(new URL('../src/ui/memory-ui.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../src/ui/memory-library-view.ts', import.meta.url), 'utf8'),
       readFile(new URL('../src/ui/memory.css', import.meta.url), 'utf8'),
     ]);
+    const source = `${memoryUiSource}\n${librarySource}`;
 
     expect(source).toContain('UI_CONTROL_ATTRIBUTE');
     expect(source).toContain('UI_CONTROL_SIZE_ATTRIBUTE');
@@ -60,6 +62,8 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(styles).toContain('@keyframes stx-memory-reinitialize-drawer-in');
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-multi-filter-trigger\[data-ss-helper-control="button"\]\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+24px[^}]*justify-content:\s*stretch/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-fact-row\[data-ss-helper-control="button"\]\s*\{[^}]*min-height:\s*116px[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)[^}]*align-items:\s*stretch[^}]*border-color:\s*transparent/u);
+    expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-library-fact-list\s*\{[^}]*grid-auto-rows:\s*max-content/u);
+    expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-library-fact-row\[data-ss-helper-control="button"\]\s*\{[^}]*min-height:\s*116px/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-fact-row\[data-ss-helper-control="button"\]\[aria-selected="true"\]\s*\{[^}]*border-color:\s*color-mix/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-graph-edge-top\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto[^}]*overflow:\s*visible/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-graph-edge-row\[data-ss-helper-control="button"\]\s*\{[^}]*min-height:\s*54px[^}]*overflow:\s*visible/u);

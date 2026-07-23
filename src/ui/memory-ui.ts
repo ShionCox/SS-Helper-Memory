@@ -1,4 +1,5 @@
 import './memory.css';
+import './initialization.css';
 import {
   UI_CONTROL_ATTRIBUTE,
   UI_CONTROL_ICON_ONLY_ATTRIBUTE,
@@ -17,6 +18,27 @@ import { describeMemoryError, type MemoryErrorDiagnostic } from '../diagnostics/
 import { traceMemoryStartup } from '../host/runtime-feedback';
 import { mountRelationshipGraphThree, type RelationshipGraphCommand, type RelationshipGraphRenderer } from './relationship-graph-three';
 import { selectGraphView } from './relationship-graph-layout';
+import {
+  getSceneEventsHeader,
+  normalizeSceneEventsSelection,
+  renderSceneEventsPage,
+  renderSelectedSceneGraphDetail,
+  sceneGraphOwnerKind,
+  sceneGraphOwnerLabel,
+  type SceneEventCategory,
+  type SceneEventsState,
+} from './scene-events-view';
+import {
+  mountSceneCastPixi,
+  type SceneCastPixiCommand,
+  type SceneCastPixiRenderer,
+} from './scene-cast-pixi';
+import { renderInitializationView } from './initialization-view';
+import {
+  renderMemoryLibraryView,
+  selectMemoryLibraryView,
+  type MemoryLibrarySort,
+} from './memory-library-view';
 
 export interface MemoryUiSettings {
   enabled: boolean;
@@ -249,6 +271,8 @@ export interface MemoryUiController {
   listActors?(): Promise<readonly import('../domain').MemoryOwner[]>;
   listActorAliases?(): Promise<readonly import('../domain').ActorAlias[]>;
   listSceneCasts?(): Promise<readonly import('../domain').SceneCast[]>;
+  listEpisodes?(): Promise<readonly import('../domain').MemoryEpisode[]>;
+  listObservations?(): Promise<readonly import('../domain').MemoryObservation[]>;
   listActorTraces?(ownerId?: string): Promise<readonly import('../domain').ActorMemoryTrace[]>;
   listActorProfiles?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
   listActorDreams?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
@@ -438,9 +462,10 @@ function safeInlineError(value: unknown, fallback: string): string {
 export type MemoryWorkbenchPage = 'overview' | 'actors' | 'scenes' | 'library' | 'actor-memory' | 'profiles' | 'dreams' | 'recall' | 'audit' | 'initialize' | 'graph' | 'data';
 const PAGES: ReadonlyArray<{ id: MemoryWorkbenchPage; label: string; description: string; icon: string }> = [
   { id: 'overview', label: '概览', description: '当前工作区与场景状态', icon: 'gauge-high' },
+  { id: 'initialize', label: '初始化', description: '选择来源并捕获当前聊天记忆', icon: 'wand-magic-sparkles' },
   { id: 'actors', label: '人物与别名', description: '主体发现与待确认归属', icon: 'users' },
   { id: 'scenes', label: '场景与事件', description: '在场、提及与事件来源', icon: 'timeline' },
-  { id: 'library', label: '记忆库', description: '浏览与编辑事实', icon: 'book-open' },
+  { id: 'library', label: '记忆块', description: '浏览、审阅与编辑事实', icon: 'book-open' },
   { id: 'actor-memory', label: '角色记忆', description: '按主体查看记忆痕迹', icon: 'brain' },
   { id: 'profiles', label: '画像与关系', description: '来源支撑的增量画像', icon: 'address-card' },
   { id: 'dreams', label: 'Dream', description: '逐主体巩固、审计与回滚', icon: 'moon' },
@@ -448,7 +473,6 @@ const PAGES: ReadonlyArray<{ id: MemoryWorkbenchPage; label: string; description
   { id: 'audit', label: '审计记录', description: '查看整理批次', icon: 'list-check' },
 ];
 const INTERNAL_PAGES: ReadonlyArray<{ id: MemoryWorkbenchPage; label: string; description: string; icon: string }> = [
-  { id: 'initialize', label: '初始化', description: '捕获当前聊天来源（场景页内）', icon: 'wand-magic-sparkles' },
   { id: 'graph', label: '关系图谱', description: '召回诊断中的只读图谱', icon: 'diagram-project' },
   { id: 'data', label: '数据维护', description: '审计页内的存储健康状态', icon: 'database' },
 ];
@@ -483,15 +507,28 @@ interface WorkbenchState {
   candidateTargetOwnerId: string;
   candidateCanonicalName: string;
   scenes: Array<import('../domain').SceneCast>;
+  episodes: Array<import('../domain').MemoryEpisode>;
+  observations: Array<import('../domain').MemoryObservation>;
+  sceneCategory: SceneEventCategory;
+  sceneQuery: string;
+  sceneFilter: string;
+  selectedSceneId: string;
+  selectedEpisodeId: string;
+  selectedObservationId: string;
+  selectedSceneOwnerId: string;
+  showSceneBoundaries: boolean;
+  showSceneSources: boolean;
+  showSceneConfidence: boolean;
   actorTraces: Array<import('../domain').ActorMemoryTrace>;
   profiles: Array<Record<string, unknown>>;
   dreams: Array<Record<string, unknown>>;
   facts: MemoryUiFact[];
+  libraryResults: MemoryUiFact[];
   query: string;
   selectedKinds: string[];
   selectedStatuses: string[];
   openFilter: '' | 'kind' | 'status';
-  sort: FactViewOptions['sort'];
+  sort: MemoryLibrarySort;
   selectedFactId: string;
   editingFactId: string;
   confirmFactId: string;
@@ -584,10 +621,52 @@ export function renderMemoryWorkbench(
   let progressRequestId = 0;
   let pageRequestId = 0;
   let graphRenderer: RelationshipGraphRenderer | undefined;
+  let sceneRenderer: SceneCastPixiRenderer | undefined;
+  let sceneRendererToken = 0;
   const requestedGraphPage = initialActionId === 'open-relationship-graph' || initialActionId === 'rebuild-relationship-graph';
   const state: WorkbenchState = {
-    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', scenes: [], actorTraces: [], profiles: [], dreams: [], facts: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
+    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', scenes: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
     selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeInvisibleHistory: false, reinitializeOpen: false, audits: [], usages: [], integrityText: '尚未执行完整性检查。', confirmBatchKey: '', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
+  };
+  const sceneEventsState = (): SceneEventsState => ({
+    category: state.sceneCategory,
+    query: state.sceneQuery,
+    filter: state.sceneFilter,
+    scenes: state.scenes,
+    episodes: state.episodes,
+    observations: state.observations,
+    actors: state.actors,
+    actorAliases: state.actorAliases,
+    selectedSceneId: state.selectedSceneId,
+    selectedEpisodeId: state.selectedEpisodeId,
+    selectedObservationId: state.selectedObservationId,
+    selectedSceneOwnerId: state.selectedSceneOwnerId,
+    showSceneBoundaries: state.showSceneBoundaries,
+    showSceneSources: state.showSceneSources,
+    showSceneConfidence: state.showSceneConfidence,
+  });
+  const syncSceneSelection = (sceneState: SceneEventsState): void => {
+    state.selectedSceneId = sceneState.selectedSceneId;
+    state.selectedEpisodeId = sceneState.selectedEpisodeId;
+    state.selectedObservationId = sceneState.selectedObservationId;
+    state.selectedSceneOwnerId = sceneState.selectedSceneOwnerId;
+  };
+  const normalizeLibrarySelection = (): void => {
+    const selection = selectMemoryLibraryView({
+      allFacts: state.facts,
+      queryFacts: state.libraryResults,
+      query: state.query,
+      selectedKinds: state.selectedKinds,
+      selectedStatuses: state.selectedStatuses,
+      openFilter: state.openFilter,
+      sort: state.sort,
+      selectedFactId: state.selectedFactId,
+      editingFactId: state.editingFactId,
+      confirmFactId: state.confirmFactId,
+      busyAction: state.busyAction,
+      chatLabel: '',
+    });
+    state.selectedFactId = selection.selected?.id ?? '';
   };
 
   const toast = (level: ToastNotification['level'], title: string, message: string, code: string): void => {
@@ -619,6 +698,26 @@ export function renderMemoryWorkbench(
       ? `<button class="stx-memory-reference-jump" ${uiButton('neutral', 'xs', true)} type="button" ${action}><ss-helper-icon name="link" decorative></ss-helper-icon></button><span>${label}</span>`
       : `<button class="stx-memory-reference-link" ${uiControl('button', 'neutral')} type="button" ${action}>${label}</button>`;
   };
+  const renderLibrarySourceReference = (value: string, mode: 'reference' | 'evidence' = 'reference'): string => {
+    if (parseMessageSourceReference(value) && navigateToMessage) {
+      return renderSourceReference(value, mode === 'evidence' ? 'evidence' : 'chip');
+    }
+    const label = escapeHtml(formatSourceReference(value));
+    const action = `data-action="show-source-info" data-source-ref="${escapeHtml(value)}" aria-label="查看${label}来源说明"`;
+    return mode === 'evidence'
+      ? `<button class="stx-memory-reference-jump" ${uiButton('neutral', 'xs', true)} type="button" ${action}><ss-helper-icon name="link" decorative></ss-helper-icon></button><span>${label}</span>`
+      : `<button class="stx-memory-reference-link" ${uiControl('button', 'neutral')} type="button" ${action}>${label}</button>`;
+  };
+  const openSceneSource = (sourceRef: string): void => {
+    const target = parseMessageSourceReference(sourceRef);
+    if (!target || !navigateToMessage) {
+      toast('info', '此来源暂不支持跳转', '世界书、角色卡和状态来源仍会保留为可追溯引用。', 'MEMORY_SOURCE_NAVIGATION_UNAVAILABLE');
+      return;
+    }
+    void navigateToMessage(target).catch(() => {
+      toast('warning', '无法跳转聊天楼层', '对应消息可能尚未加载或已被删除。', 'MEMORY_MESSAGE_NAVIGATION_UNAVAILABLE');
+    });
+  };
   const renderNow = (): void => {
     if (disposed) return;
     const focusSelector = pendingFocusSelector;
@@ -631,6 +730,9 @@ export function renderMemoryWorkbench(
     const selectionEnd = active?.selectionEnd;
     graphRenderer?.dispose();
     graphRenderer = undefined;
+    sceneRenderer?.dispose();
+    sceneRenderer = undefined;
+    sceneRendererToken += 1;
     render();
     const restoreFactListScroll = (): void => {
       if (disposed || factListScrollTop === undefined) return;
@@ -705,17 +807,40 @@ export function renderMemoryWorkbench(
   const refreshFacts = async (): Promise<void> => {
     if (state.overview?.bound === false) {
       state.facts = [];
+      state.libraryResults = [];
       state.selectedFactId = '';
       return;
     }
-    state.facts = await controller.listFacts(state.query);
-    if (!state.facts.some((fact) => fact.id === state.selectedFactId)) state.selectedFactId = state.facts[0]?.id ?? '';
+    const [allFacts, queryFacts] = await Promise.all([
+      controller.listFacts(),
+      state.query.trim() ? controller.listFacts(state.query) : Promise.resolve(undefined),
+    ]);
+    state.facts = allFacts;
+    state.libraryResults = queryFacts ?? allFacts;
+    normalizeLibrarySelection();
+  };
+  const refreshLibrarySearch = async (): Promise<void> => {
+    if (state.overview?.bound === false) {
+      state.libraryResults = [];
+      state.selectedFactId = '';
+      return;
+    }
+    state.libraryResults = state.query.trim()
+      ? await controller.listFacts(state.query)
+      : state.facts.length ? state.facts : await controller.listFacts();
+    normalizeLibrarySelection();
   };
   const loadOverview = async (): Promise<void> => {
     state.loading = true; state.errorCode = ''; state.errorDiagnostic = undefined; rerender();
     try {
       state.overview = await controller.getOverview();
-      state.facts = state.overview.bound === false ? [] : await controller.listFacts(state.query);
+      if (state.overview.bound === false) {
+        state.facts = [];
+        state.libraryResults = [];
+      } else {
+        await refreshFacts();
+        state.recall = await controller.getRecallStatus().catch(() => undefined);
+      }
       state.selectedFactId = state.facts[0]?.id ?? '';
       state.loading = false; state.errorDiagnostic = undefined; rerender();
       void updateProgress();
@@ -765,17 +890,26 @@ export function renderMemoryWorkbench(
           if (state.pendingActors.length === 0 && state.actorView === 'pending') state.actorView = 'people';
         }
       } else if (page === 'scenes') {
-        const [scenes, sources, initialization] = await Promise.all([
+        const [scenes, episodes, observations, actors, aliases] = await Promise.all([
           controller.listSceneCasts ? controller.listSceneCasts() : Promise.resolve([]),
-          controller.getInitializationSources({ includeInvisibleHistory: state.includeInvisibleHistory }),
-          controller.getInitializationState(),
+          controller.listEpisodes ? controller.listEpisodes() : Promise.resolve([]),
+          controller.listObservations ? controller.listObservations() : Promise.resolve([]),
+          controller.listActors ? controller.listActors() : Promise.resolve([]),
+          controller.listActorAliases ? controller.listActorAliases() : Promise.resolve([]),
         ]);
+        if (!isCurrent()) return;
         state.scenes = [...scenes];
-        state.sources = sources;
-        state.initialization = initialization;
-        state.selectedSourceKinds = state.sources.filter((source) => source.selected).map((source) => source.kind);
-        state.estimate = await controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory });
-        state.progress = await controller.getCaptureProgress();
+        state.episodes = [...episodes];
+        state.observations = [...observations];
+        state.actors = [...actors];
+        state.actorAliases = [...aliases];
+        const normalized = sceneEventsState();
+        normalizeSceneEventsSelection(normalized);
+        syncSceneSelection(normalized);
+      } else if (page === 'library') {
+        await refreshFacts();
+        if (!isCurrent()) return;
+        state.recall = await controller.getRecallStatus().catch(() => undefined);
       } else if (page === 'actor-memory') {
         state.actorTraces = controller.listActorTraces ? [...await controller.listActorTraces()] : [];
       } else if (page === 'profiles') {
@@ -783,13 +917,15 @@ export function renderMemoryWorkbench(
       } else if (page === 'dreams') {
         state.dreams = controller.listActorDreams ? [...await controller.listActorDreams()] : [];
       } else if (page === 'initialize') {
-        const [sources, initialization] = await Promise.all([
+        const [sources, initialization, sqlite] = await Promise.all([
           controller.getInitializationSources({ includeInvisibleHistory: state.includeInvisibleHistory }),
           controller.getInitializationState(),
+          controller.getSqliteStatus().catch(() => undefined),
         ]);
         if (!isCurrent()) return;
         state.sources = sources;
         state.initialization = initialization;
+        if (sqlite) state.sqlite = sqlite;
         state.selectedSourceKinds = state.sources.filter((source) => source.selected).map((source) => source.kind);
         state.estimate = await controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory });
         if (!isCurrent()) return;
@@ -886,20 +1022,35 @@ export function renderMemoryWorkbench(
     catch (error) { const diagnostic = describeMemoryError(error, `MEMORY_${action.toUpperCase()}_FAILED`, 'operation'); state.actionError = diagnostic; if (['initialize', 'reinitialize'].includes(action) && reload) await reload().catch(() => undefined); toast('error', diagnostic.title, diagnostic.reason, diagnostic.code); }
     finally { state.busyAction = ''; rerender(); }
   };
+  const refreshLibrary = async (): Promise<void> => {
+    await runAction(
+      'refresh-library',
+      async () => {
+        state.overview = await controller.getOverview();
+        await refreshFacts();
+        state.recall = await controller.getRecallStatus().catch(() => undefined);
+      },
+      '记忆块已刷新',
+      '当前聊天的事实、证据和召回状态已经重新读取。',
+      'MEMORY_LIBRARY_REFRESHED',
+    );
+  };
   const refreshInitialization = async (preferredKinds?: readonly string[]): Promise<void> => {
-    await controller.getSqliteStatus().catch(() => undefined);
-    const [overview, initialization, sources, progress, facts] = await Promise.all([
+    const [overview, initialization, sources, progress, facts, sqlite] = await Promise.all([
       controller.getOverview(),
       controller.getInitializationState(),
       controller.getInitializationSources({ includeInvisibleHistory: state.includeInvisibleHistory }),
       controller.getCaptureProgress(),
-      controller.listFacts(state.query),
+      controller.listFacts(),
+      controller.getSqliteStatus().catch(() => undefined),
     ]);
     state.overview = overview;
     state.initialization = initialization;
     state.sources = sources;
     state.progress = progress;
     state.facts = facts;
+    if (!state.query.trim()) state.libraryResults = facts;
+    if (sqlite) state.sqlite = sqlite;
     const availableKinds = new Set(sources.map((source) => source.kind));
     const nextKinds = preferredKinds?.filter((kind) => availableKinds.has(kind));
     state.selectedSourceKinds = nextKinds?.length
@@ -940,10 +1091,10 @@ export function renderMemoryWorkbench(
           <div><dt>最近整理</dt><dd>${escapeHtml(lastOrganized)}</dd></div>
         </dl>
         <section class="stx-memory-overview-section" aria-labelledby="stx-memory-overview-content-title"><div class="stx-memory-overview-section-heading"><ss-helper-icon name="gear" decorative></ss-helper-icon><span><h4 id="stx-memory-overview-content-title">记忆当前掌握的内容</h4><p>基于现有事实，系统可在对话中理解并组织以下类型的内容。</p></span></div><div class="stx-memory-overview-tags">${shortcut('actor-memory', 'brain', '多角色记忆')}${shortcut('scenes', 'timeline', '场景与事件')}${shortcut('profiles', 'address-card', '画像与关系')}${shortcut('dreams', 'moon', 'Dream')}${shortcut('recall', 'magnifying-glass-chart', '召回与索引')}</div><p class="stx-memory-overview-note"><ss-helper-icon name="circle-info" decorative></ss-helper-icon>世界规则不会自动广播给人物；每个主体只保留有来源支撑的认知。</p></section>
-        <section class="stx-memory-overview-section stx-memory-overview-recent" aria-labelledby="stx-memory-overview-recent-title"><h4 id="stx-memory-overview-recent-title">最近整理摘要</h4><p>${overview.lastOrganizedAt ? `上次整理完成于 ${escapeHtml(lastOrganized)}。系统已基于当前内容更新记忆库与索引。` : '当前聊天尚未完成一次整理；可前往场景与事件开始初始化。'}</p></section>
+        <section class="stx-memory-overview-section stx-memory-overview-recent" aria-labelledby="stx-memory-overview-recent-title"><h4 id="stx-memory-overview-recent-title">最近整理摘要</h4><p>${overview.lastOrganizedAt ? `上次整理完成于 ${escapeHtml(lastOrganized)}。系统已基于当前内容更新记忆库与索引。` : '当前聊天尚未完成一次整理；可前往独立的初始化页面选择来源并开始捕获。'}</p></section>
       </div>
       <aside class="stx-memory-overview-aside" aria-label="概览操作与能力状态">
-        <section class="stx-memory-overview-aside-section"><h4>下一步操作</h4><p>推荐从记忆库开始，或者查看关键内容与检索能力。</p><div class="stx-memory-overview-actions"><button class="stx-memory-overview-action is-primary" ${uiControl('button', 'primary')} type="button" data-action="view-library"><ss-helper-icon name="book-open" decorative></ss-helper-icon><span>查看记忆库</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="navigate" data-page="scenes"><ss-helper-icon name="timeline" decorative></ss-helper-icon><span>场景与事件</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="navigate" data-page="recall"><ss-helper-icon name="magnifying-glass-chart" decorative></ss-helper-icon><span>检查召回</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button></div></section>
+        <section class="stx-memory-overview-aside-section"><h4>下一步操作</h4><p>尚未整理时先初始化；已有记忆时可直接浏览或检查召回。</p><div class="stx-memory-overview-actions"><button class="stx-memory-overview-action is-primary" ${uiControl('button', 'primary')} type="button" data-action="navigate" data-page="initialize"><ss-helper-icon name="wand-magic-sparkles" decorative></ss-helper-icon><span>初始化</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="view-library"><ss-helper-icon name="book-open" decorative></ss-helper-icon><span>查看记忆库</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="navigate" data-page="scenes"><ss-helper-icon name="timeline" decorative></ss-helper-icon><span>场景与事件</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="navigate" data-page="recall"><ss-helper-icon name="magnifying-glass-chart" decorative></ss-helper-icon><span>检查召回</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button></div></section>
         <section class="stx-memory-overview-aside-section"><h4>能力与资源状态</h4><p>当前能力可用性一览。</p><div class="stx-memory-overview-routes">${routeRow('大语言模型（LLM）', 'comments', overview.llmAvailable, overview.llmAvailable ? overview.llmModel ?? overview.llmResource ?? '服务已就绪' : 'LLM 服务暂不可用')}${routeRow('向量资源（嵌入）', 'circle-nodes', overview.embedding?.available, overview.embedding?.available ? overview.embedding.model ?? overview.embedding.resourceId ?? '已配置' : overview.embedding?.blockedReason ?? '未配置向量资源')}${routeRow('重排资源（Rerank）', 'arrow-down-wide-short', overview.rerank?.available, overview.rerank?.available ? overview.rerank.model ?? overview.rerank.resourceId ?? '已配置' : overview.rerank?.blockedReason ?? '未配置重排资源')}</div></section>
         <section class="stx-memory-overview-aside-section"><h4>快速入口</h4><p>更多查看与管理选项。</p><div class="stx-memory-overview-quick-grid">${shortcut('actors', 'users', '查看人物与别名')}${shortcut('profiles', 'address-card', '画像与关系')}${shortcut('audit', 'list-check', '查看审计记录')}<button class="stx-memory-overview-shortcut" type="button" data-action="refresh-health"><ss-helper-icon name="rotate" decorative></ss-helper-icon><span>刷新运行状态</span></button></div></section>
       </aside>
@@ -1130,10 +1281,12 @@ export function renderMemoryWorkbench(
     </div>`;
   };
 
-  const renderScenes = (): string => `${state.scenes.length === 0
-    ? renderEmpty('暂无场景事件', '完成一次 Capture 后，这里显示参与者、在场者、提及者和来源楼层。')
-    : `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">SceneCast</span><h3>场景与事件</h3></div><span>${formatNumber(state.scenes.length)} 个场景</span></div><div class="stx-memory-reference-list">${state.scenes.map(scene => `<article class="stx-memory-evidence"><strong>第 ${scene.floor} 层 · ${escapeHtml(scene.chatKey)}</strong><p>发言：${escapeHtml(scene.speakerOwnerIds.join('、') || '无')}；在场：${escapeHtml(scene.presentOwnerIds.join('、') || '无')}；提及：${escapeHtml(scene.mentionedOwnerIds.join('、') || '无')}</p><small>视角：${escapeHtml(scene.viewpointOwnerId)}</small></article>`).join('')}</div></section>`}
-    <section class="stx-memory-panel stx-memory-capture-inline"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Capture</span><h3>初始化与重新捕获</h3></div></div><p class="stx-memory-muted">来源选择、进度与重新初始化操作已收口到本页；聊天原文不会被改写。</p></section>${renderInitialize()}`;
+  const renderScenes = (): string => {
+    const sceneState = sceneEventsState();
+    const markup = renderSceneEventsPage(sceneState);
+    syncSceneSelection(sceneState);
+    return markup;
+  };
 
   const renderActorMemory = (): string => state.actorTraces.length === 0
     ? renderEmpty('暂无角色记忆痕迹', '只有有来源观察支撑的主体认知才会显示。')
@@ -1147,114 +1300,63 @@ export function renderMemoryWorkbench(
     ? renderEmpty('暂无 Dream 任务', 'Dream 默认按主体自动排队；也可以从后续操作入口手动 dry-run。')
     : `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Dream Audit</span><h3>巩固任务</h3></div><span>${formatNumber(state.dreams.length)} 个任务</span></div><div class="stx-memory-reference-list">${state.dreams.map(job => `<article class="stx-memory-evidence"><strong>${escapeHtml(String(job.ownerId ?? '主体'))}</strong>${renderStatusChip(String(job.status ?? 'queued'), job.status === 'applied' ? 'success' : job.status === 'failed' ? 'error' : 'neutral')}<p>阶段：${escapeHtml(String(job.phase ?? 'gather'))}</p><small>任务：${escapeHtml(String(job.id ?? ''))}</small>${controller.runActorDream && job.id ? `<button ${uiControl('button', 'neutral')} type="button" data-action="dream-dry-run" data-job-id="${escapeHtml(String(job.id))}">dry-run 预览</button>` : ''}</article>`).join('')}</div></section>`;
 
-  const renderLibrary = (): string => {
-    const visibleFacts = filterAndSortFacts(state.facts, { kind: state.selectedKinds, status: state.selectedStatuses, sort: state.sort });
-    const selected = visibleFacts.find((fact) => fact.id === state.selectedFactId) ?? visibleFacts[0];
-    const list = visibleFacts.length === 0
-      ? renderEmpty('没有匹配的记忆', state.query ? '尝试缩短关键词或清除筛选条件。' : '当前聊天还没有可展示的事实。')
-      : visibleFacts.map((fact) => `<button class="stx-memory-fact-row" ${uiControl('button', 'neutral')} type="button" data-action="select-fact" data-fact-id="${escapeHtml(fact.id)}" aria-selected="${fact.id === selected?.id ? 'true' : 'false'}"><span class="stx-memory-fact-row-top"><strong>${escapeHtml(translateFactKind(fact.kind))}</strong><time datetime="${new Date(fact.updatedAt).toISOString()}">${escapeHtml(formatTime(fact.updatedAt))}</time></span><span class="stx-memory-fact-snippet">${escapeHtml(fact.content)}</span><span class="stx-memory-fact-row-footer">${renderStatusChip(translateFactStatus(fact.status), fact.status === 'active' ? 'success' : fact.status === 'invalid' ? 'error' : 'neutral')}<span class="stx-memory-fact-confidence"><span>置信度</span><strong>${Math.round(fact.confidence * 100)}%</strong></span></span></button>`).join('');
-    const detail = !selected ? renderEmpty('选择一条记忆', '右侧会显示证据、替代链和可执行操作。') : (() => {
-      const editing = state.editingFactId === selected.id;
-      const confirming = state.confirmFactId === selected.id;
-      const replacement = [selected.supersedesId ? '替代上一版本' : '', selected.supersededById ? '已被新版本替代' : ''].filter(Boolean).join(' · ') || '无';
-      return `<div class="stx-memory-detail-head"><div><span class="stx-memory-kicker">记忆审阅</span><h3>${escapeHtml(translateFactKind(selected.kind))}</h3></div><time class="stx-memory-detail-time" datetime="${new Date(selected.updatedAt).toISOString()}">${escapeHtml(formatTime(selected.updatedAt))}</time></div>
-        <div class="stx-memory-detail-summary">${renderStatusChip(translateFactStatus(selected.status), selected.status === 'active' ? 'success' : selected.status === 'invalid' ? 'error' : 'neutral')}<div><span>置信度</span><strong>${Math.round(selected.confidence * 100)}%</strong></div><div><span>证据</span><strong>${selected.evidence.length} 条</strong></div></div>
-        ${editing ? `<label class="stx-memory-field-label" for="stx-memory-edit-content">编辑记忆内容</label><textarea id="stx-memory-edit-content" class="stx-memory-textarea-layout" ${uiControl('textarea')} data-edit-content>${escapeHtml(selected.content)}</textarea><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="save-fact" data-fact-id="${escapeHtml(selected.id)}" ${state.busyAction === 'save-fact' ? 'disabled' : ''}>保存</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-edit">取消</button></div>` : `<section class="stx-memory-content-card" aria-labelledby="stx-memory-content-label"><h4 id="stx-memory-content-label">记忆内容</h4><p class="stx-memory-fact-content">${escapeHtml(selected.content)}</p></section><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="edit-fact" data-fact-id="${escapeHtml(selected.id)}">编辑</button>${confirming ? `<span class="stx-memory-confirm-inline"><span>确认删除？</span><button ${uiControl('button', 'danger')} type="button" data-action="confirm-delete" data-fact-id="${escapeHtml(selected.id)}">确认</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-delete">取消</button></span>` : `<button ${uiControl('button', 'danger')} type="button" data-action="delete-fact" data-fact-id="${escapeHtml(selected.id)}">删除</button>`}</div>`}
-        <section class="stx-memory-detail-section"><div class="stx-memory-section-heading"><div><h4>来源与证据</h4><p>核对记忆是否忠于聊天原文</p></div><span>${selected.evidence.length} 条</span></div><div class="stx-memory-evidence-list">${selected.evidence.length ? selected.evidence.map((item) => `<blockquote class="stx-memory-evidence"><p>${escapeHtml(item.excerpt)}</p><footer>${renderSourceReference(item.sourceRef, 'evidence')}</footer></blockquote>`).join('') : '<p class="stx-memory-muted">没有可展示的来源证据。</p>'}</div></section>
-        <div class="stx-memory-detail-grid"><section><h4>来源引用</h4><div class="stx-memory-reference-list">${selected.sourceRefs.length ? selected.sourceRefs.map((item) => renderSourceReference(item)).join('') : '<span>无</span>'}</div></section><section><h4>版本关系</h4><p>${escapeHtml(replacement)}</p></section></div>
-        <section class="stx-memory-detail-section"><h4>捕获记录</h4><div class="stx-memory-reference-list">${selected.auditBatches?.length ? selected.auditBatches.map((item) => { const batch = Math.max(1, Number(item.batchIndex) || 1); return `<span>第 ${batch} 批 · ${escapeHtml(translateRecordStatus(item.status))}</span>`; }).join('') : '<span>暂无匹配批次</span>'}</div></section>`;
-    })();
-    const chatIdentity = formatChatIdentity(state.overview);
-    const renderMultiFilter = (filter: 'kind' | 'status', allLabel: string, selectedValues: readonly string[], options: Readonly<Record<string, string>>): string => {
-      const entries = Object.entries(options);
-      const allSelected = selectedValues.length === entries.length;
-      const partiallySelected = selectedValues.length > 0 && !allSelected;
-      const selectedLabel = allSelected ? allLabel : selectedValues.length === 0 ? `未选择${filter === 'kind' ? '类型' : '状态'}` : selectedValues.length === 1 ? options[selectedValues[0]!] : `已选 ${selectedValues.length} 项`;
-      const triggerId = `stx-memory-${filter}-filter-trigger`;
-      const menuId = `stx-memory-${filter}-filter-menu`;
-      const allStateLabel = allSelected ? '已全部选择' : partiallySelected ? `已选 ${selectedValues.length} / ${entries.length}` : '未选择';
-      const allMark = allSelected ? '<ss-helper-icon name="check" decorative></ss-helper-icon>' : partiallySelected ? '<ss-helper-icon name="minus" decorative></ss-helper-icon>' : '';
-      return `<div class="stx-memory-control-wrap stx-memory-multi-filter" data-multi-filter="${filter}"><button id="${triggerId}" class="stx-memory-multi-filter-trigger" ${uiControl('button', 'neutral')} type="button" data-action="toggle-filter-menu" data-filter-menu="${filter}" aria-haspopup="true" aria-expanded="${state.openFilter === filter}" aria-controls="${menuId}"><span>${escapeHtml(selectedLabel)}</span><ss-helper-icon name="chevron-${state.openFilter === filter ? 'up' : 'down'}" decorative></ss-helper-icon></button>${state.openFilter === filter ? `<div id="${menuId}" class="stx-memory-multi-filter-menu" role="group" aria-labelledby="${triggerId}"><label class="stx-memory-multi-filter-option stx-memory-multi-filter-all ${allSelected ? 'is-selected' : partiallySelected ? 'is-partial' : ''}"><span class="stx-memory-multi-filter-option-label"><strong>${allLabel}</strong><small>${allStateLabel}</small></span><span class="stx-memory-multi-filter-mark" aria-hidden="true">${allMark}</span><input class="stx-memory-multi-filter-native stx-memory-sr-only" ${uiControl('checkbox')} type="checkbox" data-filter-all="${filter}" data-selected-count="${selectedValues.length}" data-option-count="${entries.length}" aria-checked="${partiallySelected ? 'mixed' : allSelected}" ${allSelected ? 'checked' : ''}></label>${entries.map(([value, label]) => { const selected = selectedValues.includes(value); return `<label class="stx-memory-multi-filter-option ${selected ? 'is-selected' : ''}"><span class="stx-memory-multi-filter-option-label">${escapeHtml(label)}</span><span class="stx-memory-multi-filter-mark" aria-hidden="true">${selected ? '<ss-helper-icon name="check" decorative></ss-helper-icon>' : ''}</span><input class="stx-memory-multi-filter-native stx-memory-sr-only" ${uiControl('checkbox')} type="checkbox" data-filter-option="${filter}" value="${escapeHtml(value)}" ${selected ? 'checked' : ''}></label>`; }).join('')}</div>` : ''}</div>`;
-    };
-    return `<div class="stx-memory-toolbar"><label class="stx-memory-search-wrap"><span class="stx-memory-sr-only">搜索记忆</span><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><input ${uiControl('input')} data-filter="query" value="${escapeHtml(state.query)}" placeholder="搜索记忆内容、人物或地点" /></label>${renderMultiFilter('kind', '全部类型', state.selectedKinds, FACT_KIND_LABELS)}${renderMultiFilter('status', '全部状态', state.selectedStatuses, FACT_STATUS_LABELS)}<label class="stx-memory-control-wrap"><span class="stx-memory-sr-only">排序</span><select ${uiControl('select')} aria-label="排序" data-filter="sort"><option value="updated_desc" ${state.sort === 'updated_desc' ? 'selected' : ''}>最近更新</option><option value="confidence_desc" ${state.sort === 'confidence_desc' ? 'selected' : ''}>置信度</option><option value="kind_asc" ${state.sort === 'kind_asc' ? 'selected' : ''}>类型</option></select></label><button ${uiControl('button', 'neutral')} type="button" data-action="refresh" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新</button></div><div class="stx-memory-result-line"><span aria-live="polite">共 ${visibleFacts.length} 条记忆</span><span>当前聊天：${escapeHtml(chatIdentity.label)}</span></div><div class="stx-memory-library-grid"><section class="stx-memory-fact-list" aria-label="记忆列表">${list}</section><section class="stx-memory-inspector" aria-label="记忆详情">${detail}</section></div>`;
-  };
+  const renderLibrary = (): string => renderMemoryLibraryView({
+    allFacts: state.facts,
+    queryFacts: state.libraryResults,
+    query: state.query,
+    selectedKinds: state.selectedKinds,
+    selectedStatuses: state.selectedStatuses,
+    openFilter: state.openFilter,
+    sort: state.sort,
+    selectedFactId: state.selectedFactId,
+    editingFactId: state.editingFactId,
+    confirmFactId: state.confirmFactId,
+    busyAction: state.busyAction,
+    chatLabel: formatChatIdentity(state.overview).label,
+  }, {
+    kindLabels: FACT_KIND_LABELS,
+    statusLabels: FACT_STATUS_LABELS,
+    formatTime: value => formatTime(value),
+    formatSource: renderLibrarySourceReference,
+    translateRecordStatus,
+  });
   const renderInitialize = (): string => {
-    const progress = state.progress;
+    const settings = controller.getSettings();
     const initialization = state.initialization;
-    const summarySettings = controller.getSettings();
-    const { summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors } = summarySettings;
-    const summaryNote = (summaryBatchMode === 'chars'
-      ? `按每批最多 ${formatNumber(summaryBatchChars)} 字符拆分，批次间保留 ${formatNumber(summaryOverlapFloors)} 层前置上下文；自动触发仍按 ${formatNumber(summaryIntervalFloors)} 层间隔判断。`
-      : `按每批 ${formatNumber(summaryBatchFloors)} 层可见用户/助手消息拆分，批次间保留 ${formatNumber(summaryOverlapFloors)} 层前置上下文；自动触发间隔为 ${formatNumber(summaryIntervalFloors)} 层。`);
-    const storageUnavailable = state.overview?.status === 'error' || state.overview?.errorCode === 'SQLITE_SERVICE_UNAVAILABLE';
-    const running = !storageUnavailable && Boolean(progress && ['queued', 'running'].includes(progress.status));
-    const storageAlert = storageUnavailable
-      ? `<p class="stx-memory-inline-alert" role="alert">Memory workspace 当前不可用，已安全停用整理与召回。请先删除旧 SQLite 数据并重新启动酒馆；当前实现不会自动迁移或清空旧库。${state.overview?.errorCode ? `（错误码：${escapeHtml(safeInlineError(state.overview.errorCode, 'SQLITE_SERVICE_UNAVAILABLE'))}）` : ''}</p>`
-      : '';
-    const submitting = ['initialize', 'reinitialize'].includes(state.busyAction);
-    const phaseLabel = '捕获记忆';
-    const statusLabel = submitting && (!progress || progress.status === 'idle')
-      ? '正在提交 LLM 请求'
-      : progress
-      ? progress.status === 'running' ? `正在${phaseLabel}`
-          : progress.status === 'queued' ? '已提交，等待 LLM'
-            : progress.status === 'completed' ? '已完成'
-              : progress.status === 'cancelled' ? '已取消'
-              : progress.status === 'failed' ? '失败'
-                : progress.status === 'paused' ? '已暂停' : '空闲'
-        : '尚未读取';
-    const feedback = submitting
-      ? progress?.status === 'running'
-        ? '正在提取并写入结构化记忆，事件、观察、事实和主体痕迹在同一事务中提交。'
-        : progress?.status === 'queued' ? '请求已进入 LLM 队列，等待模型反馈。'
-          : '正在读取当前聊天来源并提交 LLM 请求…'
-      : progress?.status === 'completed' ? '捕获流程已完成，结构化结果已写入数据库。'
-        : progress?.status === 'paused' ? '可重试错误已暂停当前捕获任务，可直接继续。' : '';
-    const sourceLabel = (kind: string): string => state.sources.find((source) => source.kind === kind)?.label ?? kind;
-    const selectedCount = state.selectedSourceKinds.length;
-    const latestAttempt = initialization?.attempts[0];
-    const sourceCoverage = initialization?.selectedSourceKinds.length || selectedCount;
-    const sourceTotal = state.sources.length;
-    const messageSource = state.sources.find((source) => source.kind === 'message');
-    const invisibleHistoryCount = messageSource?.invisibleCount
-      ?? Math.max(0, (messageSource?.rawCount ?? 0) - (messageSource?.defaultCount ?? 0));
-    const hasInvisibleHistory = Boolean(messageSource && invisibleHistoryCount > 0);
-    const renderSourceChoices = (locked: boolean): string => `<div class="stx-memory-source-list">${state.sources.length ? state.sources.map((source) => `<label class="stx-memory-source-option ${state.selectedSourceKinds.includes(source.kind) ? 'is-selected' : ''}"><input ${uiControl('checkbox')} type="checkbox" data-source-kind="${escapeHtml(source.kind)}" ${state.selectedSourceKinds.includes(source.kind) ? 'checked' : ''} ${locked || source.count === 0 ? 'disabled' : ''}><span><strong>${escapeHtml(source.label)}</strong><small>${formatNumber(source.count)} / ${formatNumber(source.rawCount)} 项${source.excludedCount > 0 ? ` · 排除 ${formatNumber(source.excludedCount)}` : ''}</small></span></label>`).join('') : renderEmpty('当前没有可初始化来源', '请先选择角色或打开聊天。')}</div>`;
-    const renderInvisibleHistoryOption = (locked: boolean): string => {
-      if (!hasInvisibleHistory) return '';
-      const current = messageSource?.count ?? 0;
-      const raw = messageSource?.rawCount ?? 0;
-      const defaultCount = messageSource?.defaultCount ?? current;
-      const excluded = messageSource?.excludedCount ?? Math.max(0, raw - current);
-      return `<section class="stx-memory-invisible-history-option"><label><input ${uiControl('checkbox')} type="checkbox" data-option="include-invisible-history" ${state.includeInvisibleHistory ? 'checked' : ''} ${locked ? 'disabled' : ''}><span><strong>包含 AI 不可见历史正文（本次）</strong><small>当前 ${formatNumber(current)} / ${formatNumber(raw)} 条；默认安全范围为 ${formatNumber(defaultCount)} 条。</small></span></label>${state.includeInvisibleHistory ? `<p class="stx-memory-inline-alert" role="status">已纳入被酒馆标记为不可见的历史正文；仍会排除工具输出、隐藏推理和清洗后为空的控制块（当前仍排除 ${formatNumber(excluded)} 条）。</p>` : '<p class="stx-memory-muted">默认只处理 AI 可见的用户/助手消息。此选项只对本次初始化生效，暂停后继续会沿用任务断点。</p>'}</section>`;
-    };
-    const estimateMarkup = state.estimate ? `<dl class="stx-memory-estimate-grid"><div><dt>预计批次</dt><dd>${formatNumber(state.estimate.batchCount)}</dd></div><div><dt>Token 下限</dt><dd>${formatNumber(state.estimate.tokenLow)}</dd></div><div><dt>Token 上限</dt><dd>${formatNumber(state.estimate.tokenHigh)}</dd></div></dl>` : '';
-    const progressMarkup = `<section class="stx-memory-panel stx-memory-initialize-progress"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">正在捕获 · ${escapeHtml(phaseLabel)}</span><h3>${escapeHtml(statusLabel)}</h3></div>${progress?.jobId ? renderStatusChip('任务进行中', 'warning') : ''}</div>${feedback ? `<p class="stx-memory-capture-feedback" role="status" aria-live="polite"><ss-helper-icon name="sparkles" decorative></ss-helper-icon>${escapeHtml(feedback)}</p>` : ''}<div class="stx-memory-locked-sources"><span>已锁定来源</span><strong>${escapeHtml(state.selectedSourceKinds.map(sourceLabel).join('、') || '无')}</strong></div>${progress ? `<div class="stx-memory-progress-copy"><span>当前批次 ${progress.batchIndex} / ${progress.totalBatches || 0}</span><span>${formatNumber(progress.processedCount)} 项 · ${Math.round(progress.elapsedMs / 1000)} 秒</span></div><progress ${uiControl('progress')} max="${Math.max(progress.totalBatches, 1)}" value="${Math.min(progress.batchIndex, Math.max(progress.totalBatches, 1))}">${progress.batchIndex}</progress>${progress.error ? `<p class="stx-memory-inline-alert" role="alert">错误码：${escapeHtml(safeInlineError(progress.error, 'MEMORY_CAPTURE_FAILED'))}</p>` : ''}` : ''}<div class="stx-memory-actions"><button ${uiControl('button', 'danger')} type="button" data-action="initialize-cancel" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="stop" decorative></ss-helper-icon>取消任务</button></div></section>`;
-    const activities = initialization?.attempts.length ? initialization.attempts.map((attempt) => {
-      const tone = attempt.status === 'completed' ? 'success' : attempt.status === 'failed' ? 'error' : attempt.status === 'running' || attempt.status === 'queued' ? 'warning' : 'neutral';
-      const icon = attempt.status === 'completed' ? 'circle-check' : attempt.status === 'failed' ? 'circle-xmark' : 'clock';
-      const sourceNames = attempt.selectedSourceKinds.map(sourceLabel).join('、') || '全部可用来源';
-      return `<article class="stx-memory-activity-item is-${escapeHtml(attempt.status)}"><ss-helper-icon name="${icon}" decorative></ss-helper-icon><div><div><strong>${escapeHtml(translateRecordStatus(attempt.status))}</strong>${renderStatusChip(`${formatNumber(attempt.totalBatches)} 批`, tone)}</div><time datetime="${new Date(attempt.updatedAt).toISOString()}">${escapeHtml(formatTime(attempt.updatedAt))}</time><p>${escapeHtml(sourceNames)} · ${attempt.includeInvisibleHistory ? '含不可见历史正文' : '仅 AI 可见消息'}</p>${attempt.error ? `<small title="${escapeHtml(attempt.error)}">${escapeHtml(safeInlineError(attempt.error, 'MEMORY_CAPTURE_FAILED'))}</small>` : ''}</div></article>`;
-    }).join('') : renderEmpty('暂无初始化记录', '完成初始化后会在这里保留最近 5 次活动。');
-    const drawerDisabled = storageUnavailable || !selectedCount || !state.overview?.llmAvailable || running || Boolean(state.busyAction);
-    const drawer = !state.reinitializeOpen ? '' : `<div class="stx-memory-reinitialize-layer"><button class="stx-memory-drawer-backdrop" type="button" data-action="cancel-reinitialize" aria-label="关闭重新初始化确认"></button><aside class="stx-memory-reinitialize-drawer" role="alertdialog" aria-modal="true" aria-labelledby="stx-memory-reinitialize-title" aria-describedby="stx-memory-reinitialize-description"><header><div><span class="stx-memory-kicker">危险操作确认</span><h3 id="stx-memory-reinitialize-title">重新初始化当前聊天</h3></div><button ${uiButton('neutral', 'sm', true)} type="button" data-action="cancel-reinitialize" aria-label="关闭"><ss-helper-icon name="xmark" decorative></ss-helper-icon></button></header><div class="stx-memory-drawer-body"><p id="stx-memory-reinitialize-description" class="stx-memory-drawer-warning"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon><span><strong>这会清空当前聊天的全部 Memory 派生数据</strong><small>清空后立即按下方来源重新开始初始化；如果新任务失败，旧数据无法恢复。</small></span></p><section><div class="stx-memory-section-heading"><div><h4>选择重新整理的来源</h4><p>估算会随勾选结果实时更新</p></div><span>${selectedCount} / ${sourceTotal}</span></div>${renderSourceChoices(false)}</section>${renderInvisibleHistoryOption(false)}${estimateMarkup}<section class="stx-memory-clear-scope"><h4>将清理</h4><ul><li>事实、证据、主体痕迹与派生索引</li><li>捕获任务、审计与 Usage</li><li>召回日志和总结进度</li></ul></section><section class="stx-memory-safe-scope"><h4>不会影响</h4><ul><li>聊天原文与消息</li><li>角色卡、世界书和其他聊天</li></ul></section>${!state.overview?.llmAvailable ? '<p class="stx-memory-inline-alert" role="alert">大语言模型不可用，暂时不能重新初始化。</p>' : !selectedCount ? '<p class="stx-memory-inline-alert" role="alert">请至少选择一个来源。</p>' : ''}</div><footer><button id="stx-memory-reinitialize-cancel" ${uiControl('button', 'neutral')} type="button" data-action="cancel-reinitialize">取消</button><button ${uiControl('button', 'danger')} type="button" data-action="confirm-reinitialize" ${drawerDisabled ? 'disabled' : ''}><ss-helper-icon name="trash-can-arrow-up" decorative></ss-helper-icon>清空并重新初始化</button></footer></aside></div>`;
-    if (running || submitting) return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout is-running">${progressMarkup}<section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization?.attempts.length ?? 0} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div></div>`;
-    if (initialization?.initialized) {
-      return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout"><section class="stx-memory-panel stx-memory-initialize-summary">${storageAlert}<div class="stx-memory-initialize-success"><span><ss-helper-icon name="circle-check" decorative></ss-helper-icon></span><div><span class="stx-memory-kicker">初始化状态</span><h3>已初始化</h3><p>完成于 ${escapeHtml(formatTime(initialization.lastCompletedAt))}</p></div>${renderStatusChip('召回可用', 'success')}</div><dl class="stx-memory-initialize-metrics"><div><dt>来源覆盖</dt><dd>${formatNumber(sourceCoverage)} / ${formatNumber(sourceTotal)}</dd></div><div><dt>记忆事实</dt><dd>${formatNumber(state.overview?.factCount ?? 0)}</dd></div><div><dt>占用空间</dt><dd>${escapeHtml(formatBytes(state.overview?.currentChatSizeBytes ?? 0))}</dd></div><div><dt>预计批次</dt><dd>${formatNumber(state.estimate?.batchCount ?? 0)}</dd></div></dl><p class="stx-memory-initialize-note"><ss-helper-icon name="circle-info" decorative></ss-helper-icon><span>当前聊天已经可以使用记忆召回。最近的失败任务只会记录在右侧，不会覆盖这次有效初始化。</span></p><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="view-library"><ss-helper-icon name="book-open" decorative></ss-helper-icon>查看记忆库</button><button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${storageUnavailable || state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>重新初始化</button></div></section><section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization.attempts.length} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div>${drawer}</div>`;
-    }
-    const clearedAfterFailure = latestAttempt?.status === 'failed';
-    const resumable = latestAttempt?.status === 'paused';
-    const setupKicker = resumable ? '可继续' : clearedAfterFailure ? '需要重试' : '首次使用';
-    const setupHeading = resumable ? '初始化已暂停' : clearedAfterFailure ? '当前未初始化' : '初始化当前聊天';
-    const setupNotice = resumable
-      ? '<p class="stx-memory-inline-alert" role="status">已保留已完成批次及整理进度。可直接继续，无需重新提取已暂存内容。</p>'
-      : clearedAfterFailure
-        ? '<p class="stx-memory-inline-alert" role="alert">旧 Memory 数据已清空，上一次重新初始化失败。请选择来源后直接重试。</p>'
-        : '<p class="stx-memory-muted">选择用于建立记忆的来源。初始化只读取内容，不会改写聊天原文、角色卡或世界书。</p>';
-    const setupAction = resumable
-      ? `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-resume" ${storageUnavailable || state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>继续初始化</button>`
-      : `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-start" ${storageUnavailable || !selectedCount || !state.sources.length || state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>${clearedAfterFailure ? '重新尝试初始化' : '开始初始化'}</button>`;
-    return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout"><section class="stx-memory-panel stx-memory-initialize-setup"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">${setupKicker}</span><h3>${setupHeading}</h3></div>${state.estimate ? renderStatusChip(`${formatNumber(state.estimate.messageCount)} 条消息`, 'neutral') : ''}</div>${storageAlert}${setupNotice}${resumable ? '' : `${renderSourceChoices(false)}${renderInvisibleHistoryOption(false)}${estimateMarkup}<p class="stx-memory-estimate-note">${escapeHtml(summaryNote)} 实际批次会随清洗和长消息拆分结果变化。</p>`}<div class="stx-memory-actions">${setupAction}</div></section><section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization?.attempts.length ?? 0} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div></div>`;
+    const progress = state.progress;
+    const storageUnavailable = state.sqlite?.connected === false
+      || state.overview?.status === 'error'
+      || state.overview?.errorCode === 'SQLITE_SERVICE_UNAVAILABLE';
+    const summaryNote = settings.summaryBatchMode === 'chars'
+      ? `按每批最多 ${formatNumber(settings.summaryBatchChars)} 字符拆分，批次间保留 ${formatNumber(settings.summaryOverlapFloors)} 层前置上下文；自动触发仍按 ${formatNumber(settings.summaryIntervalFloors)} 层间隔判断。`
+      : `按每批 ${formatNumber(settings.summaryBatchFloors)} 层可见用户/助手消息拆分，批次间保留 ${formatNumber(settings.summaryOverlapFloors)} 层前置上下文；自动触发间隔为 ${formatNumber(settings.summaryIntervalFloors)} 层。`;
+    const llmDetails = state.overview && !state.overview.llmAvailable ? readSafeLlmErrorDetails(state.overview) : undefined;
+    const chatIdentity = formatChatIdentity(state.overview);
+    return renderInitializationView({
+      chatLabel: chatIdentity.label,
+      chatBound: state.overview?.bound === true,
+      workspaceAvailable: !storageUnavailable,
+      workspaceReason: state.sqlite?.lastError
+        ? safeInlineError(state.sqlite.lastError, 'SQLITE_SERVICE_UNAVAILABLE')
+        : state.overview?.errorCode ? safeInlineError(state.overview.errorCode, 'SQLITE_SERVICE_UNAVAILABLE') : undefined,
+      llmAvailable: state.overview?.llmAvailable === true,
+      llmReason: llmDetails ? `${llmDetails.code} · ${llmDetails.resource} · ${llmDetails.model}` : undefined,
+      sources: state.sources,
+      selectedSourceKinds: state.selectedSourceKinds,
+      includeInvisibleHistory: state.includeInvisibleHistory,
+      estimate: state.estimate,
+      progress,
+      initialized: initialization?.initialized === true,
+      lastCompletedAt: initialization?.lastCompletedAt ?? null,
+      successfulSourceKinds: initialization?.selectedSourceKinds ?? [],
+      attempts: initialization?.attempts.slice(0, 5) ?? [],
+      factCount: state.overview?.factCount ?? 0,
+      storageBytes: state.overview?.currentChatSizeBytes ?? state.sqlite?.currentChatSizeBytes ?? 0,
+      summaryNote,
+      submitting: ['initialize', 'reinitialize'].includes(state.busyAction),
+      busy: Boolean(state.busyAction),
+      reinitializeOpen: state.reinitializeOpen,
+    });
   };
   const renderRecall = (): string => {
     const recall = state.recall;
@@ -1539,7 +1641,23 @@ export function renderMemoryWorkbench(
     const chatIdentity = formatChatIdentity(overview);
     const chatStorageLabel = overview?.bound ? formatBytes(overview.currentChatSizeBytes ?? 0) : '—';
     const chatStorageRatio = overview?.bound ? formatPercent(overview.currentChatUsageRatio ?? 0) : '—';
-    root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${renderOverviewRouteStatus('向量模型', overview?.embedding)}${renderOverviewRouteStatus('重排序模型', overview?.rerank)}${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class="stx-memory-nav-meta">${overview?.lastOrganizedAt ? `最近整理<br>${escapeHtml(formatTime(overview.lastOrganizedAt))}` : '仅展示当前已实现能力'}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${currentPage.label}</h2><p>${currentPage.description}</p></div><span class="stx-memory-page-counter">${currentPageIndex >= 0 ? `${currentPageIndex + 1} / ${PAGES.length}` : '诊断内页'}</span></header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section><div class="stx-memory-internal-routes" hidden aria-hidden="true">${INTERNAL_PAGES.map((page) => `<button type="button" data-action="navigate-internal" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}">${page.label}</button>`).join('')}</div></main></div>`;
+    const sceneHeader = state.page === 'scenes' ? getSceneEventsHeader(sceneEventsState()) : undefined;
+    const pageDescription = sceneHeader?.description ?? currentPage.description;
+    const pageCounter = sceneHeader?.count ?? (currentPageIndex >= 0 ? `${currentPageIndex + 1} / ${PAGES.length}` : '诊断内页');
+    const pageTitle = state.page === 'initialize' ? '初始化记忆' : currentPage.label;
+    const libraryRecallStatus = !state.recall
+      ? renderStatusChip('召回状态未知', 'neutral')
+      : state.recall.rebuilding
+        ? renderStatusChip('索引重建中', 'warning')
+        : state.recall.degradedReason || state.recall.lastError
+          ? renderStatusChip('召回降级', 'warning')
+          : renderStatusChip('召回可用', 'success');
+    const pageHeadingAction = state.page === 'initialize'
+      ? `<button class="stx-memory-initialize-refresh" ${uiButton('neutral', 'sm')} type="button" data-action="refresh-initialization" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新状态</button>`
+      : state.page === 'library'
+        ? `<div class="stx-memory-library-heading-actions">${libraryRecallStatus}<button ${uiButton('neutral', 'sm')} type="button" data-action="refresh-library" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新</button></div>`
+        : `<span class="stx-memory-page-counter">${escapeHtml(pageCounter)}</span>`;
+    root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${renderOverviewRouteStatus('向量模型', overview?.embedding)}${renderOverviewRouteStatus('重排序模型', overview?.rerank)}${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class="stx-memory-nav-meta">${overview?.lastOrganizedAt ? `最近整理<br>${escapeHtml(formatTime(overview.lastOrganizedAt))}` : '仅展示当前已实现能力'}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${pageTitle}</h2><p>${escapeHtml(pageDescription)}</p></div>${pageHeadingAction}</header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section><div class="stx-memory-internal-routes" hidden aria-hidden="true">${INTERNAL_PAGES.map((page) => `<button type="button" data-action="navigate-internal" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}">${page.label}</button>`).join('')}</div></main></div>`;
     traceMemoryStartup('workbench:dom-rendered');
     popupUi?.refreshControls(root);
     refreshGraphMarquees(root);
@@ -1582,6 +1700,53 @@ export function renderMemoryWorkbench(
         },
       });
     }
+    const sceneHost = root.querySelector<HTMLElement>('[data-scene-pixi-host]');
+    const selectedScene = state.scenes.find((scene) => scene.id === state.selectedSceneId);
+    if (sceneHost && selectedScene) {
+      const token = sceneRendererToken;
+      const updateSceneDetail = (): void => {
+        const detail = root.querySelector<HTMLElement>('[data-scene-graph-detail]');
+        if (detail) detail.innerHTML = renderSelectedSceneGraphDetail(sceneEventsState());
+        root.querySelectorAll<HTMLElement>('[data-action="scene-focus-owner"]').forEach((button) => {
+          button.setAttribute('aria-pressed', String(button.dataset.ownerId === state.selectedSceneOwnerId));
+        });
+        popupUi?.refreshControls(detail ?? root);
+      };
+      void mountSceneCastPixi(sceneHost, {
+        scene: selectedScene,
+        ownerName: (ownerId) => sceneGraphOwnerLabel(sceneEventsState(), ownerId),
+        ownerKind: (ownerId) => sceneGraphOwnerKind(sceneEventsState(), ownerId),
+        options: {
+          showBoundaries: state.showSceneBoundaries,
+          showSources: state.showSceneSources,
+          showConfidence: state.showSceneConfidence,
+          reduceMotion: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false,
+        },
+        selectedOwnerId: state.selectedSceneOwnerId,
+        onSelectOwner: (ownerId) => {
+          if (disposed || token !== sceneRendererToken) return;
+          state.selectedSceneOwnerId = ownerId;
+          updateSceneDetail();
+        },
+        onSelectSource: openSceneSource,
+        onZoomChange: (percent) => {
+          if (disposed || token !== sceneRendererToken) return;
+          const label = root.querySelector<HTMLElement>('[data-scene-zoom-label]');
+          if (label) label.textContent = `${percent}%`;
+        },
+      }).then((renderer) => {
+        if (disposed || token !== sceneRendererToken) {
+          renderer.dispose();
+          return;
+        }
+        sceneRenderer = renderer;
+      }).catch(() => {
+        if (!disposed && token === sceneRendererToken) {
+          const fallback = sceneHost.querySelector<HTMLElement>('[data-scene-pixi-fallback]');
+          fallback?.setAttribute('data-scene-pixi-status', 'failed');
+        }
+      });
+    }
   };
 
   root.addEventListener('click', (event) => {
@@ -1595,6 +1760,105 @@ export function renderMemoryWorkbench(
     if (action === 'toggle-filter-menu') { const filter = actionNode.dataset.filterMenu as 'kind' | 'status'; state.openFilter = state.openFilter === filter ? '' : filter; rerender(`#stx-memory-${filter}-filter-trigger`); return; }
     if (action === 'navigate') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (PAGES.some((item) => item.id === page)) void loadPage(page); return; }
     if (action === 'navigate-internal') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (INTERNAL_PAGES.some((item) => item.id === page)) void loadPage(page); return; }
+    if (action === 'scene-set-category') {
+      const category = actionNode.dataset.category;
+      if (category !== 'scene' && category !== 'event' && category !== 'observation') return;
+      state.sceneCategory = category;
+      state.sceneQuery = '';
+      state.sceneFilter = '';
+      state.selectedSceneOwnerId = '';
+      rerender();
+      return;
+    }
+    if (action === 'scene-select-record' || action === 'scene-open-record') {
+      const category = actionNode.dataset.category;
+      const recordId = actionNode.dataset.recordId ?? '';
+      if (category !== 'scene' && category !== 'event' && category !== 'observation') return;
+      if (action === 'scene-open-record') {
+        state.sceneCategory = category;
+        state.sceneQuery = '';
+        state.sceneFilter = '';
+      }
+      if (category === 'scene') {
+        state.selectedSceneId = recordId;
+        state.selectedSceneOwnerId = '';
+      } else if (category === 'event') {
+        state.selectedEpisodeId = recordId;
+      } else {
+        state.selectedObservationId = recordId;
+      }
+      rerender();
+      return;
+    }
+    if (action === 'scene-open-source') {
+      openSceneSource(actionNode.dataset.sourceRef ?? '');
+      return;
+    }
+    if (action === 'scene-open-owner') {
+      const ownerId = actionNode.dataset.ownerId ?? '';
+      if (!ownerId) return;
+      void loadPage('actors').then(() => {
+        if (disposed) return;
+        state.actorView = 'people';
+        state.selectedActorId = ownerId;
+        rerender();
+      });
+      return;
+    }
+    if (action === 'scene-refresh') {
+      void loadPage('scenes').then(() => {
+        if (!disposed && !state.pageError) toast('success', '场景数据已刷新', '即时场景、事件与观察记录已经重新读取。', 'MEMORY_SCENES_REFRESHED');
+      });
+      return;
+    }
+    if (action === 'scene-graph-command') {
+      const command = actionNode.dataset.command as SceneCastPixiCommand | undefined;
+      if (command) sceneRenderer?.command(command);
+      return;
+    }
+    if (action === 'scene-graph-toggle') {
+      const option = actionNode.dataset.option;
+      if (option === 'boundaries') state.showSceneBoundaries = !state.showSceneBoundaries;
+      else if (option === 'sources') state.showSceneSources = !state.showSceneSources;
+      else if (option === 'confidence') state.showSceneConfidence = !state.showSceneConfidence;
+      else return;
+      actionNode.setAttribute('aria-pressed', String(
+        option === 'boundaries' ? state.showSceneBoundaries
+          : option === 'sources' ? state.showSceneSources
+            : state.showSceneConfidence,
+      ));
+      sceneRenderer?.setOptions({
+        showBoundaries: state.showSceneBoundaries,
+        showSources: state.showSceneSources,
+        showConfidence: state.showSceneConfidence,
+      });
+      return;
+    }
+    if (action === 'scene-focus-owner') {
+      const ownerId = actionNode.dataset.ownerId ?? '';
+      if (!ownerId) return;
+      state.selectedSceneOwnerId = ownerId;
+      sceneRenderer?.focusOwner(ownerId);
+      const detail = root.querySelector<HTMLElement>('[data-scene-graph-detail]');
+      if (detail) detail.innerHTML = renderSelectedSceneGraphDetail(sceneEventsState());
+      root.querySelectorAll<HTMLElement>('[data-action="scene-focus-owner"]').forEach((button) => {
+        button.setAttribute('aria-pressed', String(button.dataset.ownerId === ownerId));
+      });
+      popupUi?.refreshControls(detail ?? root);
+      return;
+    }
+    if (action === 'scene-show-event-observations') {
+      const eventId = actionNode.dataset.eventId ?? '';
+      const first = state.observations
+        .filter((observation) => observation.episodeId === eventId)
+        .sort((left, right) => right.occurredAt - left.occurredAt || left.id.localeCompare(right.id))[0];
+      state.sceneCategory = 'observation';
+      state.sceneQuery = '';
+      state.sceneFilter = '';
+      if (first) state.selectedObservationId = first.id;
+      rerender();
+      return;
+    }
     if (action === 'dream-dry-run') {
       const jobId = actionNode.dataset.jobId;
       if (!jobId || !controller.runActorDream) return;
@@ -1814,6 +2078,17 @@ export function renderMemoryWorkbench(
       return;
     }
     if (action === 'refresh') { void refreshAll(); return; }
+    if (action === 'refresh-library') { void refreshLibrary(); return; }
+    if (action === 'refresh-initialization') {
+      void runAction(
+        'refresh-initialization',
+        () => refreshInitialization(state.selectedSourceKinds),
+        '初始化状态已刷新',
+        '来源、估算、任务进度和最近活动已经重新读取。',
+        'MEMORY_INITIALIZATION_REFRESHED',
+      );
+      return;
+    }
     if (action === 'retry-load') { void loadOverview(); return; }
     if (action === 'retry-page') { void loadPage(state.page); return; }
     if (action === 'dismiss-error') { state.actionError = undefined; rerender(); return; }
@@ -1830,10 +2105,35 @@ export function renderMemoryWorkbench(
       void navigateToMessage(target).catch(() => toast('warning', '无法跳转聊天楼层', '对应消息可能尚未加载或已被删除。', 'MEMORY_MESSAGE_NAVIGATION_UNAVAILABLE'));
       return;
     }
-    if (action === 'select-fact') { state.selectedFactId = actionNode.dataset.factId ?? ''; state.editingFactId = ''; state.confirmFactId = ''; rerender(); return; }
+    if (action === 'show-source-info') {
+      openSceneSource(actionNode.dataset.sourceRef ?? '');
+      return;
+    }
+    if (action === 'library-scope') {
+      const filter = actionNode.dataset.scopeFilter;
+      const value = actionNode.dataset.scopeValue ?? '';
+      if (filter === 'kind') state.selectedKinds = value ? [value] : Object.keys(FACT_KIND_LABELS);
+      else if (filter === 'status') state.selectedStatuses = value ? [value] : Object.keys(FACT_STATUS_LABELS);
+      else return;
+      state.openFilter = '';
+      state.editingFactId = '';
+      state.confirmFactId = '';
+      normalizeLibrarySelection();
+      rerender();
+      return;
+    }
+    if (action === 'select-fact') {
+      const factId = actionNode.dataset.factId ?? '';
+      if (!factId) return;
+      state.selectedFactId = factId;
+      state.editingFactId = '';
+      state.confirmFactId = '';
+      rerender();
+      return;
+    }
     if (action === 'edit-fact') { state.editingFactId = actionNode.dataset.factId ?? ''; rerender('#stx-memory-edit-content'); return; }
     if (action === 'cancel-edit') { state.editingFactId = ''; rerender(); return; }
-    if (action === 'save-fact') { const id = actionNode.dataset.factId ?? ''; const textarea = root.querySelector<HTMLTextAreaElement>('[data-edit-content]'); const content = textarea?.value.trim() ?? ''; if (!id || !content) return; void runAction('save-fact', () => controller.updateFact(id, content), '记忆已保存', '事实内容已更新。', 'MEMORY_FACT_UPDATED', async () => { state.editingFactId = ''; await refreshFacts(); }); return; }
+    if (action === 'save-fact') { const id = actionNode.dataset.factId ?? ''; const textarea = root.querySelector<HTMLTextAreaElement>('[data-edit-content]'); const content = textarea?.value.trim() ?? ''; if (!id || !content) { toast('warning', '记忆内容不能为空', '请输入事实文本后再保存。', 'MEMORY_FACT_CONTENT_REQUIRED'); return; } void runAction('save-fact', () => controller.updateFact(id, content), '记忆已保存', '事实内容已更新，聊天原文未被修改。', 'MEMORY_FACT_UPDATED', async () => { state.editingFactId = ''; await refreshFacts(); }); return; }
     if (action === 'delete-fact') { state.confirmFactId = actionNode.dataset.factId ?? ''; rerender(); return; }
     if (action === 'cancel-delete') { state.confirmFactId = ''; rerender(); return; }
     if (action === 'confirm-delete') { const id = actionNode.dataset.factId ?? ''; void runAction('delete-fact', () => controller.removeFact(id), '记忆已删除', '原聊天消息不受影响。', 'MEMORY_FACT_DELETED', async () => { state.confirmFactId = ''; await refreshFacts(); }); return; }
@@ -1942,6 +2242,11 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('input', (event) => {
     const input = event.target as HTMLInputElement;
+    if (input.dataset.sceneInput === 'query') {
+      state.sceneQuery = input.value;
+      rerender('', true);
+      return;
+    }
     if (input.dataset.actorInput === 'query') {
       state.actorQuery = input.value;
       rerender('', true);
@@ -1965,7 +2270,7 @@ export function renderMemoryWorkbench(
     if (input.dataset.filter === 'query') {
       state.query = input.value;
       if (searchTimer) window.clearTimeout(searchTimer);
-      searchTimer = window.setTimeout(() => { void refreshFacts().then(() => rerender('', true)).catch((error) => toast('error', '搜索失败', '无法读取筛选结果，请稍后重试。', safeErrorCode(error, 'MEMORY_SEARCH_FAILED'))); }, 220);
+      searchTimer = window.setTimeout(() => { void refreshLibrarySearch().then(() => rerender('', true)).catch((error) => toast('error', '搜索失败', '无法读取筛选结果，请稍后重试。', safeErrorCode(error, 'MEMORY_SEARCH_FAILED'))); }, 220);
       return;
     }
     if (input.dataset.filter === 'graph-query') {
@@ -1979,6 +2284,11 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('change', (event) => {
     const input = event.target as HTMLInputElement | HTMLSelectElement;
+    if (input.dataset.sceneSelect === 'filter') {
+      state.sceneFilter = input.value;
+      rerender();
+      return;
+    }
     if (input instanceof HTMLInputElement && input.dataset.captureRejectionId) {
       const rejectionId = input.dataset.captureRejectionId;
       state.selectedRejectionIds = input.checked
@@ -2012,6 +2322,7 @@ export function renderMemoryWorkbench(
       const values = Object.keys(filter === 'kind' ? FACT_KIND_LABELS : FACT_STATUS_LABELS);
       if (filter === 'kind') state.selectedKinds = checkbox.checked ? values : [];
       else state.selectedStatuses = checkbox.checked ? values : [];
+      normalizeLibrarySelection();
       rerender(); return;
     }
     if (input.dataset.filterOption) {
@@ -2021,9 +2332,10 @@ export function renderMemoryWorkbench(
       const next = checkbox.checked ? [...new Set([...current, checkbox.value])] : current.filter((value) => value !== checkbox.value);
       if (filter === 'kind') state.selectedKinds = next;
       else state.selectedStatuses = next;
+      normalizeLibrarySelection();
       rerender(); return;
     }
-    if (input.dataset.filter === 'sort') { state.sort = input.value as FactViewOptions['sort']; rerender(); return; }
+    if (input.dataset.filter === 'sort') { state.sort = input.value as MemoryLibrarySort; normalizeLibrarySelection(); rerender(); return; }
     if (input.dataset.graphFilter === 'kind') { state.graphKind = input.value; state.selectedGraphEdgeId = ''; state.selectedGraphEventId = ''; state.selectedGraphNodeId = ''; syncGraphUi(); return; }
     if (input.dataset.graphFilter === 'status') { state.graphStatusFilter = input.value; state.selectedGraphEdgeId = ''; state.selectedGraphEventId = ''; state.selectedGraphNodeId = ''; syncGraphUi(); return; }
     if (input.dataset.option === 'include-invisible-history') {
@@ -2108,6 +2420,9 @@ export function renderMemoryWorkbench(
     graphMarqueeResizeObserver?.disconnect();
     graphRenderer?.dispose();
     graphRenderer = undefined;
+    sceneRendererToken += 1;
+    sceneRenderer?.dispose();
+    sceneRenderer = undefined;
     root.replaceChildren();
   };
 }

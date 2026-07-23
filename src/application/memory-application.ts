@@ -8,6 +8,8 @@ import type {
   MemoryGraphPreview,
   MemoryGraphStatus,
   MemoryJob,
+  MemoryEpisode,
+  MemoryObservation,
   MemoryRecallLog,
   AutomaticIngestRejection,
 } from '../domain';
@@ -1006,6 +1008,20 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   async listSceneCasts(): Promise<readonly SceneCast[]> {
     return this.multiActorRepository ? this.multiActorRepository.listSceneCasts() : [];
+  }
+
+  async listEpisodes(): Promise<readonly MemoryEpisode[]> {
+    return this.multiActorRepository ? this.multiActorRepository.listEpisodes() : [];
+  }
+
+  async listObservations(): Promise<readonly MemoryObservation[]> {
+    if (!this.multiActorRepository) return [];
+    const [episodes, observations] = await Promise.all([
+      this.multiActorRepository.listEpisodes(),
+      this.multiActorRepository.listObservations(),
+    ]);
+    const episodeIds = new Set(episodes.map((episode) => episode.id));
+    return observations.filter((observation) => episodeIds.has(observation.episodeId));
   }
 
   async listActorTraces(ownerId?: string): Promise<readonly import('../domain').ActorMemoryTrace[]> {

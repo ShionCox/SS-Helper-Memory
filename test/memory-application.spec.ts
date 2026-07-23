@@ -106,6 +106,27 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     state.recallRouteRelease = null;
   });
 
+  it('场景工作台观察记录只返回当前聊天事件精确归属的数据', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    const currentEpisode = { id: 'episode:chat-a', chatKey: 'chat-a' };
+    const otherEpisode = { id: 'episode:chat-b', chatKey: 'chat-b' };
+    const currentObservation = { id: 'observation:chat-a', episodeId: currentEpisode.id };
+    const otherObservation = { id: 'observation:chat-b', episodeId: otherEpisode.id };
+    (app as unknown as {
+      multiActorRepository: {
+        listEpisodes(): Promise<Array<typeof currentEpisode>>;
+        listObservations(): Promise<Array<typeof currentObservation>>;
+      };
+    }).multiActorRepository = {
+      listEpisodes: async () => [currentEpisode],
+      listObservations: async () => [otherObservation, currentObservation],
+    };
+
+    await expect(app.listEpisodes()).resolves.toEqual([currentEpisode]);
+    await expect(app.listObservations()).resolves.toEqual([currentObservation]);
+  });
+
   it('旧设置缺失时启用旧记忆参考默认值，并收敛损坏的持久化范围', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const repository = new FakeRepository();

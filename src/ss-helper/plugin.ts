@@ -102,6 +102,13 @@ export function registerMemoryContributions(
         popupUi,
       ),
     }),
+    session.registerExtensionMenuItem?.({
+      id: 'memory-workbench',
+      label: '记忆工作台',
+      icon: 'brain',
+      order: 100,
+      onActivate: () => session.ui.openPopup(MEMORY_WORKBENCH_POPUP, {}),
+    }) ?? (() => undefined),
   ];
   return {
     publishUpdated: services.publishUpdated,

@@ -79,7 +79,10 @@ export interface MemoryPluginApi {
   runActorDream?(jobId: string, options?: { readonly dryRun?: boolean; readonly narrative?: boolean }): Promise<import('./application/dream').DreamAudit>;
   auditActorOutput?(output: string): import('./application/recall').KnowledgeLeakageAudit | null;
   listActors?(): Promise<readonly import('./domain').MemoryOwner[]>;
+  listActorAliases?(): Promise<readonly import('./domain').ActorAlias[]>;
   listSceneCasts?(): Promise<readonly import('./domain').SceneCast[]>;
+  listEpisodes?(): Promise<readonly import('./domain').MemoryEpisode[]>;
+  listObservations?(): Promise<readonly import('./domain').MemoryObservation[]>;
   listActorTraces?(ownerId?: string): Promise<readonly import('./domain').ActorMemoryTrace[]>;
   listActorProfiles?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
   listActorDreams?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
