@@ -1,15 +1,18 @@
 import './memory.css';
 import {
   UI_CONTROL_ATTRIBUTE,
+  UI_CONTROL_ICON_ONLY_ATTRIBUTE,
+  UI_CONTROL_SIZE_ATTRIBUTE,
   UI_CONTROL_TONE_ATTRIBUTE,
   type PopupUiContext,
   type ToastNotification,
   type UiControlKind,
+  type UiControlSize,
   type UiControlTone,
   type ChatNavigationTarget,
 } from '@ss-helper/sdk';
 import type { SummaryInitializationEstimate } from '../application/ingest/summary-strategy';
-import type { MemoryGraphPreview, MemoryGraphStatus } from '../domain';
+import { DEFAULT_MEMORY_TRAITS, type MemoryGraphPreview, type MemoryGraphStatus } from '../domain';
 import { describeMemoryError, type MemoryErrorDiagnostic } from '../diagnostics/memory-error';
 import { traceMemoryStartup } from '../host/runtime-feedback';
 import { mountRelationshipGraphThree, type RelationshipGraphCommand, type RelationshipGraphRenderer } from './relationship-graph-three';
@@ -160,6 +163,8 @@ export interface MemoryCaptureProgress {
   elapsedMs: number;
   error?: string;
   phase?: 'capture';
+  outcome?: 'complete' | 'partial';
+  rejectedCount?: number;
 }
 
 export interface MemoryInitializationAttempt {
@@ -188,6 +193,7 @@ export interface MemoryAuditRecord {
   sourceRefs?: string[];
   accepted?: number;
   rejected?: unknown[];
+  outcome?: 'complete' | 'partial';
   model?: string;
   resource?: string;
   resourceId?: string;
@@ -225,6 +231,9 @@ export interface MemoryUiController {
   removeFact(id: string): Promise<void>;
   getLastRecall(): Promise<unknown>;
   listAuditRecords(): Promise<MemoryAuditRecord[]>;
+  getCaptureRepairEstimate?(auditId: string, rejectionIds: readonly string[]): Promise<{ requestCount: number; groupCounts: Partial<Record<'actor' | 'episode' | 'observation' | 'fact', number>> }>;
+  repairCaptureRejections?(auditId: string, rejectionIds: readonly string[]): Promise<void>;
+  ignoreCaptureRejections?(auditId: string, rejectionIds: readonly string[]): Promise<void>;
   getMainChatUsage(): Promise<unknown[]>;
   getRecallStatus(): Promise<MemoryRecallStatus>;
   rebuildVectorIndex(): Promise<void>;
@@ -238,6 +247,7 @@ export interface MemoryUiController {
   checkSqliteIntegrity(): Promise<MemorySqliteIntegrityResult>;
   /** Optional multi-actor workbench read models. */
   listActors?(): Promise<readonly import('../domain').MemoryOwner[]>;
+  listActorAliases?(): Promise<readonly import('../domain').ActorAlias[]>;
   listSceneCasts?(): Promise<readonly import('../domain').SceneCast[]>;
   listActorTraces?(ownerId?: string): Promise<readonly import('../domain').ActorMemoryTrace[]>;
   listActorProfiles?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
@@ -247,7 +257,7 @@ export interface MemoryUiController {
   listActorCorrectionReviews?(): Promise<readonly ActorCorrectionReview[]>;
   resolveActorCorrection?(auditId: string, action: 'confirm' | 'undo'): Promise<void>;
   listPendingActorCandidates?(): Promise<readonly import('../domain').ActorCandidate[]>;
-  confirmActorCandidate?(candidateId: string, canonicalName?: string): Promise<void>;
+  confirmActorCandidate?(candidateId: string, resolution?: import('../domain').ActorCandidateResolution): Promise<void>;
   mergeActors?(fromOwnerId: string, intoOwnerId: string): Promise<void>;
   splitActor?(ownerId: string, aliasValue: string, displayName?: string): Promise<void>;
   renameActor?(ownerId: string, displayName: string): Promise<void>;
@@ -454,8 +464,24 @@ interface WorkbenchState {
   actionError?: MemoryErrorDiagnostic;
   overview?: MemoryUiOverview;
   actors: Array<import('../domain').MemoryOwner>;
+  actorAliases: Array<import('../domain').ActorAlias>;
   pendingActors: Array<import('../domain').ActorCandidate>;
   actorCorrectionReviews: ActorCorrectionReview[];
+  actorView: 'people' | 'pending';
+  actorQuery: string;
+  actorStatus: '' | import('../domain').ActorResolutionStatus;
+  selectedActorId: string;
+  selectedCandidateId: string;
+  renamingActorId: string;
+  actorRenameValue: string;
+  editingActorTraitsId: string;
+  actorOperation: '' | 'merge' | 'split' | 'alias';
+  actorOperationAliasId: string;
+  actorOperationTargetId: string;
+  actorOperationName: string;
+  candidateResolutionMode: 'existing' | 'new';
+  candidateTargetOwnerId: string;
+  candidateCanonicalName: string;
   scenes: Array<import('../domain').SceneCast>;
   actorTraces: Array<import('../domain').ActorMemoryTrace>;
   profiles: Array<Record<string, unknown>>;
@@ -493,11 +519,16 @@ interface WorkbenchState {
   sqlite?: MemorySqliteStatus;
   integrityText: string;
   confirmBatchKey: string;
+  selectedRejectionIds: string[];
   dangerConfirm: '' | 'current' | 'all';
 }
 
 function uiControl(kind: UiControlKind, tone?: UiControlTone): string {
   return `${UI_CONTROL_ATTRIBUTE}="${kind}"${tone === undefined ? '' : ` ${UI_CONTROL_TONE_ATTRIBUTE}="${tone}"`}`;
+}
+
+function uiButton(tone: UiControlTone = 'neutral', size: UiControlSize = 'md', iconOnly = false): string {
+  return `${uiControl('button', tone)} ${UI_CONTROL_SIZE_ATTRIBUTE}="${size}"${iconOnly ? ` ${UI_CONTROL_ICON_ONLY_ATTRIBUTE}` : ''}`;
 }
 
 function renderStatusChip(label: string, tone: 'neutral' | 'success' | 'warning' | 'error' = 'neutral'): string {
@@ -555,12 +586,25 @@ export function renderMemoryWorkbench(
   let graphRenderer: RelationshipGraphRenderer | undefined;
   const requestedGraphPage = initialActionId === 'open-relationship-graph' || initialActionId === 'rebuild-relationship-graph';
   const state: WorkbenchState = {
-    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', actors: [], pendingActors: [], actorCorrectionReviews: [], scenes: [], actorTraces: [], profiles: [], dreams: [], facts: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
-    selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeInvisibleHistory: false, reinitializeOpen: false, audits: [], usages: [], integrityText: '尚未执行完整性检查。', confirmBatchKey: '', dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
+    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', scenes: [], actorTraces: [], profiles: [], dreams: [], facts: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
+    selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeInvisibleHistory: false, reinitializeOpen: false, audits: [], usages: [], integrityText: '尚未执行完整性检查。', confirmBatchKey: '', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
   };
 
   const toast = (level: ToastNotification['level'], title: string, message: string, code: string): void => {
     notify({ level, title, message, code, durationMs: level === 'error' ? 0 : 3200 });
+  };
+  const isChatUnbound = (overview: MemoryUiOverview | undefined = state.overview): boolean =>
+    overview?.bound === false || overview?.status === 'unselected';
+  const clearActorState = (): void => {
+    state.actors = [];
+    state.actorAliases = [];
+    state.pendingActors = [];
+    state.actorCorrectionReviews = [];
+    state.selectedActorId = '';
+    state.selectedCandidateId = '';
+    state.renamingActorId = '';
+    state.editingActorTraitsId = '';
+    state.actorOperation = '';
   };
   const renderSourceReference = (value: string, mode: 'chip' | 'evidence' = 'chip'): string => {
     const label = escapeHtml(formatSourceReference(value));
@@ -572,7 +616,7 @@ export function renderMemoryWorkbench(
     const index = target.index === undefined ? '' : ` data-message-index="${target.index}"`;
     const action = `data-action="jump-to-message"${messageId}${index} aria-label="跳转到${label}" title="点击跳转到对应聊天楼层"`;
     return mode === 'evidence'
-      ? `<button class="stx-memory-reference-jump" ${uiControl('button', 'neutral')} type="button" ${action}><ss-helper-icon name="link" decorative></ss-helper-icon></button><span>${label}</span>`
+      ? `<button class="stx-memory-reference-jump" ${uiButton('neutral', 'xs', true)} type="button" ${action}><ss-helper-icon name="link" decorative></ss-helper-icon></button><span>${label}</span>`
       : `<button class="stx-memory-reference-link" ${uiControl('button', 'neutral')} type="button" ${action}>${label}</button>`;
   };
   const renderNow = (): void => {
@@ -634,6 +678,11 @@ export function renderMemoryWorkbench(
       renderNow();
     });
   };
+  const revealActorInspector = (): void => {
+    if (!window.matchMedia?.('(max-width: 760px)').matches) return;
+    const target = state.actorView === 'pending' ? '#stx-memory-actor-candidate-inspector' : '#stx-memory-actor-inspector';
+    window.setTimeout(() => root.querySelector<HTMLElement>(target)?.scrollIntoView?.({ block: 'start' }), 0);
+  };
   const scheduleProgress = (): void => {
     if (progressTimer) window.clearTimeout(progressTimer);
     progressTimer = undefined;
@@ -682,6 +731,7 @@ export function renderMemoryWorkbench(
       const overview = await controller.getOverview();
       if (disposed) return;
       state.overview = overview;
+      if (isChatUnbound(overview)) clearActorState();
       rerender('', true);
     } catch { /* background route diagnostics must not interrupt the workbench */ }
   };
@@ -696,12 +746,24 @@ export function renderMemoryWorkbench(
       if (page === 'overview') {
         state.overview = await controller.getOverview();
       } else if (page === 'actors') {
-        const [actors, pending, reviews] = await Promise.all([
-          controller.listActors ? controller.listActors() : Promise.resolve([]),
-          controller.listPendingActorCandidates ? controller.listPendingActorCandidates() : Promise.resolve([]),
-          controller.listActorCorrectionReviews ? controller.listActorCorrectionReviews() : Promise.resolve([]),
-        ]);
-        state.actors = [...actors]; state.pendingActors = [...pending]; state.actorCorrectionReviews = [...reviews];
+        if (isChatUnbound()) {
+          clearActorState();
+        } else {
+          const [actors, aliases, pending, reviews] = await Promise.all([
+            controller.listActors ? controller.listActors() : Promise.resolve([]),
+            controller.listActorAliases ? controller.listActorAliases() : Promise.resolve([]),
+            controller.listPendingActorCandidates ? controller.listPendingActorCandidates() : Promise.resolve([]),
+            controller.listActorCorrectionReviews ? controller.listActorCorrectionReviews() : Promise.resolve([]),
+          ]);
+          state.actors = [...actors];
+          state.actorAliases = [...aliases];
+          state.pendingActors = [...pending];
+          state.actorCorrectionReviews = [...reviews];
+          const userActors = state.actors.filter(actor => actor.kind === 'actor');
+          if (!state.actors.some(actor => actor.id === state.selectedActorId)) state.selectedActorId = userActors[0]?.id ?? state.actors[0]?.id ?? '';
+          if (!state.pendingActors.some(candidate => candidate.localId === state.selectedCandidateId)) state.selectedCandidateId = state.pendingActors[0]?.localId ?? '';
+          if (state.pendingActors.length === 0 && state.actorView === 'pending') state.actorView = 'people';
+        }
       } else if (page === 'scenes') {
         const [scenes, sources, initialization] = await Promise.all([
           controller.listSceneCasts ? controller.listSceneCasts() : Promise.resolve([]),
@@ -888,7 +950,185 @@ export function renderMemoryWorkbench(
     </section>`;
   };
 
-  const renderActors = (): string => `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Actor Registry</span><h3>人物与别名</h3></div><span>${formatNumber(state.actors.length)} 个主体</span></div>${state.actors.length === 0 ? renderEmpty('尚未发现卡内人物', '进入聊天并完成一次 Capture 后，明确人物会出现在这里。') : `<div class="stx-memory-reference-list">${state.actors.map(actor => `<article class="stx-memory-evidence"><strong>${escapeHtml(actor.displayName)}</strong>${renderStatusChip(actor.kind === 'actor' ? actor.status : actor.kind, actor.status === 'confirmed' ? 'success' : 'warning')}<p>${escapeHtml(actor.aliases.join('、') || '无别名')}</p><small>owner_id：${escapeHtml(actor.id)} · 置信度 ${Math.round(actor.confidence * 100)}%</small></article>`).join('')}</div>`}</section>${state.pendingActors.length > 0 ? `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Pending</span><h3>待确认归属</h3></div><span>${formatNumber(state.pendingActors.length)} 条</span></div><div class="stx-memory-reference-list">${state.pendingActors.map(candidate => `<article class="stx-memory-evidence"><strong>${escapeHtml(candidate.displayName)}</strong><p>来源：${escapeHtml(candidate.sourceRefs.join('、') || '无')}；置信度 ${Math.round(candidate.confidence * 100)}%</p><button ${uiControl('button', 'primary')} type="button" data-action="confirm-actor" data-candidate-id="${escapeHtml(candidate.localId)}">确认归属</button></article>`).join('')}</div></section>` : ''}${state.actorCorrectionReviews.length > 0 ? `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Audit</span><h3>人物纠正审计</h3></div><span>${formatNumber(state.actorCorrectionReviews.length)} 条</span></div><div class="stx-memory-reference-list">${state.actorCorrectionReviews.map(review => `<article class="stx-memory-evidence"><strong>${escapeHtml(review.operation)}</strong>${renderStatusChip(review.status, review.status === 'undone' ? 'neutral' : 'success')}<small>${escapeHtml(review.id)}</small>${controller.resolveActorCorrection && review.status === 'applied' ? `<button ${uiControl('button', 'neutral')} type="button" data-action="undo-actor-correction" data-audit-id="${escapeHtml(review.id)}">撤销</button>` : ''}</article>`).join('')}</div></section>` : ''}`;
+  const renderActors = (): string => {
+    if (isChatUnbound()) {
+      return `<section class="stx-memory-panel stx-memory-actor-unbound"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Actor Registry</span><h3>人物与别名</h3></div><span>0 个主体</span></div>${renderEmpty('尚未进入聊天', '请先选择一个角色或加入群聊；进入聊天后，这里会显示人物及其别名归属。')}</section>`;
+    }
+    const actorStatusLabels: Readonly<Record<string, string>> = {
+      confirmed: '已确认',
+      pending: '待确认',
+      unknown: '未识别',
+      merged: '已合并',
+    };
+    const actorKindLabels: Readonly<Record<string, string>> = {
+      actor: '人物',
+      world: '世界',
+      narrator: '旁白',
+      player: '玩家',
+      unknown: '未知主体',
+    };
+    const reviewOperationLabels: Readonly<Record<ActorCorrectionReview['operation'], string>> = {
+      correction: '确认人物',
+      merge: '合并人物',
+      split: '拆分人物',
+      rename: '人物改名',
+      alias: '纠正别名',
+    };
+    const people = state.actors.filter(actor => actor.kind === 'actor');
+    const systemActors = state.actors.filter(actor => actor.kind !== 'actor');
+    const normalizeActorOptionText = (value: string): string => value
+      .normalize('NFKC')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .toLocaleLowerCase('zh-CN');
+    const actorOptionAliases = (actor: import('../domain').MemoryOwner): string[] => {
+      const primaryName = (actor.canonicalName ?? actor.displayName).trim() || actor.displayName.trim();
+      const primaryKey = normalizeActorOptionText(primaryName);
+      const seen = new Set<string>([primaryKey]);
+      return [actor.displayName, ...actor.aliases].map((value) => value.trim()).filter((value) => {
+        const key = normalizeActorOptionText(value);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    };
+    const actorMatchesCandidate = (actor: import('../domain').MemoryOwner, candidate: import('../domain').ActorCandidate): boolean => {
+      const candidateKeys = new Set([candidate.displayName, ...(candidate.aliases ?? [])].map(normalizeActorOptionText).filter(Boolean));
+      return [actor.canonicalName ?? '', actor.displayName, ...actor.aliases]
+        .some((value) => candidateKeys.has(normalizeActorOptionText(value)));
+    };
+    const renderActorTargetOptions = (candidate: import('../domain').ActorCandidate, selectedId: string): string => {
+      const byName = (left: import('../domain').MemoryOwner, right: import('../domain').MemoryOwner): number =>
+        (left.canonicalName ?? left.displayName).localeCompare(right.canonicalName ?? right.displayName, 'zh-CN');
+      const recommended = people.filter((actor) => actor.id === candidate.ownerRef || actorMatchesCandidate(actor, candidate)).sort(byName);
+      const recommendedIds = new Set(recommended.map((actor) => actor.id));
+      const confirmed = people.filter((actor) => !recommendedIds.has(actor.id) && actor.status === 'confirmed').sort(byName);
+      const pending = people.filter((actor) => !recommendedIds.has(actor.id) && actor.status !== 'confirmed').sort(byName);
+      const renderOptions = (actors: readonly import('../domain').MemoryOwner[]): string => actors.map((actor) => {
+        const aliases = actorOptionAliases(actor);
+        const description = [
+          actorStatusLabels[actor.status] ?? actor.status,
+          `置信度 ${Math.round(actor.confidence * 100)}%`,
+          ...(aliases.length ? [`别名：${aliases.slice(0, 3).join('、')}`] : []),
+        ].join(' · ');
+        return `<option value="${escapeHtml(actor.id)}" data-ss-helper-description="${escapeHtml(description)}" ${actor.id === selectedId ? 'selected' : ''}>${escapeHtml((actor.canonicalName ?? actor.displayName).trim() || actor.displayName)}</option>`;
+      }).join('');
+      return [
+        recommended.length ? `<optgroup label="推荐匹配">${renderOptions(recommended)}</optgroup>` : '',
+        confirmed.length ? `<optgroup label="已确认人物">${renderOptions(confirmed)}</optgroup>` : '',
+        pending.length ? `<optgroup label="待确认人物">${renderOptions(pending)}</optgroup>` : '',
+      ].join('');
+    };
+    const normalizedQuery = state.actorQuery.trim().toLocaleLowerCase('zh-CN');
+    const matchesActor = (actor: import('../domain').MemoryOwner): boolean =>
+      (!state.actorStatus || actor.status === state.actorStatus)
+      && (!normalizedQuery || [actor.displayName, actor.canonicalName ?? '', ...actor.aliases].some(value => value.toLocaleLowerCase('zh-CN').includes(normalizedQuery)));
+    const visiblePeople = people.filter(matchesActor);
+    const visibleSystemActors = systemActors.filter(matchesActor);
+    const visibleActorIds = new Set([...visiblePeople, ...visibleSystemActors].map(actor => actor.id));
+    const selectedActor = state.actors.find(actor => actor.id === state.selectedActorId && visibleActorIds.has(actor.id))
+      ?? visiblePeople[0]
+      ?? visibleSystemActors[0];
+    const selectedCandidate = state.pendingActors.find(candidate => candidate.localId === state.selectedCandidateId)
+      ?? state.pendingActors[0];
+    const aliasesForSelected = selectedActor
+      ? state.actorAliases.filter(alias => alias.ownerId === selectedActor.id).sort((left, right) => right.updatedAt - left.updatedAt)
+      : [];
+    const aliasCount = state.actorAliases.length || people.reduce((total, actor) => total + actor.aliases.length, 0);
+    const busy = Boolean(state.busyAction);
+    const renderActorRows = (actors: readonly import('../domain').MemoryOwner[], label: string): string => {
+      if (actors.length === 0) return '';
+      return `<div class="stx-memory-actor-group"><div class="stx-memory-actor-group-title"><span>${label}</span><small>${actors.length}</small></div>${actors.map(actor => {
+        const aliasSummary = actor.aliases.length ? actor.aliases.slice(0, 3).join('、') : '暂无别名';
+        const statusLabel = actor.kind === 'actor' ? actorStatusLabels[actor.status] ?? actor.status : actorKindLabels[actor.kind] ?? actor.kind;
+        return `<button class="stx-memory-actor-row" ${uiControl('button', 'neutral')} type="button" data-action="select-actor" data-owner-id="${escapeHtml(actor.id)}" aria-selected="${actor.id === selectedActor?.id}"><span class="stx-memory-actor-symbol" aria-hidden="true"><ss-helper-icon name="${actor.kind === 'actor' ? 'user' : actor.kind === 'world' ? 'globe' : actor.kind === 'narrator' ? 'microphone-lines' : actor.kind === 'player' ? 'user-pen' : 'circle-question'}" decorative></ss-helper-icon></span><span class="stx-memory-actor-row-copy"><strong>${escapeHtml(actor.displayName)}</strong><small>${escapeHtml(aliasSummary)}</small></span><span class="stx-memory-actor-row-meta">${renderStatusChip(statusLabel, actor.status === 'confirmed' ? 'success' : actor.status === 'unknown' ? 'warning' : 'neutral')}<small>${Math.round(actor.confidence * 100)}%</small></span></button>`;
+      }).join('')}</div>`;
+    };
+    const actorList = visiblePeople.length || visibleSystemActors.length
+      ? `${renderActorRows(visiblePeople, '人物')}${renderActorRows(visibleSystemActors, '系统主体 · 只读')}`
+      : renderEmpty('没有匹配的人物', state.actorQuery || state.actorStatus ? '请尝试清除搜索词或状态筛选。' : '完成一次 Capture 后，明确人物会出现在这里。');
+    const pendingList = state.pendingActors.length
+      ? state.pendingActors.map(candidate => `<button class="stx-memory-actor-row stx-memory-candidate-row" ${uiControl('button', 'neutral')} type="button" data-action="select-candidate" data-candidate-id="${escapeHtml(candidate.localId)}" aria-selected="${candidate.localId === selectedCandidate?.localId}"><span class="stx-memory-actor-symbol is-pending" aria-hidden="true"><ss-helper-icon name="user-clock" decorative></ss-helper-icon></span><span class="stx-memory-actor-row-copy"><strong>${escapeHtml(candidate.displayName)}</strong><small>${candidate.sourceRefs.length} 条来源${candidate.aliases?.length ? ` · ${candidate.aliases.length} 个候选别名` : ''}</small></span><span class="stx-memory-actor-row-meta">${renderStatusChip('待确认', 'warning')}<small>${Math.round(candidate.confidence * 100)}%</small></span></button>`).join('')
+      : renderEmpty('没有待确认项', '当前人物和别名归属已处理完成。');
+    const recentReviews = [...state.actorCorrectionReviews].sort((left, right) => right.createdAt - left.createdAt).slice(0, 6);
+    const renderReviews = (): string => recentReviews.length
+      ? `<div class="stx-memory-actor-review-list">${recentReviews.map(review => `<article class="stx-memory-actor-review"><span class="stx-memory-actor-review-icon" aria-hidden="true"><ss-helper-icon name="${review.status === 'undone' ? 'rotate-left' : 'clock-rotate-left'}" decorative></ss-helper-icon></span><span><strong>${escapeHtml(reviewOperationLabels[review.operation] ?? review.operation)}</strong><small>${escapeHtml(formatTime(review.createdAt))}</small></span>${renderStatusChip(review.status === 'undone' ? '已撤销' : '已应用', review.status === 'undone' ? 'neutral' : 'success')}${controller.resolveActorCorrection && review.status === 'applied' ? `<button ${uiControl('button', 'neutral')} type="button" data-action="undo-actor-correction" data-audit-id="${escapeHtml(review.id)}" ${busy ? 'disabled' : ''}>撤销</button>` : ''}</article>`).join('')}</div>`
+      : '<p class="stx-memory-muted">还没有人物纠正记录。</p>';
+    const actorDetail = !selectedActor ? renderEmpty('选择一个人物', '右侧会显示名称、别名来源和可执行操作。') : (() => {
+      const editable = selectedActor.kind === 'actor';
+      const renaming = state.renamingActorId === selectedActor.id;
+      const editingTraits = state.editingActorTraitsId === selectedActor.id;
+      const memoryTraits = { ...DEFAULT_MEMORY_TRAITS, ...(selectedActor.memoryTraits ?? {}) };
+      const halfLifeDays = Math.max(1, Math.round(memoryTraits.halfLifeMs / (1000 * 60 * 60 * 24)));
+      const traitBars = {
+        halfLife: Math.min(100, Math.max(4, Math.round((halfLifeDays / 45) * 100))),
+        rehearsal: Math.min(100, Math.max(4, Math.round((memoryTraits.rehearsalGain / .1) * 100))),
+        emotional: Math.min(100, Math.max(4, Math.round((memoryTraits.emotionalGain / .2) * 100))),
+        interference: Math.min(100, Math.max(4, Math.round((memoryTraits.interference / .2) * 100))),
+      };
+      const aliasRows = aliasesForSelected.length
+        ? aliasesForSelected.map(alias => {
+          const canonical = alias.value.trim().toLocaleLowerCase('zh-CN') === (selectedActor.canonicalName ?? selectedActor.displayName).trim().toLocaleLowerCase('zh-CN');
+          return `<article class="stx-memory-alias-row"><div><strong>${escapeHtml(alias.value)}</strong>${renderStatusChip(actorStatusLabels[alias.status] ?? alias.status, alias.status === 'confirmed' ? 'success' : 'warning')}${canonical ? '<span class="stx-memory-actor-canonical-chip">规范名称</span>' : ''}</div><div class="stx-memory-alias-meta"><span>置信度 ${Math.round(alias.confidence * 100)}%</span><span>${renderSourceReference(alias.sourceRef)}</span></div>${editable && controller.correctActorAlias && people.length > 1 ? `<button ${uiControl('button', 'neutral')} type="button" data-action="open-actor-operation" data-operation="alias" data-alias-id="${escapeHtml(alias.id)}" ${busy ? 'disabled' : ''}>纠正归属</button>` : ''}</article>`;
+        }).join('')
+        : selectedActor.aliases.length
+          ? selectedActor.aliases.map(alias => `<article class="stx-memory-alias-row"><div><strong>${escapeHtml(alias)}</strong>${renderStatusChip('已确认', 'success')}</div><p class="stx-memory-muted">暂无可展示的别名来源记录。</p></article>`).join('')
+          : renderEmpty('暂无别名', '后续 Capture 发现新称呼后会显示在这里。');
+      return `<div class="stx-memory-actor-detail-head"><div><span class="stx-memory-kicker">${editable ? '人物主档' : '系统主体'}</span><div class="stx-memory-actor-headline"><h3>${escapeHtml(selectedActor.displayName)}</h3>${renderStatusChip(editable ? actorStatusLabels[selectedActor.status] ?? selectedActor.status : actorKindLabels[selectedActor.kind] ?? selectedActor.kind, selectedActor.status === 'confirmed' ? 'success' : 'warning')}</div><p>${editable ? '维护规范名称、别名归属与该人物的记忆特性。' : '系统主体用于标记叙事范围，不支持人物操作。'}</p></div></div>
+        ${renaming ? `<section class="stx-memory-actor-edit" aria-labelledby="stx-memory-actor-rename-label"><label id="stx-memory-actor-rename-label" for="stx-memory-actor-rename-input">新的规范名称</label><input id="stx-memory-actor-rename-input" ${uiControl('input')} data-actor-input="rename" value="${escapeHtml(state.actorRenameValue)}" autocomplete="off"><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="save-actor-rename" ${!state.actorRenameValue.trim() || busy ? 'disabled' : ''}>保存名称</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-actor-rename">取消</button></div></section>` : editable ? `<div class="stx-memory-actor-primary-actions"><button id="stx-memory-actor-rename-trigger" ${uiControl('button', 'primary')} type="button" data-action="start-actor-rename" ${busy ? 'disabled' : ''}><ss-helper-icon name="pen" decorative></ss-helper-icon>改名</button><button id="stx-memory-actor-split-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-actor-operation" data-operation="split" ${busy || selectedActor.aliases.length === 0 ? 'disabled' : ''}><ss-helper-icon name="code-branch" decorative></ss-helper-icon>拆分人物</button><button id="stx-memory-actor-merge-trigger" ${uiControl('button', 'danger')} type="button" data-action="open-actor-operation" data-operation="merge" ${busy || people.length < 2 ? 'disabled' : ''}><ss-helper-icon name="object-group" decorative></ss-helper-icon>合并人物</button></div>` : ''}
+        <dl class="stx-memory-actor-summary"><div><dt>规范名称</dt><dd>${escapeHtml(selectedActor.canonicalName ?? selectedActor.displayName)}</dd></div><div><dt>别名数量</dt><dd>${formatNumber(selectedActor.aliases.length)}</dd></div><div><dt>置信度</dt><dd>${Math.round(selectedActor.confidence * 100)}%</dd></div></dl>
+        <section class="stx-memory-actor-section" aria-labelledby="stx-memory-aliases-title"><div class="stx-memory-section-heading"><div><h4 id="stx-memory-aliases-title">别名与来源</h4><p>每个称呼都保留发现来源与确认状态</p></div><span>${selectedActor.aliases.length} 个</span></div><div class="stx-memory-alias-list">${aliasRows}</div></section>
+        ${editable ? `<section class="stx-memory-actor-section stx-memory-actor-traits"><div class="stx-memory-section-heading"><div><h4>人物记忆特性</h4><p>影响这个人物记忆的衰减、复述强化、情绪强化和干扰程度</p></div>${editingTraits ? '' : `<button ${uiControl('button', 'neutral')} type="button" data-action="start-actor-traits" ${busy ? 'disabled' : ''}>编辑特性</button>`}</div>${editingTraits ? `<div class="stx-memory-actor-traits-form"><label><span>记忆半衰期</span><span class="stx-memory-trait-input"><input ${uiControl('input')} type="number" min="1" step="1" value="${halfLifeDays}" data-actor-trait="half-life-days"><em>天</em></span><small>时间越长，未复述的记忆衰减越慢。</small></label><label><span>复述增益</span><input ${uiControl('input')} type="number" min="0" step="0.01" value="${memoryTraits.rehearsalGain}" data-actor-trait="rehearsal-gain"><small>成功召回后增加的记忆强度。</small></label><label><span>情绪增益</span><input ${uiControl('input')} type="number" min="0" step="0.01" value="${memoryTraits.emotionalGain}" data-actor-trait="emotional-gain"><small>高情绪显著内容获得的额外强化。</small></label><label><span>干扰惩罚</span><input ${uiControl('input')} type="number" min="0" step="0.01" value="${memoryTraits.interference}" data-actor-trait="interference"><small>相似或冲突记忆造成的固定削弱。</small></label></div><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="save-actor-traits" ${busy ? 'disabled' : ''}>保存特性</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-actor-traits">取消</button></div>` : `<dl class="stx-memory-actor-trait-grid"><div><span><dt>记忆半衰期</dt><dd>${halfLifeDays} 天</dd></span><i><b style="--stx-memory-trait-value:${traitBars.halfLife}%"></b></i></div><div><span><dt>复述增益</dt><dd>${memoryTraits.rehearsalGain.toFixed(2)}</dd></span><i><b style="--stx-memory-trait-value:${traitBars.rehearsal}%"></b></i></div><div><span><dt>情绪增益</dt><dd>${memoryTraits.emotionalGain.toFixed(2)}</dd></span><i><b style="--stx-memory-trait-value:${traitBars.emotional}%"></b></i></div><div><span><dt>干扰惩罚</dt><dd>${memoryTraits.interference.toFixed(2)}</dd></span><i><b style="--stx-memory-trait-value:${traitBars.interference}%"></b></i></div></dl>`}</section>` : ''}
+        <section class="stx-memory-actor-section"><div class="stx-memory-section-heading"><div><h4>发现方式</h4><p>用于解释人物是如何进入当前注册表的</p></div></div><div class="stx-memory-reference-list">${selectedActor.discoverySources.map(source => `<span>${escapeHtml(source)}</span>`).join('') || '<span>未记录</span>'}</div></section>
+        <details class="stx-memory-actor-technical"><summary>查看技术信息</summary><dl><div><dt>人物 ID</dt><dd>${escapeHtml(selectedActor.id)}</dd></div><div><dt>更新时间</dt><dd>${escapeHtml(formatTime(selectedActor.updatedAt))}</dd></div></dl></details>`;
+    })();
+    const candidateDetail = !selectedCandidate ? renderEmpty('没有待确认项', '当前人物归属已经处理完成。') : (() => {
+      const suggestedTargetId = people.find((actor) => actorMatchesCandidate(actor, selectedCandidate))?.id;
+      const targetId = state.candidateTargetOwnerId || selectedCandidate.ownerRef || suggestedTargetId || people[0]?.id || '';
+      const canonicalName = state.candidateCanonicalName;
+      const canConfirm = controller.confirmActorCandidate
+        && !busy
+        && (state.candidateResolutionMode === 'existing' ? Boolean(targetId) : Boolean(canonicalName.trim()));
+      return `<div class="stx-memory-actor-detail-head"><div><span class="stx-memory-kicker">待确认归属</span><h3>${escapeHtml(selectedCandidate.displayName)}</h3><p>核对证据后，将这个称呼归入人物主档。</p></div>${renderStatusChip(`${Math.round(selectedCandidate.confidence * 100)}%`, 'warning')}</div>
+        ${selectedCandidate.aliases?.length ? `<section class="stx-memory-actor-section"><h4>候选别名</h4><div class="stx-memory-reference-list">${selectedCandidate.aliases.map(alias => `<span>${escapeHtml(alias)}</span>`).join('')}</div></section>` : ''}
+        <section class="stx-memory-actor-section"><div class="stx-memory-section-heading"><div><h4>来源证据</h4><p>确认前请核对上下文是否指向同一个人物</p></div><span>${selectedCandidate.sourceRefs.length} 条</span></div><div class="stx-memory-evidence-list">${selectedCandidate.evidenceExcerpts.length ? selectedCandidate.evidenceExcerpts.map((excerpt, index) => `<blockquote class="stx-memory-evidence"><p>${escapeHtml(excerpt)}</p><footer>${renderSourceReference(selectedCandidate.sourceRefs[index] ?? selectedCandidate.sourceRefs[0] ?? '', 'evidence')}</footer></blockquote>`).join('') : selectedCandidate.sourceRefs.map(source => `<div class="stx-memory-reference-list">${renderSourceReference(source)}</div>`).join('') || '<p class="stx-memory-muted">暂无可展示的证据片段。</p>'}</div></section>
+        <section class="stx-memory-candidate-resolution" aria-labelledby="stx-memory-candidate-resolution-title"><h4 id="stx-memory-candidate-resolution-title">确认方式</h4><div class="stx-memory-actor-mode-switch" ${uiControl('segmented')} role="group" aria-label="候选人物确认方式"><button ${uiControl('button', 'neutral')} type="button" data-action="candidate-resolution-mode" data-mode="existing" aria-pressed="${state.candidateResolutionMode === 'existing'}">归入已有人物</button><button ${uiControl('button', 'neutral')} type="button" data-action="candidate-resolution-mode" data-mode="new" aria-pressed="${state.candidateResolutionMode === 'new'}">创建新人物</button></div>${state.candidateResolutionMode === 'existing' ? `<label for="stx-memory-candidate-target">目标人物</label><select id="stx-memory-candidate-target" ${uiControl('select')} data-actor-select="candidate-target" ${people.length === 0 ? 'disabled' : ''}>${renderActorTargetOptions(selectedCandidate, targetId)}</select>${people.length === 0 ? '<p class="stx-memory-inline-alert" role="alert">当前没有可归入的人物，请选择“创建新人物”。</p>' : ''}` : `<label for="stx-memory-candidate-name">规范名称</label><input id="stx-memory-candidate-name" ${uiControl('input')} data-actor-input="candidate-name" value="${escapeHtml(canonicalName)}" autocomplete="off">`}<button class="stx-memory-candidate-confirm" ${uiButton('primary', 'md')} type="button" data-action="confirm-actor" data-candidate-id="${escapeHtml(selectedCandidate.localId)}" ${canConfirm ? '' : 'disabled'}>确认归属</button></section>`;
+    })();
+    const selectedAlias = state.actorAliases.find(alias => alias.id === state.actorOperationAliasId);
+    const operationOwner = state.actors.find(actor => actor.id === state.selectedActorId) ?? selectedActor;
+    const operationTargets = people.filter(actor => actor.id !== operationOwner?.id);
+    const defaultTargetId = state.actorOperationTargetId || operationTargets[0]?.id || '';
+    const splitAliases = operationOwner
+      ? state.actorAliases.filter(alias => alias.ownerId === operationOwner.id).map(alias => ({ id: alias.value, label: alias.value }))
+      : [];
+    const fallbackSplitAliases = operationOwner?.aliases.map(alias => ({ id: alias, label: alias })) ?? [];
+    const availableSplitAliases = splitAliases.length ? splitAliases : fallbackSplitAliases;
+    const selectedSplitAlias = state.actorOperationAliasId || availableSplitAliases[0]?.id || '';
+    const operationTitle = state.actorOperation === 'merge' ? '合并人物'
+      : state.actorOperation === 'split' ? '拆分人物'
+        : state.actorOperation === 'alias' ? '纠正别名归属' : '';
+    const drawer = !state.actorOperation || !operationOwner ? '' : `<div class="stx-memory-actor-drawer-layer"><button class="stx-memory-drawer-backdrop" type="button" data-action="close-actor-operation" aria-label="关闭${operationTitle}"></button><aside class="stx-memory-actor-drawer" role="${state.actorOperation === 'merge' ? 'alertdialog' : 'dialog'}" aria-modal="true" aria-labelledby="stx-memory-actor-operation-title" aria-describedby="stx-memory-actor-operation-description"><header><div><span class="stx-memory-kicker">人物主档操作</span><h3 id="stx-memory-actor-operation-title">${operationTitle}</h3></div><button ${uiButton('neutral', 'sm', true)} type="button" data-action="close-actor-operation" aria-label="关闭"><ss-helper-icon name="xmark" decorative></ss-helper-icon></button></header><div class="stx-memory-drawer-body">${state.actorOperation === 'merge' ? `<div class="stx-memory-drawer-warning"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon><span><strong id="stx-memory-actor-operation-description">将“${escapeHtml(operationOwner.displayName)}”合并到目标人物</strong><small>源人物会从人物列表中消失，它的别名与关联记忆会迁入目标人物。此操作可从最近人物操作中撤销。</small></span></div><label for="stx-memory-actor-operation-target">合并到</label><select id="stx-memory-actor-operation-target" ${uiControl('select')} data-actor-select="operation-target">${operationTargets.map(actor => `<option value="${escapeHtml(actor.id)}" ${actor.id === defaultTargetId ? 'selected' : ''}>${escapeHtml(actor.displayName)}</option>`).join('')}</select>` : state.actorOperation === 'split' ? `<p id="stx-memory-actor-operation-description" class="stx-memory-muted">从“${escapeHtml(operationOwner.displayName)}”移出一个现有别名，并用它建立独立人物。</p><label for="stx-memory-actor-operation-alias">要拆分的别名</label><select id="stx-memory-actor-operation-alias" ${uiControl('select')} data-actor-select="operation-alias">${availableSplitAliases.map(alias => `<option value="${escapeHtml(alias.id)}" ${alias.id === selectedSplitAlias ? 'selected' : ''}>${escapeHtml(alias.label)}</option>`).join('')}</select><label for="stx-memory-actor-operation-name">新人物名称</label><input id="stx-memory-actor-operation-name" ${uiControl('input')} data-actor-input="operation-name" value="${escapeHtml(state.actorOperationName || selectedSplitAlias)}" autocomplete="off">` : `<p id="stx-memory-actor-operation-description" class="stx-memory-muted">把别名“${escapeHtml(selectedAlias?.value ?? '')}”移动到正确的人物主档。</p><label for="stx-memory-actor-operation-target">目标人物</label><select id="stx-memory-actor-operation-target" ${uiControl('select')} data-actor-select="operation-target">${operationTargets.map(actor => `<option value="${escapeHtml(actor.id)}" ${actor.id === defaultTargetId ? 'selected' : ''}>${escapeHtml(actor.displayName)}</option>`).join('')}</select>`}</div><footer><button ${uiButton('neutral', 'md')} type="button" data-action="close-actor-operation">取消</button><button ${uiControl('button', state.actorOperation === 'merge' ? 'danger' : 'primary')} type="button" data-action="confirm-actor-operation" ${busy || (state.actorOperation === 'merge' && !defaultTargetId) || (state.actorOperation === 'split' && (!selectedSplitAlias || !(state.actorOperationName || selectedSplitAlias).trim())) || (state.actorOperation === 'alias' && (!selectedAlias || !defaultTargetId)) ? 'disabled' : ''}>${state.actorOperation === 'merge' ? '确认合并' : state.actorOperation === 'split' ? '确认拆分' : '确认纠正'}</button></footer></aside></div>`;
+    const asideSuggestedTargetId = selectedCandidate ? people.find((actor) => actorMatchesCandidate(actor, selectedCandidate))?.id : undefined;
+    const asideTargetId = state.candidateTargetOwnerId || selectedCandidate?.ownerRef || asideSuggestedTargetId || people[0]?.id || '';
+    const asideCanConfirm = Boolean(controller.confirmActorCandidate)
+      && !busy
+      && Boolean(selectedCandidate)
+      && (state.candidateResolutionMode === 'existing' ? Boolean(asideTargetId) : Boolean(state.candidateCanonicalName.trim()));
+    const candidateQueue = state.pendingActors.filter(candidate => candidate.localId !== selectedCandidate?.localId).slice(0, 3);
+    const candidateAside = selectedCandidate ? `<article class="stx-memory-actor-candidate-card">
+      <div class="stx-memory-actor-candidate-head"><div><h4>${escapeHtml(selectedCandidate.displayName)}</h4><p>通用称呼 · 无安全自动归属</p></div>${renderStatusChip(`${Math.round(selectedCandidate.confidence * 100)}%`, 'warning')}</div>
+      <blockquote class="stx-memory-actor-candidate-quote">${escapeHtml(selectedCandidate.evidenceExcerpts[0] ?? '暂无证据摘录')}<small>${selectedCandidate.sourceRefs[0] ? `${renderSourceReference(selectedCandidate.sourceRefs[0], 'evidence')}` : '暂无来源'}</small></blockquote>
+      <div class="stx-memory-reference-list">${selectedCandidate.aliases?.map(alias => `<span>候选别名：${escapeHtml(alias)}</span>`).join('') ?? ''}<span>来源 ${selectedCandidate.sourceRefs.length} 条</span></div>
+      <div class="stx-memory-actor-mode-switch" ${uiControl('segmented')} role="group" aria-label="候选人物确认方式"><button ${uiControl('button', 'neutral')} type="button" data-action="candidate-resolution-mode" data-mode="existing" aria-pressed="${state.candidateResolutionMode === 'existing'}">归入已有人物</button><button ${uiControl('button', 'neutral')} type="button" data-action="candidate-resolution-mode" data-mode="new" aria-pressed="${state.candidateResolutionMode === 'new'}">创建新人物</button></div>
+      ${state.candidateResolutionMode === 'existing' ? `<label for="stx-memory-candidate-aside-target">目标人物</label><select id="stx-memory-candidate-aside-target" ${uiControl('select')} data-actor-select="candidate-target" ${people.length === 0 ? 'disabled' : ''}>${renderActorTargetOptions(selectedCandidate, asideTargetId)}</select>` : `<label for="stx-memory-candidate-aside-name">规范名称</label><input id="stx-memory-candidate-aside-name" ${uiControl('input')} data-actor-input="candidate-name" value="${escapeHtml(state.candidateCanonicalName)}" autocomplete="off">`}
+      <button class="stx-memory-candidate-confirm" ${uiButton('primary', 'md')} type="button" data-action="confirm-actor" data-candidate-id="${escapeHtml(selectedCandidate.localId)}" ${asideCanConfirm ? '' : 'disabled'}>确认归属</button>
+    </article>` : '<p class="stx-memory-muted">当前没有待确认人物。</p>';
+    const actorAside = `<aside class="stx-memory-actor-aside" aria-label="待确认归属与最近人物操作"><section class="stx-memory-actor-aside-section"><div class="stx-memory-actor-side-head"><h4>待确认归属</h4><span>${state.pendingActors.length} 条</span></div>${candidateAside}${candidateQueue.length ? `<div class="stx-memory-actor-candidate-queue">${candidateQueue.map(candidate => `<button ${uiControl('button', 'neutral')} type="button" data-action="select-candidate-aside" data-candidate-id="${escapeHtml(candidate.localId)}"><span><strong>${escapeHtml(candidate.displayName)}</strong><small>${candidate.sourceRefs.length} 条证据 · ${Math.round(candidate.confidence * 100)}%</small></span>${renderStatusChip('待确认', 'warning')}</button>`).join('')}</div>` : ''}</section><section class="stx-memory-actor-aside-section"><div class="stx-memory-actor-side-head"><h4>最近人物操作</h4><span>可撤销</span></div>${renderReviews()}</section></aside>`;
+    return `<div class="stx-memory-actor-shell">
+      <div class="stx-memory-actor-toolbar"><label class="stx-memory-search-wrap" for="stx-memory-actor-query"><span class="stx-memory-sr-only">搜索人物或别名</span><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><input id="stx-memory-actor-query" ${uiControl('input')} data-actor-input="query" value="${escapeHtml(state.actorQuery)}" placeholder="搜索人物名称或别名"></label><label class="stx-memory-control-wrap"><span class="stx-memory-sr-only">人物状态</span><select ${uiControl('select')} aria-label="人物状态" data-actor-select="status"><option value="" ${state.actorStatus === '' ? 'selected' : ''}>全部状态</option><option value="confirmed" ${state.actorStatus === 'confirmed' ? 'selected' : ''}>已确认</option><option value="pending" ${state.actorStatus === 'pending' ? 'selected' : ''}>待确认</option><option value="unknown" ${state.actorStatus === 'unknown' ? 'selected' : ''}>未识别</option></select></label><div class="stx-memory-actor-counts" aria-label="人物注册表统计"><span><strong>${people.length}</strong> 人物</span><span><strong>${aliasCount}</strong> 别名</span><button ${uiControl('button', state.pendingActors.length ? 'primary' : 'neutral')} type="button" data-action="actor-tab" data-view="pending"><strong>${state.pendingActors.length}</strong> 待确认</button></div><button ${uiControl('button', 'neutral')} type="button" data-action="refresh-actors" ${busy ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新</button></div>
+      <div class="stx-memory-actor-grid"><section class="stx-memory-actor-list-panel" aria-label="人物与待确认列表"><div class="stx-memory-actor-tabs" role="tablist" aria-label="人物注册表视图"><button ${uiButton('neutral', 'sm')} type="button" role="tab" data-action="actor-tab" data-view="people" aria-selected="${state.actorView === 'people'}">人物 <span>${people.length + systemActors.length}</span></button><button ${uiButton('neutral', 'sm')} type="button" role="tab" data-action="actor-tab" data-view="pending" aria-selected="${state.actorView === 'pending'}">待确认 <span>${state.pendingActors.length}</span></button></div><div class="stx-memory-actor-list" role="tabpanel">${state.actorView === 'people' ? actorList : pendingList}</div></section><section class="stx-memory-actor-inspector" id="${state.actorView === 'people' ? 'stx-memory-actor-inspector' : 'stx-memory-actor-candidate-inspector'}" aria-label="${state.actorView === 'people' ? '人物详情' : '待确认人物详情'}" tabindex="-1">${state.actorView === 'people' ? actorDetail : candidateDetail}</section>${actorAside}</div>${drawer}
+    </div>`;
+  };
 
   const renderScenes = (): string => `${state.scenes.length === 0
     ? renderEmpty('暂无场景事件', '完成一次 Capture 后，这里显示参与者、在场者、提及者和来源楼层。')
@@ -997,7 +1237,7 @@ export function renderMemoryWorkbench(
       return `<article class="stx-memory-activity-item is-${escapeHtml(attempt.status)}"><ss-helper-icon name="${icon}" decorative></ss-helper-icon><div><div><strong>${escapeHtml(translateRecordStatus(attempt.status))}</strong>${renderStatusChip(`${formatNumber(attempt.totalBatches)} 批`, tone)}</div><time datetime="${new Date(attempt.updatedAt).toISOString()}">${escapeHtml(formatTime(attempt.updatedAt))}</time><p>${escapeHtml(sourceNames)} · ${attempt.includeInvisibleHistory ? '含不可见历史正文' : '仅 AI 可见消息'}</p>${attempt.error ? `<small title="${escapeHtml(attempt.error)}">${escapeHtml(safeInlineError(attempt.error, 'MEMORY_CAPTURE_FAILED'))}</small>` : ''}</div></article>`;
     }).join('') : renderEmpty('暂无初始化记录', '完成初始化后会在这里保留最近 5 次活动。');
     const drawerDisabled = storageUnavailable || !selectedCount || !state.overview?.llmAvailable || running || Boolean(state.busyAction);
-    const drawer = !state.reinitializeOpen ? '' : `<div class="stx-memory-reinitialize-layer"><button class="stx-memory-drawer-backdrop" type="button" data-action="cancel-reinitialize" aria-label="关闭重新初始化确认"></button><aside class="stx-memory-reinitialize-drawer" role="alertdialog" aria-modal="true" aria-labelledby="stx-memory-reinitialize-title" aria-describedby="stx-memory-reinitialize-description"><header><div><span class="stx-memory-kicker">危险操作确认</span><h3 id="stx-memory-reinitialize-title">重新初始化当前聊天</h3></div><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-reinitialize" aria-label="关闭"><ss-helper-icon name="xmark" decorative></ss-helper-icon></button></header><div class="stx-memory-drawer-body"><p id="stx-memory-reinitialize-description" class="stx-memory-drawer-warning"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon><span><strong>这会清空当前聊天的全部 Memory 派生数据</strong><small>清空后立即按下方来源重新开始初始化；如果新任务失败，旧数据无法恢复。</small></span></p><section><div class="stx-memory-section-heading"><div><h4>选择重新整理的来源</h4><p>估算会随勾选结果实时更新</p></div><span>${selectedCount} / ${sourceTotal}</span></div>${renderSourceChoices(false)}</section>${renderInvisibleHistoryOption(false)}${estimateMarkup}<section class="stx-memory-clear-scope"><h4>将清理</h4><ul><li>事实、证据、主体痕迹与派生索引</li><li>捕获任务、审计与 Usage</li><li>召回日志和总结进度</li></ul></section><section class="stx-memory-safe-scope"><h4>不会影响</h4><ul><li>聊天原文与消息</li><li>角色卡、世界书和其他聊天</li></ul></section>${!state.overview?.llmAvailable ? '<p class="stx-memory-inline-alert" role="alert">大语言模型不可用，暂时不能重新初始化。</p>' : !selectedCount ? '<p class="stx-memory-inline-alert" role="alert">请至少选择一个来源。</p>' : ''}</div><footer><button id="stx-memory-reinitialize-cancel" ${uiControl('button', 'neutral')} type="button" data-action="cancel-reinitialize">取消</button><button ${uiControl('button', 'danger')} type="button" data-action="confirm-reinitialize" ${drawerDisabled ? 'disabled' : ''}><ss-helper-icon name="trash-can-arrow-up" decorative></ss-helper-icon>清空并重新初始化</button></footer></aside></div>`;
+    const drawer = !state.reinitializeOpen ? '' : `<div class="stx-memory-reinitialize-layer"><button class="stx-memory-drawer-backdrop" type="button" data-action="cancel-reinitialize" aria-label="关闭重新初始化确认"></button><aside class="stx-memory-reinitialize-drawer" role="alertdialog" aria-modal="true" aria-labelledby="stx-memory-reinitialize-title" aria-describedby="stx-memory-reinitialize-description"><header><div><span class="stx-memory-kicker">危险操作确认</span><h3 id="stx-memory-reinitialize-title">重新初始化当前聊天</h3></div><button ${uiButton('neutral', 'sm', true)} type="button" data-action="cancel-reinitialize" aria-label="关闭"><ss-helper-icon name="xmark" decorative></ss-helper-icon></button></header><div class="stx-memory-drawer-body"><p id="stx-memory-reinitialize-description" class="stx-memory-drawer-warning"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon><span><strong>这会清空当前聊天的全部 Memory 派生数据</strong><small>清空后立即按下方来源重新开始初始化；如果新任务失败，旧数据无法恢复。</small></span></p><section><div class="stx-memory-section-heading"><div><h4>选择重新整理的来源</h4><p>估算会随勾选结果实时更新</p></div><span>${selectedCount} / ${sourceTotal}</span></div>${renderSourceChoices(false)}</section>${renderInvisibleHistoryOption(false)}${estimateMarkup}<section class="stx-memory-clear-scope"><h4>将清理</h4><ul><li>事实、证据、主体痕迹与派生索引</li><li>捕获任务、审计与 Usage</li><li>召回日志和总结进度</li></ul></section><section class="stx-memory-safe-scope"><h4>不会影响</h4><ul><li>聊天原文与消息</li><li>角色卡、世界书和其他聊天</li></ul></section>${!state.overview?.llmAvailable ? '<p class="stx-memory-inline-alert" role="alert">大语言模型不可用，暂时不能重新初始化。</p>' : !selectedCount ? '<p class="stx-memory-inline-alert" role="alert">请至少选择一个来源。</p>' : ''}</div><footer><button id="stx-memory-reinitialize-cancel" ${uiControl('button', 'neutral')} type="button" data-action="cancel-reinitialize">取消</button><button ${uiControl('button', 'danger')} type="button" data-action="confirm-reinitialize" ${drawerDisabled ? 'disabled' : ''}><ss-helper-icon name="trash-can-arrow-up" decorative></ss-helper-icon>清空并重新初始化</button></footer></aside></div>`;
     if (running || submitting) return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout is-running">${progressMarkup}<section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization?.attempts.length ?? 0} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div></div>`;
     if (initialization?.initialized) {
       return `<div class="stx-memory-initialize-shell"><div class="stx-memory-initialize-layout"><section class="stx-memory-panel stx-memory-initialize-summary">${storageAlert}<div class="stx-memory-initialize-success"><span><ss-helper-icon name="circle-check" decorative></ss-helper-icon></span><div><span class="stx-memory-kicker">初始化状态</span><h3>已初始化</h3><p>完成于 ${escapeHtml(formatTime(initialization.lastCompletedAt))}</p></div>${renderStatusChip('召回可用', 'success')}</div><dl class="stx-memory-initialize-metrics"><div><dt>来源覆盖</dt><dd>${formatNumber(sourceCoverage)} / ${formatNumber(sourceTotal)}</dd></div><div><dt>记忆事实</dt><dd>${formatNumber(state.overview?.factCount ?? 0)}</dd></div><div><dt>占用空间</dt><dd>${escapeHtml(formatBytes(state.overview?.currentChatSizeBytes ?? 0))}</dd></div><div><dt>预计批次</dt><dd>${formatNumber(state.estimate?.batchCount ?? 0)}</dd></div></dl><p class="stx-memory-initialize-note"><ss-helper-icon name="circle-info" decorative></ss-helper-icon><span>当前聊天已经可以使用记忆召回。最近的失败任务只会记录在右侧，不会覆盖这次有效初始化。</span></p><div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="view-library"><ss-helper-icon name="book-open" decorative></ss-helper-icon>查看记忆库</button><button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${storageUnavailable || state.busyAction || !state.overview?.llmAvailable ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>重新初始化</button></div></section><section class="stx-memory-panel stx-memory-activity-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3></div><span>${initialization.attempts.length} / 5</span></div><div class="stx-memory-activity-list">${activities}</div></section></div>${drawer}</div>`;
@@ -1087,7 +1327,7 @@ export function renderMemoryWorkbench(
     const listCount = state.graphListMode === 'events' ? eventEdges.length : view.edges.length;
     const listLabel = state.graphListMode === 'events' ? '事件列表' : '边列表';
     const detail = renderGraphDetail(selection);
-    return `<section class="stx-memory-panel stx-memory-graph-status-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">图谱状态</span><h3>当前聊天</h3></div><div class="stx-memory-graph-status-actions">${renderStatusChip(phaseLabel, phaseTone)}<button class="stx-memory-graph-icon-button" ${uiControl('button', 'neutral')} type="button" data-action="rebuild-graph" aria-label="重建关系图谱" title="重建关系图谱" ${state.busyAction || status.phase === 'rebuilding' ? 'disabled' : ''}><ss-helper-icon name="arrows-rotate" decorative></ss-helper-icon></button></div></div><p class="stx-memory-muted">仅以当前聊天中已验证事实为准；视觉聚类只用于浏览，不会写入记忆。</p><dl class="stx-memory-graph-metric-grid"><div><dt>节点</dt><dd>${formatNumber(graph.nodes.length)}</dd></div><div><dt>已载入关系</dt><dd>${formatNumber(graph.edges.length)} / ${formatNumber(status.edgeCount)}</dd></div><div><dt>最后协调</dt><dd>${escapeHtml(status.lastRebuiltAt ? formatTime(status.lastRebuiltAt) : '尚未完成')}</dd></div></dl>${status.lastError ? '<p class="stx-memory-inline-alert" role="alert">图谱暂时降级，普通整理和召回不受影响。</p>' : ''}<div class="stx-memory-graph-filter-row"><label>类型<select ${uiControl('select')} data-graph-filter="kind"><option value="">全部</option>${kinds.map((kind) => `<option value="${escapeHtml(kind)}" ${state.graphKind === kind ? 'selected' : ''}>${escapeHtml(translateFactKind(kind))}</option>`).join('')}</select></label><label>状态<select ${uiControl('select')} data-graph-filter="status"><option value="">全部</option>${statuses.map((value) => `<option value="${escapeHtml(value)}" ${state.graphStatusFilter === value ? 'selected' : ''}>${escapeHtml(translateFactStatus(value))}</option>`).join('')}</select></label></div></section><section class="stx-memory-panel stx-memory-graph-relations-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">已验证关系</span><h3 data-graph-list-heading>${listLabel}</h3></div><span data-graph-list-count>${formatNumber(listCount)} 条</span></div><div class="stx-memory-graph-list-switch" role="tablist" aria-label="已验证关系显示模式"><button ${uiControl('button', 'neutral')} type="button" role="tab" data-action="set-graph-list-mode" data-graph-list-mode="edges" aria-selected="${state.graphListMode === 'edges'}"><ss-helper-icon name="link" decorative></ss-helper-icon>边列表</button><button ${uiControl('button', 'neutral')} type="button" role="tab" data-action="set-graph-list-mode" data-graph-list-mode="events" aria-selected="${state.graphListMode === 'events'}"><ss-helper-icon name="bolt" decorative></ss-helper-icon>事件列表</button></div><div class="stx-memory-graph-list-stack"><div class="stx-memory-graph-edge-list" data-graph-edge-list data-graph-list-mode="edges" data-graph-list-count="${view.edges.length}" ${state.graphListMode === 'edges' ? '' : 'hidden'}>${relationRows}</div><div class="stx-memory-graph-edge-list" data-graph-edge-list data-graph-list-mode="events" data-graph-list-count="${eventEdges.length}" ${state.graphListMode === 'events' ? '' : 'hidden'}>${eventRows}</div></div></section><section class="stx-memory-panel stx-memory-graph-detail-panel" data-graph-inspector-detail>${detail}</section>`;
+    return `<section class="stx-memory-panel stx-memory-graph-status-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">图谱状态</span><h3>当前聊天</h3></div><div class="stx-memory-graph-status-actions">${renderStatusChip(phaseLabel, phaseTone)}<button class="stx-memory-graph-icon-button" ${uiButton('neutral', 'sm', true)} type="button" data-action="rebuild-graph" aria-label="重建关系图谱" title="重建关系图谱" ${state.busyAction || status.phase === 'rebuilding' ? 'disabled' : ''}><ss-helper-icon name="arrows-rotate" decorative></ss-helper-icon></button></div></div><p class="stx-memory-muted">仅以当前聊天中已验证事实为准；视觉聚类只用于浏览，不会写入记忆。</p><dl class="stx-memory-graph-metric-grid"><div><dt>节点</dt><dd>${formatNumber(graph.nodes.length)}</dd></div><div><dt>已载入关系</dt><dd>${formatNumber(graph.edges.length)} / ${formatNumber(status.edgeCount)}</dd></div><div><dt>最后协调</dt><dd>${escapeHtml(status.lastRebuiltAt ? formatTime(status.lastRebuiltAt) : '尚未完成')}</dd></div></dl>${status.lastError ? '<p class="stx-memory-inline-alert" role="alert">图谱暂时降级，普通整理和召回不受影响。</p>' : ''}<div class="stx-memory-graph-filter-row"><label>类型<select ${uiControl('select')} data-graph-filter="kind"><option value="">全部</option>${kinds.map((kind) => `<option value="${escapeHtml(kind)}" ${state.graphKind === kind ? 'selected' : ''}>${escapeHtml(translateFactKind(kind))}</option>`).join('')}</select></label><label>状态<select ${uiControl('select')} data-graph-filter="status"><option value="">全部</option>${statuses.map((value) => `<option value="${escapeHtml(value)}" ${state.graphStatusFilter === value ? 'selected' : ''}>${escapeHtml(translateFactStatus(value))}</option>`).join('')}</select></label></div></section><section class="stx-memory-panel stx-memory-graph-relations-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">已验证关系</span><h3 data-graph-list-heading>${listLabel}</h3></div><span data-graph-list-count>${formatNumber(listCount)} 条</span></div><div class="stx-memory-graph-list-switch" role="tablist" aria-label="已验证关系显示模式"><button ${uiButton('neutral', 'sm')} type="button" role="tab" data-action="set-graph-list-mode" data-graph-list-mode="edges" aria-selected="${state.graphListMode === 'edges'}"><ss-helper-icon name="link" decorative></ss-helper-icon>边列表</button><button ${uiButton('neutral', 'sm')} type="button" role="tab" data-action="set-graph-list-mode" data-graph-list-mode="events" aria-selected="${state.graphListMode === 'events'}"><ss-helper-icon name="bolt" decorative></ss-helper-icon>事件列表</button></div><div class="stx-memory-graph-list-stack"><div class="stx-memory-graph-edge-list" data-graph-edge-list data-graph-list-mode="edges" data-graph-list-count="${view.edges.length}" ${state.graphListMode === 'edges' ? '' : 'hidden'}>${relationRows}</div><div class="stx-memory-graph-edge-list" data-graph-edge-list data-graph-list-mode="events" data-graph-list-count="${eventEdges.length}" ${state.graphListMode === 'events' ? '' : 'hidden'}>${eventRows}</div></div></section><section class="stx-memory-panel stx-memory-graph-detail-panel" data-graph-inspector-detail>${detail}</section>`;
   };
   const renderGraph = (): string => {
     const graph = state.graph ? localizeLegacyGraphPreview(state.graph) : undefined;
@@ -1095,7 +1335,7 @@ export function renderMemoryWorkbench(
     if (!graph || !status) return renderEmpty('正在读取关系图谱', '图谱只会展示当前聊天中由已验证事实派生的关系。');
     if (!status.enabled) return `<section class="stx-memory-panel">${renderEmpty('关系图谱已关闭', '可在“高级 → 关系图谱”中开启；关闭时不会影响普通整理或召回。')}</section>`;
     const focusNodeId = state.selectedGraphNodeId || state.selectedGraphEdgeId || state.selectedGraphEventId;
-    return `<div class="stx-memory-graph-shell"><section class="stx-memory-graph-stage-panel" aria-label="关系图谱画布"><div class="stx-memory-graph-toolbar"><label class="stx-memory-graph-search"><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><span class="stx-memory-sr-only">搜索节点或关系</span><input id="stx-memory-graph-query" ${uiControl('input')} data-filter="graph-query" value="${escapeHtml(state.graphQuery)}" placeholder="搜索节点或关系"></label><div class="stx-memory-graph-command-group" aria-label="图谱视图控制"><button ${uiControl('button', 'neutral')} type="button" data-action="graph-command" data-graph-command="zoom-out" aria-label="缩小图谱" title="缩小图谱"><ss-helper-icon name="minus" decorative></ss-helper-icon></button><button ${uiControl('button', 'neutral')} type="button" data-action="graph-command" data-graph-command="zoom-in" aria-label="放大图谱" title="放大图谱"><ss-helper-icon name="plus" decorative></ss-helper-icon></button><button ${uiControl('button', 'neutral')} type="button" data-action="graph-command" data-graph-command="fit" aria-label="适配视图" title="适配视图"><ss-helper-icon name="expand" decorative></ss-helper-icon></button><button ${uiControl('button', 'neutral')} type="button" data-action="graph-command" data-graph-command="reset-layout" aria-label="重新布局" title="重新布局"><ss-helper-icon name="shuffle" decorative></ss-helper-icon></button></div><button class="stx-memory-graph-focus-button stx-memory-graph-icon-button" ${uiControl('button', 'neutral')} type="button" data-action="toggle-graph-neighbor-focus" aria-pressed="${state.graphNeighborFocus}" aria-label="${state.graphNeighborFocus ? '显示全部关系' : '只看选中邻接'}" title="${state.graphNeighborFocus ? '显示全部关系' : '只看选中邻接'}" ${focusNodeId ? '' : 'disabled'}><ss-helper-icon name="${state.graphNeighborFocus ? 'eye' : 'eye-slash'}" decorative></ss-helper-icon></button><button class="stx-memory-graph-orbit-button stx-memory-graph-icon-button" ${uiControl('button', 'neutral')} type="button" data-action="graph-command" data-graph-command="toggle-orbit" aria-label="切换自动旋转" title="切换自动旋转"><ss-helper-icon name="rotate" decorative></ss-helper-icon></button></div><div class="stx-memory-relationship-graph-stage"><div class="stx-memory-relationship-graph-three-host" data-relationship-graph-three-host></div><div class="stx-memory-graph-overlay"><span><ss-helper-icon name="arrows-to-circle" decorative></ss-helper-icon> 拖动旋转 · 右键平移 · 滚轮缩放</span></div></div></section><aside class="stx-memory-graph-inspector" data-relationship-graph-inspector>${renderGraphInspector()}</aside></div>`;
+    return `<div class="stx-memory-graph-shell"><section class="stx-memory-graph-stage-panel" aria-label="关系图谱画布"><div class="stx-memory-graph-toolbar"><label class="stx-memory-graph-search"><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><span class="stx-memory-sr-only">搜索节点或关系</span><input id="stx-memory-graph-query" ${uiControl('input')} data-filter="graph-query" value="${escapeHtml(state.graphQuery)}" placeholder="搜索节点或关系"></label><div class="stx-memory-graph-command-group" aria-label="图谱视图控制"><button ${uiButton('neutral', 'sm', true)} type="button" data-action="graph-command" data-graph-command="zoom-out" aria-label="缩小图谱" title="缩小图谱"><ss-helper-icon name="minus" decorative></ss-helper-icon></button><button ${uiButton('neutral', 'sm', true)} type="button" data-action="graph-command" data-graph-command="zoom-in" aria-label="放大图谱" title="放大图谱"><ss-helper-icon name="plus" decorative></ss-helper-icon></button><button ${uiButton('neutral', 'sm', true)} type="button" data-action="graph-command" data-graph-command="fit" aria-label="适配视图" title="适配视图"><ss-helper-icon name="expand" decorative></ss-helper-icon></button><button ${uiButton('neutral', 'sm', true)} type="button" data-action="graph-command" data-graph-command="reset-layout" aria-label="重新布局" title="重新布局"><ss-helper-icon name="shuffle" decorative></ss-helper-icon></button></div><button class="stx-memory-graph-focus-button stx-memory-graph-icon-button" ${uiButton('neutral', 'sm', true)} type="button" data-action="toggle-graph-neighbor-focus" aria-pressed="${state.graphNeighborFocus}" aria-label="${state.graphNeighborFocus ? '显示全部关系' : '只看选中邻接'}" title="${state.graphNeighborFocus ? '显示全部关系' : '只看选中邻接'}" ${focusNodeId ? '' : 'disabled'}><ss-helper-icon name="${state.graphNeighborFocus ? 'eye' : 'eye-slash'}" decorative></ss-helper-icon></button><button class="stx-memory-graph-orbit-button stx-memory-graph-icon-button" ${uiButton('neutral', 'sm', true)} type="button" data-action="graph-command" data-graph-command="toggle-orbit" aria-label="切换自动旋转" title="切换自动旋转"><ss-helper-icon name="rotate" decorative></ss-helper-icon></button></div><div class="stx-memory-relationship-graph-stage"><div class="stx-memory-relationship-graph-three-host" data-relationship-graph-three-host></div><div class="stx-memory-graph-overlay"><span><ss-helper-icon name="arrows-to-circle" decorative></ss-helper-icon> 拖动旋转 · 右键平移 · 滚轮缩放</span></div></div></section><aside class="stx-memory-graph-inspector" data-relationship-graph-inspector>${renderGraphInspector()}</aside></div>`;
   };
   const refreshGraphMarquees = (scope: ParentNode = root): void => {
     queueMicrotask(() => {
@@ -1233,9 +1473,22 @@ export function renderMemoryWorkbench(
         : `<button ${uiControl('button', 'danger')} type="button" data-action="rollback" data-rollback-key="${escapeHtml(key)}">${isActorCapture ? '回滚本次 Capture' : '回滚此批及后续批次'}</button>`;
       const kicker = isActorCapture ? '多主体 Capture' : record.type === 'recall' ? '召回' : `捕获批次 ${batchNumber}`;
       const heading = translateRecordStatus(String(record.status ?? '已记录'));
-      return `<article class="stx-memory-audit-item"><div class="stx-memory-audit-heading"><div><span class="stx-memory-kicker">${kicker}</span><h3>${escapeHtml(heading)}</h3></div>${renderStatusChip(`${formatNumber(acceptedCount)} 条事实`, 'neutral')}</div><dl class="stx-memory-audit-metrics">${metrics.map(([label, value]) => `<div title="${escapeHtml(value)}"><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl><details class="stx-memory-audit-details"><summary>查看技术明细</summary><pre class="stx-memory-code">${escapeHtml(formatJson(record))}</pre></details>${rollback ? `<div class="stx-memory-audit-actions">${rollback}</div>` : ''}</article>`;
+      const rejections = (Array.isArray(record.rejected) ? record.rejected : [])
+        .filter((item): item is import('../domain').AutomaticIngestRejection => Boolean(item && typeof item === 'object' && ('code' in item || 'id' in item)));
+      const unresolved = rejections.filter(item => (item.status ?? 'unresolved') === 'unresolved' && Boolean(item.id));
+      const unresolvedIds = new Set(unresolved.map(item => item.id!));
+      const selectedIds = state.selectedRejectionIds.filter(id => unresolvedIds.has(id));
+      const selectedTypes = new Set(unresolved.filter(item => item.id && selectedIds.includes(item.id)).map(item => item.recordType).filter(Boolean));
+      const rejectionDetails = rejections.length === 0 ? '' : `<details class="stx-memory-capture-rejections" ${unresolved.length ? 'open' : ''}><summary>失败项 ${unresolved.length} 条待处理 / ${rejections.length} 条总计</summary><div class="stx-memory-rejection-list">${rejections.map((rejection) => {
+        const rejectionId = rejection.id ?? '';
+        const pending = (rejection.status ?? 'unresolved') === 'unresolved';
+        const sourceRefs = rejection.sourceRefs ?? [];
+        const statusLabel = pending ? '待处理' : rejection.status === 'repaired' ? '已修复' : rejection.status === 'ignored' ? '已忽略' : '处理中';
+        return `<article class="stx-memory-rejection-item" data-rejection-status="${escapeHtml(rejection.status ?? 'unresolved')}"><label><input ${uiControl('checkbox')} type="checkbox" data-capture-rejection-id="${escapeHtml(rejectionId)}" ${selectedIds.includes(rejectionId) ? 'checked' : ''} ${!pending || !rejectionId || state.busyAction ? 'disabled' : ''}><span><strong>${escapeHtml(String(rejection.recordType ?? '记录'))} · ${escapeHtml(rejection.fieldPath ?? '结构')}</strong><small>${escapeHtml(rejection.message)}</small></span>${renderStatusChip(statusLabel, pending ? 'warning' : rejection.status === 'repaired' ? 'success' : 'neutral')}</label>${sourceRefs.length ? `<div class="stx-memory-rejection-sources">${sourceRefs.map(ref => renderSourceReference(ref)).join('')}</div>` : ''}<details><summary>查看候选快照</summary><pre class="stx-memory-code">${escapeHtml(formatJson(rejection.candidateSnapshot ?? {}))}</pre></details></article>`;
+      }).join('')}</div>${unresolved.length ? `<div class="stx-memory-rejection-actions"><span>已选 ${selectedIds.length} 项 · 预计 ${selectedTypes.size} 次请求</span><button ${uiControl('button', 'primary')} type="button" data-action="repair-capture-rejections" data-audit-id="${escapeHtml(record.id ?? '')}" ${!selectedIds.length || !controller.repairCaptureRejections || state.busyAction ? 'disabled' : ''}>定向修复</button><button ${uiControl('button', 'neutral')} type="button" data-action="ignore-capture-rejections" data-audit-id="${escapeHtml(record.id ?? '')}" ${!selectedIds.length || !controller.ignoreCaptureRejections || state.busyAction ? 'disabled' : ''}>忽略所选</button></div>` : ''}</details>`;
+      return `<article class="stx-memory-audit-item"><div class="stx-memory-audit-heading"><div><span class="stx-memory-kicker">${kicker}</span><h3>${escapeHtml(heading)}</h3></div>${renderStatusChip(`${formatNumber(acceptedCount)} 条事实 · 已接受`, record.outcome === 'partial' ? 'warning' : 'neutral')}</div><dl class="stx-memory-audit-metrics">${metrics.map(([label, value]) => `<div title="${escapeHtml(value)}"><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>${rejectionDetails}<details class="stx-memory-audit-details"><summary>查看技术明细</summary><pre class="stx-memory-code">${escapeHtml(formatJson(record))}</pre></details>${rollback ? `<div class="stx-memory-audit-actions">${rollback}</div>` : ''}</article>`;
     }).join('') : renderEmpty('暂无捕获审计', '新 Capture 完成后会在这里出现。');
-    return `<div class="stx-memory-page-actions"><p class="stx-memory-muted">审计记录只读展示已提交的整理结果。</p><button ${uiControl('button', 'neutral')} type="button" data-action="refresh-audit" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新审计</button></div><div class="stx-memory-audit-list">${records}</div><details class="stx-memory-panel stx-memory-usage"><summary>主聊天 Token / usage（${state.usages.length} 条）</summary><pre class="stx-memory-code">${escapeHtml(formatJson(state.usages))}</pre></details>`;
+    return `<div class="stx-memory-page-actions"><p class="stx-memory-muted">合法项已经提交；失败项可在对应 Capture 中选择修复或忽略。</p><button ${uiControl('button', 'neutral')} type="button" data-action="refresh-audit" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新审计</button></div><div class="stx-memory-audit-list">${records}</div><details class="stx-memory-panel stx-memory-usage"><summary>主聊天 Token / usage（${state.usages.length} 条）</summary><pre class="stx-memory-code">${escapeHtml(formatJson(state.usages))}</pre></details>`;
   };
   const renderData = (): string => {
     const sqlite = state.sqlite;
@@ -1348,10 +1601,210 @@ export function renderMemoryWorkbench(
       void runAction('dream-dry-run', () => controller.runActorDream!(jobId, { dryRun: true }).then(() => undefined), 'Dream 预览完成', '本次 dry-run 未写入巩固结果。', 'MEMORY_DREAM_DRY_RUN_COMPLETED', () => loadPage('dreams'));
       return;
     }
+    if (action === 'actor-tab') {
+      state.actorView = actionNode.dataset.view === 'pending' ? 'pending' : 'people';
+      state.renamingActorId = '';
+      state.editingActorTraitsId = '';
+      state.actorOperation = '';
+      rerender();
+      revealActorInspector();
+      return;
+    }
+    if (action === 'select-actor') {
+      state.actorView = 'people';
+      state.selectedActorId = actionNode.dataset.ownerId ?? '';
+      state.renamingActorId = '';
+      state.editingActorTraitsId = '';
+      state.actorOperation = '';
+      rerender();
+      return;
+    }
+    if (action === 'select-candidate') {
+      const candidateId = actionNode.dataset.candidateId ?? '';
+      const candidate = state.pendingActors.find(item => item.localId === candidateId);
+      state.actorView = 'pending';
+      state.selectedCandidateId = candidateId;
+      state.candidateResolutionMode = candidate?.ownerRef ? 'existing' : state.actors.some(actor => actor.kind === 'actor') ? 'existing' : 'new';
+      state.candidateTargetOwnerId = candidate?.ownerRef ?? state.actors.find(actor => actor.kind === 'actor')?.id ?? '';
+      state.candidateCanonicalName = '';
+      rerender();
+      revealActorInspector();
+      return;
+    }
+    if (action === 'select-candidate-aside') {
+      const candidateId = actionNode.dataset.candidateId ?? '';
+      const candidate = state.pendingActors.find(item => item.localId === candidateId);
+      state.selectedCandidateId = candidateId;
+      state.candidateResolutionMode = candidate?.ownerRef ? 'existing' : state.actors.some(actor => actor.kind === 'actor') ? 'existing' : 'new';
+      state.candidateTargetOwnerId = candidate?.ownerRef ?? state.actors.find(actor => actor.kind === 'actor')?.id ?? '';
+      state.candidateCanonicalName = '';
+      rerender();
+      return;
+    }
+    if (action === 'refresh-actors') { void loadPage('actors'); return; }
+    if (action === 'start-actor-rename') {
+      const actor = state.actors.find(item => item.id === state.selectedActorId);
+      if (!actor || actor.kind !== 'actor') return;
+      state.editingActorTraitsId = '';
+      state.renamingActorId = actor.id;
+      state.actorRenameValue = actor.displayName;
+      rerender('#stx-memory-actor-rename-input');
+      return;
+    }
+    if (action === 'cancel-actor-rename') {
+      state.renamingActorId = '';
+      state.actorRenameValue = '';
+      rerender('#stx-memory-actor-rename-trigger');
+      return;
+    }
+    if (action === 'save-actor-rename') {
+      const ownerId = state.renamingActorId;
+      const displayName = state.actorRenameValue.trim();
+      if (!ownerId || !displayName || !controller.renameActor) {
+        toast('warning', '名称不能为空', '请输入新的规范名称后再保存。', 'MEMORY_ACTOR_NAME_REQUIRED');
+        return;
+      }
+      void runAction('rename-actor', () => controller.renameActor!(ownerId, displayName), '人物名称已更新', '新的规范名称和别名已经保存。', 'MEMORY_ACTOR_RENAMED', async () => {
+        state.renamingActorId = '';
+        state.actorRenameValue = '';
+        await loadPage('actors');
+      });
+      return;
+    }
+    if (action === 'start-actor-traits') {
+      const actor = state.actors.find(item => item.id === state.selectedActorId);
+      if (!actor || actor.kind !== 'actor' || !controller.updateActorMemoryTraits) return;
+      state.renamingActorId = '';
+      state.editingActorTraitsId = actor.id;
+      rerender('[data-actor-trait="half-life-days"]');
+      return;
+    }
+    if (action === 'cancel-actor-traits') {
+      state.editingActorTraitsId = '';
+      rerender('[data-action="start-actor-traits"]');
+      return;
+    }
+    if (action === 'save-actor-traits') {
+      const ownerId = state.editingActorTraitsId;
+      if (!ownerId || !controller.updateActorMemoryTraits) return;
+      const readTrait = (name: string): number => Number(root.querySelector<HTMLInputElement>(`[data-actor-trait="${name}"]`)?.value ?? Number.NaN);
+      const halfLifeDays = readTrait('half-life-days');
+      const rehearsalGain = readTrait('rehearsal-gain');
+      const emotionalGain = readTrait('emotional-gain');
+      const interference = readTrait('interference');
+      if (![halfLifeDays, rehearsalGain, emotionalGain, interference].every(Number.isFinite) || halfLifeDays < 1 || rehearsalGain < 0 || emotionalGain < 0 || interference < 0) {
+        toast('warning', '记忆特性数值无效', '半衰期至少为 1 天，其余数值不能小于 0。', 'MEMORY_ACTOR_TRAITS_INVALID');
+        return;
+      }
+      void runAction('update-actor-traits', () => controller.updateActorMemoryTraits!(ownerId, {
+        halfLifeMs: Math.round(halfLifeDays * 24 * 60 * 60 * 1000),
+        rehearsalGain,
+        emotionalGain,
+        interference,
+      }), '人物记忆特性已更新', '新的衰减与强化参数已经保存。', 'MEMORY_ACTOR_TRAITS_UPDATED', async () => {
+        state.editingActorTraitsId = '';
+        await loadPage('actors');
+      });
+      return;
+    }
+    if (action === 'candidate-resolution-mode') {
+      state.candidateResolutionMode = actionNode.dataset.mode === 'new' ? 'new' : 'existing';
+      const candidate = state.pendingActors.find(item => item.localId === state.selectedCandidateId);
+      if (state.candidateResolutionMode === 'existing' && !state.candidateTargetOwnerId) {
+        state.candidateTargetOwnerId = candidate?.ownerRef ?? state.actors.find(actor => actor.kind === 'actor')?.id ?? '';
+      }
+      if (state.candidateResolutionMode === 'new') state.candidateCanonicalName = '';
+      rerender(state.candidateResolutionMode === 'new' ? '#stx-memory-candidate-name' : '#stx-memory-candidate-target');
+      return;
+    }
     if (action === 'confirm-actor') {
       const candidateId = actionNode.dataset.candidateId;
       if (!candidateId || !controller.confirmActorCandidate) return;
-      void runAction('confirm-actor', () => controller.confirmActorCandidate!(candidateId), '人物归属已确认', '已写入人物注册表和审计记录。', 'MEMORY_ACTOR_CONFIRMED', () => loadPage('actors'));
+      const resolution: import('../domain').ActorCandidateResolution = state.candidateResolutionMode === 'existing'
+        ? { mode: 'existing', ownerId: state.candidateTargetOwnerId || state.pendingActors.find(candidate => candidate.localId === candidateId)?.ownerRef || state.actors.find(actor => actor.kind === 'actor')?.id || '' }
+        : { mode: 'new', canonicalName: state.candidateCanonicalName.trim() };
+      if ((resolution.mode === 'existing' && !resolution.ownerId) || (resolution.mode === 'new' && !resolution.canonicalName)) {
+        toast('warning', '确认信息不完整', resolution.mode === 'existing' ? '请选择要归入的人物。' : '请输入新人物的规范名称。', 'MEMORY_ACTOR_RESOLUTION_REQUIRED');
+        return;
+      }
+      void runAction('confirm-actor', () => controller.confirmActorCandidate!(candidateId, resolution), '人物归属已确认', '候选称呼、别名和来源已写入人物主档。', 'MEMORY_ACTOR_CONFIRMED', async () => {
+        await loadPage('actors');
+        state.actorView = state.pendingActors.length ? 'pending' : 'people';
+      });
+      return;
+    }
+    if (action === 'open-actor-operation') {
+      const operation = actionNode.dataset.operation;
+      if (operation !== 'merge' && operation !== 'split' && operation !== 'alias') return;
+      const owner = state.actors.find(actor => actor.id === state.selectedActorId);
+      if (!owner || owner.kind !== 'actor') return;
+      const targets = state.actors.filter(actor => actor.kind === 'actor' && actor.id !== owner.id);
+      const ownerAliases = state.actorAliases.filter(alias => alias.ownerId === owner.id);
+      const initialAlias = operation === 'alias'
+        ? actionNode.dataset.aliasId ?? ''
+        : ownerAliases[0]?.value ?? owner.aliases[0] ?? '';
+      state.actorOperation = operation;
+      state.actorOperationAliasId = initialAlias;
+      state.actorOperationTargetId = targets[0]?.id ?? '';
+      state.actorOperationName = operation === 'split' ? initialAlias : '';
+      rerender('#stx-memory-actor-operation-target, #stx-memory-actor-operation-alias');
+      return;
+    }
+    if (action === 'close-actor-operation') {
+      const operation = state.actorOperation;
+      const aliasId = state.actorOperationAliasId;
+      state.actorOperation = '';
+      state.actorOperationAliasId = '';
+      state.actorOperationTargetId = '';
+      state.actorOperationName = '';
+      const focusSelector = operation === 'merge' ? '#stx-memory-actor-merge-trigger'
+        : operation === 'split' ? '#stx-memory-actor-split-trigger'
+          : aliasId ? `[data-action="open-actor-operation"][data-alias-id="${aliasId}"]` : '';
+      rerender(focusSelector);
+      return;
+    }
+    if (action === 'confirm-actor-operation') {
+      const owner = state.actors.find(actor => actor.id === state.selectedActorId);
+      if (!owner || owner.kind !== 'actor') return;
+      const operation = state.actorOperation;
+      if (operation === 'merge' && controller.mergeActors) {
+        const targetId = state.actorOperationTargetId || state.actors.find(actor => actor.kind === 'actor' && actor.id !== owner.id)?.id || '';
+        if (!targetId || targetId === owner.id) {
+          toast('warning', '请选择合并目标', '合并目标必须是另一个人物。', 'MEMORY_ACTOR_MERGE_TARGET_REQUIRED');
+          return;
+        }
+        void runAction('merge-actors', () => controller.mergeActors!(owner.id, targetId), '人物已合并', '源人物的别名与关联记忆已迁入目标人物。', 'MEMORY_ACTORS_MERGED', async () => {
+          state.selectedActorId = targetId;
+          state.actorOperation = '';
+          await loadPage('actors');
+        });
+        return;
+      }
+      if (operation === 'split' && controller.splitActor) {
+        const aliasValue = state.actorOperationAliasId || owner.aliases[0] || '';
+        const displayName = (state.actorOperationName || aliasValue).trim();
+        if (!aliasValue || !displayName) {
+          toast('warning', '拆分信息不完整', '请选择别名并填写新人物名称。', 'MEMORY_ACTOR_SPLIT_VALUES_REQUIRED');
+          return;
+        }
+        void runAction('split-actor', () => controller.splitActor!(owner.id, aliasValue, displayName), '人物已拆分', '所选别名已建立为独立人物。', 'MEMORY_ACTOR_SPLIT', async () => {
+          state.actorOperation = '';
+          await loadPage('actors');
+        });
+        return;
+      }
+      if (operation === 'alias' && controller.correctActorAlias) {
+        const aliasId = state.actorOperationAliasId;
+        const targetId = state.actorOperationTargetId || state.actors.find(actor => actor.kind === 'actor' && actor.id !== owner.id)?.id || '';
+        if (!aliasId || !targetId || targetId === owner.id) {
+          toast('warning', '请选择目标人物', '别名必须移动到另一个人物主档。', 'MEMORY_ACTOR_ALIAS_TARGET_REQUIRED');
+          return;
+        }
+        void runAction('correct-actor-alias', () => controller.correctActorAlias!(aliasId, targetId), '别名归属已纠正', '该称呼已移动到目标人物主档。', 'MEMORY_ACTOR_ALIAS_CORRECTED', async () => {
+          state.actorOperation = '';
+          await loadPage('actors');
+        });
+      }
       return;
     }
     if (action === 'undo-actor-correction') {
@@ -1438,6 +1891,32 @@ export function renderMemoryWorkbench(
     if (action === 'select-graph-edge') { const edgeId = actionNode.dataset.edgeId ?? ''; const refocus = state.selectedGraphEdgeId === edgeId && !state.selectedGraphNodeId; state.selectedGraphEdgeId = edgeId; state.selectedGraphEventId = ''; state.selectedGraphNodeId = ''; syncGraphUi(true); if (refocus) graphRenderer?.focusEdge(edgeId); return; }
     if (action === 'select-graph-event') { const edgeId = actionNode.dataset.eventEdgeId ?? ''; const refocus = state.selectedGraphEventId === edgeId && !state.selectedGraphNodeId; state.selectedGraphEventId = edgeId; state.selectedGraphEdgeId = ''; state.selectedGraphNodeId = ''; syncGraphUi(true); if (refocus) graphRenderer?.focusEdge(edgeId); return; }
     if (action === 'rebuild-graph') { void runAction('rebuild-graph', () => controller.rebuildGraph(), '关系图谱已重建', '已依据当前聊天的已验证事实重新协调节点和关系边。', 'MEMORY_GRAPH_REBUILT', async () => { await loadPage(state.page === 'recall' ? 'recall' : 'graph'); }); return; }
+    if (action === 'repair-capture-rejections' || action === 'ignore-capture-rejections') {
+      const auditId = actionNode.dataset.auditId ?? '';
+      const record = state.audits.find(item => item.id === auditId);
+      const validIds = new Set((Array.isArray(record?.rejected) ? record.rejected : [])
+        .filter((item): item is import('../domain').AutomaticIngestRejection => Boolean(item && typeof item === 'object' && ('code' in item || 'id' in item)))
+        .filter(item => (item.status ?? 'unresolved') === 'unresolved' && Boolean(item.id))
+        .map(item => item.id!));
+      const rejectionIds = state.selectedRejectionIds.filter(id => validIds.has(id));
+      if (!auditId || rejectionIds.length === 0) {
+        toast('warning', '请选择失败项', '至少选择一条待处理记录。', 'MEMORY_CAPTURE_REJECTION_SELECTION_REQUIRED');
+        return;
+      }
+      if (action === 'repair-capture-rejections' && controller.repairCaptureRejections) {
+        void runAction('repair-capture-rejections', () => controller.repairCaptureRejections!(auditId, rejectionIds), '定向修复已完成', '通过校验的记录已经写入，仍失败的项目继续保留。', 'MEMORY_CAPTURE_REJECTIONS_REPAIRED', async () => {
+          state.selectedRejectionIds = state.selectedRejectionIds.filter(id => !validIds.has(id));
+          await loadPage('audit');
+          await refreshFacts();
+        });
+      } else if (action === 'ignore-capture-rejections' && controller.ignoreCaptureRejections) {
+        void runAction('ignore-capture-rejections', () => controller.ignoreCaptureRejections!(auditId, rejectionIds), '失败项已忽略', '这些项目保留在审计中，不会写入记忆。', 'MEMORY_CAPTURE_REJECTIONS_IGNORED', async () => {
+          state.selectedRejectionIds = state.selectedRejectionIds.filter(id => !validIds.has(id));
+          await loadPage('audit');
+        });
+      }
+      return;
+    }
     if (action === 'refresh-audit') { void loadPage('audit'); return; }
     if (action === 'rollback') { state.confirmBatchKey = actionNode.dataset.rollbackKey ?? ''; rerender(); return; }
     if (action === 'cancel-rollback') { state.confirmBatchKey = ''; rerender(); return; }
@@ -1463,6 +1942,26 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('input', (event) => {
     const input = event.target as HTMLInputElement;
+    if (input.dataset.actorInput === 'query') {
+      state.actorQuery = input.value;
+      rerender('', true);
+      return;
+    }
+    if (input.dataset.actorInput === 'rename') {
+      state.actorRenameValue = input.value;
+      rerender();
+      return;
+    }
+    if (input.dataset.actorInput === 'candidate-name') {
+      state.candidateCanonicalName = input.value;
+      rerender();
+      return;
+    }
+    if (input.dataset.actorInput === 'operation-name') {
+      state.actorOperationName = input.value;
+      rerender();
+      return;
+    }
     if (input.dataset.filter === 'query') {
       state.query = input.value;
       if (searchTimer) window.clearTimeout(searchTimer);
@@ -1480,6 +1979,33 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('change', (event) => {
     const input = event.target as HTMLInputElement | HTMLSelectElement;
+    if (input instanceof HTMLInputElement && input.dataset.captureRejectionId) {
+      const rejectionId = input.dataset.captureRejectionId;
+      state.selectedRejectionIds = input.checked
+        ? [...new Set([...state.selectedRejectionIds, rejectionId])]
+        : state.selectedRejectionIds.filter(id => id !== rejectionId);
+      rerender();
+      return;
+    }
+    if (input.dataset.actorSelect === 'status') {
+      state.actorStatus = input.value as WorkbenchState['actorStatus'];
+      rerender();
+      return;
+    }
+    if (input.dataset.actorSelect === 'candidate-target') {
+      state.candidateTargetOwnerId = input.value;
+      return;
+    }
+    if (input.dataset.actorSelect === 'operation-target') {
+      state.actorOperationTargetId = input.value;
+      return;
+    }
+    if (input.dataset.actorSelect === 'operation-alias') {
+      state.actorOperationAliasId = input.value;
+      state.actorOperationName = input.value;
+      rerender('#stx-memory-actor-operation-name');
+      return;
+    }
     if (input.dataset.filterAll) {
       const checkbox = input as HTMLInputElement;
       const filter = input.dataset.filterAll;
@@ -1518,6 +2044,18 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
+    if (state.actorOperation) {
+      event.preventDefault();
+      event.stopPropagation();
+      const operation = state.actorOperation;
+      const aliasId = state.actorOperationAliasId;
+      state.actorOperation = '';
+      state.actorOperationAliasId = '';
+      state.actorOperationTargetId = '';
+      state.actorOperationName = '';
+      rerender(operation === 'merge' ? '#stx-memory-actor-merge-trigger' : operation === 'split' ? '#stx-memory-actor-split-trigger' : aliasId ? `[data-action="open-actor-operation"][data-alias-id="${aliasId}"]` : '');
+      return;
+    }
     if (state.reinitializeOpen) {
       event.preventDefault();
       event.stopPropagation();

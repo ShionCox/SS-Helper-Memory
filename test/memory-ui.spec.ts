@@ -145,6 +145,52 @@ describe('Memory UI 展示适配', () => {
     dispose();
   });
 
+  it('展示部分完成失败项，并把所选 ID 交给定向修复和忽略操作', async () => {
+    const repairCaptureRejections = vi.fn(async () => undefined);
+    const ignoreCaptureRejections = vi.fn(async () => undefined);
+    const rejection = {
+      id: 'capture-rejection:1',
+      index: 1,
+      recordType: 'fact' as const,
+      code: 'invalid_enum' as const,
+      fieldPath: 'kind',
+      message: '事实 kind 不在允许范围内。',
+      sourceRefs: ['message:1'],
+      candidateSnapshot: { localId: 'fact:1', kind: 'action' },
+      status: 'unresolved' as const,
+      repairAttempts: 0,
+    };
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listAuditRecords: async () => [{
+        id: 'change-audit:partial',
+        kind: 'capture-change-set-v0',
+        status: '部分完成',
+        outcome: 'partial',
+        accepted: 2,
+        rejected: [rejection],
+      }],
+      repairCaptureRejections,
+      ignoreCaptureRejections,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="audit"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    container.querySelector<HTMLInputElement>('[data-capture-rejection-id="capture-rejection:1"]')!.click();
+    expect(container.textContent).toContain('预计 1 次请求');
+    (container.querySelector('[data-action="repair-capture-rejections"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(repairCaptureRejections).toHaveBeenCalledWith('change-audit:partial', ['capture-rejection:1']);
+
+    container.querySelector<HTMLInputElement>('[data-capture-rejection-id="capture-rejection:1"]')!.click();
+    (container.querySelector('[data-action="ignore-capture-rejections"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(ignoreCaptureRejections).toHaveBeenCalledWith('change-audit:partial', ['capture-rejection:1']);
+    dispose();
+  });
+
   it('按类型与状态筛选，并支持确定性排序', () => {
     const facts: MemoryUiFact[] = [
       { id: 'a', kind: 'state', status: 'active', content: 'a', confidence: 0.8, sourceRefs: [], evidence: [], updatedAt: 10 },
@@ -863,21 +909,255 @@ describe('Memory UI 展示适配', () => {
     dispose();
   });
 
+  it('人物页使用人物主档双栏，并明确确认候选归属', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const confirmActorCandidate = vi.fn(async () => undefined);
+    const actors = [
+      { id: 'owner-a', workspaceId: 'workspace:test', kind: 'actor' as const, displayName: '艾琳', canonicalName: '艾琳', aliases: ['艾琳', '店长'], status: 'confirmed' as const, discoverySources: ['message' as const], confidence: 0.93, createdAt: 1, updatedAt: 10 },
+      { id: 'owner-b', workspaceId: 'workspace:test', kind: 'actor' as const, displayName: '贝拉', canonicalName: '贝拉', aliases: ['贝拉'], status: 'pending' as const, discoverySources: ['prompt' as const], confidence: 0.86, createdAt: 2, updatedAt: 9 },
+      { id: 'owner:world', workspaceId: 'workspace:test', kind: 'world' as const, displayName: '世界', canonicalName: '世界', aliases: ['世界'], status: 'confirmed' as const, discoverySources: ['system' as const], confidence: 1, createdAt: 1, updatedAt: 1 },
+    ];
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listActors: async () => actors,
+      listActorAliases: async () => [
+        { id: 'alias-a', workspaceId: 'workspace:test', ownerId: 'owner-a', value: '艾琳', normalizedValue: '艾琳', sourceRef: 'message:1', confidence: 0.93, status: 'confirmed', createdAt: 1, updatedAt: 10 },
+        { id: 'alias-shopkeeper', workspaceId: 'workspace:test', ownerId: 'owner-a', value: '店长', normalizedValue: '店长', sourceRef: 'message:2', confidence: 0.72, status: 'confirmed', createdAt: 2, updatedAt: 9 },
+      ],
+      listPendingActorCandidates: async () => [{ localId: 'candidate-her', displayName: '她', aliases: ['老板娘'], sourceRefs: ['message:3'], evidenceExcerpts: ['她把钥匙放在柜台上。'], confidence: 0.64, status: 'pending', ownerRef: 'owner-a' }],
+      listActorCorrectionReviews: async () => [{ id: 'audit-rename', operation: 'rename', status: 'applied', ownerIds: ['owner-a'], createdAt: 10 }],
+      confirmActorCandidate,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="actors"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.textContent).toContain('人物主档');
+    expect(container.textContent).toContain('系统主体 · 只读');
+    expect(container.textContent).toContain('聊天消息 #1');
+    expect(container.textContent).toContain('最近人物操作');
+    expect(container.querySelector('[data-owner-id="owner-a"]')?.getAttribute('aria-selected')).toBe('true');
+    expect(container.querySelector('.stx-memory-actor-grid')?.children).toHaveLength(3);
+    expect(container.querySelectorAll('.stx-memory-actor-aside > .stx-memory-actor-aside-section')).toHaveLength(2);
+    expect(container.querySelector('.stx-memory-actor-candidate-card')).not.toBeNull();
+    expect(container.querySelectorAll('.stx-memory-actor-trait-grid i > b')).toHaveLength(4);
+    expect(container.querySelector('.stx-memory-alias-row')).not.toBeNull();
+    expect(container.querySelector('.stx-memory-actor-canonical-chip')?.textContent).toBe('规范名称');
+    const actorTargetSelects = Array.from(container.querySelectorAll<HTMLSelectElement>('[data-actor-select="candidate-target"]'));
+    expect(actorTargetSelects).toHaveLength(1);
+    expect(Array.from(actorTargetSelects[0]!.querySelectorAll('optgroup')).map((group) => group.label)).toEqual(['推荐匹配', '待确认人物']);
+    expect(Array.from(actorTargetSelects[0]!.options).map((option) => option.textContent)).toEqual(['艾琳', '贝拉']);
+    expect(actorTargetSelects[0]!.options[0]?.getAttribute('data-ss-helper-description')).toBe('已确认 · 置信度 93% · 别名：店长');
+    expect(actorTargetSelects[0]!.options[1]?.getAttribute('data-ss-helper-description')).toBe('待确认 · 置信度 86%');
+    expect(container.textContent).not.toContain('艾琳 · 艾琳');
+    const actorQuery = container.querySelector('[data-actor-input="query"]') as HTMLInputElement;
+    actorQuery.value = '贝拉';
+    actorQuery.dispatchEvent(new Event('input', { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(container.querySelector('[data-owner-id="owner-a"]')).toBeNull();
+    expect(container.querySelector('[data-owner-id="owner-b"]')).not.toBeNull();
+    const actorStatus = container.querySelector('[data-actor-select="status"]') as HTMLSelectElement;
+    actorStatus.value = 'confirmed';
+    actorStatus.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(container.querySelector('[data-owner-id="owner-b"]')).toBeNull();
+
+    (container.querySelector('[data-action="actor-tab"][data-view="pending"]') as HTMLButtonElement).click();
+    expect(container.textContent).toContain('她把钥匙放在柜台上。');
+    expect(container.textContent).toContain('归入已有人物');
+    (container.querySelector('[data-action="candidate-resolution-mode"][data-mode="new"]') as HTMLButtonElement).click();
+    const candidateName = container.querySelector('[data-actor-input="candidate-name"]') as HTMLInputElement;
+    expect(candidateName.value).toBe('');
+    expect((container.querySelector('[data-action="confirm-actor"]') as HTMLButtonElement).disabled).toBe(true);
+    candidateName.value = '艾琳娜';
+    candidateName.dispatchEvent(new Event('input', { bubbles: true }));
+    expect((container.querySelector('[data-action="confirm-actor"]') as HTMLButtonElement).disabled).toBe(false);
+    (container.querySelector('[data-action="candidate-resolution-mode"][data-mode="existing"]') as HTMLButtonElement).click();
+    (container.querySelector('[data-action="confirm-actor"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(confirmActorCandidate).toHaveBeenCalledWith('candidate-her', { mode: 'existing', ownerId: 'owner-a' });
+    dispose();
+  });
+
+  it('人物主档把改名、别名纠正、拆分和合并连接到现有控制器', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const renameActor = vi.fn(async () => undefined);
+    const correctActorAlias = vi.fn(async () => undefined);
+    const splitActor = vi.fn(async () => undefined);
+    const mergeActors = vi.fn(async () => undefined);
+    const actors = [
+      { id: 'owner-a', workspaceId: 'workspace:test', kind: 'actor' as const, displayName: '艾琳', canonicalName: '艾琳', aliases: ['艾琳', '小艾'], status: 'confirmed' as const, discoverySources: ['message' as const], confidence: 0.93, createdAt: 1, updatedAt: 10 },
+      { id: 'owner-b', workspaceId: 'workspace:test', kind: 'actor' as const, displayName: '贝拉', canonicalName: '贝拉', aliases: ['贝拉'], status: 'confirmed' as const, discoverySources: ['message' as const], confidence: 0.86, createdAt: 2, updatedAt: 9 },
+    ];
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listActors: async () => actors,
+      listActorAliases: async () => [{ id: 'alias-little-ai', workspaceId: 'workspace:test', ownerId: 'owner-a', value: '小艾', normalizedValue: '小艾', sourceRef: 'message:2', confidence: 0.8, status: 'confirmed', createdAt: 2, updatedAt: 9 }],
+      listPendingActorCandidates: async () => [],
+      listActorCorrectionReviews: async () => [],
+      renameActor,
+      correctActorAlias,
+      splitActor,
+      mergeActors,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="actors"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    (container.querySelector('[data-action="start-actor-rename"]') as HTMLButtonElement).click();
+    const renameInput = container.querySelector('[data-actor-input="rename"]') as HTMLInputElement;
+    renameInput.value = '艾琳娜';
+    renameInput.dispatchEvent(new Event('input', { bubbles: true }));
+    (container.querySelector('[data-action="save-actor-rename"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(renameActor).toHaveBeenCalledWith('owner-a', '艾琳娜');
+
+    (container.querySelector('[data-action="open-actor-operation"][data-operation="alias"]') as HTMLButtonElement).click();
+    expect(container.querySelector('.stx-memory-actor-drawer')?.getAttribute('role')).toBe('dialog');
+    (container.querySelector('[data-action="confirm-actor-operation"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(correctActorAlias).toHaveBeenCalledWith('alias-little-ai', 'owner-b');
+
+    (container.querySelector('[data-action="open-actor-operation"][data-operation="split"]') as HTMLButtonElement).click();
+    (container.querySelector('[data-action="confirm-actor-operation"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(splitActor).toHaveBeenCalledWith('owner-a', '小艾', '小艾');
+
+    (container.querySelector('[data-action="open-actor-operation"][data-operation="merge"]') as HTMLButtonElement).click();
+    expect(container.querySelector('.stx-memory-actor-drawer')?.getAttribute('role')).toBe('alertdialog');
+    expect(container.textContent).toContain('源人物会从人物列表中消失');
+    (container.querySelector('[data-action="confirm-actor-operation"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mergeActors).toHaveBeenCalledWith('owner-a', 'owner-b');
+    dispose();
+  });
+
+  it('人物主档可编辑并保存逐人物记忆特性', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const updateActorMemoryTraits = vi.fn(async () => undefined);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listActors: async () => [{
+        id: 'owner-a', workspaceId: 'workspace:test', kind: 'actor', displayName: '艾琳', canonicalName: '艾琳', aliases: ['艾琳'],
+        memoryTraits: { halfLifeMs: 30 * 24 * 60 * 60 * 1000, rehearsalGain: 0.04, emotionalGain: 0.15, interference: 0 },
+        status: 'confirmed', discoverySources: ['message'], confidence: 0.93, createdAt: 1, updatedAt: 10,
+      }],
+      listActorAliases: async () => [],
+      listPendingActorCandidates: async () => [],
+      listActorCorrectionReviews: async () => [],
+      updateActorMemoryTraits,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="actors"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.textContent).toContain('人物记忆特性');
+    expect(container.textContent).toContain('30 天');
+    (container.querySelector('[data-action="start-actor-traits"]') as HTMLButtonElement).click();
+    const halfLife = container.querySelector('[data-actor-trait="half-life-days"]') as HTMLInputElement;
+    const rehearsal = container.querySelector('[data-actor-trait="rehearsal-gain"]') as HTMLInputElement;
+    halfLife.value = '45';
+    rehearsal.value = '0.08';
+    (container.querySelector('[data-action="save-actor-traits"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(updateActorMemoryTraits).toHaveBeenCalledWith('owner-a', {
+      halfLifeMs: 45 * 24 * 60 * 60 * 1000,
+      rehearsalGain: 0.08,
+      emotionalGain: 0.15,
+      interference: 0,
+    });
+    dispose();
+  });
+
   it('未绑定聊天时展示空状态且不会请求当前聊天事实', async () => {
     const container = document.createElement('div');
     document.body.append(container);
     let listCalls = 0;
+    let actorCalls = 0;
+    const notifications: Array<{ code?: string }> = [];
     const controller = workbenchController({
       getOverview: async () => ({ status: 'unselected', bound: false, factCount: 0, lastOrganizedAt: null, pendingJobs: 0, llmAvailable: false }),
       listFacts: async () => { listCalls += 1; throw new Error('chat key required'); },
+      listActors: async () => { actorCalls += 1; throw new Error('chat key required'); },
+      listPendingActorCandidates: async () => { actorCalls += 1; throw new Error('chat key required'); },
+      listActorCorrectionReviews: async () => { actorCalls += 1; throw new Error('chat key required'); },
     });
-    const dispose = renderMemoryWorkbench(container, controller);
+    const dispose = renderMemoryWorkbench(container, controller, (notification) => notifications.push(notification));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(listCalls).toBe(0);
     expect(container.textContent).toContain('未绑定');
     expect(container.textContent).toContain('未选择');
     expect(container.textContent).not.toContain('已停用');
     expect(container.textContent).toContain('当前聊天还没有可展示的事实');
+
+    (container.querySelector('[data-page="actors"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(actorCalls).toBe(0);
+    expect(notifications).toHaveLength(0);
+    expect(container.textContent).toContain('尚未进入聊天');
+    expect(container.textContent).toContain('请先选择一个角色或加入群聊');
+    expect(container.textContent).not.toContain('PAYLOAD_INVALID');
+    dispose();
+  });
+
+  it('人物页在聊天解绑后清空上一聊天的人物、候选和纠正审计', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    let bound = true;
+    let notifyOverviewChanged: (() => void) | undefined;
+    const controller = workbenchController({
+      getOverview: async () => bound
+        ? { status: 'ready', bound: true, factCount: 1, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: true }
+        : { status: 'unselected', bound: false, factCount: 0, lastOrganizedAt: null, pendingJobs: 0, llmAvailable: true },
+      onOverviewChanged: (listener) => { notifyOverviewChanged = listener; return () => undefined; },
+      listActors: async () => [{
+        id: 'owner-old',
+        workspaceId: 'workspace-old',
+        kind: 'actor',
+        displayName: '旧聊天人物',
+        aliases: ['旧别名'],
+        status: 'confirmed',
+        discoverySources: ['message'],
+        confidence: 0.9,
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      listPendingActorCandidates: async () => [{
+        localId: 'candidate-old',
+        displayName: '旧待确认人物',
+        sourceRefs: ['message:1'],
+        evidenceExcerpts: ['旧聊天证据'],
+        confidence: 0.7,
+      }],
+      listActorCorrectionReviews: async () => [{
+        id: 'audit-old',
+        operation: 'alias',
+        status: 'applied',
+        ownerIds: ['owner-old'],
+        createdAt: 1,
+      }],
+    });
+    const dispose = renderMemoryWorkbench(container, controller);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="actors"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.textContent).toContain('旧聊天人物');
+    expect(container.textContent).toContain('纠正别名');
+    (container.querySelector('[data-action="actor-tab"][data-view="pending"]') as HTMLButtonElement).click();
+    expect(container.textContent).toContain('旧待确认人物');
+
+    bound = false;
+    notifyOverviewChanged?.();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(container.textContent).toContain('尚未进入聊天');
+    expect(container.textContent).toContain('0 个主体');
+    expect(container.textContent).not.toContain('旧聊天人物');
+    expect(container.textContent).not.toContain('旧待确认人物');
+    expect(container.textContent).not.toContain('audit-old');
     dispose();
   });
 

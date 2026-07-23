@@ -47,3 +47,9 @@
 - Memory 只能使用 SDK Core 注册的 `<ss-helper-icon name="...">`，名称不带 `fa-` 前缀并且必须存在于 SDK Solid 图标清单。
 - 禁止加载或复制 Font Awesome CSS/字体、使用全局 `fa-*` class、内联 SVG 或 Emoji 替代现有统一图标；Three.js 图谱几何与着色器不属于 UI 图标。
 - 带可见文本或位于已有 `aria-label` 按钮内的图标必须使用 `decorative`；独立表达状态的图标必须提供 `label`，图标按钮的可访问名称由按钮自身承担。
+
+## 结构化 Capture
+
+- 合法项必须提交，非法项必须记录；同批失败不得拖垮已通过校验的记录。
+- 未知枚举不得静默降级，失败项必须支持用户定向修复或忽略。
+- 提示词、校验、写入、审计或修复字段变更时必须同步测试。详细用法见 [docs/structured-capture.md](docs/structured-capture.md)。

@@ -33,11 +33,38 @@ describe('ActorRegistry correction and pending state', () => {
     const resolution = registry.discover({ displayName: '未确认人物', sourceRef: 'prompt:1', sourceType: 'prompt', excerpt: '未确认人物可能在门外。', confidence: 0.4 });
     const candidate = registry.listPending()[0]!;
     expect(resolution.owner.id).toBe('owner:unknown');
-    const confirmed = registry.confirm(candidate.localId, '确认人物');
+    const confirmed = registry.confirm(candidate.localId, { mode: 'new', canonicalName: '确认人物' });
     expect(confirmed?.kind).toBe('actor');
     expect(confirmed?.displayName).toBe('确认人物');
     expect(registry.resolveMention('未确认人物')?.owner.id).toBe(confirmed?.id);
     expect(registry.listPending()).toEqual([]);
+  });
+
+  it('assigns a pending candidate and its aliases to an existing actor with provenance', () => {
+    const registry = new ActorRegistry('workspace:test');
+    const target = registry.discover({ displayName: '艾琳', sourceRef: 'message:owner', sourceType: 'message', confidence: 0.95 }).owner;
+    registry.discover({ displayName: '店长', aliases: ['老板娘'], sourceRef: 'message:alias', sourceType: 'message', excerpt: '店长把钥匙交给了老板娘。', confidence: 0.5 });
+    const candidate = registry.listPending()[0]!;
+
+    const confirmed = registry.confirm(candidate.localId, { mode: 'existing', ownerId: target.id });
+
+    expect(confirmed?.id).toBe(target.id);
+    expect(registry.resolveMention('店长')?.owner.id).toBe(target.id);
+    expect(registry.resolveMention('老板娘')?.owner.id).toBe(target.id);
+    expect(registry.listAliases()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ownerId: target.id, value: '店长', sourceRef: 'message:alias', status: 'confirmed' }),
+      expect.objectContaining({ ownerId: target.id, value: '老板娘', sourceRef: 'message:alias', status: 'confirmed' }),
+    ]));
+  });
+
+  it('rejects invalid candidate destinations and empty new-person names', () => {
+    const registry = new ActorRegistry('workspace:test');
+    registry.discover({ displayName: '某人', sourceRef: 'message:generic', sourceType: 'message', confidence: 0.8 });
+    const candidate = registry.listPending()[0]!;
+
+    expect(() => registry.confirm(candidate.localId, { mode: 'existing', ownerId: 'owner:world' })).toThrow('归属目标不存在');
+    expect(() => registry.confirm(candidate.localId, { mode: 'new', canonicalName: '   ' })).toThrow('名称不能为空');
+    expect(registry.listPending()).toHaveLength(1);
   });
 
   it('moves aliases during split and correction instead of leaving duplicate owners', () => {

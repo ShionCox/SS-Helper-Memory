@@ -9,6 +9,7 @@ import type {
   MemoryGraphStatus,
   MemoryJob,
   MemoryRecallLog,
+  AutomaticIngestRejection,
 } from '../domain';
 import {
   MemoryRecallIndex,
@@ -31,6 +32,7 @@ import { MemoryIngestService } from './ingest/memory-ingest-service';
 import { ExistingMemoryContextRetriever } from './ingest/existing-memory-context';
 import { filterSourceBlocks } from './ingest/source-blocks';
 import {
+  buildSummaryBatchPlans,
   buildSummaryBatches,
   DEFAULT_SUMMARY_STRATEGY,
   estimateSummaryInitialization,
@@ -40,7 +42,7 @@ import {
   visibleConversationMessages,
   type SummaryProgress,
 } from './ingest/summary-strategy';
-import type { SourceBlock } from './ingest/types';
+import type { CaptureRepairRequest, SourceBlock } from './ingest/types';
 import { collectCurrentChatSources, selectSourceGroups, summarizeSourceGroups } from '../host/source-adapter';
 import type { MemoryPluginApi, MemorySqliteStatus } from '../index';
 import type {
@@ -434,54 +436,108 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     throw error;
   }
 
-  private async runActorCapture(sourceOverride?: readonly SourceBlock[], includeInvisibleHistory = false, captureJobId?: string): Promise<import('./actors').MultiActorCaptureResult> {
+  private async executeActorCapture(
+    sources: readonly SourceBlock[],
+    options: {
+      includeInvisibleHistory?: boolean;
+      captureJobId?: string;
+      writableSourceRefs?: readonly string[];
+      existingMemoryContext?: readonly import('./ingest/types').ExistingMemoryContextItem[];
+      graphLlmRelationEnabled?: boolean;
+      idempotencyKey?: string;
+      repairRequest?: import('./ingest/types').CaptureRepairRequest;
+    } = {},
+  ): Promise<import('./actors').MultiActorCaptureResult> {
     const capture = this.actorCapture;
     const context = this.hostContext;
     if (!capture || !context) throw new Error('多角色 Memory 尚未绑定宿主工作区。');
     const chatKey = this.getChatKey();
     const captureVersion = this.captureVersion;
-    const sources = sourceOverride ? [...sourceOverride] : await context.collectSources(chatKey);
     const currentFloor = Math.max(0, ...sources.map(source => source.floor ?? 0));
-    const previousTraces = await this.multiActorRepository?.listTraces() ?? [];
-    const result = await capture.capture({ workspaceId: this.hostContext?.getWorkspaceId() ?? '', chatKey, sources, currentFloor, includeInvisibleHistory, ...(captureJobId ? { captureJobId } : {}) });
+    const result = await capture.capture({
+      workspaceId: context.getWorkspaceId(),
+      chatKey,
+      sources,
+      currentFloor,
+      includeInvisibleHistory: options.includeInvisibleHistory === true,
+      ...(options.captureJobId ? { captureJobId: options.captureJobId } : {}),
+      ...(options.writableSourceRefs === undefined ? {} : { writableSourceRefs: options.writableSourceRefs }),
+      ...(options.existingMemoryContext === undefined ? {} : { existingMemoryContext: options.existingMemoryContext }),
+      ...(options.graphLlmRelationEnabled === undefined ? {} : { graphLlmRelationEnabled: options.graphLlmRelationEnabled }),
+      ...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
+      ...(options.repairRequest === undefined ? {} : { repairRequest: options.repairRequest }),
+    });
     if (this.stopped || this.captureVersion !== captureVersion || this.getChatKey() !== chatKey) {
       if (result.changeAudit?.id && this.multiActorRepository) await this.multiActorRepository.rollbackChangeSet(result.changeAudit.id).catch(() => undefined);
       throw new Error('聊天已切换，Capture 结果已丢弃。');
     }
-    this.lastSceneCast = result.sceneCast;
+    return result;
+  }
+
+  private async rollbackActorCaptureResults(results: readonly import('./actors').MultiActorCaptureResult[]): Promise<void> {
+    const repository = this.multiActorRepository;
+    if (!repository) return;
+    for (const result of [...results].reverse()) {
+      if (result.changeAudit?.id) await repository.rollbackChangeSet(result.changeAudit.id).catch(() => undefined);
+    }
+  }
+
+  private async finalizeActorCaptureResults(
+    results: readonly import('./actors').MultiActorCaptureResult[],
+    sources: readonly SourceBlock[],
+    captureVersion: number,
+    chatKey: string,
+    scheduleIndexes = true,
+  ): Promise<void> {
+    const repository = this.multiActorRepository;
+    const lastResult = results.at(-1);
+    if (!repository || !lastResult) return;
+    const currentFloor = Math.max(0, ...sources.map(source => source.floor ?? 0));
+    const [facts, traces] = await Promise.all([repository.listFacts(), repository.listTraces()]);
+    this.assertCaptureCurrent(captureVersion, chatKey);
+    const aggregateResult: import('./actors').MultiActorCaptureResult = {
+      ...lastResult,
+      owners: this.actorRegistry?.listOwners() ?? lastResult.owners,
+      facts,
+      traces,
+    };
+    const finalChangeSetId = lastResult.changeAudit?.id;
+    this.lastSceneCast = aggregateResult.sceneCast;
     // Keep the objective candidate index in sync with the v0 actor facts. The
     // owner/trace filter remains downstream in ActorRecallService; this index
     // only answers which facts are relevant to the query.
-    for (const fact of result.facts) this.recallIndex.upsert(fact);
-    // Actor Capture writes canonical facts in the v0 transaction; vector and
-    // relationship indexes remain asynchronous derived projections and must be
-    // queued explicitly so the next recall sees the new objective candidates.
+    this.recallIndex.replace(facts);
+    // Standalone Capture schedules indexes here. A multi-batch workflow lets
+    // the single final bind schedule them after every batch has committed.
     const effectiveSettings = this.getEffectiveSettings();
-    if (usesVectorIndex(effectiveSettings)) this.vectorIndex.scheduleSync(chatKey);
-    if (effectiveSettings.graphEnabled) this.scheduleGraph(chatKey);
-    const persistedTraces = await this.persistCaptureDerivations(result, chatKey);
+    if (scheduleIndexes && usesVectorIndex(effectiveSettings)) this.vectorIndex.scheduleSync(chatKey);
+    if (scheduleIndexes && effectiveSettings.graphEnabled) this.scheduleGraph(chatKey);
+    // Job-final derived projections are attached to the last batch ChangeSet.
+    // Rolling that ChangeSet back also removes/restores every derived write
+    // produced after the multi-batch job completed.
+    const persistedTraces = await this.persistCaptureDerivations(aggregateResult, chatKey);
     if (this.stopped || this.captureVersion !== captureVersion || this.getChatKey() !== chatKey) {
-      if (result.changeAudit?.id && this.multiActorRepository) await this.multiActorRepository.rollbackChangeSet(result.changeAudit.id).catch(() => undefined);
+      await this.rollbackActorCaptureResults(results);
       throw new Error('聊天已切换，Capture 派生结果已丢弃。');
     }
-    this.actorExposureTracker = new RecallExposureTracker([...previousTraces, ...persistedTraces]);
+    this.actorExposureTracker = new RecallExposureTracker(persistedTraces);
     this.lastExposureIds.clear();
-    const activeActorIds = new Set([...result.sceneCast.presentOwnerIds, ...result.sceneCast.speakerOwnerIds].filter(ownerId => ownerId.startsWith('owner:actor:')));
-    const changedActorIds = new Set(result.traces.map(trace => trace.ownerId).filter(ownerId => ownerId.startsWith('owner:actor:')));
+    const activeActorIds = new Set([...aggregateResult.sceneCast.presentOwnerIds, ...aggregateResult.sceneCast.speakerOwnerIds].filter(ownerId => ownerId.startsWith('owner:actor:')));
+    const changedActorIds = new Set(traces.map(trace => trace.ownerId).filter(ownerId => ownerId.startsWith('owner:actor:')));
     // A card/world seed may be the only new evidence for an actor that is not
     // currently in the cast. It is allowed to bootstrap that actor's profile;
     // a merely mentioned/present actor with no new trace is not.
-    const seededActorIds = new Set(result.facts
+    const seededActorIds = new Set(facts
       .filter(fact => Boolean(fact.scope?.hostCardKeys?.length || fact.scope?.worldKeys?.length))
       .flatMap(fact => fact.entityKeys.filter(ownerId => ownerId.startsWith('owner:actor:'))));
     const profileActorIds = new Set([...activeActorIds].filter(ownerId => changedActorIds.has(ownerId)).concat([...seededActorIds]));
     try {
       this.assertCaptureCurrent(captureVersion, chatKey);
       for (const ownerId of profileActorIds) {
-        await this.updateActorProfile(ownerId, result.changeAudit?.id).catch(error => logger.warn('人物画像派生失败。', error));
+        await this.updateActorProfile(ownerId, finalChangeSetId).catch(error => logger.warn('人物画像派生失败。', error));
         this.assertCaptureCurrent(captureVersion, chatKey);
       }
-      for (const owner of result.owners.filter(item => item.kind === 'actor' && activeActorIds.has(item.id))) {
+      for (const owner of aggregateResult.owners.filter(item => item.kind === 'actor' && activeActorIds.has(item.id))) {
         this.assertCaptureCurrent(captureVersion, chatKey);
         const ownerTraceIds = persistedTraces.filter(trace => trace.ownerId === owner.id).map(trace => trace.id);
         const existingJobs = this.multiActorRepository ? await this.multiActorRepository.listDerived('dream-jobs', owner.id) : [];
@@ -508,7 +564,16 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         const trigger: import('../domain').DreamJob['trigger'] = salient >= 0.85 ? 'salience' : addedTraceCount >= this.dreamCoordinator.options.traceThreshold ? 'trace-count' : 'floor-count';
         try {
           const job = this.dreamCoordinator.enqueue({ workspaceId: this.hostContext?.getWorkspaceId() ?? '', chatKey, ownerId: owner.id, traceIds: ownerTraceIds, trigger });
-          if (this.multiActorRepository) await this.multiActorRepository.upsertDerived('dream-jobs', [{ ...job, visibleFloor: currentFloor, ...(result.changeAudit?.id ? { sourceChangeSetId: result.changeAudit.id } : {}) }]);
+          const dreamRecord = {
+            ...job,
+            visibleFloor: currentFloor,
+            ...(finalChangeSetId ? { sourceChangeSetId: finalChangeSetId } : {}),
+          };
+          if (finalChangeSetId) {
+            await repository.upsertDerivedForChangeSet(finalChangeSetId, [{ collection: 'dream-jobs', records: [dreamRecord] }]);
+          } else {
+            await repository.upsertDerived('dream-jobs', [dreamRecord]);
+          }
           this.assertCaptureCurrent(captureVersion, chatKey);
           this.scheduleAutomaticDream(job.id, chatKey, owner.id);
         } catch (error) {
@@ -519,11 +584,48 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         }
       }
     } catch (error) {
-      if ((this.stopped || this.captureVersion !== captureVersion || this.getChatKey() !== chatKey) && result.changeAudit?.id && this.multiActorRepository) {
-        await this.multiActorRepository.rollbackChangeSet(result.changeAudit.id).catch(() => undefined);
+      if (this.stopped || this.captureVersion !== captureVersion || this.getChatKey() !== chatKey) {
+        await this.rollbackActorCaptureResults(results);
       }
       throw error;
     }
+  }
+
+  private async runActorCapture(sourceOverride?: readonly SourceBlock[], includeInvisibleHistory = false, captureJobId?: string): Promise<import('./actors').MultiActorCaptureResult> {
+    const context = this.hostContext;
+    if (!this.actorCapture || !context) throw new Error('多角色 Memory 尚未绑定宿主工作区。');
+    const chatKey = this.getChatKey();
+    const captureVersion = this.captureVersion;
+    const sources = sourceOverride ? [...sourceOverride] : await context.collectSources(chatKey);
+    const settings = this.getEffectiveSettings();
+    const baselineFacts = settings.preExtractReferenceEnabled ? await this.multiActorRepository?.listFacts() ?? [] : [];
+    const referenceScope = settings.preExtractReferenceEnabled ? await context.getRecallContext?.() : undefined;
+    const referenceRetriever = settings.preExtractReferenceEnabled
+      ? new ExistingMemoryContextRetriever(
+        baselineFacts,
+        this.vectorIndex,
+        settings.graphEnabled ? new MemoryGraphRecallIndex(deriveMemoryGraphProjection(baselineFacts)) : undefined,
+      )
+      : null;
+    const existingMemoryContext = referenceRetriever ? await referenceRetriever.load({
+      chatKey,
+      sources,
+      maxItems: settings.preExtractReferenceItems,
+      maxChars: settings.preExtractReferenceMaxChars,
+      mode: settings.preExtractReferenceMode,
+      characterKeys: referenceScope?.characterKeys ?? [],
+      worldKeys: referenceScope?.worldKeys ?? [],
+      graphMaxHops: settings.graphMaxHops,
+      graphMaxEdges: settings.graphMaxEdges,
+    }) : [];
+    this.assertCaptureCurrent(captureVersion, chatKey);
+    const result = await this.executeActorCapture(sources, {
+      includeInvisibleHistory,
+      ...(captureJobId ? { captureJobId } : {}),
+      existingMemoryContext,
+      graphLlmRelationEnabled: settings.graphEnabled && settings.graphLlmRelationEnabled,
+    });
+    await this.finalizeActorCaptureResults([result], sources, captureVersion, chatKey);
     return result;
   }
 
@@ -772,6 +874,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return this.multiActorRepository ? this.multiActorRepository.listOwners() : [];
   }
 
+  async listActorAliases(): Promise<readonly import('../domain').ActorAlias[]> {
+    return this.actorRegistry?.listAliases() ?? [];
+  }
+
   async listPendingActorCandidates(): Promise<readonly ActorCandidate[]> {
     return this.actorRegistry?.listPending() ?? [];
   }
@@ -801,9 +907,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     if (registryAuditId) this.actorCorrectionChangeSets.set(registryAuditId, audit.id);
   }
 
-  async confirmActorCandidate(candidateId: string, canonicalName?: string): Promise<void> {
+  async confirmActorCandidate(candidateId: string, resolution?: import('../domain').ActorCandidateResolution): Promise<void> {
     if (!this.actorRegistry) throw new Error('人物注册表尚未就绪。');
-    if (!this.actorRegistry.confirm(candidateId, canonicalName)) throw new Error('待确认人物不存在。');
+    if (!this.actorRegistry.confirm(candidateId, resolution)) throw new Error('待确认人物不存在。');
     const registryAuditId = this.actorRegistry.listAudits().at(-1)?.id;
     await this.persistActorRegistryChange({ operation: 'confirm', candidateId, ...(registryAuditId ? { registryAuditId } : {}) });
   }
@@ -1431,13 +1537,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     if (!chatKey) return estimateSummaryInitialization(0, []);
     const sources = selectSourceGroups(filterSourceBlocks(await this.collectSources(chatKey), options), selectedKinds);
     const messageCount = sources.filter((source) => source.kind === 'message').length;
-    if (this.actorCapture && this.multiActorRepository) {
-      // Production v0 uses one structured Capture request for the selected
-      // source set. Keep the UI estimate aligned with the actual transaction;
-      // the old summary batch estimator is retained only for the isolated
-      // compatibility test double without the actor repository.
-      return estimateSummaryInitialization(messageCount, sources.length > 0 ? [sources] : []);
-    }
     return estimateSummaryInitialization(messageCount, buildSummaryBatches(sources, summaryStrategyFromSettings(this.settings), {
       includeSystemMessages: options.includeInvisibleHistory === true,
     }));
@@ -1466,6 +1565,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       elapsedMs: Math.max(0, latest.updatedAt - latest.createdAt),
       ...(latest.error ? { error: latest.error } : {}),
       ...(latest.checkpoint.phase ? { phase: latest.checkpoint.phase } : {}),
+      ...(latest.outcome ? { outcome: latest.outcome } : {}),
+      ...(latest.outcome === 'partial' ? { rejectedCount: Number((latest as MemoryJob & { rejectionCount?: number }).rejectionCount ?? 0) } : {}),
     };
   }
 
@@ -1479,16 +1580,139 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         rejected: audit.rejections,
       }));
     const actorAudits = this.multiActorRepository
-      ? (await this.multiActorRepository.listChangeAudits()).filter(record => String(record.kind ?? '') === 'capture-change-set-v0').map(record => ({
-        ...record,
-        type: 'actor-capture',
-        status: record.rolledBackAt ? '已回滚' : '已完成',
-        accepted: Number(record.factCount ?? 0),
-        sourceRefs: Array.isArray(record.sourceRefs) ? record.sourceRefs : [],
-      }))
+      ? (await this.multiActorRepository.listChangeAudits()).filter(record => String(record.kind ?? '') === 'capture-change-set-v0').map(record => {
+        const metadata = record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
+          ? record.metadata as Record<string, unknown>
+          : {};
+        const acceptedCounts = metadata.accepted && typeof metadata.accepted === 'object' && !Array.isArray(metadata.accepted)
+          ? metadata.accepted as Record<string, unknown>
+          : {};
+        const rejected = Array.isArray(metadata.rejections) ? metadata.rejections : [];
+        return {
+          ...record,
+          type: 'actor-capture',
+          status: record.rolledBackAt ? '已回滚' : metadata.outcome === 'partial' ? '部分完成' : '已完成',
+          outcome: metadata.outcome ?? 'complete',
+          accepted: Object.values(acceptedCounts).reduce<number>((total, value) => total + Number(value ?? 0), 0),
+          rejected,
+          sourceRefs: Array.isArray(metadata.sourceRefs) ? metadata.sourceRefs : [],
+        };
+      })
       : [];
     const auditTimestamp = (record: Record<string, unknown>): number => Number(record.createdAt ?? record.updatedAt ?? 0);
     return [...batchAudits, ...actorAudits].sort((left, right) => auditTimestamp(right) - auditTimestamp(left));
+  }
+
+  private async readCaptureRejections(
+    auditId: string,
+  ): Promise<{ audit: import('../infrastructure').ChangeAudit; rejections: AutomaticIngestRejection[] }> {
+    const repository = this.multiActorRepository;
+    if (!repository) throw new Error('当前存储不支持 Capture 定向修复。');
+    const audit = await repository.getChangeAudit(auditId);
+    if (!audit || audit.kind !== 'capture-change-set-v0' || audit.chatKey !== this.requireChatKey()) throw new Error('找不到当前聊天的 Capture 审计记录。');
+    const metadata = audit.metadata && typeof audit.metadata === 'object' && !Array.isArray(audit.metadata)
+      ? audit.metadata as Record<string, unknown>
+      : {};
+    const rejections = Array.isArray(metadata.rejections)
+      ? metadata.rejections.filter((item): item is AutomaticIngestRejection => Boolean(item && typeof item === 'object'))
+      : [];
+    return { audit, rejections: structuredClone(rejections) };
+  }
+
+  async getCaptureRepairEstimate(auditId: string, rejectionIds: readonly string[]): Promise<{
+    requestCount: number;
+    groupCounts: Partial<Record<'actor' | 'episode' | 'observation' | 'fact', number>>;
+  }> {
+    const selected = new Set(rejectionIds.map(String));
+    const { rejections } = await this.readCaptureRejections(auditId);
+    const groupCounts: Partial<Record<'actor' | 'episode' | 'observation' | 'fact', number>> = {};
+    for (const rejection of rejections) {
+      if (!rejection.id || !selected.has(rejection.id) || (rejection.status ?? 'unresolved') !== 'unresolved') continue;
+      if (!['actor', 'episode', 'observation', 'fact'].includes(String(rejection.recordType))) continue;
+      const recordType = rejection.recordType as 'actor' | 'episode' | 'observation' | 'fact';
+      groupCounts[recordType] = (groupCounts[recordType] ?? 0) + 1;
+    }
+    return { requestCount: Object.keys(groupCounts).length, groupCounts };
+  }
+
+  async ignoreCaptureRejections(auditId: string, rejectionIds: readonly string[]): Promise<void> {
+    const repository = this.multiActorRepository;
+    if (!repository) throw new Error('当前存储不支持 Capture 失败项处理。');
+    const selected = new Set(rejectionIds.map(String));
+    const { rejections } = await this.readCaptureRejections(auditId);
+    let changed = false;
+    const updated = rejections.map((rejection) => {
+      if (!rejection.id || !selected.has(rejection.id) || (rejection.status ?? 'unresolved') !== 'unresolved') return rejection;
+      changed = true;
+      return { ...rejection, status: 'ignored' as const, resolvedAt: Date.now() };
+    });
+    if (!changed) throw new Error('没有可忽略的待处理项。');
+    await repository.updateCaptureAuditRejections(auditId, updated);
+  }
+
+  async repairCaptureRejections(auditId: string, rejectionIds: readonly string[]): Promise<void> {
+    const repository = this.multiActorRepository;
+    const context = this.hostContext;
+    if (!repository || !context) throw new Error('当前存储不支持 Capture 定向修复。');
+    const selected = new Set(rejectionIds.map(String));
+    const { audit, rejections } = await this.readCaptureRejections(auditId);
+    const sources = await context.collectSources(this.requireChatKey());
+    const sourceById = new Map(sources.map(source => [source.id, source]));
+    const captureVersion = this.captureVersion;
+    const chatKey = this.requireChatKey();
+    const results: import('./actors').MultiActorCaptureResult[] = [];
+    let updated = [...rejections];
+    const order: CaptureRepairRequest['recordType'][] = ['actor', 'episode', 'observation', 'fact'];
+    for (const recordType of order) {
+      const group = updated.filter(rejection => rejection.recordType === recordType
+        && Boolean(rejection.id && selected.has(rejection.id))
+        && (rejection.status ?? 'unresolved') === 'unresolved');
+      if (group.length === 0) continue;
+      const groupIds = new Set(group.map(item => item.id!));
+      const groupSourceRefs = [...new Set(group.flatMap(item => item.sourceRefs ?? []))];
+      const groupSources = groupSourceRefs.map(ref => sourceById.get(ref)).filter((source): source is SourceBlock => Boolean(source));
+      if (groupSources.length === 0) throw new Error('失败项的原始来源已不存在，无法定向修复。');
+      const repairRequest: CaptureRepairRequest = {
+        recordType,
+        items: group.map(rejection => ({
+          rejectionId: rejection.id!,
+          localId: String(rejection.candidateSnapshot?.localId ?? rejection.id),
+          code: rejection.code,
+          fieldPath: rejection.fieldPath ?? '',
+          message: rejection.message,
+          candidateSnapshot: structuredClone(rejection.candidateSnapshot ?? {}),
+        })),
+      };
+      const attempt = Math.max(0, ...group.map(item => item.repairAttempts ?? 0)) + 1;
+      try {
+        const result = await this.executeActorCapture(groupSources, {
+          captureJobId: String((audit.metadata as Record<string, unknown> | undefined)?.captureJobId ?? ''),
+          writableSourceRefs: groupSourceRefs,
+          repairRequest,
+          idempotencyKey: `capture-repair:${auditId}:${recordType}:${[...groupIds].sort().join(',')}:attempt:${attempt}`,
+          graphLlmRelationEnabled: this.getEffectiveSettings().graphEnabled && this.getEffectiveSettings().graphLlmRelationEnabled,
+        });
+        results.push(result);
+        const accepted = new Set(result.acceptedLocalIds[recordType]);
+        updated = updated.map((rejection) => {
+          if (!rejection.id || !groupIds.has(rejection.id)) return rejection;
+          const localId = String(rejection.candidateSnapshot?.localId ?? rejection.id);
+          return accepted.has(localId)
+            ? { ...rejection, status: 'repaired' as const, repairAttempts: attempt, resolvedAt: Date.now() }
+            : { ...rejection, status: 'unresolved' as const, repairAttempts: attempt, lastRepairAt: Date.now() };
+        });
+        await repository.updateCaptureAuditRejections(auditId, updated);
+      } catch (error) {
+        updated = updated.map(rejection => rejection.id && groupIds.has(rejection.id)
+          ? { ...rejection, status: 'unresolved' as const, repairAttempts: attempt, lastRepairAt: Date.now() }
+          : rejection);
+        await repository.updateCaptureAuditRejections(auditId, updated);
+        throw error;
+      }
+    }
+    if (results.length === 0) throw new Error('没有可修复的待处理项。');
+    await this.finalizeActorCaptureResults(results, sources, captureVersion, chatKey);
+    await this.bindCurrentChat();
   }
 
   async getMainChatUsage(): Promise<MainChatUsage[]> {
@@ -1958,12 +2182,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return this.capturePromise;
   }
 
-  /**
-   * The production initialization path uses the same multi-owner Capture
-   * transaction as post-generation capture. The legacy batch extractor remains
-   * available only for isolated contract tests and for hosts that have not
-   * exposed the v0 actor repository yet.
-   */
+  /** Production multi-owner Capture uses the same summary window and batching settings as the compatibility path. */
   private async runMultiActorCaptureWorkflow(
     mode: 'initialize' | 'incremental',
     resumeJob?: MemoryJob,
@@ -1976,6 +2195,22 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     if (!capture || !context || !actorRepository) throw new Error('多角色 Capture 尚未绑定宿主工作区。');
     const chatKey = this.requireChatKey();
     const captureVersion = this.captureVersion;
+    const captureSettings = this.getEffectiveSettings();
+    const strategy = summaryStrategyFromSettings(captureSettings);
+    const [baselineFacts, referenceScope] = captureSettings.preExtractReferenceEnabled
+      ? await Promise.all([
+        actorRepository.listFacts(),
+        context.getRecallContext?.() ?? Promise.resolve(undefined),
+      ])
+      : [[], undefined] as const;
+    this.assertCaptureCurrent(captureVersion, chatKey);
+    const referenceRetriever = captureSettings.preExtractReferenceEnabled
+      ? new ExistingMemoryContextRetriever(
+        baselineFacts,
+        this.vectorIndex,
+        captureSettings.graphEnabled ? new MemoryGraphRecallIndex(deriveMemoryGraphProjection(baselineFacts)) : undefined,
+      )
+      : null;
     const includeInvisibleHistory = mode === 'initialize'
       && (resumeJob?.checkpoint.includeInvisibleHistory ?? options.includeInvisibleHistory === true);
     const allSources = selectSourceGroups(
@@ -1983,20 +2218,60 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       mode === 'incremental' ? undefined : (resumeJob?.checkpoint.selectedSourceGroupIds ?? selectedSourceGroups),
     );
     this.assertCaptureCurrent(captureVersion, chatKey);
-    if (allSources.length === 0) return;
+    const existingProgress = await this.ensureSummaryProgress(chatKey, allSources);
+    if (existingProgress) {
+      const waiting = getSummaryWaitingFloors(allSources, existingProgress, strategy);
+      if (waiting !== undefined) this.summaryWaitingByChat.set(chatKey, waiting);
+      this.emitSettingsChanged();
+    }
+    const automaticWindow = mode === 'incremental'
+      ? selectAutomaticSummaryWindow(allSources, existingProgress, strategy)
+      : undefined;
+    const sources = automaticWindow?.sources ?? (mode === 'incremental' ? [] : allSources);
+    if (sources.length === 0) return;
+    const summaryOptions = {
+      includeSystemMessages: includeInvisibleHistory,
+      ...(automaticWindow ? { writableSourceRefs: automaticWindow.writableSourceRefs } : {}),
+    };
+    const messageSources = visibleConversationMessages(sources, summaryOptions);
+    const target = automaticWindow
+      ? { startFloor: automaticWindow.startFloor, endFloor: automaticWindow.endFloor, endMessageId: automaticWindow.endMessageId }
+      : messageSources.length > 0
+        ? {
+          startFloor: messageSources[0]?.floor ?? 1,
+          endFloor: messageSources.at(-1)?.floor ?? messageSources.length,
+          endMessageId: messageSources.at(-1)?.id ?? '',
+        }
+        : undefined;
+    const allPlans = buildSummaryBatchPlans(sources, strategy, summaryOptions);
+    const requestedResumeBatchIndex = Math.min(allPlans.length, Math.max(0, resumeJob?.checkpoint.batchIndex ?? 0));
+    // A job can fail after its last canonical batch but before job-final
+    // derivations/status are durable. Re-run the last batch on retry so a fresh
+    // ChangeSet can own the final projections.
+    const retryLastCompletedBatch = Boolean(resumeJob && allPlans.length > 0 && requestedResumeBatchIndex === allPlans.length);
+    const resumeBatchIndex = retryLastCompletedBatch ? allPlans.length - 1 : requestedResumeBatchIndex;
+    const resumedProcessedCount = Math.max(
+      0,
+      (resumeJob?.checkpoint.processedCount ?? 0) - (retryLastCompletedBatch ? allPlans.at(-1)?.messageCount ?? 0 : 0),
+    );
+    const plans = allPlans.slice(resumeBatchIndex);
+    if (plans.length === 0) return;
     const selectedGroups = resumeJob?.checkpoint.selectedSourceGroupIds
       ?? selectedSourceGroups
       ?? summarizeSourceGroups(allSources).map(group => group.id);
-    const messageCount = allSources.filter(source => source.kind === 'message').length;
-    const totalBatches = 1;
+    const totalBatches = allPlans.length;
     const jobId = resumeJob?.id ?? createId('job');
     const createdAt = resumeJob?.createdAt ?? Date.now();
     const baseCheckpoint: MemoryJob['checkpoint'] = {
-      batchIndex: 0,
+      batchIndex: resumeBatchIndex,
       totalBatches,
-      processedCount: 0,
+      processedCount: resumedProcessedCount,
+      ...(resumeJob?.checkpoint.lastSourceRef === undefined ? {} : { lastSourceRef: resumeJob.checkpoint.lastSourceRef }),
+      ...(resumeJob?.checkpoint.overlapSourceRefs === undefined ? {} : { overlapSourceRefs: resumeJob.checkpoint.overlapSourceRefs }),
+      ...(resumeJob?.checkpoint.metadataSourceRefs === undefined ? {} : { metadataSourceRefs: resumeJob.checkpoint.metadataSourceRefs }),
       selectedSourceGroupIds: selectedGroups,
       ...(mode === 'initialize' ? { includeInvisibleHistory } : {}),
+      ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
       phase: 'capture',
     };
     const persistJob = (job: MemoryJob): Promise<void> => actorRepository.upsertCaptureJob({
@@ -2006,35 +2281,140 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.status = 'working';
     this.cancelRequested = false;
     this.captureStartedAt = Date.now();
-    this.activeCaptureProgress = { status: 'running', jobId, batchIndex: 0, totalBatches, processedCount: 0, elapsedMs: 0, phase: 'capture' };
+    this.activeCaptureProgress = {
+      status: 'running',
+      jobId,
+      batchIndex: resumeBatchIndex,
+      totalBatches,
+      processedCount: baseCheckpoint.processedCount,
+      elapsedMs: 0,
+      phase: 'capture',
+    };
     await persistJob({ id: jobId, chatKey, type: mode, status: 'running', checkpoint: baseCheckpoint, createdAt, updatedAt: Date.now() });
+    let processedCount = baseCheckpoint.processedCount;
+    let checkpoint = baseCheckpoint;
+    const processedMetadataRefs = new Set(baseCheckpoint.metadataSourceRefs ?? []);
+    const captureResults: import('./actors').MultiActorCaptureResult[] = [];
+    let finalizationStarted = false;
     try {
-      const result = await this.runActorCapture(allSources, includeInvisibleHistory, jobId);
+      for (let index = 0; index < plans.length; index += 1) {
+        const plan = plans[index]!;
+        this.activeCaptureProgress = {
+          status: 'running',
+          jobId,
+          batchIndex: resumeBatchIndex + index + 1,
+          totalBatches,
+          processedCount,
+          elapsedMs: Date.now() - this.captureStartedAt,
+          phase: 'capture',
+        };
+        const existingMemoryContext = referenceRetriever ? await referenceRetriever.load({
+          chatKey,
+          sources: plan.sources,
+          maxItems: captureSettings.preExtractReferenceItems,
+          maxChars: captureSettings.preExtractReferenceMaxChars,
+          mode: captureSettings.preExtractReferenceMode,
+          characterKeys: referenceScope?.characterKeys ?? [],
+          worldKeys: referenceScope?.worldKeys ?? [],
+          graphMaxHops: captureSettings.graphMaxHops,
+          graphMaxEdges: captureSettings.graphMaxEdges,
+        }) : [];
+        this.assertCaptureCurrent(captureVersion, chatKey);
+        const result = await this.executeActorCapture(plan.sources, {
+          includeInvisibleHistory,
+          captureJobId: jobId,
+          writableSourceRefs: plan.writableSourceRefs,
+          existingMemoryContext,
+          graphLlmRelationEnabled: captureSettings.graphEnabled && captureSettings.graphLlmRelationEnabled,
+          idempotencyKey: `capture:${jobId}:batch:${resumeBatchIndex + index + 1}`,
+        });
+        captureResults.push(result);
+        processedCount += plan.messageCount;
+        const writableRefs = new Set(plan.writableSourceRefs);
+        plan.sources
+          .filter((source) => source.kind !== 'message' && writableRefs.has(source.id))
+          .forEach((source) => processedMetadataRefs.add(source.id));
+        checkpoint = {
+          ...baseCheckpoint,
+          batchIndex: resumeBatchIndex + index + 1,
+          processedCount,
+          lastSourceRef: plan.sources.at(-1)?.id,
+          overlapSourceRefs: plan.sources.filter((source) => !writableRefs.has(source.id)).map((source) => source.id),
+          metadataSourceRefs: [...processedMetadataRefs],
+        };
+        const currentRejections = captureResults.flatMap(item => item.rejections ?? []);
+        await persistJob({
+          id: jobId,
+          chatKey,
+          type: mode,
+          status: 'running',
+          ...(currentRejections.length > 0 ? { outcome: 'partial' as const, rejectionCount: currentRejections.length, rejections: currentRejections } : {}),
+          checkpoint,
+          createdAt,
+          updatedAt: Date.now(),
+        });
+      }
+      finalizationStarted = true;
+      await this.finalizeActorCaptureResults(captureResults, sources, captureVersion, chatKey, false);
       this.assertCaptureCurrent(captureVersion, chatKey);
-      const completedCheckpoint: MemoryJob['checkpoint'] = {
-        ...baseCheckpoint,
-        batchIndex: 1,
-        processedCount: messageCount,
-      };
-      await persistJob({ id: jobId, chatKey, type: mode, status: 'completed', checkpoint: completedCheckpoint, createdAt, updatedAt: Date.now() });
-      // The v0 actor Capture job is the source of truth for initialization
-      // progress; the retired summary-progress cursor is not written here.
+      const outcome = captureResults.some(result => result.outcome === 'partial') ? 'partial' as const : 'complete' as const;
+      const finalRejections = captureResults.flatMap(result => result.rejections ?? []);
+      await persistJob({ id: jobId, chatKey, type: mode, status: 'completed', outcome, rejectionCount: finalRejections.length, rejections: finalRejections, checkpoint, createdAt, updatedAt: Date.now() });
       await this.bindCurrentChat();
+      this.lastOrganizedAt = Date.now();
+      if (target) {
+        await this.saveSummaryProgress(chatKey, target.endFloor, target.endMessageId, jobId);
+        const waiting = getSummaryWaitingFloors(allSources, this.summaryProgressByChat[chatKey], strategy);
+        if (waiting !== undefined) this.summaryWaitingByChat.set(chatKey, waiting);
+        this.emitSettingsChanged();
+      }
       this.status = 'ready';
       this.clearRuntimeError();
-      this.activeCaptureProgress = { status: 'completed', jobId, batchIndex: 1, totalBatches, processedCount: messageCount, elapsedMs: Date.now() - this.captureStartedAt, phase: 'capture' };
-      void result;
+      this.activeCaptureProgress = {
+        status: 'completed',
+        jobId,
+        batchIndex: totalBatches,
+        totalBatches,
+        processedCount,
+        elapsedMs: Date.now() - this.captureStartedAt,
+        phase: 'capture',
+        outcome,
+        rejectedCount: captureResults.reduce((total, result) => total + (result.rejections ?? []).filter(item => (item.status ?? 'unresolved') === 'unresolved').length, 0),
+      };
     } catch (error) {
       if (this.stopped || captureVersion !== this.captureVersion || this.getChatKey() !== chatKey) {
-        if (!this.stopped) await persistJob({ id: jobId, chatKey, type: mode, status: 'paused', checkpoint: baseCheckpoint, createdAt, updatedAt: Date.now() });
+        if (finalizationStarted) checkpoint = baseCheckpoint;
+        if (!this.stopped) await persistJob({ id: jobId, chatKey, type: mode, status: 'paused', checkpoint, createdAt, updatedAt: Date.now() });
         this.status = this.getEffectiveSettings().enabled ? 'ready' : 'disabled';
-        this.activeCaptureProgress = { status: this.cancelRequested ? 'cancelled' : 'paused', jobId, batchIndex: 0, totalBatches, processedCount: 0, elapsedMs: Date.now() - this.captureStartedAt, phase: 'capture' };
+        this.activeCaptureProgress = {
+          status: this.cancelRequested ? 'cancelled' : 'paused',
+          jobId,
+          batchIndex: checkpoint.batchIndex,
+          totalBatches,
+          processedCount: checkpoint.processedCount,
+          elapsedMs: Date.now() - this.captureStartedAt,
+          phase: 'capture',
+        };
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
+      if (finalizationStarted) {
+        await this.rollbackActorCaptureResults(captureResults);
+        checkpoint = baseCheckpoint;
+      }
       this.setRuntimeError(error, 'MEMORY_CAPTURE_FAILED', 'operation');
-      await persistJob({ id: jobId, chatKey, type: mode, status: isRetryableCaptureError(error) ? 'paused' : 'failed', checkpoint: baseCheckpoint, error: message, createdAt, updatedAt: Date.now() });
-      this.activeCaptureProgress = { status: isRetryableCaptureError(error) ? 'paused' : 'failed', jobId, batchIndex: 0, totalBatches, processedCount: 0, elapsedMs: Date.now() - this.captureStartedAt, error: message, phase: 'capture' };
+      const pauseForRetry = isRetryableCaptureError(error);
+      await persistJob({ id: jobId, chatKey, type: mode, status: pauseForRetry ? 'paused' : 'failed', checkpoint, error: message, createdAt, updatedAt: Date.now() });
+      this.activeCaptureProgress = {
+        status: pauseForRetry ? 'paused' : 'failed',
+        jobId,
+        batchIndex: checkpoint.batchIndex,
+        totalBatches,
+        processedCount: checkpoint.processedCount,
+        elapsedMs: Date.now() - this.captureStartedAt,
+        error: message,
+        phase: 'capture',
+      };
       throw error;
     }
   }

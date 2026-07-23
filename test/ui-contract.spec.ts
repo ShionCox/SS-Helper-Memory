@@ -9,9 +9,17 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     ]);
 
     expect(source).toContain('UI_CONTROL_ATTRIBUTE');
+    expect(source).toContain('UI_CONTROL_SIZE_ATTRIBUTE');
+    expect(source).toContain('UI_CONTROL_ICON_ONLY_ATTRIBUTE');
     expect(source).toContain('UI_CONTROL_TONE_ATTRIBUTE');
+    expect(source).toContain("uiButton('neutral', 'xs', true)");
+    expect(source).toContain("uiButton('neutral', 'sm', true)");
+    expect(source).toContain("uiButton('primary', 'md')");
     expect(source).toContain('popupUi?.refreshControls(root)');
     expect(styles).toContain('--ss-control-input-padding-inline-start: 34px');
+    expect(styles).toMatch(/\.stx-memory-workbench\s*\{[^}]*--ss-theme-surface:\s*#17191c[^}]*--ss-theme-surface-2:\s*#1d2024[^}]*--ss-theme-surface-3:\s*#23272c/u);
+    expect(styles).toMatch(/\.stx-memory-workbench\s*\{[^}]*--ss-theme-border:\s*#34383f[^}]*--ss-theme-accent:\s*#c5a059/u);
+    expect(styles).toMatch(/\.stx-memory-page-content\s*\{[^}]*background:\s*var\(--stx-memory-content-surface\)/u);
     expect(styles).toMatch(/\.stx-memory-statusbar\s+\[data-ss-helper-control="status"\][^}]*justify-self:\s*start/u);
     expect(styles).toMatch(/\.stx-memory-statusbar\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1\.35fr\)\s+repeat\(6,/u);
     expect(styles).toMatch(/\.stx-memory-panel\s*>\s*p\.stx-memory-estimate-note\s*\{[^}]*margin:\s*14px\s+0\s+0/u);

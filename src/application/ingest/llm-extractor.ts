@@ -1,5 +1,4 @@
 import type {
-  ExistingMemoryContextItem,
   ExtractedFactProposal,
   MemoryExtractionInput,
   MemoryExtractionResult,
@@ -158,7 +157,7 @@ const EXTRACTION_SCHEMA = {
           'confidence', 'sourceRef', 'evidenceExcerpt', 'actionHint', 'validFrom', 'validTo', 'stable',
         ],
         properties: {
-          kind: { type: 'string', enum: ['identity', 'relationship', 'location', 'world_rule', 'state', 'goal', 'commitment', 'event', 'preference', 'capability'] },
+          kind: { type: 'string', enum: ['identity', 'relationship', 'location', 'world_rule', 'state', 'goal', 'commitment', 'event', 'preference', 'capability', 'other'] },
           subjectKey: { type: 'string', description: '简洁自然的中文主体名称；仅可保留来源原文中逐字出现的英文专名。' },
           predicateKey: { type: 'string', description: '必须包含中文的简洁关系、动作或属性名称，禁止英文标识符和 snake_case。' },
           objectKey: { type: ['string', 'null'], description: '简洁自然的中文对象名称；仅可保留来源原文中逐字出现的英文专名。' },
@@ -180,7 +179,7 @@ const EXTRACTION_SCHEMA = {
 function normalizeProposal(value: unknown): ExtractedFactProposal | null {
   if (!value || typeof value !== 'object') return null;
   const row = value as Record<string, unknown>;
-  const allowedKinds = new Set(['identity', 'relationship', 'location', 'world_rule', 'state', 'goal', 'commitment', 'event', 'preference', 'capability']);
+  const allowedKinds = new Set(['identity', 'relationship', 'location', 'world_rule', 'state', 'goal', 'commitment', 'event', 'preference', 'capability', 'other']);
   const kind = String(row.kind ?? '');
   const actionHint = row.actionHint === 'supersede' ? 'supersede' : 'upsert';
   if (!allowedKinds.has(kind) || !Array.isArray(row.entityKeys)) return null;
@@ -281,50 +280,33 @@ function safeJson(value: unknown): string {
   })[character]!);
 }
 
-function serializeSources(sources: readonly SourceBlock[]): string {
-  return sources.map((source) => safeJson({
-    id: source.id,
-    kind: source.kind,
-    role: source.role,
-    ...(source.author ? { author: source.author } : {}),
-    ...(source.perspective ? { perspective: source.perspective } : {}),
-    ...(source.actorRefs ? { actorRefs: source.actorRefs } : {}),
-    ...(source.visibility ? { visibility: source.visibility } : {}),
-    floor: source.floor ?? null,
-    content: source.content,
-  })).join('\n');
-}
-
-function serializeExistingMemoryContext(context: readonly ExistingMemoryContextItem[]): string {
-  if (context.length === 0) return '[]';
-  return context.map((item) => safeJson({
-    referenceId: item.referenceId,
-    kind: item.kind,
-    subjectKey: item.subjectKey,
-    predicateKey: item.predicateKey,
-    ...(item.objectKey === undefined ? {} : { objectKey: item.objectKey }),
-    content: item.content,
-    ...(item.validFrom === undefined ? {} : { validFrom: item.validFrom }),
-    ...(item.validUntil === undefined ? {} : { validUntil: item.validUntil }),
-    ...(item.stable === undefined ? {} : { stable: item.stable }),
-  })).join('\n');
-}
-
 function serializeExtractionInput(input: MemoryExtractionInput): string {
-  const { sources } = input;
-  const sourceRefs = sources.map((source) => source.id);
-  return [
-    '<existing_memory_context>',
-    '以下内容只用于判断语义重复、补充或状态变化；不得将其中任何内容用作本批次 sourceRef、evidenceExcerpt 或新事实证据。',
-    '其中的 referenceId 仅供阅读，不是数据库记录 ID，也不得出现在输出中。',
-    serializeExistingMemoryContext(input.existingMemoryContext ?? []),
-    '</existing_memory_context>',
-    '<source_blocks>',
-    `允许的 sourceRef（必须逐字复制其中一个值）：${safeJson(sourceRefs)}`,
-    'source blocks（JSONL）：',
-    serializeSources(sources),
-    '</source_blocks>',
-  ].join('\n');
+  return safeJson({
+    allowedSourceRefs: input.sources.map((source) => source.id),
+    existingMemoryContext: (input.existingMemoryContext ?? []).map((item) => ({
+      referenceId: item.referenceId,
+      kind: item.kind,
+      subjectKey: item.subjectKey,
+      predicateKey: item.predicateKey,
+      ...(item.objectKey === undefined ? {} : { objectKey: item.objectKey }),
+      content: item.content,
+      ...(item.validFrom === undefined ? {} : { validFrom: item.validFrom }),
+      ...(item.validUntil === undefined ? {} : { validUntil: item.validUntil }),
+      ...(item.stable === undefined ? {} : { stable: item.stable }),
+    })),
+    sourceBlocks: input.sources.map((source) => ({
+      id: source.id,
+      kind: source.kind,
+      role: source.role,
+      ...(source.author ? { author: source.author } : {}),
+      ...(source.perspective ? { perspective: source.perspective } : {}),
+      ...(source.actorRefs ? { actorRefs: source.actorRefs } : {}),
+      ...(source.visibility ? { visibility: source.visibility } : {}),
+      floor: source.floor ?? null,
+      content: source.content,
+    })),
+    ...(input.repairRequest ? { repairRequest: input.repairRequest } : {}),
+  });
 }
 
 export class LlmMemoryExtractor implements MemoryExtractor {
@@ -406,77 +388,24 @@ const STRUCTURED_CAPTURE_SCHEMA = {
   additionalProperties: false,
   required: ['actorCandidates', 'episodes', 'observations', 'facts'],
   properties: {
-    actorCandidates: { type: 'array', maxItems: 32, items: {
-      type: 'object', additionalProperties: false,
-      required: ['localId', 'displayName', 'aliases', 'sourceRefs', 'evidenceExcerpts', 'confidence', 'status'],
-      properties: {
-        localId: { type: 'string' }, displayName: { type: 'string', minLength: 1, maxLength: 80 },
-        aliases: { type: 'array', items: { type: 'string' }, maxItems: 12 }, sourceRefs: { type: 'array', items: { type: 'string' }, maxItems: 16 },
-        evidenceExcerpts: { type: 'array', items: { type: 'string' }, maxItems: 8 }, confidence: { type: 'number', minimum: 0, maximum: 1 },
-        status: { type: 'string', enum: ['confirmed', 'pending', 'unknown'] },
-      },
-    } },
-    episodes: { type: 'array', maxItems: 16, items: {
-      type: 'object', additionalProperties: false,
-      required: ['localId', 'sourceRefs', 'floorStart', 'floorEnd', 'participantRefs', 'presentRefs', 'mentionedRefs', 'occurredAt', 'summary'],
-      properties: {
-        localId: { type: 'string', minLength: 1 }, sourceRefs: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32 },
-        floorStart: { type: 'number' }, floorEnd: { type: 'number' }, participantRefs: { type: 'array', items: { type: 'string' }, maxItems: 32 },
-        presentRefs: { type: 'array', items: { type: 'string' }, maxItems: 32 }, mentionedRefs: { type: 'array', items: { type: 'string' }, maxItems: 32 },
-        location: { type: ['string', 'null'], maxLength: 160 }, occurredAt: { type: 'number' }, summary: { type: ['string', 'null'], maxLength: 240 },
-      },
-    } },
-    observations: { type: 'array', maxItems: 64, items: {
-      type: 'object', additionalProperties: false,
-      required: ['localId', 'episodeLocalId', 'sourceRef', 'speakerRef', 'viewpointRef', 'observerRefs', 'channel', 'privacy', 'knowledgeMode', 'excerpt', 'mentionedRefs', 'presentRefs', 'factRefs', 'occurredAt'],
-      properties: {
-        localId: { type: 'string', minLength: 1 }, episodeLocalId: { type: 'string', minLength: 1 }, sourceRef: { type: 'string', minLength: 1 },
-        speakerRef: { type: 'string', minLength: 1 }, viewpointRef: { type: 'string', minLength: 1 }, observerRefs: { type: 'array', items: { type: 'string' }, maxItems: 32 },
-        channel: { type: 'string', enum: ['public_speech', 'private_thought', 'narration', 'worldbook', 'state', 'rumor', 'inference'] },
-        privacy: { type: 'string', enum: ['public', 'limited', 'private', 'secret'] },
-        knowledgeMode: { type: 'string', enum: ['asserted', 'self_reported', 'heard', 'experienced', 'inferred', 'believed', 'suspected', 'unknown'] },
-        excerpt: { type: 'string', minLength: 1, maxLength: 2000 }, mentionedRefs: { type: 'array', items: { type: 'string' }, maxItems: 32 },
-        presentRefs: { type: 'array', items: { type: 'string' }, maxItems: 32 }, factRefs: { type: 'array', items: { type: 'string' }, maxItems: 32 }, occurredAt: { type: 'number' },
-      },
-    } },
-    facts: { type: 'array', maxItems: 24, items: {
-      type: 'object', additionalProperties: false,
-      required: ['localId', 'kind', 'sourceRef', 'subjectKey', 'predicateKey', 'objectKey', 'content', 'entityKeys', 'ownerRefs', 'confidence', 'privacy', 'knowledgeMode', 'evidenceExcerpt'],
-      properties: {
-        localId: { type: 'string', minLength: 1 }, kind: { type: 'string', enum: ['identity', 'relationship', 'location', 'world_rule', 'state', 'goal', 'commitment', 'preference', 'capability', 'event', 'other'] },
-        sourceRef: { type: 'string', minLength: 1 }, subjectKey: { type: 'string', minLength: 1, maxLength: 80 }, predicateKey: { type: 'string', minLength: 1, maxLength: 80 },
-        objectKey: { type: ['string', 'null'], maxLength: 80 }, content: { type: 'string', minLength: 6, maxLength: 240 }, entityKeys: { type: 'array', items: { type: 'string' }, maxItems: 32 },
-        ownerRefs: { type: 'array', items: { type: 'string' }, maxItems: 32 }, confidence: { type: 'number', minimum: 0, maximum: 1 },
-        privacy: { type: 'string', enum: ['public', 'limited', 'private', 'secret'] }, knowledgeMode: { type: 'string', enum: ['asserted', 'self_reported', 'heard', 'experienced', 'inferred', 'believed', 'suspected', 'unknown'] },
-        evidenceExcerpt: { type: 'string', minLength: 1, maxLength: 2000 },
-      },
-    } },
+    actorCandidates: { type: 'array', maxItems: 32, items: { type: 'object' } },
+    episodes: { type: 'array', maxItems: 16, items: { type: 'object' } },
+    observations: { type: 'array', maxItems: 64, items: { type: 'object' } },
+    facts: { type: 'array', maxItems: 24, items: { type: 'object' } },
   },
 } as const;
 
 function normalizeStructuredCapture(value: unknown): StructuredCaptureResult {
   const row = value && typeof value === 'object' ? value as Record<string, unknown> : {};
-  const actorCandidates = Array.isArray(row.actorCandidates) ? row.actorCandidates.flatMap((candidate): StructuredCaptureResult['actorCandidates'] => {
-    if (!candidate || typeof candidate !== 'object') return [];
-    const item = candidate as Record<string, unknown>;
-    const displayName = String(item.displayName ?? '').trim();
-    if (!displayName) return [];
-    const status = item.status === 'confirmed' || item.status === 'pending' || item.status === 'unknown' ? item.status : 'pending';
-    return [{
-      localId: String(item.localId ?? `actor:${displayName}`), displayName,
-      aliases: Array.isArray(item.aliases) ? item.aliases.map(String).map(text => text.trim()).filter(Boolean).slice(0, 12) : [],
-      sourceRefs: Array.isArray(item.sourceRefs) ? item.sourceRefs.map(String).map(text => text.trim()).filter(Boolean).slice(0, 16) : [],
-      evidenceExcerpts: Array.isArray(item.evidenceExcerpts) ? item.evidenceExcerpts.map(String).map(text => text.trim()).filter(Boolean).slice(0, 8) : [],
-      confidence: Math.max(0, Math.min(1, Number(item.confidence) || 0)), status,
-    }];
-  }).slice(0, 32) : [];
   const records = (input: unknown): Array<Record<string, unknown>> => Array.isArray(input)
     ? input.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item))).map(item => structuredClone(item))
     : [];
-  const episodes = records(row.episodes).filter(item => typeof item.localId === 'string' && Array.isArray(item.sourceRefs) && item.sourceRefs.length > 0).slice(0, 16);
-  const observations = records(row.observations).filter(item => typeof item.localId === 'string' && typeof item.episodeLocalId === 'string' && typeof item.sourceRef === 'string' && typeof item.excerpt === 'string' && item.excerpt.trim().length > 0).slice(0, 64);
-  const facts = records(row.facts).filter(item => typeof item.localId === 'string' && typeof item.sourceRef === 'string' && typeof item.subjectKey === 'string' && typeof item.predicateKey === 'string' && typeof item.content === 'string' && item.content.trim().length >= 6 && typeof item.evidenceExcerpt === 'string' && item.evidenceExcerpt.trim().length > 0).slice(0, 24);
-  return { actorCandidates, episodes, observations, facts };
+  return {
+    actorCandidates: records(row.actorCandidates).slice(0, 32),
+    episodes: records(row.episodes).slice(0, 16),
+    observations: records(row.observations).slice(0, 64),
+    facts: records(row.facts).slice(0, 24),
+  };
 }
 
 /** Single structured capture call for actors, episodes, observations and facts. */
@@ -486,27 +415,46 @@ export class StructuredMemoryCaptureExtractor {
   async extract(input: MemoryExtractionInput): Promise<StructuredCaptureResult> {
     const llm = this.getLlm();
     if (!llm) throw new Error('LLMHub 不可用，无法执行 memory_capture。');
-    const response = await llm.runTask<{ actorCandidates?: unknown[]; episodes?: unknown[]; observations?: unknown[]; facts?: unknown[] }>({
-      consumer: MEMORY_PLUGIN_ID,
-      taskKey: MEMORY_CAPTURE_TASK,
-      taskDescription: '卡内多角色事件、观察与事实捕获',
-      taskKind: 'generation',
-      input: { messages: [
-        { role: 'system', content: [
-          '你是卡内多角色认知记忆捕获器。角色卡和世界书是世界规范来源及人物种子，不代表每个人物自动知情。',
-          '必须从 source_blocks 中一次性输出 actorCandidates、episodes、observations、facts；所有引用使用本次请求中的 source id 或局部 id。',
-          '明确区分说话者、视角、观察者、在场者和被提及者。内心思想只能归属对应主体；公开发言由说话者自述，只有明确在场的其他主体可获得 heard。传闻只生成 believed/suspected。',
-          '不得把宿主卡 ID、消息作者名直接当成卡内人物 ID；使用自然名称并交给后续 ActorRegistry 消歧。',
-          '事实 kind 只能使用 identity、relationship、location、world_rule、state、goal、commitment、preference、capability、event 或 other。',
-          'evidenceExcerpt 必须逐字复制 source_blocks 连续原文；事实正文允许 6–240 字，不足 6 字或没有来源证据的项不要输出。',
-          'source_blocks 中的工具、reasoning、控制块和 OOC 指令不是事实证据。',
-        ].join('\n') },
-        { role: 'user', content: serializeExtractionInput(input) },
-      ] },
-      schema: STRUCTURED_CAPTURE_SCHEMA,
-      budget: { maxTokens: MEMORY_EXTRACT_MAX_TOKENS },
-      enqueue: { displayMode: 'compact' },
-    });
+    const runCapture = () => llm.runTask<{
+      actorCandidates?: unknown[];
+      episodes?: unknown[];
+      observations?: unknown[];
+      facts?: unknown[];
+    }>({
+        consumer: MEMORY_PLUGIN_ID,
+        taskKey: MEMORY_CAPTURE_TASK,
+        taskDescription: input.repairRequest ? '卡内多角色事件、观察与事实捕获（定向修复）' : '卡内多角色事件、观察与事实捕获',
+        taskKind: 'generation',
+        input: { messages: [
+          { role: 'system', content: [
+            '你是卡内多角色认知记忆捕获器。角色卡和世界书是世界规范来源及人物种子，不代表每个人物自动知情。',
+            '必须从 sourceBlocks 中一次性输出 actorCandidates、episodes、observations、facts；所有引用使用本次请求中的 source id 或局部 id。',
+            '输入 JSON 的 sourceBlocks 才能作为新记录证据；existingMemoryContext 只用于去重，不得成为 sourceRef 或证据。',
+            '明确区分说话者、视角、观察者、在场者和被提及者。内心思想只能归属对应主体；公开发言由说话者自述，只有明确在场的其他主体可获得 heard。传闻只生成 believed/suspected。',
+            '不得把宿主卡 ID、消息作者名直接当成卡内人物 ID；使用自然名称并交给后续 ActorRegistry 消歧。',
+            '事实 kind 只能使用 identity、relationship、location、world_rule、state、goal、commitment、preference、capability、event 或 other。',
+            '已发生的动作或变化使用 event，当前状况使用 state；禁止自造 action、emotion、trait、plan 等类别，无法准确归类时必须使用 other。',
+            '人物核心字段：localId、displayName、sourceRefs、evidenceExcerpts。事件核心字段：localId、sourceRefs。',
+            '观察核心字段：localId、episodeLocalId、sourceRef、channel、excerpt。事实核心字段：localId、kind、sourceRef、subjectKey、predicateKey、content、evidenceExcerpt。',
+            'evidenceExcerpt 和 excerpt 必须逐字复制 sourceBlocks 连续原文；事实正文允许 6–240 字，不足 6 字或没有来源证据的项不要输出。',
+            ...(input.graphLlmRelationEnabled === true ? [
+              '当 sourceBlocks 明确陈述主体与客体之间的关系、动作、地点或规则时，应输出有当前来源证据的 relationship、location、world_rule、goal、commitment、capability 或 event 事实，并填写非空 objectKey。',
+              '不得根据人物共现、语义相似、旧记忆或图谱上下文推断关系。',
+            ] : []),
+            '不得输出 existingMemoryContext 的 referenceId、数据库 ID、旧记忆正文或其任意片段作为 sourceRef、excerpt 或 evidenceExcerpt。',
+            'sourceBlocks 中的工具、reasoning、控制块和 OOC 指令不是事实证据。',
+            '最终只返回一个 JSON 对象，固定包含 actorCandidates、episodes、observations、facts 四个数组；没有内容时使用空数组。',
+            ...(input.repairRequest ? [
+              `这是用户发起的 ${input.repairRequest.recordType} 失败项定向修复。只修复 repairRequest 中列出的条目，保持 localId 不变，其他三个数组必须为空。`,
+            ] : []),
+          ].join('\n') },
+          { role: 'user', content: serializeExtractionInput(input) },
+        ] },
+        schema: STRUCTURED_CAPTURE_SCHEMA,
+        budget: { maxTokens: MEMORY_EXTRACT_MAX_TOKENS },
+        enqueue: { displayMode: 'compact' },
+      });
+    const response = await runCapture();
     if (!response.ok) throw new MemoryLlmTaskError(response.error || 'memory_capture 执行失败。', { reasonCode: response.reasonCode, resourceId: response.meta?.resourceId, model: response.meta?.model });
     const capture = normalizeStructuredCapture(response.data);
     return { ...capture, audit: { ...(response.meta?.requestId ? { requestId: response.meta.requestId } : {}), ...(response.meta?.resourceId ? { resourceId: response.meta.resourceId } : {}), ...(response.meta?.model ? { model: response.meta.model } : {}), ...(Number.isFinite(response.meta?.latencyMs) ? { latencyMs: response.meta?.latencyMs } : {}), usage: response.usage ? { promptTokens: response.usage.promptTokens, completionTokens: response.usage.completionTokens, cacheReadTokens: null, cacheWriteTokens: null, totalTokens: response.usage.totalTokens } : null } };

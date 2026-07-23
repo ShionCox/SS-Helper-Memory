@@ -1,72 +1,55 @@
-# Memory Overview Design QA
+# 人物与别名重设计 Design QA
 
-## Comparison target
+## 验收目标
 
-- Source visual truth: `C:/Users/liao/.codex/generated_images/019f8aea-e866-7f51-8537-e5ec02f8ea4f/exec-51d40aff-beb1-47ee-afff-4c6f42eb6e68.png`
-- Final browser-rendered implementation: `G:/vue/SS-Helpers/SS-Helper-Memory/.design-qa/overview-implementation-final.png`
-- Full-view comparison: `G:/vue/SS-Helpers/SS-Helper-Memory/.design-qa/overview-comparison-final.png`
-- Focused content comparison: `G:/vue/SS-Helpers/SS-Helper-Memory/.design-qa/overview-comparison-focus.png`
-- State: current Assistant chat, Memory ready, 4 facts, no pending work, LLM available, embedding and rerank unconfigured.
+- 视觉基线：`I:/VUE/SS-Helpers/.tmp/product-design/current-actors-live.png`
+- 真实 SillyTavern 空数据状态：`I:/VUE/SS-Helpers/.tmp/product-design/actors-redesign-live.png`
+- 有数据人物主档状态：`I:/VUE/SS-Helpers/.tmp/product-design/actors-redesign-populated.png`
+- 待确认归属状态：`I:/VUE/SS-Helpers/.tmp/product-design/actors-redesign-pending.png`
+- 前后并排对照：`I:/VUE/SS-Helpers/.tmp/product-design/actors-redesign-comparison.png`
 
-## Viewport and normalization
+## 视口与状态
 
-- Source pixels: 1624 × 969. The generated source is treated as a 1× visual reference.
-- Implementation browser CSS viewport: 2049 × 1038 with reported `devicePixelRatio: 1.5`.
-- Implementation screenshot pixels: 2049 × 1038; the in-app browser capture is already normalized to CSS pixels.
-- The live popup is wider than the generated concept. Full-view evidence scales both captures to a common maximum height without changing either aspect ratio. Focused evidence crops the corresponding overview content regions and scales them to a common height.
-- The different live chat date/name text is intentional runtime data, not visual drift.
+- 视觉基线：1786 × 1272，旧版未绑定聊天空状态。
+- 真实实现：1280 × 720，SillyTavern 1.18.0、本地已绑定聊天、当前聊天尚无 Capture 结果。
+- 有数据与待确认状态：1280 × 720，使用实际 `renderMemoryWorkbench` 与真实 CSS，在隔离的 Vite QA 页面中注入人物、别名、系统主体、待确认候选和审计记录；截图完成后已删除临时 QA 页面。
+- 页面保留原工作台弹窗、顶部状态条、左侧导航和宿主字体；工作台内部使用设计稿炭黑色板。
 
-## Full-view comparison evidence
+## 视觉比较
 
-- Information architecture matches the selected option: status brief and metrics on the left, next actions, capability readiness, and quick entries on the right.
-- The existing top status strip, left navigation, page heading, popup frame, and SmartTheme shell remain unchanged.
-- The wider live viewport introduces additional horizontal breathing room, but all content remains above the fold and the two-column proportion stays legible.
+- 旧版单块空面板已替换为人物主档优先的双栏工作区；左侧负责选择人物或待确认项，右侧集中展示资料和操作。
+- 搜索、状态筛选、人物/别名/待确认计数和刷新位于统一工具栏，待确认数量使用金色描边入口，没有引入额外视觉概念。
+- 人物与系统主体分组清晰；名称、别名摘要、状态和置信度可以在列表中快速扫读。
+- 人物详情的名称、统计、别名来源、最近操作与技术信息形成稳定层级，原始 ID 不再占据主要位置。
+- 空状态仍保持双栏骨架，因此从无数据到有数据不会发生页面结构跳变。
+- 没有新增位图资产；所有图标沿用 `ss-helper-icon`。人物页和其他工作台页面自动继承局部炭黑表面、暖白文字和金色强调，不覆盖 SDK 设置中心或其他插件的 SmartTheme。
 
-## Focused comparison evidence
+## 核心交互验收
 
-- The focused comparison confirms the readiness icon, metric row, content chips, recent summary, action hierarchy, resource states, dividers, and quick-entry grid are all present and aligned with the selected visual direction.
-- Small text and state chips were readable in the original-resolution implementation capture and were also checked through the browser accessibility snapshot.
+- 人物/待确认标签切换：通过。
+- 名称与别名搜索、状态筛选：通过自动化 UI 测试。
+- 人物选择与刷新后选择保持：通过自动化 UI 测试。
+- 改名、纠正别名、合并、拆分：控制器参数通过自动化 UI 测试。
+- 别名纠正抽屉：真实浏览器中确认 `role="dialog"`、目标选择获得初始焦点、Escape 关闭并将焦点恢复到原“纠正归属”按钮。
+- 待确认归入已有人物：证据、来源、目标人物和确认动作均可见，参数通过自动化 UI 测试。
+- 待确认创建新人物：切换后规范名称为空，确认按钮保持禁用；输入有效名称后才可提交。
+- 审计撤销：已应用记录显示“撤销”，已撤销记录只读。
 
-## Required fidelity surfaces
+## 响应式与可访问性
 
-- Fonts and typography: passed. The implementation reuses the product's existing Segoe UI / Microsoft YaHei stack, weights, line heights, muted copy, and heading hierarchy.
-- Spacing and layout rhythm: passed. The two-column composition, section dividers, status/metric rhythm, restrained radii, and responsive collapse are preserved. Extra horizontal whitespace is an expected consequence of the wider live viewport.
-- Colors and visual tokens: passed. Surfaces, borders, warm-white text, muted gray text, semantic green/red states, and gold emphasis all use existing SmartTheme variables.
-- Image quality and asset fidelity: passed. This screen has no raster imagery. All visible icons use the existing `ss-helper-icon` / Font Awesome asset system; no handcrafted SVG, CSS illustration, emoji, or placeholder asset was introduced.
-- Copy and content: passed. Headings and actions match the selected concept while all counts, dates, model names, availability states, and chat identity come from live Memory data.
+- 桌面为双栏，`760px` 以下切换单列；选择人物后滚动到详情，操作抽屉改为全宽。
+- 标签使用 `tablist` / `tab` / `tabpanel`，选中人物使用 `aria-selected`，候选确认方式使用 `aria-pressed`。
+- 操作抽屉标题与对话框关联，支持 Escape、初始焦点与焦点恢复。
+- 已保留减少动画规则，并增加强制颜色样式。
+- 键盘、ARIA、焦点恢复、空状态、加载失败、操作失败与忙碌禁用由 UI 测试覆盖。
 
-## Findings
+## 验证结果
 
-- No actionable P0, P1, or P2 findings remain.
-- P3: At very wide desktop sizes the primary content has more open horizontal space than the 1624 px source. This is acceptable responsive behavior and keeps scanning simple.
-
-## Comparison history
-
-### Iteration 1
-
-- Evidence: `.design-qa/overview-implementation.png` and `.design-qa/overview-comparison.png`.
-- Finding: P2 — the SDK primary-button rule rendered “查看记忆库” as a bright solid gold block, while the source uses a restrained dark gold emphasis.
-- Fix: added a scoped unlayered override for overview action rows and restored the primary action to `--ss-theme-accent-soft` with an accent border/text treatment.
-
-### Iteration 2
-
-- Evidence: `.design-qa/overview-implementation-final.png`, `.design-qa/overview-comparison-final.png`, and `.design-qa/overview-comparison-focus.png`.
-- Result: the earlier action-hierarchy mismatch is fixed. No P0/P1/P2 findings remain.
-
-## Browser verification
-
-- Primary interactions tested: 查看记忆库 → 记忆库; 场景与事件 → 场景与事件; 检查召回 → 召回与索引; 查看审计记录 → 审计记录; 刷新运行状态 → remains on 概览 after successful refresh.
-- Browser console errors/warnings after final reload and interaction pass: 0.
-- SillyTavern service and the deployed SS-Helper SDK, LLM, and Memory extensions loaded successfully.
-
-## Implementation checklist
-
-- [x] Preserve the existing workbench shell and theme tokens.
-- [x] Implement the selected status-brief overview.
-- [x] Connect every visible action to an existing workbench capability.
-- [x] Add desktop, tablet, and mobile layout rules.
-- [x] Add UI coverage for live overview data and navigation.
-- [x] Build, deploy, reload, test interactions, and check console output.
-- [x] Complete two-pass visual comparison.
+- `pnpm test`：41 个测试文件通过，1 个跳过；267 个测试通过，1 个跳过。
+- `pnpm typecheck`：通过。
+- `pnpm lint`：通过，legacy scan PASS。
+- `pnpm build`：通过。
+- 真实 SillyTavern 已成功加载 SDK、LLM、Memory 扩展并打开重设计页面；实机人物面板为 `#1d2024`、内容底为 `#121417`、边框为 `#34383f`，记忆库同步继承，无裁切或阻断性错误。
+- 无剩余 P0、P1、P2 视觉或交互问题。
 
 final result: passed

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildSummaryBatchPlans,
   buildSummaryBatches,
   getSummaryWaitingFloors,
   selectAutomaticSummaryWindow,
@@ -44,6 +45,7 @@ describe('Memory 总结策略', () => {
     }, { triggerIntervalFloors: 5, overlapFloors: 2 });
     expect(window).toMatchObject({ startFloor: 58, endFloor: 65, endMessageId: 'message:65' });
     expect(window?.sources.map((source) => source.floor)).toEqual([58, 59, 60, 61, 62, 63, 64, 65]);
+    expect(window?.writableSourceRefs).toEqual(['message:61', 'message:62', 'message:63', 'message:64', 'message:65']);
     expect(getSummaryWaitingFloors(messages, { completedFloor: 60, completedMessageId: 'message:60', updatedAt: 1 }, { triggerIntervalFloors: 5 })).toBe(0);
   });
 
@@ -60,6 +62,64 @@ describe('Memory 总结策略', () => {
     const charBatches = buildSummaryBatches(messages, { batchMode: 'chars', batchChars: 2_000, overlapFloors: 1 });
     expect(charBatches).toHaveLength(4);
     expect(charBatches[1]?.map((source) => source.floor)).toEqual([2, 3, 4]);
+  });
+
+  it('marks overlap as read-only while keeping current sources writable', () => {
+    const messages = Array.from({ length: 8 }, (_, index) => message(index + 1));
+    const plans = buildSummaryBatchPlans(messages, { batchMode: 'floors', batchFloors: 3, overlapFloors: 2 });
+
+    expect(plans.map((plan) => plan.sources.map((source) => source.id))).toEqual([
+      ['message:1', 'message:2', 'message:3'],
+      ['message:2', 'message:3', 'message:4', 'message:5', 'message:6'],
+      ['message:5', 'message:6', 'message:7', 'message:8'],
+    ]);
+    expect(plans.map((plan) => plan.writableSourceRefs)).toEqual([
+      ['message:1', 'message:2', 'message:3'],
+      ['message:4', 'message:5', 'message:6'],
+      ['message:7', 'message:8'],
+    ]);
+    expect(plans.map((plan) => plan.messageCount)).toEqual([3, 3, 2]);
+  });
+
+  it('applies an automatic-window write whitelist after splitting long messages', () => {
+    const sources = [
+      message(1, 'user', '旧'.repeat(2_500)),
+      message(2, 'assistant', '新'.repeat(2_500)),
+    ];
+    const plans = buildSummaryBatchPlans(
+      sources,
+      { batchMode: 'floors', batchFloors: 2, batchChars: 2_000 },
+      { writableSourceRefs: ['message:2'] },
+    );
+
+    expect(plans[0]?.sources.map((source) => source.id)).toEqual([
+      'message:1:summary-part:1',
+      'message:1:summary-part:2',
+      'message:2:summary-part:1',
+      'message:2:summary-part:2',
+    ]);
+    expect(plans[0]?.writableSourceRefs).toEqual([
+      'message:2:summary-part:1',
+      'message:2:summary-part:2',
+    ]);
+    expect(plans[0]?.messageCount).toBe(1);
+  });
+
+  it('folds leading read-only floors into the first writable automatic batch', () => {
+    const sources = Array.from({ length: 5 }, (_, index) => message(index + 1));
+    const plans = buildSummaryBatchPlans(
+      sources,
+      { batchMode: 'floors', batchFloors: 2, overlapFloors: 1 },
+      { writableSourceRefs: ['message:4', 'message:5'] },
+    );
+
+    expect(plans).toHaveLength(2);
+    expect(plans[0]?.sources.map((source) => source.id)).toEqual([
+      'message:1', 'message:2', 'message:3', 'message:4',
+    ]);
+    expect(plans[0]?.writableSourceRefs).toEqual(['message:4']);
+    expect(plans[1]?.sources.map((source) => source.id)).toEqual(['message:4', 'message:5']);
+    expect(plans[1]?.writableSourceRefs).toEqual(['message:5']);
   });
 
   it('keeps a split long message in its original chat floor', () => {

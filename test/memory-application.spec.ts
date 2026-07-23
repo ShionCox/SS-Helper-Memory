@@ -152,6 +152,46 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     app.stop();
   });
 
+  it('完整持久化每个业务设置键而不遗漏运行时链路输入', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    await app.start();
+    const settings = {
+      ...app.getSettings(),
+      enabled: false,
+      autoOrganize: false,
+      summaryBatchMode: 'chars' as const,
+      summaryBatchFloors: 7,
+      summaryBatchChars: 9_500,
+      summaryIntervalFloors: 9,
+      summaryOverlapFloors: 3,
+      maxRecallItems: 6,
+      promptMaxChars: 6_000,
+      answerMode: 'diagnostic' as const,
+      recallMode: 'lexical' as const,
+      rerankMode: 'off' as const,
+      preExtractReferenceEnabled: false,
+      preExtractReferenceItems: 4,
+      preExtractReferenceMode: 'lexical' as const,
+      preExtractReferenceMaxChars: 1_500,
+      graphEnabled: false,
+      graphLlmRelationEnabled: false,
+      graphMaxHops: 2 as const,
+      graphMaxEdges: 8,
+      chatMode: 'disabled' as const,
+    };
+
+    await app.saveSettings(settings);
+
+    const { chatMode: _chatMode, ...persistedSettings } = settings;
+    expect(Object.fromEntries([...repository.settings.entries()].filter(([key]) => key !== 'chatOverrides'))).toMatchObject(persistedSettings);
+    expect(repository.settings.get('chatOverrides')).toEqual({ '["character:c1","chat-a"]': false });
+    expect(app.getSettings()).toMatchObject(settings);
+    app.stop();
+  });
+
   it('工作区不可用时在进入 LLM Capture 前安全失败', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const repository = new FakeRepository();
@@ -217,6 +257,127 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     const messagesOnly = await app.getInitializationEstimate(['message']);
     expect(all.tokenHigh).toBeGreaterThan(messagesOnly.tokenHigh);
     expect(messagesOnly.messageCount).toBe(21);
+    app.stop();
+  });
+
+  it('多人物初始化实际消费总结批次、重叠、参考记忆和关系提取设置', async () => {
+    state.sources = Array.from({ length: 8 }, (_, index): SourceBlock => ({
+      ...message(index + 1),
+      floor: index + 1,
+      content: index === 0 ? '紫罗拥有银钥匙，正在守卫城门。' : `第 ${index + 1} 层继续讨论紫罗与银钥匙。`,
+    }));
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    await app.start();
+    await app.saveSettings({
+      ...app.getSettings(),
+      summaryBatchMode: 'floors',
+      summaryBatchFloors: 3,
+      summaryOverlapFloors: 1,
+      preExtractReferenceEnabled: true,
+      preExtractReferenceItems: 1,
+      preExtractReferenceMode: 'lexical',
+      preExtractReferenceMaxChars: 500,
+      graphEnabled: true,
+      graphLlmRelationEnabled: false,
+    });
+
+    const captureJobs: MemoryJob[] = [];
+    const baselineFact = fact('actor-baseline', '紫罗拥有银钥匙并负责守卫城门。');
+    const actorRepository = {
+      boundWorkspaceId: 'character:c1',
+      listFacts: vi.fn(async () => [structuredClone(baselineFact)]),
+      listTraces: vi.fn(async () => []),
+      upsertCaptureJob: vi.fn(async (job: MemoryJob) => {
+        const index = captureJobs.findIndex((item) => item.id === job.id);
+        if (index >= 0) captureJobs[index] = structuredClone(job);
+        else captureJobs.push(structuredClone(job));
+      }),
+      rollbackChangeSet: vi.fn(async () => undefined),
+      upsertDerived: vi.fn(async () => undefined),
+    };
+    const captureCalls: Array<{
+      sources: readonly SourceBlock[];
+      writableSourceRefs?: readonly string[];
+      existingMemoryContext?: readonly ExistingMemoryContextItem[];
+      graphLlmRelationEnabled?: boolean;
+    }> = [];
+    const actorCapture = {
+      capture: vi.fn(async (input: (typeof captureCalls)[number]) => {
+        captureCalls.push(structuredClone(input));
+        const now = Date.now();
+        return {
+          envelope: { workspaceId: 'character:c1', chatKey: 'chat-a', sourceRefs: input.sources.map((source) => source.id), actorCandidates: [], episodes: [], observations: [], facts: [], capturedAt: now },
+          owners: [],
+          pendingCandidates: [],
+          episodes: [],
+          observations: [],
+          facts: [],
+          traces: [],
+          sceneCast: { id: `scene:${captureCalls.length}`, workspaceId: 'character:c1', chatKey: 'chat-a', floor: Math.max(...input.sources.map((source) => source.floor ?? 0)), members: [], viewpointOwnerId: 'owner:unknown', speakerOwnerIds: [], presentOwnerIds: [], mentionedOwnerIds: [], createdAt: now },
+        };
+      }),
+    };
+    (app as unknown as { multiActorRepository: unknown }).multiActorRepository = actorRepository;
+    (app as unknown as { actorCapture: unknown }).actorCapture = actorCapture;
+    vi.spyOn(app, 'bindCurrentChat').mockResolvedValue();
+
+    await expect(app.getInitializationEstimate(['message'])).resolves.toMatchObject({ messageCount: 8, batchCount: 3 });
+    await app.initialize(['message']);
+
+    expect(captureCalls).toHaveLength(3);
+    expect(captureCalls.map((call) => call.sources.map((source) => source.id))).toEqual([
+      ['message:1', 'message:2', 'message:3'],
+      ['message:3', 'message:4', 'message:5', 'message:6'],
+      ['message:6', 'message:7', 'message:8'],
+    ]);
+    expect(captureCalls.map((call) => call.writableSourceRefs)).toEqual([
+      ['message:1', 'message:2', 'message:3'],
+      ['message:4', 'message:5', 'message:6'],
+      ['message:7', 'message:8'],
+    ]);
+    expect(captureCalls.every((call) => call.graphLlmRelationEnabled === false)).toBe(true);
+    expect(captureCalls.every((call) => call.existingMemoryContext?.[0]?.content === baselineFact.content)).toBe(true);
+    expect(captureJobs.at(-1)).toMatchObject({
+      status: 'completed',
+      checkpoint: { batchIndex: 3, totalBatches: 3, processedCount: 8 },
+    });
+    expect(repository.settings.get('summaryProgressByChat')).toMatchObject({
+      'chat-a': { completedFloor: 8, completedMessageId: 'message:8' },
+    });
+
+    await app.saveSettings({ ...app.getSettings(), summaryIntervalFloors: 2 });
+    state.sources.push(...Array.from({ length: 2 }, (_, index): SourceBlock => ({
+      ...message(index + 9),
+      floor: index + 9,
+      content: `第 ${index + 9} 层继续讨论紫罗与银钥匙。`,
+    })));
+    await app.capture.flush();
+    expect(captureCalls).toHaveLength(3);
+    state.sources.push({
+      ...message(11),
+      floor: 11,
+      content: '第 11 层继续讨论紫罗与银钥匙。',
+    });
+    await app.capture.flush();
+
+    expect(captureCalls.slice(3).map((call) => ({
+      sources: call.sources.map((source) => source.id),
+      writable: call.writableSourceRefs,
+    }))).toEqual([
+      { sources: ['message:7', 'message:8', 'message:9'], writable: ['message:9'] },
+      { sources: ['message:9', 'message:10'], writable: ['message:10'] },
+    ]);
+    expect(captureJobs.at(-1)).toMatchObject({
+      type: 'incremental',
+      status: 'completed',
+      checkpoint: { batchIndex: 2, totalBatches: 2, processedCount: 2 },
+    });
+    expect(repository.settings.get('summaryProgressByChat')).toMatchObject({
+      'chat-a': { completedFloor: 10, completedMessageId: 'message:10' },
+    });
     app.stop();
   });
 

@@ -1,6 +1,6 @@
-import { createCanonicalKey, createFactSlotKey, decideFactReconciliation, normalizeFactContent, type MemoryFact, type MemoryEpisode, type MemoryObservation } from '../../domain';
+import { createCanonicalKey, createFactSlotKey, decideFactReconciliation, normalizeFactContent, type AutomaticIngestRejection, type AutomaticProposalErrorCode, type MemoryFact, type MemoryEpisode, type MemoryObservation } from '../../domain';
 import { FIXED_OWNER_IDS, type ActorCandidate, type CaptureEnvelope, type MemoryKnowledgeMode, type MemoryOwner, type MemoryPrivacy } from '../../domain';
-import type { SourceBlock, StructuredCaptureResult } from '../ingest/types';
+import type { ExistingMemoryContextItem, SourceBlock, StructuredCaptureResult } from '../ingest/types';
 import { filterSourceBlocks } from '../ingest/source-blocks';
 import type { StructuredMemoryCaptureExtractor } from '../ingest/llm-extractor';
 import { ActiveCastResolver } from './active-cast-resolver';
@@ -28,7 +28,26 @@ export interface MultiActorCaptureResult {
   readonly traces: readonly import('../../domain').ActorMemoryTrace[];
   readonly sceneCast: import('../../domain').SceneCast;
   readonly audit?: import('../ingest/types').MemoryExtractionAudit;
+  readonly outcome: 'complete' | 'partial';
+  readonly rejections: readonly AutomaticIngestRejection[];
+  readonly acceptedLocalIds: Readonly<Record<'actor' | 'episode' | 'observation' | 'fact', readonly string[]>>;
   readonly changeAudit?: import('../../infrastructure').ChangeAudit;
+}
+
+export interface MultiActorCaptureInput {
+  readonly workspaceId: string;
+  readonly chatKey: string;
+  readonly sources: readonly SourceBlock[];
+  /** Sources omitted from this set remain prompt context, but cannot create records. */
+  readonly writableSourceRefs?: readonly string[];
+  readonly existingMemoryContext?: readonly ExistingMemoryContextItem[];
+  readonly graphLlmRelationEnabled?: boolean;
+  readonly currentFloor?: number;
+  readonly sceneEpoch?: string;
+  readonly includeInvisibleHistory?: boolean;
+  readonly captureJobId?: string;
+  readonly idempotencyKey?: string;
+  readonly repairRequest?: import('../ingest/types').CaptureRepairRequest;
 }
 
 /** Coordinates the single Capture call and the atomic knowledge projection. */
@@ -90,7 +109,7 @@ export class MultiActorCaptureService {
     }
   }
 
-  async capture(input: { readonly workspaceId: string; readonly chatKey: string; readonly sources: readonly SourceBlock[]; readonly currentFloor?: number; readonly sceneEpoch?: string; readonly includeInvisibleHistory?: boolean; readonly captureJobId?: string }): Promise<MultiActorCaptureResult> {
+  async capture(input: MultiActorCaptureInput): Promise<MultiActorCaptureResult> {
     // Workspace record IDs use the SDK v0 safe alphabet. Chat keys are host
     // provenance and commonly contain spaces, CJK text, `@`, `/`, or other
     // filename characters, so never interpolate the raw key into a record ID.
@@ -99,10 +118,23 @@ export class MultiActorCaptureService {
       input.sources.filter(source => source.chatKey === input.chatKey && source.content.trim()),
       { includeInvisibleHistory: input.includeInvisibleHistory === true },
     );
-    this.discoverFromSources(sources);
+    const sourceIds = new Set(sources.map((source) => source.id));
+    const writableSourceRefs = new Set(
+      input.writableSourceRefs === undefined
+        ? sourceIds
+        : input.writableSourceRefs.filter((sourceRef) => sourceIds.has(sourceRef)),
+    );
+    const isWritableSource = (sourceRef: string): boolean => writableSourceRefs.has(sourceRef);
+    this.discoverFromSources(sources.filter((source) => isWritableSource(source.id)));
     let structured: StructuredCaptureResult;
     try {
-      structured = await this.extractor.extract({ chatKey: input.chatKey, sources });
+      structured = await this.extractor.extract({
+        chatKey: input.chatKey,
+        sources,
+        ...(input.existingMemoryContext === undefined ? {} : { existingMemoryContext: input.existingMemoryContext }),
+        ...(input.graphLlmRelationEnabled === undefined ? {} : { graphLlmRelationEnabled: input.graphLlmRelationEnabled }),
+        ...(input.repairRequest === undefined ? {} : { repairRequest: input.repairRequest }),
+      });
     } catch {
       // A structured Capture is the write authority for episodes,
       // observations and facts. Do not turn an unavailable/failed LLM request
@@ -110,18 +142,91 @@ export class MultiActorCaptureService {
       // safe failed job and retry without losing deterministic source scans.
       throw Object.assign(new Error('memory_capture 结构化请求不可用。'), { code: 'MEMORY_CAPTURE_LLM_UNAVAILABLE' });
     }
+    const rejections: AutomaticIngestRejection[] = [...(structured.rejections ?? [])];
+    const acceptedLocalIds: Record<'actor' | 'episode' | 'observation' | 'fact', string[]> = {
+      actor: [],
+      episode: [],
+      observation: [],
+      fact: [],
+    };
+    const snapshotKeys = new Set([
+      'localId', 'displayName', 'aliases', 'sourceRefs', 'evidenceExcerpts',
+      'sourceRef', 'episodeLocalId', 'speakerRef', 'viewpointRef', 'observerRefs',
+      'channel', 'privacy', 'knowledgeMode', 'excerpt', 'mentionedRefs', 'presentRefs',
+      'factRefs', 'kind', 'subjectKey', 'predicateKey', 'objectKey', 'content',
+      'entityKeys', 'ownerRefs', 'confidence', 'evidenceExcerpt',
+    ]);
+    const candidateSnapshot = (value: Record<string, unknown>): Record<string, unknown> => Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => snapshotKeys.has(key))
+        .map(([key, item]) => [key, typeof item === 'string' ? item.slice(0, 2_000) : structuredClone(item)]),
+    );
+    const reject = (
+      recordType: 'actor' | 'episode' | 'observation' | 'fact',
+      index: number,
+      code: AutomaticProposalErrorCode,
+      message: string,
+      fieldPath: string,
+      value: Record<string, unknown>,
+      allowedValues?: readonly string[],
+    ): void => {
+      const snapshot = candidateSnapshot(value);
+      const sourceRefs = [...new Set([
+        ...stringArray(value.sourceRefs),
+        ...(String(value.sourceRef ?? '').trim() ? [String(value.sourceRef).trim()] : []),
+      ])];
+      const rejectionId = `capture-rejection:${hash(`${input.captureJobId ?? input.chatKey}:${recordType}:${index}:${fieldPath}:${JSON.stringify(snapshot)}`)}`;
+      rejections.push({
+        id: rejectionId,
+        index,
+        code,
+        message,
+        recordType,
+        fieldPath,
+        sourceRefs,
+        ...(allowedValues ? { allowedValues: [...allowedValues] } : {}),
+        candidateSnapshot: snapshot,
+        status: 'unresolved',
+        repairAttempts: 0,
+      });
+    };
     const ownerByLocalId = new Map<string, string>();
-    for (const candidate of structured.actorCandidates) {
+    const acceptedActorCandidates: ActorCandidate[] = [];
+    for (const [index, value] of structured.actorCandidates.entries()) {
+      const candidate = {
+        localId: String(value.localId ?? `actor:${index}`).trim(),
+        displayName: String(value.displayName ?? '').trim(),
+        aliases: stringArray(value.aliases).slice(0, 12),
+        sourceRefs: stringArray(value.sourceRefs).slice(0, 16),
+        evidenceExcerpts: stringArray(value.evidenceExcerpts).slice(0, 8),
+        confidence: Math.max(0, Math.min(1, numberValue(value.confidence, 0.5))),
+        status: value.status === 'confirmed' || value.status === 'unknown' ? value.status : 'pending',
+      } satisfies ActorCandidate;
+      if (!candidate.displayName || !candidate.localId) {
+        reject('actor', index, 'invalid_shape', '人物缺少 localId 或 displayName。', !candidate.localId ? 'localId' : 'displayName', value);
+        continue;
+      }
       const candidateSources = candidate.sourceRefs.map(ref => sources.find(source => source.id === ref)).filter((source): source is SourceBlock => Boolean(source));
       const sourceRefsValid = candidate.sourceRefs.length > 0 && candidate.sourceRefs.every(ref => sources.some(source => source.id === ref));
       const excerptsValid = candidate.evidenceExcerpts.length > 0
         && candidate.evidenceExcerpts.every(excerpt => candidateSources.some(source => source.content.includes(excerpt)));
-      if (!sourceRefsValid || !excerptsValid) {
+      if (!sourceRefsValid || !excerptsValid || !candidate.sourceRefs.some(isWritableSource)) {
         // A model-provided identity without source evidence remains isolated as
         // unknown; it must never silently become a confirmed actor.
         ownerByLocalId.set(candidate.localId, FIXED_OWNER_IDS.unknown);
+        reject(
+          'actor',
+          index,
+          !sourceRefsValid ? 'invalid_reference' : 'excerpt_mismatch',
+          !sourceRefsValid ? '人物引用了不存在或不可写的来源。' : '人物证据未逐字出现在对应来源中。',
+          !sourceRefsValid ? 'sourceRefs' : 'evidenceExcerpts',
+          value,
+          !sourceRefsValid ? [...writableSourceRefs] : undefined,
+        );
         continue;
       }
+      acceptedActorCandidates.push(candidate);
+      acceptedLocalIds.actor.push(candidate.localId);
       const sourceType = candidateSources.some(source => source.kind === 'host_card')
         ? 'host_card'
         : candidateSources.some(source => source.kind === 'worldbook') ? 'worldbook' : 'message';
@@ -150,29 +255,70 @@ export class MultiActorCaptureService {
       // Local references are part of the structured Capture contract. Do not
       // silently drop an invalid ref and attach the episode to an unrelated
       // source; quarantine the whole malformed episode instead.
-      if (sourceRefs.length === 0 || sourceRefs.length !== declaredSourceRefs.length) continue;
-      const localId = String(row.localId ?? index);
+      if (sourceRefs.length === 0 || sourceRefs.length !== declaredSourceRefs.length || !sourceRefs.some(isWritableSource)) {
+        reject('episode', index, 'invalid_reference', '事件引用了不存在或不可写的来源。', 'sourceRefs', row, [...writableSourceRefs]);
+        continue;
+      }
+      const localId = String(row.localId ?? '').trim();
+      if (!localId) {
+        reject('episode', index, 'invalid_shape', '事件缺少 localId。', 'localId', row);
+        continue;
+      }
       const id = `episode:${encodedChatKey}:${localId}:${hash(sourceRefs.join('|'))}`;
       const floorStart = numberValue(row.floorStart, Math.min(...sourceRefs.map(ref => sources.find(source => source.id === ref)?.floor ?? 0)));
       const floorEnd = numberValue(row.floorEnd, Math.max(...sourceRefs.map(ref => sources.find(source => source.id === ref)?.floor ?? floorStart)));
       const episode: MemoryEpisode = { id, workspaceId: input.workspaceId, chatKey: input.chatKey, floorStart, floorEnd, sourceRefs, participantIds: stringArray(row.participantRefs ?? row.participantIds).map(ref => resolveOwner(ref)), presentOwnerIds: stringArray(row.presentRefs ?? row.presentOwnerIds).map(ref => resolveOwner(ref)), mentionedOwnerIds: stringArray(row.mentionedRefs ?? row.mentionedOwnerIds).map(ref => resolveOwner(ref)), ...(String(row.location ?? '').trim() ? { location: String(row.location).trim() } : {}), occurredAt: numberValue(row.occurredAt, Date.now()), ...(String(row.summary ?? '').trim() ? { summary: String(row.summary).trim() } : {}), createdAt: Date.now() };
       episodeEntries.push({ localId, episode });
+      acceptedLocalIds.episode.push(localId);
     }
     const episodes = episodeEntries.map(entry => entry.episode);
     const episodeByLocalId = new Map(episodeEntries.map(entry => [entry.localId, entry.episode.id]));
+    const existingEpisodes = input.repairRequest?.recordType === 'observation' && this.repository
+      ? await this.repository.listEpisodes()
+      : [];
     const observationLocalIdById = new Map<string, string>();
     const observations: MemoryObservation[] = structured.observations.flatMap((value, index) => {
       const row = value as Record<string, unknown>;
       const sourceRef = String(row.sourceRef ?? stringArray(row.sourceRefs)[0] ?? '').trim();
       const source = sources.find(item => item.id === sourceRef);
-      if (!source) return [];
+      if (!source || !isWritableSource(sourceRef)) {
+        reject('observation', index, 'invalid_reference', '观察引用了不存在或不可写的来源。', 'sourceRef', row, [...writableSourceRefs]);
+        return [];
+      }
       const declaredEpisodeRef = String(row.episodeLocalId ?? row.episodeId ?? '').trim();
       const episodeId = (declaredEpisodeRef ? episodeByLocalId.get(declaredEpisodeRef) : undefined)
-        ?? (!declaredEpisodeRef ? episodes.find(episode => episode.sourceRefs.includes(sourceRef))?.id : undefined);
-      if (!episodeId) return [];
+        ?? (declaredEpisodeRef ? existingEpisodes.find(episode => episode.id === declaredEpisodeRef)?.id : undefined)
+        ?? ((!declaredEpisodeRef || input.repairRequest?.recordType === 'observation')
+          ? [...episodes, ...existingEpisodes].find(episode => episode.sourceRefs.includes(sourceRef))?.id
+          : undefined);
+      if (!episodeId) {
+        reject('observation', index, 'dependency_invalid', '观察引用的事件不存在或未通过校验。', 'episodeLocalId', row);
+        return [];
+      }
       const rawExcerpt = String(row.excerpt ?? '').trim();
-      if (rawExcerpt && !source.content.includes(rawExcerpt)) return [];
-      const channel = ['public_speech', 'private_thought', 'narration', 'worldbook', 'state', 'rumor', 'inference'].includes(String(row.channel)) ? String(row.channel) as MemoryObservation['channel'] : source.kind === 'worldbook' ? 'worldbook' : source.kind === 'state' ? 'state' : source.author?.kind === 'narrator' ? 'narration' : 'public_speech';
+      if (!rawExcerpt || !source.content.includes(rawExcerpt)) {
+        reject('observation', index, 'excerpt_mismatch', '观察证据必须逐字出现在对应来源中。', 'excerpt', row);
+        return [];
+      }
+      const allowedChannels: MemoryObservation['channel'][] = ['public_speech', 'private_thought', 'narration', 'worldbook', 'state', 'rumor', 'inference'];
+      const channelValue = String(row.channel ?? '').trim();
+      if (!allowedChannels.includes(channelValue as MemoryObservation['channel'])) {
+        reject('observation', index, 'invalid_enum', '观察 channel 不在允许范围内。', 'channel', row, allowedChannels);
+        return [];
+      }
+      const channel = channelValue as MemoryObservation['channel'];
+      const allowedPrivacy: MemoryPrivacy[] = ['public', 'limited', 'private', 'secret'];
+      const privacyValue = String(row.privacy ?? '').trim();
+      if (privacyValue && !allowedPrivacy.includes(privacyValue as MemoryPrivacy)) {
+        reject('observation', index, 'invalid_enum', '观察 privacy 不在允许范围内。', 'privacy', row, allowedPrivacy);
+        return [];
+      }
+      const allowedKnowledgeModes: MemoryKnowledgeMode[] = ['asserted', 'self_reported', 'heard', 'experienced', 'inferred', 'believed', 'suspected', 'unknown'];
+      const knowledgeModeValue = String(row.knowledgeMode ?? '').trim();
+      if (knowledgeModeValue && !allowedKnowledgeModes.includes(knowledgeModeValue as MemoryKnowledgeMode)) {
+        reject('observation', index, 'invalid_enum', '观察 knowledgeMode 不在允许范围内。', 'knowledgeMode', row, allowedKnowledgeModes);
+        return [];
+      }
       const hostSpeakerRef = source.author?.kind === 'user'
         ? 'player'
         : source.author?.kind === 'narrator'
@@ -189,6 +335,7 @@ export class MultiActorCaptureService {
       const localId = String(row.localId ?? index);
       const observationId = `observation:${encodedChatKey}:${localId}:${hash(sourceRef)}`;
       observationLocalIdById.set(observationId, localId);
+      acceptedLocalIds.observation.push(localId);
       return [{ id: observationId, workspaceId: input.workspaceId, episodeId, sourceRef, speakerOwnerId, viewpointOwnerId, observerOwnerIds: [...new Set(observerOwnerIds)], channel, privacy: privacy(row.privacy, channel === 'private_thought' ? 'private' : 'public'), knowledgeMode: knowledgeMode(row.knowledgeMode, channel === 'rumor' ? 'believed' : channel === 'public_speech' ? 'self_reported' : 'experienced'), excerpt: (rawExcerpt || source.content).slice(0, 2_000), mentionedOwnerIds: stringArray(row.mentionedRefs ?? row.mentionedOwnerIds).map(ref => resolveOwner(ref, source)), presentOwnerIds: [...new Set(presentOwnerIds)], factLocalIds: stringArray(row.factLocalIds ?? row.factRefs), occurredAt: numberValue(row.occurredAt, source.createdAt), createdAt: Date.now() }];
     });
     const factEntries: Array<{
@@ -217,12 +364,26 @@ export class MultiActorCaptureService {
       const factSources = factSourceRefs
         .map(ref => sources.find(item => item.id === ref))
         .filter((item): item is SourceBlock => Boolean(item));
-      const source = factSources[0];
+      const source = sources.find(item => item.id === sourceRef);
       const evidenceExcerpt = String(row.evidenceExcerpt ?? '').trim();
-      if (content.length < 6 || content.length > 240 || !source || factSourceRefs.length === 0 || !factSourceRefs.includes(sourceRef) || factSourceRefs.some(ref => !sources.some(item => item.id === ref)) || !evidenceExcerpt || !source.content.includes(evidenceExcerpt)) continue;
+      if (content.length < 6 || content.length > 240) {
+        reject('fact', index, 'invalid_shape', '事实 content 长度必须为 6 到 240 个字符。', 'content', row);
+        continue;
+      }
+      if (!source || !isWritableSource(sourceRef) || factSourceRefs.length === 0 || !factSourceRefs.includes(sourceRef) || factSourceRefs.some(ref => !sources.some(item => item.id === ref))) {
+        reject('fact', index, 'invalid_reference', '事实引用了不存在或不可写的来源。', 'sourceRefs', row, [...writableSourceRefs]);
+        continue;
+      }
+      if (!evidenceExcerpt || !source.content.includes(evidenceExcerpt)) {
+        reject('fact', index, 'excerpt_mismatch', '事实证据必须逐字出现在对应来源中。', 'evidenceExcerpt', row);
+        continue;
+      }
       const subjectKey = String(row.subjectKey ?? '').trim();
       const predicateKey = String(row.predicateKey ?? '').trim();
-      if (!subjectKey || !predicateKey) continue;
+      if (!subjectKey || !predicateKey) {
+        reject('fact', index, 'invalid_shape', '事实缺少 subjectKey 或 predicateKey。', !subjectKey ? 'subjectKey' : 'predicateKey', row);
+        continue;
+      }
       const objectKey = String(row.objectKey ?? '').trim() || undefined;
       const canonicalKey = createCanonicalKey(subjectKey, predicateKey, objectKey);
       // Keep repeated captures of the same evidence idempotent, while giving a
@@ -239,8 +400,12 @@ export class MultiActorCaptureService {
         ...(objectEntityId ? [objectEntityId] : []),
       ])];
       const status = numberValue(row.confidence, 0) >= 0.75 ? 'active' : 'pending';
-      const kindValue = String(row.kind ?? 'other') as MemoryFact['kind'];
-      const fact: MemoryFact = { id, chatKey: input.chatKey, kind: factKinds.has(kindValue) ? kindValue : 'other', subjectKey, ...(subjectEntityId ? { subjectEntityId } : {}), predicateKey, ...(objectKey ? { objectKey } : {}), ...(objectEntityId ? { objectEntityId } : {}), canonicalKey, slotKey: createFactSlotKey(subjectKey, predicateKey), content, entityKeys, confidence: Math.max(0, Math.min(1, numberValue(row.confidence, 0.5))), status, sourceRefs: [...factSourceRefs], evidenceIds: [`evidence:${id}:${hash(evidenceExcerpt)}`], freshestEvidenceAt: Math.max(...factSources.map(item => item.createdAt)), ...(source.kind === 'host_card' || source.kind === 'worldbook' || source.kind === 'state' ? { scope: { hostCardKeys: source.kind === 'host_card' ? [source.id] : undefined, worldKeys: source.entityKeys?.length ? [...source.entityKeys] : [source.id] } } : {}), origin: 'automatic', revision: 1, createdAt: Date.now(), updatedAt: Date.now() };
+      const kindValue = String(row.kind ?? '').trim() as MemoryFact['kind'];
+      if (!factKinds.has(kindValue)) {
+        reject('fact', index, 'invalid_enum', '事实 kind 不在允许范围内；只有模型明确输出 other 时才接受 other。', 'kind', row, [...factKinds]);
+        continue;
+      }
+      const fact: MemoryFact = { id, chatKey: input.chatKey, kind: kindValue, subjectKey, ...(subjectEntityId ? { subjectEntityId } : {}), predicateKey, ...(objectKey ? { objectKey } : {}), ...(objectEntityId ? { objectEntityId } : {}), canonicalKey, slotKey: createFactSlotKey(subjectKey, predicateKey), content, entityKeys, confidence: Math.max(0, Math.min(1, numberValue(row.confidence, 0.5))), status, sourceRefs: [...factSourceRefs], evidenceIds: [`evidence:${id}:${hash(evidenceExcerpt)}`], freshestEvidenceAt: Math.max(...factSources.map(item => item.createdAt)), ...(source.kind === 'host_card' || source.kind === 'worldbook' || source.kind === 'state' ? { scope: { hostCardKeys: source.kind === 'host_card' ? [source.id] : undefined, worldKeys: source.entityKeys?.length ? [...source.entityKeys] : [source.id] } } : {}), origin: 'automatic', revision: 1, createdAt: Date.now(), updatedAt: Date.now() };
       const localId = String(row.localId ?? index);
       const validFrom = Number(row.validFrom);
       const validUntil = Number(row.validUntil);
@@ -261,6 +426,7 @@ export class MultiActorCaptureService {
           ...(typeof row.stableAnchor === 'boolean' ? { stableAnchor: row.stableAnchor } : {}),
         },
       });
+      acceptedLocalIds.fact.push(localId);
     }
     // Reconcile against the v0 fact set before projection. Duplicate source
     // evidence is appended to the existing canonical fact; a newer confident
@@ -278,6 +444,14 @@ export class MultiActorCaptureService {
       const decision = decideFactReconciliation(existing, entry.fact);
       if (decision === 'duplicate' && existing) {
         const evidenceId = `evidence:${existing.id}:${hash(entry.evidenceExcerpt)}`;
+        const evidenceAlreadyStored = existing.evidenceIds.includes(evidenceId)
+          && entry.fact.sourceRefs.every((sourceRef) => existing.sourceRefs.includes(sourceRef));
+        if (evidenceAlreadyStored) {
+          // Retry and overlap context are idempotent: keep local links valid,
+          // but do not create a revision, evidence row, or ChangeSet entry.
+          localFactIds.set(entry.localId, existing.id);
+          continue;
+        }
         const merged: MemoryFact = {
           ...existing,
           sourceRefs: [...new Set([...existing.sourceRefs, ...entry.fact.sourceRefs])],
@@ -312,7 +486,13 @@ export class MultiActorCaptureService {
     }
     const facts = [...new Map(reconciledFacts.map(fact => [fact.id, fact])).values()];
     const factByLocalId = localFactIds;
-    const linkedObservations = observations.map(observation => ({ ...observation, factLocalIds: observation.factLocalIds.map(ref => factByLocalId.get(ref) ?? ref).filter(ref => facts.some(fact => fact.id === ref)) }));
+    const existingFactIds = new Set(existingFacts.map((fact) => fact.id));
+    const linkedObservations = observations.map(observation => ({
+      ...observation,
+      factLocalIds: observation.factLocalIds
+        .map(ref => factByLocalId.get(ref) ?? ref)
+        .filter(ref => facts.some(fact => fact.id === ref) || existingFactIds.has(ref)),
+    }));
     const projection = this.projector.project({ workspaceId: input.workspaceId, facts, episodes, observations: linkedObservations, owners: this.registry.listOwners() });
     const cast = new ActiveCastResolver(this.registry).resolve(sources, { currentFloor: input.currentFloor, sceneEpoch: input.sceneEpoch }).scene;
     const evidenceByFactId = evidenceExcerptByFactId;
@@ -320,7 +500,7 @@ export class MultiActorCaptureService {
       workspaceId: input.workspaceId,
       chatKey: input.chatKey,
       sourceRefs: sources.map(source => source.id),
-      actorCandidates: structured.actorCandidates.map(candidate => ({ ...candidate, sourceRefs: candidate.sourceRefs, evidenceExcerpts: candidate.evidenceExcerpts })),
+      actorCandidates: acceptedActorCandidates.map(candidate => ({ ...candidate, sourceRefs: candidate.sourceRefs, evidenceExcerpts: candidate.evidenceExcerpts })),
       episodes: episodeEntries.map(entry => ({ ...entry.episode, localId: entry.localId })),
       observations: linkedObservations.map(observation => ({ ...observation, ...(observationLocalIdById.get(observation.id) ? { localId: observationLocalIdById.get(observation.id) } : {}) })),
       facts: facts.map(fact => {
@@ -347,10 +527,14 @@ export class MultiActorCaptureService {
       }),
       capturedAt: Date.now(),
     };
+    const outcome = rejections.some(item => (item.status ?? 'unresolved') === 'unresolved') ? 'partial' as const : 'complete' as const;
     let changeAudit: import('../../infrastructure').ChangeAudit | undefined;
     if (this.repository) changeAudit = await this.repository.commitCapture({
       envelope,
       ...(input.captureJobId ? { captureJobId: input.captureJobId } : {}),
+      ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      outcome,
+      rejections,
       owners: this.registry.listOwners(),
       aliases: this.registry.listAliases(),
       pendingCandidates: this.registry.listPending(),
@@ -366,6 +550,6 @@ export class MultiActorCaptureService {
       traces: projection.traces,
       sceneCasts: [cast],
     });
-    return { envelope, owners: this.registry.listOwners(), pendingCandidates: this.registry.listPending(), episodes, observations: linkedObservations, facts, traces: projection.traces, sceneCast: cast, audit: structured.audit, ...(changeAudit ? { changeAudit } : {}) };
+    return { envelope, owners: this.registry.listOwners(), pendingCandidates: this.registry.listPending(), episodes, observations: linkedObservations, facts, traces: projection.traces, sceneCast: cast, audit: structured.audit, outcome, rejections, acceptedLocalIds, ...(changeAudit ? { changeAudit } : {}) };
   }
 }

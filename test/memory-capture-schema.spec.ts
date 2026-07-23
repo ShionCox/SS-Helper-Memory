@@ -45,9 +45,7 @@ describe('structured capture schema', () => {
     const input: MemoryExtractionInput = { chatKey: source.chatKey, sources: [source] };
     const result = await new StructuredMemoryCaptureExtractor(() => llm).extract(input);
     const factSchema = (schema?.properties as Record<string, unknown> | undefined)?.facts as Record<string, unknown>;
-    const itemSchema = factSchema.items as Record<string, unknown>;
-    const properties = itemSchema.properties as Record<string, unknown>;
-    expect((properties.kind as { enum?: string[] }).enum).toContain('capability');
+    expect(factSchema).toMatchObject({ type: 'array', maxItems: 24, items: { type: 'object' } });
     expect(result.facts[0]?.kind).toBe('capability');
   });
 });

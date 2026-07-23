@@ -165,6 +165,7 @@ export interface MemoryEvidence {
 
 export type MemoryJobType = 'initialize' | 'incremental';
 export type MemoryJobStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed';
+export type MemoryJobOutcome = 'complete' | 'partial';
 export type MemoryInitializationPhase = 'capture';
 
 export interface MemoryJobCheckpoint {
@@ -189,6 +190,9 @@ export interface MemoryJob {
   chatKey: string;
   type: MemoryJobType;
   status: MemoryJobStatus;
+  outcome?: MemoryJobOutcome;
+  rejectionCount?: number;
+  rejections?: readonly AutomaticIngestRejection[];
   checkpoint: MemoryJobCheckpoint;
   error?: string;
   createdAt: number;
@@ -213,6 +217,7 @@ export interface MemoryJobBatchAudit {
   sourceRefs: string[];
   accepted: number;
   rejected: number;
+  outcome?: MemoryJobOutcome;
   duplicated: number;
   pending: number;
   superseded: number;
@@ -312,9 +317,22 @@ export interface MemoryRecallLog {
 }
 
 export interface AutomaticIngestRejection {
+  /** Stable within a Capture batch; older audit rows may omit it. */
+  id?: string;
   index: number;
   code: AutomaticProposalErrorCode;
   message: string;
+  recordType?: 'batch' | 'actor' | 'episode' | 'observation' | 'fact';
+  fieldPath?: string;
+  sourceRefs?: string[];
+  allowedValues?: string[];
+  /** Only known Capture fields are retained; no prompt/provider payloads. */
+  candidateSnapshot?: Record<string, unknown>;
+  status?: 'unresolved' | 'repairing' | 'repaired' | 'ignored';
+  repairAttempts?: number;
+  lastAttemptAt?: number;
+  repairedAt?: number;
+  ignoredAt?: number;
 }
 
 export interface AutomaticIngestResult {
@@ -328,6 +346,11 @@ export interface AutomaticIngestResult {
 
 export type AutomaticProposalErrorCode =
   | 'invalid_shape'
+  | 'invalid_enum'
+  | 'invalid_reference'
+  | 'dependency_invalid'
+  | 'unknown_field'
+  | 'batch_invalid_json'
   | 'content_length'
   | 'invalid_confidence'
   | 'missing_evidence'

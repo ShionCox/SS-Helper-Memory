@@ -5,6 +5,7 @@ import {
   normalizeActorName,
   type ActorAlias,
   type ActorCandidate,
+  type ActorCandidateResolution,
   type ActorDiscoverySource,
   type MemoryTraits,
   type MemoryOwner,
@@ -330,18 +331,42 @@ export class ActorRegistry {
     });
   }
 
-  confirm(candidateId: string, canonicalName?: string): MemoryOwner | undefined {
+  confirm(candidateId: string, resolution?: ActorCandidateResolution): MemoryOwner | undefined {
     const pending = this.pending.get(candidateId);
     if (!pending) return undefined;
     const before = this.snapshot();
-    let owner = pending.ownerRef ? this.ownersById.get(pending.ownerRef) : this.resolveMention(pending.displayName)?.owner;
+    let owner: MemoryOwner | undefined;
+    if (resolution?.mode === 'existing') {
+      owner = this.ownersById.get(resolution.ownerId);
+      if (!owner || owner.kind !== 'actor' || owner.mergedIntoId) throw new Error('待确认人物的归属目标不存在。');
+    } else if (resolution?.mode === 'new') {
+      const canonicalName = resolution.canonicalName.trim();
+      if (!canonicalName) throw new Error('新人物名称不能为空。');
+      const normalizedCanonical = normalizeActorName(canonicalName);
+      const duplicate = this.listOwners().some(candidate =>
+        candidate.kind === 'actor'
+        && !candidate.mergedIntoId
+        && normalizeActorName(ownerName(candidate)) === normalizedCanonical);
+      if (duplicate) throw new Error('该人物名称已存在，请改为归入已有人物。');
+      const created = this.discover({
+        displayName: canonicalName,
+        aliases: [pending.displayName, ...(pending.aliases ?? [])],
+        sourceRef: pending.sourceRefs[0] ?? `manual:${candidateId}`,
+        sourceType: 'manual',
+        excerpt: pending.evidenceExcerpts[0],
+        confidence: Math.max(pending.confidence, 0.8),
+        confirmed: true,
+      });
+      owner = created.owner;
+    } else {
+      owner = pending.ownerRef ? this.ownersById.get(pending.ownerRef) : this.resolveMention(pending.displayName)?.owner;
+    }
     // A low-confidence prompt candidate intentionally has no ownerRef. An
     // explicit user confirmation must be able to create its actor rather than
     // failing because there was no safe automatic owner to attach to.
     if (!owner) {
-      const displayName = canonicalName?.trim() || pending.displayName;
       const created = this.discover({
-        displayName,
+        displayName: pending.displayName,
         aliases: [pending.displayName, ...(pending.aliases ?? [])],
         sourceRef: pending.sourceRefs[0] ?? `manual:${candidateId}`,
         sourceType: 'manual',
@@ -352,7 +377,30 @@ export class ActorRegistry {
       owner = created.owner;
     }
     if (owner.kind !== 'actor') return undefined;
-    const updated = this.updateOwner(owner, { status: 'confirmed', ...(canonicalName ? { displayName: canonicalName, canonicalName } : {}), confidence: Math.max(owner.confidence, pending.confidence) });
+    const updated = this.updateOwner(owner, { status: 'confirmed', confidence: Math.max(owner.confidence, pending.confidence) });
+    const aliasValues = [...new Set([pending.displayName, ...(pending.aliases ?? [])].map(value => value.trim()).filter(Boolean))];
+    for (const aliasValue of aliasValues) {
+      const normalizedValue = normalizeActorName(aliasValue);
+      for (const [aliasId, alias] of this.aliasesById.entries()) {
+        if (alias.ownerId === updated.id || alias.normalizedValue !== normalizedValue) continue;
+        const previousOwner = this.ownersById.get(alias.ownerId);
+        if (previousOwner) {
+          this.updateOwner(previousOwner, {
+            aliases: previousOwner.aliases.filter(value => normalizeActorName(value) !== normalizedValue),
+          });
+        }
+        this.aliasesById.delete(aliasId);
+      }
+      this.addAlias(
+        this.ownersById.get(updated.id)!,
+        aliasValue,
+        pending.sourceRefs[0] ?? `manual:${candidateId}`,
+        pending.confidence,
+        'confirmed',
+        'manual',
+      );
+    }
+    this.rebuildAliasIndex();
     // A pending candidate's aliases are intentionally excluded from automatic
     // matching. Once the user confirms it, promote those same evidence-backed
     // aliases in the same in-memory operation so the next Capture can resolve

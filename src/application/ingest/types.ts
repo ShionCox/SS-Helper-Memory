@@ -40,7 +40,7 @@ export interface SourceBlock {
   sceneRefs?: string[];
 }
 
-export type FactKind = 'identity' | 'relationship' | 'location' | 'world_rule' | 'state' | 'goal' | 'commitment' | 'event' | 'preference' | 'capability';
+export type FactKind = 'identity' | 'relationship' | 'location' | 'world_rule' | 'state' | 'goal' | 'commitment' | 'event' | 'preference' | 'capability' | 'other';
 
 export interface ExtractedFactProposal {
   kind: FactKind;
@@ -109,19 +109,28 @@ export interface MemoryExtractionResult {
 
 /** One-call structured capture output. All refs are local to the request. */
 export interface StructuredCaptureResult {
-  actorCandidates: Array<{
-    localId: string;
-    displayName: string;
-    aliases?: string[];
-    sourceRefs: string[];
-    evidenceExcerpts: string[];
-    confidence: number;
-    status?: 'confirmed' | 'pending' | 'unknown';
-  }>;
+  actorCandidates: Array<Record<string, unknown>>;
   episodes: Array<Record<string, unknown>>;
   observations: Array<Record<string, unknown>>;
   facts: Array<Record<string, unknown>>;
+  rejections?: AutomaticIngestRejection[];
+  diagnostics?: {
+    parser?: string;
+    deterministicRepairs?: number;
+  };
   audit?: MemoryExtractionAudit;
+}
+
+export interface CaptureRepairRequest {
+  recordType: 'actor' | 'episode' | 'observation' | 'fact';
+  items: Array<{
+    rejectionId: string;
+    localId: string;
+    code: string;
+    fieldPath?: string;
+    message: string;
+    candidateSnapshot?: Record<string, unknown>;
+  }>;
 }
 
 /**
@@ -149,6 +158,8 @@ export interface MemoryExtractionInput {
   existingMemoryContext?: readonly ExistingMemoryContextItem[];
   /** Enables source-grounded relation-fact guidance in the existing single call. */
   graphLlmRelationEnabled?: boolean;
+  /** User-selected failed rows only; never used by automatic background Capture. */
+  repairRequest?: CaptureRepairRequest;
 }
 
 /** Validated extraction output that can either be staged or committed. */

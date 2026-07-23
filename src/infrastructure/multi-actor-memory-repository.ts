@@ -8,6 +8,7 @@ import {
   type ActorAlias,
   type ActorCandidate,
   type ActorMemoryTrace,
+  type AutomaticIngestRejection,
   type CaptureEnvelope,
   type FactListOptions,
   type ManualFactInput,
@@ -51,6 +52,9 @@ interface CaptureCommit {
   readonly envelope: CaptureEnvelope;
   /** Existing v0 progress record to fold into the Capture ChangeSet. */
   readonly captureJobId?: string;
+  readonly idempotencyKey?: string;
+  readonly outcome?: 'complete' | 'partial';
+  readonly rejections?: readonly AutomaticIngestRejection[];
   readonly owners: readonly MemoryOwner[];
   readonly aliases: readonly ActorAlias[];
   readonly pendingCandidates?: readonly ActorCandidate[];
@@ -62,7 +66,7 @@ interface CaptureCommit {
   readonly sceneCasts?: readonly SceneCast[];
 }
 interface ChangeEntry { collection: string; recordId: string; before?: PlainData; after?: PlainData; }
-interface ChangeAudit { id: string; workspaceId: string; chatKey: string; kind: 'capture-change-set-v0' | 'derived-change-set-v0' | 'actor-registry-change-set-v0' | 'dream-change-set-v0'; createdAt: number; entries: readonly ChangeEntry[]; metadata?: PlainData; rolledBackAt?: number; }
+export interface ChangeAudit { id: string; workspaceId: string; chatKey: string; kind: 'capture-change-set-v0' | 'derived-change-set-v0' | 'actor-registry-change-set-v0' | 'dream-change-set-v0'; createdAt: number; entries: readonly ChangeEntry[]; metadata?: PlainData; rolledBackAt?: number; }
 
 function manualFactId(chatKey: string): string { return `fact:${encodeURIComponent(chatKey)}:manual:${crypto.randomUUID()}`; }
 function factHeadId(chatKey: string, slotKey: string): string { return `fact-head:${encodeURIComponent(chatKey)}:${encodeURIComponent(slotKey)}`; }
@@ -70,6 +74,11 @@ function factHeadId(chatKey: string, slotKey: string): string { return `fact-hea
 function asPlain(value: unknown): PlainData { return structuredClone(value) as PlainData; }
 function idOf(value: unknown): string { return String((value as { id?: unknown }).id ?? ''); }
 function rows<T>(page: { records?: readonly WorkspaceRecord[] } | undefined): WorkspaceRecord[] { return [...(page?.records ?? [])]; }
+function stableKey(value: string): string {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < value.length; index += 1) hash = Math.imul(hash ^ value.charCodeAt(index), 16_777_619);
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
 
 const KNOWLEDGE_MODE_RANK: Readonly<Record<ActorMemoryTrace['knowledgeMode'], number>> = Object.freeze({ unknown: 0, suspected: 1, believed: 2, inferred: 3, heard: 4, experienced: 5, self_reported: 6, asserted: 7 });
 const PRIVACY_RANK: Readonly<Record<ActorMemoryTrace['privacy'], number>> = Object.freeze({ public: 0, limited: 1, private: 2, secret: 3 });
@@ -150,6 +159,38 @@ export class MultiActorMemoryRepository {
     });
   }
   async listChangeAudits(): Promise<Record<string, unknown>[]> { return (await this.list('change-audits', { workspaceId: this.workspaceId, chatKey: this.chatKey })).map(record => record.value as unknown as Record<string, unknown>); }
+  async getChangeAudit(auditId: string): Promise<ChangeAudit | undefined> {
+    const record = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
+    return record?.value as unknown as ChangeAudit | undefined;
+  }
+  async updateCaptureAuditRejections(auditId: string, rejections: readonly AutomaticIngestRejection[]): Promise<void> {
+    const current = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
+    const audit = current?.value as unknown as ChangeAudit | undefined;
+    if (!current || !audit || audit.kind !== 'capture-change-set-v0') throw new Error('找不到 Capture 审计记录。');
+    const metadata = audit.metadata && typeof audit.metadata === 'object' && !Array.isArray(audit.metadata)
+      ? audit.metadata as Record<string, PlainData>
+      : {};
+    const outcome = rejections.some(item => (item.status ?? 'unresolved') === 'unresolved') ? 'partial' : 'complete';
+    const operations: WorkspaceTransactionOperation[] = [{
+      action: 'upsert',
+      collection: 'change-audits',
+      recordId: auditId,
+      value: asPlain({ ...audit, metadata: { ...metadata, outcome, rejections: [...rejections] } }),
+      expectedVersion: current.version,
+    }];
+    const captureJobId = String(metadata.captureJobId ?? '').trim();
+    if (captureJobId) {
+      const captureJob = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'capture-jobs', recordId: captureJobId });
+      if (captureJob?.value && typeof captureJob.value === 'object') operations.push({
+        action: 'upsert',
+        collection: 'capture-jobs',
+        recordId: captureJobId,
+        value: asPlain({ ...(captureJob.value as Record<string, unknown>), outcome, rejectionCount: rejections.length, rejections: [...rejections], updatedAt: Date.now() }),
+        expectedVersion: captureJob.version,
+      });
+    }
+    await this.workspace.transaction({ workspaceId: this.workspaceId, idempotencyKey: `capture-rejections:${auditId}:${crypto.randomUUID()}`, operations });
+  }
   async recordKnowledgeLeakageAudit(audit: {
     readonly outputHash: string;
     readonly checkedOwners: readonly string[];
@@ -487,7 +528,8 @@ export class MultiActorMemoryRepository {
       }
     }
     for (const value of commit.sceneCasts ?? []) await add('scene-casts', value);
-    const auditId = `change-audit:${crypto.randomUUID()}`;
+    const transactionKey = commit.idempotencyKey?.trim() || `capture:${commit.captureJobId ?? this.chatKey}:${commit.envelope.sourceRefs.join('|')}`;
+    const auditId = `change-audit:${stableKey(transactionKey)}`;
     const captureJobId = commit.captureJobId ?? `capture-job:${auditId}`;
     const previousCaptureJob = commit.captureJobId
       ? await this.workspace.get({ workspaceId: this.workspaceId, collection: 'capture-jobs', recordId: commit.captureJobId })
@@ -498,6 +540,9 @@ export class MultiActorMemoryRepository {
       workspaceId: this.workspaceId,
       chatKey: this.chatKey,
       status: 'completed',
+      outcome: commit.outcome ?? 'complete',
+      rejectionCount: commit.rejections?.length ?? 0,
+      rejections: [...(commit.rejections ?? [])],
       sourceRefs: [...commit.envelope.sourceRefs],
       actorCount: commit.owners.length,
       episodeCount: commit.episodes.length,
@@ -508,9 +553,28 @@ export class MultiActorMemoryRepository {
       updatedAt: Date.now(),
     };
     await add('capture-jobs', captureJob);
-    const audit: ChangeAudit = { id: auditId, workspaceId: this.workspaceId, chatKey: this.chatKey, kind: 'capture-change-set-v0', createdAt: Date.now(), entries };
+    const audit: ChangeAudit = {
+      id: auditId,
+      workspaceId: this.workspaceId,
+      chatKey: this.chatKey,
+      kind: 'capture-change-set-v0',
+      createdAt: Date.now(),
+      entries,
+      metadata: asPlain({
+        captureJobId,
+        sourceRefs: [...commit.envelope.sourceRefs],
+        outcome: commit.outcome ?? 'complete',
+        rejections: [...(commit.rejections ?? [])],
+        accepted: {
+          actors: commit.owners.length,
+          episodes: commit.episodes.length,
+          observations: commit.observations.length,
+          facts: commit.facts.length,
+        },
+      }),
+    };
     operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
-    await this.workspace.transaction({ workspaceId: this.workspaceId, idempotencyKey: audit.id, operations });
+    await this.workspace.transaction({ workspaceId: this.workspaceId, idempotencyKey: transactionKey, operations });
     return audit;
   }
 
@@ -756,4 +820,4 @@ export class MultiActorMemoryRepository {
   }
 }
 
-export type { CaptureCommit, ChangeAudit };
+export type { CaptureCommit };

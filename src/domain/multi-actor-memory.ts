@@ -74,6 +74,10 @@ export interface ActorCandidate {
   readonly ownerRef?: string;
 }
 
+export type ActorCandidateResolution =
+  | { readonly mode: 'existing'; readonly ownerId: string }
+  | { readonly mode: 'new'; readonly canonicalName: string };
+
 export type MemoryObservationChannel = 'public_speech' | 'private_thought' | 'narration' | 'worldbook' | 'state' | 'rumor' | 'inference';
 export type MemoryPrivacy = 'public' | 'limited' | 'private' | 'secret';
 export type MemoryKnowledgeMode = 'asserted' | 'self_reported' | 'heard' | 'experienced' | 'inferred' | 'believed' | 'suspected' | 'unknown';
