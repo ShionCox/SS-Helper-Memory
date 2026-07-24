@@ -66,14 +66,26 @@ function gist(content: string): string {
   return sentence.length > max ? `${sentence.slice(0, Math.max(2, max - 1))}…` : `${sentence.slice(0, Math.max(2, sentence.length - 1))}…`;
 }
 
-function detailUnits(trace: ActorMemoryTrace, fact: MemoryFact): MemoryDetailUnit[] {
+type RecallFact = Pick<MemoryFact, 'id' | 'content'>;
+
+function detailUnits(trace: ActorMemoryTrace, fact: RecallFact): MemoryDetailUnit[] {
   return [{ id: `detail:${trace.id}:gist`, traceId: trace.id, text: gist(fact.content), sensitivity: 'gist', minStrength: MEMORY_STRENGTH_LEVELS.fragment, sourceFactId: fact.id },
     { id: `detail:${trace.id}:exact`, traceId: trace.id, text: fact.content, sensitivity: 'exact', minStrength: MEMORY_STRENGTH_LEVELS.exact, sourceFactId: fact.id }];
 }
 
-/** Builds a packet without handing forbidden fact details to a fuzzy rewriter. */
-export function buildMemoryRecallPacket(trace: ActorMemoryTrace, fact: MemoryFact, now = Date.now(), sceneEpoch = 'default', config?: MemoryStrengthConfig): MemoryRecallPacket | null {
-  const strength = effectiveMemoryStrength(trace, now, config);
+/**
+ * Builds the exact packet shape used by actor recall from an already resolved
+ * effective strength.  The workbench uses this for the read-only strength
+ * indicator so hovering a threshold previews the same gist/detail omissions
+ * that production recall would emit, without mutating the persisted trace.
+ */
+export function buildMemoryRecallPacketAtStrength(
+  trace: ActorMemoryTrace,
+  fact: RecallFact,
+  effectiveStrengthValue: number,
+  sceneEpoch = 'default',
+): MemoryRecallPacket | null {
+  const strength = clamp(effectiveStrengthValue);
   if (strength <= 0 || strength < MEMORY_STRENGTH_LEVELS.forgotten) return null;
   const seed = deterministicSeed(trace.ownerId, trace.factId, trace.traceRevision, sceneEpoch);
   const available = detailUnits(trace, fact).filter(detail => strength >= detail.minStrength);
@@ -83,6 +95,11 @@ export function buildMemoryRecallPacket(trace: ActorMemoryTrace, fact: MemoryFac
   const clarity = strength >= MEMORY_STRENGTH_LEVELS.clear ? trace.clarity : strength >= MEMORY_STRENGTH_LEVELS.gist ? Math.min(trace.clarity, 65) : Math.min(trace.clarity, 35);
   const packetGist = strength >= MEMORY_STRENGTH_LEVELS.gist ? gist(fact.content) : (seedNumber(seed) > 0.15 ? '关于某件事的模糊记忆' : '一段不清晰的相关记忆');
   return { traceId: trace.id, factId: fact.id, ownerId: trace.ownerId, gist: packetGist, details: packetDetails, effectiveStrength: strength, clarity, deterministicSeed: seed, omittedDetailCount };
+}
+
+/** Builds a packet without handing forbidden fact details to a fuzzy rewriter. */
+export function buildMemoryRecallPacket(trace: ActorMemoryTrace, fact: RecallFact, now = Date.now(), sceneEpoch = 'default', config?: MemoryStrengthConfig): MemoryRecallPacket | null {
+  return buildMemoryRecallPacketAtStrength(trace, fact, effectiveMemoryStrength(trace, now, config), sceneEpoch);
 }
 
 export function rehearsalAllowed(input: { readonly confidence: number; readonly used: boolean; readonly explicitRecall?: boolean; readonly newObservation?: boolean }): boolean {

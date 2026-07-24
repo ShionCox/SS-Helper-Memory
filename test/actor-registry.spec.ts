@@ -15,15 +15,18 @@ describe('ActorRegistry correction and pending state', () => {
     const registry = new ActorRegistry('workspace:test');
     const resolution = registry.discover({ displayName: '艾琳', sourceRef: 'message:1', sourceType: 'message', excerpt: '艾琳出现在门口。', confidence: 0.5 });
     expect(resolution.ambiguous).toBe(true);
+    expect(resolution.owner).toMatchObject({ kind: 'actor', status: 'pending' });
     expect(registry.listPending()).toHaveLength(1);
     const repeated = registry.discover({ displayName: '艾琳', sourceRef: 'message:2', sourceType: 'message', excerpt: '艾琳再次被提及。', confidence: 0.55 });
     expect(repeated.method).toBe('pending');
     expect(repeated.ambiguous).toBe(true);
-    const firstCandidate = registry.listPending()[0]!;
-    expect(registry.confirm(firstCandidate.localId)?.status).toBe('confirmed');
-    expect(registry.resolveMention('艾琳')?.method).toBe('exact');
+    expect(repeated.owner.id).toBe(resolution.owner.id);
     expect(registry.listPending()).toHaveLength(1);
-    expect(registry.confirm(registry.listPending()[0]!.localId)?.status).toBe('confirmed');
+    const firstCandidate = registry.listPending()[0]!;
+    expect(firstCandidate.ownerRef).toBe(resolution.owner.id);
+    const confirmed = registry.confirm(firstCandidate.localId);
+    expect(confirmed).toMatchObject({ id: resolution.owner.id, status: 'confirmed' });
+    expect(registry.resolveMention('艾琳')?.method).toBe('exact');
     expect(registry.listPending()).toEqual([]);
     expect(registry.listAudits()[0]?.operation).toBe('confirm');
   });
@@ -32,11 +35,14 @@ describe('ActorRegistry correction and pending state', () => {
     const registry = new ActorRegistry('workspace:test');
     const resolution = registry.discover({ displayName: '未确认人物', sourceRef: 'prompt:1', sourceType: 'prompt', excerpt: '未确认人物可能在门外。', confidence: 0.4 });
     const candidate = registry.listPending()[0]!;
-    expect(resolution.owner.id).toBe('owner:unknown');
+    expect(resolution.owner).toMatchObject({ kind: 'actor', status: 'pending' });
+    expect(candidate.ownerRef).toBe(resolution.owner.id);
     const confirmed = registry.confirm(candidate.localId, { mode: 'new', canonicalName: '确认人物' });
     expect(confirmed?.kind).toBe('actor');
     expect(confirmed?.displayName).toBe('确认人物');
+    expect(confirmed?.id).not.toBe(resolution.owner.id);
     expect(registry.resolveMention('未确认人物')?.owner.id).toBe(confirmed?.id);
+    expect(registry.listOwners().some(owner => owner.id === resolution.owner.id)).toBe(false);
     expect(registry.listPending()).toEqual([]);
   });
 

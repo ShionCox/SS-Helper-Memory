@@ -124,6 +124,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
 export class MemoryVectorIndexService {
   private readonly queryCache = new Map<string, CachedQueryVector>();
   private readonly statuses = new Map<string, VectorIndexStatus>();
+  private readonly statusListeners = new Set<(chatKey: string, status: VectorIndexStatus) => void>();
   /**
    * LLMHub may execute an embedding request on a fallback route.  Keep that
    * route for the current service lifetime so the next sync looks for the
@@ -141,6 +142,25 @@ export class MemoryVectorIndexService {
     private readonly getLlm: () => MemoryLlmApi | null = readMemoryLlmApi,
     private readonly getRoutes: typeof readMemoryRecallRouteDiagnostics = readMemoryRecallRouteDiagnostics,
   ) {}
+
+  onStatusChanged(listener: (chatKey: string, status: VectorIndexStatus) => void): () => void {
+    this.statusListeners.add(listener);
+    return () => this.statusListeners.delete(listener);
+  }
+
+  private setStatus(chatKey: string, status: VectorIndexStatus): void {
+    this.statuses.set(chatKey, status);
+    this.statusListeners.forEach((listener) => {
+      try { listener(chatKey, status); } catch { /* presentation observers cannot break index work */ }
+    });
+  }
+
+  private finishSync(): void {
+    this.syncPromise = null;
+    const pendingChatKey = this.pendingSyncChatKey;
+    this.pendingSyncChatKey = '';
+    if (this.active && pendingChatKey) this.scheduleSync(pendingChatKey);
+  }
 
   start(): void {
     this.active = true;
@@ -161,12 +181,7 @@ export class MemoryVectorIndexService {
       this.pendingSyncChatKey = chatKey;
       return;
     }
-    this.syncPromise = this.syncChat(chatKey).finally(() => {
-      this.syncPromise = null;
-      const pendingChatKey = this.pendingSyncChatKey;
-      this.pendingSyncChatKey = '';
-      if (this.active && pendingChatKey) this.scheduleSync(pendingChatKey);
-    });
+    this.syncPromise = this.syncChat(chatKey).finally(() => this.finishSync());
   }
 
   async rebuild(chatKey: string): Promise<void> {
@@ -176,58 +191,63 @@ export class MemoryVectorIndexService {
     await this.repository.clearFactVectors(chatKey);
     this.queryCache.clear();
     this.resolvedEmbeddingTargets.delete(chatKey);
-    this.syncPromise = this.syncChat(chatKey).finally(() => { this.syncPromise = null; });
+    this.syncPromise = this.syncChat(chatKey).finally(() => this.finishSync());
     await this.syncPromise;
   }
 
   async rebuildFacts(chatKey: string, factIds: readonly string[]): Promise<void> {
     if (!this.active || !chatKey) throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
     if (this.syncPromise) await this.syncPromise;
-    const lifecycleRevision = this.lifecycleRevision;
-    const route = (await this.getRoutes()).embedding;
-    const llm = this.getLlm();
-    if (!route.available || !route.resourceId || !route.model || route.blockedReason || !llm?.embed) {
-      throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
-    }
-    const facts = (await Promise.all([...new Set(factIds)].map((factId) => this.repository.getFact(chatKey, factId))))
-      .filter((fact): fact is MemoryFact => Boolean(fact && (fact.status === 'active' || fact.status === 'pending')));
-    this.queryCache.clear();
-    let observedResponseRoute: { resourceId: string; model: string } | undefined;
-    try {
-      for (let offset = 0; offset < facts.length; offset += VECTOR_BATCH_SIZE) {
-        if (!this.active || lifecycleRevision !== this.lifecycleRevision) throw new Error('Memory 生命周期已变化。');
-        const batch = facts.slice(offset, offset + VECTOR_BATCH_SIZE);
-        const response = await withTimeout(llm.embed({
-          consumer: MEMORY_PLUGIN_ID,
-          taskKey: MEMORY_EMBED_TASK,
-          taskDescription: '回滚后选择性重建事实向量',
-          texts: batch.map(embeddingText),
-          budget: { maxLatencyMs: EMBEDDING_TIMEOUT_MS },
-          enqueue: { displayMode: 'silent' },
-        }), EMBEDDING_TIMEOUT_MS, '回滚向量修复');
-        if (!response.ok || response.vectors.length !== batch.length) throw new Error('回滚向量修复失败。');
-        const vectors = response.vectors.map(validateVector);
-        const dimensions = vectors[0]?.length;
-        if (!dimensions || vectors.some((vector) => vector.length !== dimensions)) throw new Error('回滚向量维度不一致。');
-        const resourceId = response.meta?.resourceId ?? route.resourceId;
-        const model = response.meta?.model ?? response.model ?? route.model;
-        if (observedResponseRoute && (observedResponseRoute.resourceId !== resourceId || observedResponseRoute.model !== model)) {
-          throw new Error('embedding 路由在修复期间发生变化。');
-        }
-        observedResponseRoute = { resourceId, model };
-        await Promise.all(batch.map((fact, index) => this.repository.upsertFactVector({
-          factId: fact.id,
-          chatKey,
-          content: embeddingText(fact),
-          resourceId,
-          model,
-          vector: vectors[index]!,
-        })));
-        this.rememberEmbeddingTarget(chatKey, route.resourceId, route.model, { resourceId, model });
+    const operation = (async (): Promise<void> => {
+      const lifecycleRevision = this.lifecycleRevision;
+      const route = (await this.getRoutes()).embedding;
+      const llm = this.getLlm();
+      if (!route.available || !route.resourceId || !route.model || route.blockedReason || !llm?.embed) {
+        throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
       }
-    } catch {
-      throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
-    }
+      const facts = (await Promise.all([...new Set(factIds)].map((factId) => this.repository.getFact(chatKey, factId))))
+        .filter((fact): fact is MemoryFact => Boolean(fact && (fact.status === 'active' || fact.status === 'pending')));
+      this.queryCache.clear();
+      let observedResponseRoute: { resourceId: string; model: string } | undefined;
+      try {
+        for (let offset = 0; offset < facts.length; offset += VECTOR_BATCH_SIZE) {
+          if (!this.active || lifecycleRevision !== this.lifecycleRevision) throw new Error('Memory 生命周期已变化。');
+          const batch = facts.slice(offset, offset + VECTOR_BATCH_SIZE);
+          const response = await withTimeout(llm.embed({
+            consumer: MEMORY_PLUGIN_ID,
+            taskKey: MEMORY_EMBED_TASK,
+            taskDescription: '回滚后选择性重建事实向量',
+            texts: batch.map(embeddingText),
+            budget: { maxLatencyMs: EMBEDDING_TIMEOUT_MS },
+            enqueue: { displayMode: 'silent' },
+          }), EMBEDDING_TIMEOUT_MS, '回滚向量修复');
+          if (!this.active || lifecycleRevision !== this.lifecycleRevision) throw new Error('Memory 生命周期已变化。');
+          if (!response.ok || response.vectors.length !== batch.length) throw new Error('回滚向量修复失败。');
+          const vectors = response.vectors.map(validateVector);
+          const dimensions = vectors[0]?.length;
+          if (!dimensions || vectors.some((vector) => vector.length !== dimensions)) throw new Error('回滚向量维度不一致。');
+          const resourceId = response.meta?.resourceId ?? route.resourceId;
+          const model = response.meta?.model ?? response.model ?? route.model;
+          if (observedResponseRoute && (observedResponseRoute.resourceId !== resourceId || observedResponseRoute.model !== model)) {
+            throw new Error('embedding 路由在修复期间发生变化。');
+          }
+          observedResponseRoute = { resourceId, model };
+          await Promise.all(batch.map((fact, index) => this.repository.upsertFactVector({
+            factId: fact.id,
+            chatKey,
+            content: embeddingText(fact),
+            resourceId,
+            model,
+            vector: vectors[index]!,
+          })));
+          this.rememberEmbeddingTarget(chatKey, route.resourceId, route.model, { resourceId, model });
+        }
+      } catch {
+        throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
+      }
+    })();
+    this.syncPromise = operation.finally(() => this.finishSync());
+    await this.syncPromise;
   }
 
   async getStatus(chatKey: string): Promise<VectorIndexStatus> {
@@ -250,7 +270,7 @@ export class MemoryVectorIndexService {
 
   async search(chatKey: string, query: string, maxItems = VECTOR_TOP_K): Promise<VectorSearchResult> {
     const startedAt = Date.now();
-    const queryEmbedding = await this.embedQuery(query);
+    const queryEmbedding = await this.embedQuery(chatKey, query);
     const scored = (await this.repository.vectorSearch({
       chatKey,
       vector: queryEmbedding.vector,
@@ -289,7 +309,7 @@ export class MemoryVectorIndexService {
     const batches: VectorBatchAudit[] = [];
     const status = (patch: Partial<VectorIndexStatus>): void => {
       const previous = this.statuses.get(chatKey);
-      this.statuses.set(chatKey, {
+      this.setStatus(chatKey, {
         route,
         coverage: previous?.coverage ?? null,
         rebuilding: previous?.rebuilding ?? false,
@@ -396,6 +416,13 @@ export class MemoryVectorIndexService {
     requestedModel: string,
     actual: { resourceId: string; model: string },
   ): void {
+    const previous = this.resolvedEmbeddingTargets.get(chatKey);
+    if (previous && (
+      previous.requestedResourceId !== requestedResourceId
+      || previous.requestedModel !== requestedModel
+      || previous.resourceId !== actual.resourceId
+      || previous.model !== actual.model
+    )) this.queryCache.clear();
     this.resolvedEmbeddingTargets.set(chatKey, {
       requestedResourceId,
       requestedModel,
@@ -404,13 +431,15 @@ export class MemoryVectorIndexService {
     });
   }
 
-  private async embedQuery(query: string): Promise<CachedQueryVector> {
+  private async embedQuery(chatKey: string, query: string): Promise<CachedQueryVector> {
     const diagnostics = await this.getRoutes();
     const route = diagnostics.embedding;
     if (!route.available || !route.resourceId || !route.model || route.blockedReason) {
       throw new Error(route.blockedReason ?? '没有可用的 embedding 路由。');
     }
-    const key = `${route.resourceId}\u0000${route.model}\u0000${query.normalize('NFKC').trim()}`;
+    const requestedTarget = this.getEmbeddingTarget(chatKey, route.resourceId, route.model);
+    const normalizedQuery = query.normalize('NFKC').trim();
+    const key = `${requestedTarget.resourceId}\u0000${requestedTarget.model}\u0000${normalizedQuery}`;
     const cached = this.queryCache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
       this.queryCache.delete(key);
@@ -430,17 +459,21 @@ export class MemoryVectorIndexService {
     }), EMBEDDING_TIMEOUT_MS, '查询 embedding');
     if (!response.ok) throw new Error(response.error || '查询 embedding 失败。');
     if (response.vectors.length !== 1) throw new Error('查询 embedding 返回数量不为 1。');
+    const resourceId = response.meta?.resourceId ?? route.resourceId;
+    const model = response.meta?.model ?? response.model ?? route.model;
+    this.rememberEmbeddingTarget(chatKey, route.resourceId, route.model, { resourceId, model });
+    const actualKey = `${resourceId}\u0000${model}\u0000${normalizedQuery}`;
     const entry: CachedQueryVector = {
-      key,
+      key: actualKey,
       vector: validateVector(response.vectors[0]!),
-      resourceId: response.meta?.resourceId ?? route.resourceId,
-      model: response.meta?.model ?? response.model ?? route.model,
+      resourceId,
+      model,
       ...(response.meta ? { meta: response.meta } : {}),
       usage: memoryUsage(response.usage),
       expiresAt: Date.now() + QUERY_CACHE_TTL_MS,
       cached: false,
     };
-    this.queryCache.set(key, entry);
+    this.queryCache.set(actualKey, entry);
     while (this.queryCache.size > QUERY_CACHE_SIZE) {
       const oldest = this.queryCache.keys().next().value as string | undefined;
       if (!oldest) break;

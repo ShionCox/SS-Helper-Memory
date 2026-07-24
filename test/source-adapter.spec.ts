@@ -124,6 +124,34 @@ describe('宿主聊天来源适配', () => {
     expect(block?.content).not.toContain('命运分支');
   });
 
+  it('变量状态和 UpdateVariable 不会把凭据送入 Capture，但保留普通剧情秘密', () => {
+    const [snapshot] = buildLatestVariableStateBlock('chat', [{
+      mesid: 'secure-state',
+      variables: [{ stat_data: {
+        世界: { 剧情秘密: '地下室藏着银钥匙', 当前天数: 8 },
+        LLM配置: {
+          openai_api_key: 'sk-abcdefghijklmnopqrstuvwxyz123456',
+          access_token: 'Bearer abcdefghijklmnopqrstuvwxyz',
+          nested: { clientSecret: 'should-not-leak' },
+        },
+      } }],
+    }]);
+    expect(snapshot?.content).toContain('剧情秘密\t地下室藏着银钥匙');
+    expect(snapshot?.content).toContain('当前天数\t8');
+    expect(snapshot?.content).not.toMatch(/openai|api.?key|access.?token|clientSecret|sk-|Bearer|should-not-leak/iu);
+
+    const [message] = filterSourceBlocks(buildVisibleChatSourceBlocks('chat', [{
+      mesid: 'secure-patch',
+      mes: `<UpdateVariable>\n${JSON.stringify([
+        { op: 'replace', path: '/世界/剧情秘密', value: '地下室藏着银钥匙' },
+        { op: 'replace', path: '/设置/deepseek_api_key', value: 'sk-abcdefghijklmnopqrstuvwxyz123456' },
+        { op: 'replace', path: '/设置/授权信息', value: 'Bearer abcdefghijklmnopqrstuvwxyz' },
+      ])}\n</UpdateVariable>`,
+    }]));
+    expect(message?.content).toContain('世界 / 剧情秘密：地下室藏着银钥匙');
+    expect(message?.content).not.toMatch(/deepseek|api.?key|授权信息|sk-|Bearer/iu);
+  });
+
   it('HostPort DTO 只接受 variables 数组，并保留数组内最后一个 stat_data', async () => {
     const base = { id: 'm1', index: 0, role: 'assistant' as const, text: '正文', createdAt: '2026-07-14T00:00:00.000Z' };
     const reader = {

@@ -203,7 +203,7 @@ export class SemanticRecallService {
         degradedReason = degradedReason || error;
         rerankDiagnostic = { requested: true, success: false, error };
       } else {
-        const timeoutMs = Math.min(RERANK_TIMEOUT_MS, remainingMs);
+        const routeTimeoutMs = Math.min(RERANK_TIMEOUT_MS, remainingMs);
         const rerankStartedAt = Date.now();
         try {
           const route = llm.inspect?.previewRoute
@@ -212,7 +212,7 @@ export class SemanticRecallService {
                 taskKey: MEMORY_RERANK_TASK,
                 taskKind: 'rerank',
                 requiredCapabilities: ['rerank'],
-              })), timeoutMs, 'memory_rerank_route')
+              })), routeTimeoutMs, 'memory_rerank_route')
             : null;
           if (route?.blockedReason) {
             degradedReason = degradedReason || route.blockedReason;
@@ -225,53 +225,68 @@ export class SemanticRecallService {
               error: route.blockedReason,
             };
           } else {
-          llmCalls += 1;
-          const response = await withTimeout(llm.rerank({
-            consumer: MEMORY_PLUGIN_ID,
-            taskKey: MEMORY_RERANK_TASK,
-            taskDescription: '记忆候选重排',
-            query: query.query,
-            docs: rerankItems.map(item => item.fact.content),
-            topK: rerankItems.length,
-            budget: { maxLatencyMs: timeoutMs },
-            enqueue: { displayMode: 'silent' },
-          }), timeoutMs, 'memory_rerank');
-          if (!response.ok) throw new Error(response.error || 'memory_rerank 失败。');
-          const seen = new Set<number>();
-          const valid = response.results
-            .filter(item => {
-              if (!Number.isInteger(item.index)
-                || item.index < 0
-                || item.index >= rerankItems.length
-                || !Number.isFinite(item.score)
-                || seen.has(item.index)) return false;
-              seen.add(item.index);
-              return true;
-            })
-            .sort((left, right) => right.score - left.score || left.index - right.index);
-          const rankedIndexes = new Set(valid.map(item => item.index));
-          const reranked = valid.map(result => ({
-            ...rerankItems[result.index]!,
-            score: result.score,
-            rerankScore: result.score,
-          }));
-          orderedItems = [
-            ...preservedTemporalItems,
-            ...reranked,
-            ...rerankItems.filter((_, index) => !rankedIndexes.has(index)),
-            ...orderedItems.slice(temporalHeadSize + rerankItems.length),
-          ];
-          rerankDiagnostic = {
-            requested: true,
-            success: true,
-            ...(response.meta?.requestId ? { requestId: response.meta.requestId } : {}),
-            ...(response.meta?.resourceId || response.resource ? { resourceId: response.meta?.resourceId ?? response.resource } : {}),
-            ...(response.meta?.model ? { model: response.meta.model } : {}),
-            latencyMs: response.meta?.latencyMs ?? Date.now() - rerankStartedAt,
-            usage: usageOrNull(response.usage),
-            ...(response.fallbackUsed ? { fallbackUsed: true } : {}),
-          };
-          if (response.fallbackUsed) degradedReason = degradedReason || '重排资源使用了非 LLM 关键词兜底。';
+            const rerankRemainingMs = Math.max(0, deadline - Date.now());
+            if (rerankRemainingMs === 0) {
+              const error = '召回总预算已用尽，已跳过重排。';
+              degradedReason = degradedReason || error;
+              rerankDiagnostic = {
+                requested: true,
+                success: false,
+                ...(route?.resourceId ? { resourceId: route.resourceId } : {}),
+                ...(route?.model ? { model: route.model } : {}),
+                latencyMs: Date.now() - rerankStartedAt,
+                error,
+              };
+            } else {
+              const rerankTimeoutMs = Math.min(RERANK_TIMEOUT_MS, rerankRemainingMs);
+              llmCalls += 1;
+              const response = await withTimeout(llm.rerank({
+                consumer: MEMORY_PLUGIN_ID,
+                taskKey: MEMORY_RERANK_TASK,
+                taskDescription: '记忆候选重排',
+                query: query.query,
+                docs: rerankItems.map(item => item.fact.content),
+                topK: rerankItems.length,
+                budget: { maxLatencyMs: rerankTimeoutMs },
+                enqueue: { displayMode: 'silent' },
+              }), rerankTimeoutMs, 'memory_rerank');
+              if (!response.ok) throw new Error(response.error || 'memory_rerank 失败。');
+              const seen = new Set<number>();
+              const valid = response.results
+                .filter(item => {
+                  if (!Number.isInteger(item.index)
+                    || item.index < 0
+                    || item.index >= rerankItems.length
+                    || !Number.isFinite(item.score)
+                    || seen.has(item.index)) return false;
+                  seen.add(item.index);
+                  return true;
+                })
+                .sort((left, right) => right.score - left.score || left.index - right.index);
+              const rankedIndexes = new Set(valid.map(item => item.index));
+              const reranked = valid.map(result => ({
+                ...rerankItems[result.index]!,
+                score: result.score,
+                rerankScore: result.score,
+              }));
+              orderedItems = [
+                ...preservedTemporalItems,
+                ...reranked,
+                ...rerankItems.filter((_, index) => !rankedIndexes.has(index)),
+                ...orderedItems.slice(temporalHeadSize + rerankItems.length),
+              ];
+              rerankDiagnostic = {
+                requested: true,
+                success: true,
+                ...(response.meta?.requestId ? { requestId: response.meta.requestId } : {}),
+                ...(response.meta?.resourceId || response.resource ? { resourceId: response.meta?.resourceId ?? response.resource } : {}),
+                ...(response.meta?.model ? { model: response.meta.model } : {}),
+                latencyMs: response.meta?.latencyMs ?? Date.now() - rerankStartedAt,
+                usage: usageOrNull(response.usage),
+                ...(response.fallbackUsed ? { fallbackUsed: true } : {}),
+              };
+              if (response.fallbackUsed) degradedReason = degradedReason || '重排资源使用了非 LLM 关键词兜底。';
+            }
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);

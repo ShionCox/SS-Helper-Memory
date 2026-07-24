@@ -1108,11 +1108,13 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async addRecallLog(log: MemoryRecallLog): Promise<void> {
+    this.requireChatKey(log.chatKey);
     const { injectedPrompt: _sensitivePrompt, ...safeLog } = log;
     await this.workspace.upsert({ workspaceId: this.requireWorkspaceId(), collection: 'recall-logs', recordId: log.id, value: asPlain(safeLog) });
   }
 
   async getLastRecall(chatKey: string): Promise<MemoryRecallLog | undefined> {
+    chatKey = this.requireChatKey(chatKey);
     const page = await this.workspace.query({ workspaceId: this.requireWorkspaceId(), collection: 'recall-logs', filter: { chatKey }, orderBy: { field: 'createdAt', direction: 'desc' }, limit: 1 });
     return page.records[0]?.value as unknown as MemoryRecallLog | undefined;
   }

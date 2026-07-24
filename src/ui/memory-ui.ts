@@ -1,5 +1,6 @@
 import './memory.css';
 import './initialization.css';
+import './actor-memory.css';
 import {
   UI_CONTROL_ATTRIBUTE,
   UI_CONTROL_ICON_ONLY_ATTRIBUTE,
@@ -39,6 +40,16 @@ import {
   selectMemoryLibraryView,
   type MemoryLibrarySort,
 } from './memory-library-view';
+import {
+  normalizeActorMemorySelection,
+  renderActorMemoryPage,
+  updateActorMemoryGaugeZone,
+  type ActorMemoryGroup,
+  type ActorMemoryLevel,
+  type ActorMemorySort,
+  type ActorMemoryTab,
+  type ActorMemoryViewState,
+} from './actor-memory-view';
 
 export interface MemoryUiSettings {
   enabled: boolean;
@@ -238,7 +249,7 @@ export interface MemoryUiController {
   getSettings(): MemoryUiSettings;
   saveSettings(settings: MemoryUiSettings): Promise<void>;
   getOverview(): Promise<MemoryUiOverview>;
-  /** Optional notification for background overview diagnostics finishing. */
+  /** Optional notification for current-workspace data, binding, or health changes. */
   onOverviewChanged?: (listener: () => void) => () => void;
   getInitializationEstimate(selectedKinds?: string[], options?: MemoryInitializationOptions): Promise<MemoryInitializationEstimate>;
   getInitializationSources(options?: MemoryInitializationOptions): Promise<MemoryInitializationSourceOption[]>;
@@ -520,6 +531,16 @@ interface WorkbenchState {
   showSceneSources: boolean;
   showSceneConfidence: boolean;
   actorTraces: Array<import('../domain').ActorMemoryTrace>;
+  actorMemoryQuery: string;
+  actorMemoryKnowledgeMode: '' | import('../domain').MemoryKnowledgeMode;
+  actorMemoryPrivacy: '' | import('../domain').MemoryPrivacy;
+  actorMemoryLevel: '' | ActorMemoryLevel;
+  actorMemorySort: ActorMemorySort;
+  actorMemorySelectedOwnerId: string;
+  actorMemorySelectedTraceId: string;
+  actorMemoryTab: ActorMemoryTab;
+  actorMemoryCollapsedGroups: ActorMemoryGroup[];
+  actorMemoryNow: number;
   profiles: Array<Record<string, unknown>>;
   dreams: Array<Record<string, unknown>>;
   facts: MemoryUiFact[];
@@ -619,13 +640,18 @@ export function renderMemoryWorkbench(
   let graphMarqueeResizeObserver: ResizeObserver | undefined;
   let pendingFocusSelector = '';
   let progressRequestId = 0;
+  let librarySearchRequestId = 0;
+  let overviewRequestId = 0;
   let pageRequestId = 0;
+  let backgroundPageRequestId = 0;
+  let liveRefreshRunning = false;
+  let liveRefreshRequested = false;
   let graphRenderer: RelationshipGraphRenderer | undefined;
   let sceneRenderer: SceneCastPixiRenderer | undefined;
   let sceneRendererToken = 0;
   const requestedGraphPage = initialActionId === 'open-relationship-graph' || initialActionId === 'rebuild-relationship-graph';
   const state: WorkbenchState = {
-    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', scenes: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
+    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', scenes: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
     selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeInvisibleHistory: false, reinitializeOpen: false, audits: [], usages: [], integrityText: '尚未执行完整性检查。', confirmBatchKey: '', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
   };
   const sceneEventsState = (): SceneEventsState => ({
@@ -645,6 +671,26 @@ export function renderMemoryWorkbench(
     showSceneSources: state.showSceneSources,
     showSceneConfidence: state.showSceneConfidence,
   });
+  const actorMemoryState = (): ActorMemoryViewState => ({
+    actors: state.actors,
+    traces: state.actorTraces,
+    facts: state.facts,
+    observations: state.observations,
+    query: state.actorMemoryQuery,
+    knowledgeMode: state.actorMemoryKnowledgeMode,
+    privacy: state.actorMemoryPrivacy,
+    level: state.actorMemoryLevel,
+    sort: state.actorMemorySort,
+    selectedOwnerId: state.actorMemorySelectedOwnerId,
+    selectedTraceId: state.actorMemorySelectedTraceId,
+    tab: state.actorMemoryTab,
+    collapsedGroups: state.actorMemoryCollapsedGroups,
+    now: state.actorMemoryNow,
+  });
+  const syncActorMemorySelection = (viewState: ActorMemoryViewState): void => {
+    state.actorMemorySelectedOwnerId = viewState.selectedOwnerId;
+    state.actorMemorySelectedTraceId = viewState.selectedTraceId;
+  };
   const syncSceneSelection = (sceneState: SceneEventsState): void => {
     state.selectedSceneId = sceneState.selectedSceneId;
     state.selectedEpisodeId = sceneState.selectedEpisodeId;
@@ -684,6 +730,12 @@ export function renderMemoryWorkbench(
     state.renamingActorId = '';
     state.editingActorTraitsId = '';
     state.actorOperation = '';
+    state.actorTraces = [];
+    state.actorMemorySelectedOwnerId = '';
+    state.actorMemorySelectedTraceId = '';
+    state.actorMemoryTab = 'overview';
+    state.actorMemoryCollapsedGroups = [];
+    state.actorMemoryNow = Date.now();
   };
   const renderSourceReference = (value: string, mode: 'chip' | 'evidence' = 'chip'): string => {
     const label = escapeHtml(formatSourceReference(value));
@@ -696,7 +748,7 @@ export function renderMemoryWorkbench(
     const action = `data-action="jump-to-message"${messageId}${index} aria-label="跳转到${label}" title="点击跳转到对应聊天楼层"`;
     return mode === 'evidence'
       ? `<button class="stx-memory-reference-jump" ${uiButton('neutral', 'xs', true)} type="button" ${action}><ss-helper-icon name="link" decorative></ss-helper-icon></button><span>${label}</span>`
-      : `<button class="stx-memory-reference-link" ${uiControl('button', 'neutral')} type="button" ${action}>${label}</button>`;
+      : `<button class="stx-memory-reference-link" ${uiControl('button', 'neutral')} type="button" ${action}><ss-helper-icon name="link" decorative></ss-helper-icon><span>${label}</span></button>`;
   };
   const renderLibrarySourceReference = (value: string, mode: 'reference' | 'evidence' = 'reference'): string => {
     if (parseMessageSourceReference(value) && navigateToMessage) {
@@ -799,77 +851,145 @@ export function renderMemoryWorkbench(
     const requestId = ++progressRequestId;
     if (progressTimer) window.clearTimeout(progressTimer);
     progressTimer = undefined;
-    try { state.progress = await controller.getCaptureProgress(); } catch { state.progress = undefined; }
+    let progress: MemoryCaptureProgress | undefined;
+    try { progress = await controller.getCaptureProgress(); } catch { progress = undefined; }
     if (disposed || requestId !== progressRequestId) return;
+    state.progress = progress;
     rerender('', true);
     scheduleProgress();
   };
-  const refreshFacts = async (): Promise<void> => {
+  const refreshFacts = async (isCurrent: () => boolean = () => !disposed): Promise<boolean> => {
+    const query = state.query.trim();
     if (state.overview?.bound === false) {
+      if (!isCurrent()) return false;
       state.facts = [];
       state.libraryResults = [];
       state.selectedFactId = '';
-      return;
+      return true;
     }
     const [allFacts, queryFacts] = await Promise.all([
       controller.listFacts(),
-      state.query.trim() ? controller.listFacts(state.query) : Promise.resolve(undefined),
+      query ? controller.listFacts(query) : Promise.resolve(undefined),
     ]);
+    if (!isCurrent() || state.query.trim() !== query) return false;
     state.facts = allFacts;
     state.libraryResults = queryFacts ?? allFacts;
     normalizeLibrarySelection();
+    return true;
   };
-  const refreshLibrarySearch = async (): Promise<void> => {
+  const refreshLibrarySearch = async (): Promise<boolean> => {
+    const requestId = ++librarySearchRequestId;
+    const query = state.query.trim();
     if (state.overview?.bound === false) {
+      if (disposed || requestId !== librarySearchRequestId) return false;
       state.libraryResults = [];
       state.selectedFactId = '';
-      return;
+      return true;
     }
-    state.libraryResults = state.query.trim()
-      ? await controller.listFacts(state.query)
+    const results = query
+      ? await controller.listFacts(query)
       : state.facts.length ? state.facts : await controller.listFacts();
+    if (disposed || requestId !== librarySearchRequestId || state.page !== 'library' || state.query.trim() !== query) return false;
+    state.libraryResults = results;
     normalizeLibrarySelection();
+    return true;
   };
   const loadOverview = async (): Promise<void> => {
+    const requestId = ++overviewRequestId;
+    const isCurrent = (): boolean => !disposed && requestId === overviewRequestId;
     state.loading = true; state.errorCode = ''; state.errorDiagnostic = undefined; rerender();
     try {
-      state.overview = await controller.getOverview();
-      if (state.overview.bound === false) {
+      const overview = await controller.getOverview();
+      if (!isCurrent()) return;
+      state.overview = overview;
+      if (overview.bound === false) {
         state.facts = [];
         state.libraryResults = [];
       } else {
-        await refreshFacts();
+        if (!await refreshFacts(isCurrent)) return;
         state.recall = await controller.getRecallStatus().catch(() => undefined);
       }
+      if (!isCurrent()) return;
       state.selectedFactId = state.facts[0]?.id ?? '';
       state.loading = false; state.errorDiagnostic = undefined; rerender();
       void updateProgress();
     } catch (error) {
+      if (!isCurrent()) return;
       const diagnostic = describeMemoryError(error, 'MEMORY_WORKBENCH_LOAD_FAILED', 'workbench-load');
       state.loading = false; state.errorCode = diagnostic.code; state.errorDiagnostic = diagnostic; rerender();
       toast('error', diagnostic.title, diagnostic.reason, diagnostic.code);
     }
   };
-  const refreshOverviewSnapshot = async (): Promise<void> => {
+  const refreshLiveSnapshot = async (): Promise<void> => {
     if (disposed) return;
+    liveRefreshRequested = true;
+    if (liveRefreshRunning) return;
+    liveRefreshRunning = true;
     try {
-      const overview = await controller.getOverview();
-      if (disposed) return;
-      state.overview = overview;
-      if (isChatUnbound(overview)) clearActorState();
-      rerender('', true);
-    } catch { /* background route diagnostics must not interrupt the workbench */ }
+      while (liveRefreshRequested && !disposed) {
+        liveRefreshRequested = false;
+        try {
+          const requestId = ++overviewRequestId;
+          const overview = await controller.getOverview();
+          if (disposed || requestId !== overviewRequestId) continue;
+          state.overview = overview;
+          if (isChatUnbound(overview)) {
+            clearActorState();
+            state.facts = [];
+            state.libraryResults = [];
+            state.scenes = [];
+            state.episodes = [];
+            state.observations = [];
+            state.profiles = [];
+            state.dreams = [];
+            state.audits = [];
+            state.usages = [];
+            state.graph = { nodes: [], edges: [] };
+            state.loading = false;
+            rerender('', true);
+            continue;
+          }
+          state.loading = false;
+          state.errorDiagnostic = undefined;
+          await loadPage(state.page, { background: true });
+          if (disposed || requestId !== overviewRequestId) continue;
+        } catch {
+          // 实时刷新失败时保留当前已展示数据；用户主动刷新仍会显示明确错误。
+          if (state.loading) {
+            state.loading = false;
+            rerender('', true);
+          }
+        }
+      }
+    } finally {
+      liveRefreshRunning = false;
+    }
   };
-  const loadPage = async (page: MemoryWorkbenchPage): Promise<void> => {
+  const loadPage = async (page: MemoryWorkbenchPage, options: { background?: boolean } = {}): Promise<void> => {
     if (disposed) return;
-    const requestId = ++pageRequestId;
-    const enteringInitialize = page === 'initialize' && state.page !== 'initialize';
+    const background = options.background === true;
+    if (background && page !== state.page) return;
+    if (!background) {
+      backgroundPageRequestId += 1;
+      librarySearchRequestId += 1;
+    }
+    const requestId = background ? ++backgroundPageRequestId : ++pageRequestId;
+    const enteringInitialize = !background && page === 'initialize' && state.page !== 'initialize';
     if (enteringInitialize) state.includeInvisibleHistory = false;
-    state.page = page; state.pageLoading = true; state.pageError = undefined; rerender();
-    const isCurrent = (): boolean => !disposed && requestId === pageRequestId;
+    if (!background) {
+      state.page = page;
+      state.pageLoading = true;
+      state.pageError = undefined;
+      rerender();
+    }
+    const isCurrent = (): boolean => !disposed && (background
+      ? requestId === backgroundPageRequestId && state.page === page
+      : requestId === pageRequestId);
     try {
       if (page === 'overview') {
-        state.overview = await controller.getOverview();
+        const overview = await controller.getOverview();
+        if (!isCurrent()) return;
+        state.overview = overview;
       } else if (page === 'actors') {
         if (isChatUnbound()) {
           clearActorState();
@@ -880,6 +1000,7 @@ export function renderMemoryWorkbench(
             controller.listPendingActorCandidates ? controller.listPendingActorCandidates() : Promise.resolve([]),
             controller.listActorCorrectionReviews ? controller.listActorCorrectionReviews() : Promise.resolve([]),
           ]);
+          if (!isCurrent()) return;
           state.actors = [...actors];
           state.actorAliases = [...aliases];
           state.pendingActors = [...pending];
@@ -907,15 +1028,42 @@ export function renderMemoryWorkbench(
         normalizeSceneEventsSelection(normalized);
         syncSceneSelection(normalized);
       } else if (page === 'library') {
-        await refreshFacts();
+        if (!await refreshFacts(isCurrent)) return;
+        const recall = await controller.getRecallStatus().catch(() => undefined);
         if (!isCurrent()) return;
-        state.recall = await controller.getRecallStatus().catch(() => undefined);
+        state.recall = recall;
       } else if (page === 'actor-memory') {
-        state.actorTraces = controller.listActorTraces ? [...await controller.listActorTraces()] : [];
+        if (isChatUnbound()) {
+          clearActorState();
+          state.observations = [];
+          state.facts = [];
+          return;
+        }
+        const [actors, aliases, traces, observations, facts] = await Promise.all([
+          controller.listActors ? controller.listActors() : Promise.resolve([]),
+          controller.listActorAliases ? controller.listActorAliases() : Promise.resolve([]),
+          controller.listActorTraces ? controller.listActorTraces() : Promise.resolve([]),
+          controller.listObservations ? controller.listObservations() : Promise.resolve([]),
+          state.overview?.bound === false ? Promise.resolve([]) : controller.listFacts(),
+        ]);
+        if (!isCurrent()) return;
+        state.actors = [...actors];
+        state.actorAliases = [...aliases];
+        state.actorTraces = [...traces];
+        state.observations = [...observations];
+        state.facts = facts;
+        state.actorMemoryNow = Date.now();
+        const actorMemory = actorMemoryState();
+        normalizeActorMemorySelection(actorMemory);
+        syncActorMemorySelection(actorMemory);
       } else if (page === 'profiles') {
-        state.profiles = controller.listActorProfiles ? [...await controller.listActorProfiles()] : [];
+        const profiles = controller.listActorProfiles ? [...await controller.listActorProfiles()] : [];
+        if (!isCurrent()) return;
+        state.profiles = profiles;
       } else if (page === 'dreams') {
-        state.dreams = controller.listActorDreams ? [...await controller.listActorDreams()] : [];
+        const dreams = controller.listActorDreams ? [...await controller.listActorDreams()] : [];
+        if (!isCurrent()) return;
+        state.dreams = dreams;
       } else if (page === 'initialize') {
         const [sources, initialization, sqlite] = await Promise.all([
           controller.getInitializationSources({ includeInvisibleHistory: state.includeInvisibleHistory }),
@@ -927,15 +1075,20 @@ export function renderMemoryWorkbench(
         state.initialization = initialization;
         if (sqlite) state.sqlite = sqlite;
         state.selectedSourceKinds = state.sources.filter((source) => source.selected).map((source) => source.kind);
-        state.estimate = await controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory });
+        const estimate = await controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory });
         if (!isCurrent()) return;
-        state.progress = await controller.getCaptureProgress();
+        state.estimate = estimate;
+        const progress = await controller.getCaptureProgress();
         if (!isCurrent()) return;
+        state.progress = progress;
         scheduleProgress();
       } else if (page === 'recall') {
-        state.recall = await controller.getRecallStatus();
+        const recall = await controller.getRecallStatus();
         if (!isCurrent()) return;
-        state.diagnostics = state.overview?.bound === false ? null : await controller.getLastRecall();
+        state.recall = recall;
+        const diagnostics = state.overview?.bound === false ? null : await controller.getLastRecall();
+        if (!isCurrent()) return;
+        state.diagnostics = diagnostics;
         if (state.overview?.bound === false) {
           state.graph = { nodes: [], edges: [] };
           state.graphStatus = controller.getGraphStatus();
@@ -971,33 +1124,54 @@ export function renderMemoryWorkbench(
           state.audits = [];
           state.usages = [];
         } else {
-          state.audits = await controller.listAuditRecords();
+          const audits = await controller.listAuditRecords();
           if (!isCurrent()) return;
-          state.usages = await controller.getMainChatUsage();
+          const usages = await controller.getMainChatUsage();
+          if (!isCurrent()) return;
+          state.audits = audits;
+          state.usages = usages;
         }
-        state.sqlite = await controller.getSqliteStatus();
+        const sqlite = await controller.getSqliteStatus();
+        if (!isCurrent()) return;
+        state.sqlite = sqlite;
       } else if (page === 'data') {
-        state.sqlite = await controller.getSqliteStatus();
+        const sqlite = await controller.getSqliteStatus();
+        if (!isCurrent()) return;
+        state.sqlite = sqlite;
         if (state.overview) state.overview = {
           ...state.overview,
-          currentChatSizeBytes: state.sqlite.currentChatSizeBytes,
-          currentChatUsageRatio: state.sqlite.currentChatUsageRatio,
+          currentChatSizeBytes: sqlite.currentChatSizeBytes,
+          currentChatUsageRatio: sqlite.currentChatUsageRatio,
         };
       }
       if (!isCurrent()) return;
     } catch (error) {
       if (!isCurrent()) return;
+      if (background) return;
       const diagnostic = describeMemoryError(error, 'MEMORY_WORKBENCH_PAGE_FAILED', 'workbench-page');
       state.errorCode = diagnostic.code;
       state.pageError = diagnostic;
       toast('error', diagnostic.title, diagnostic.reason, diagnostic.code);
     } finally {
-      if (isCurrent()) { state.pageLoading = false; rerender(); }
+      if (isCurrent()) {
+        if (!background) state.pageLoading = false;
+        rerender('', background);
+      }
     }
   };
   const refreshAll = async (): Promise<void> => {
     state.busyAction = 'refresh'; rerender();
-    try { state.sqlite = await controller.getSqliteStatus(); await controller.getOverview().then((overview) => { state.overview = overview; }); await refreshFacts(); state.actionError = undefined; toast('success', '已刷新', '记忆工作台数据已更新。', 'MEMORY_WORKBENCH_REFRESHED'); }
+    try {
+      const [sqlite, overview] = await Promise.all([controller.getSqliteStatus(), controller.getOverview()]);
+      state.sqlite = sqlite;
+      state.overview = overview;
+      await loadPage(state.page);
+      if (state.pageError) state.actionError = state.pageError;
+      else {
+        state.actionError = undefined;
+        toast('success', '已刷新', '当前页面和工作台状态已经重新读取。', 'MEMORY_WORKBENCH_REFRESHED');
+      }
+    }
     catch (error) { const diagnostic = describeMemoryError(error, 'MEMORY_WORKBENCH_REFRESH_FAILED', 'operation'); state.actionError = diagnostic; toast('error', diagnostic.title, diagnostic.reason, diagnostic.code); }
     finally { state.busyAction = ''; rerender(); }
   };
@@ -1288,9 +1462,15 @@ export function renderMemoryWorkbench(
     return markup;
   };
 
-  const renderActorMemory = (): string => state.actorTraces.length === 0
-    ? renderEmpty('暂无角色记忆痕迹', '只有有来源观察支撑的主体认知才会显示。')
-    : `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">ActorMemoryTrace</span><h3>角色记忆</h3></div><span>${formatNumber(state.actorTraces.length)} 条痕迹</span></div><div class="stx-memory-reference-list">${state.actorTraces.map(trace => `<article class="stx-memory-evidence"><strong>${escapeHtml(trace.ownerId)} · ${escapeHtml(trace.factId)}</strong>${renderStatusChip(trace.knowledgeMode, trace.privacy === 'private' || trace.privacy === 'secret' ? 'warning' : 'neutral')}<p>强度 ${Math.round(trace.strength)} · 清晰度 ${Math.round(trace.clarity)} · 置信度 ${Math.round(trace.beliefConfidence * 100)}%</p><small>观察来源：${escapeHtml(trace.sourceObservationIds.join('、') || '无')}</small></article>`).join('')}</div></section>`;
+  const renderActorMemory = (): string => {
+    const viewState = actorMemoryState();
+    normalizeActorMemorySelection(viewState);
+    syncActorMemorySelection(viewState);
+    return renderActorMemoryPage(viewState, {
+      formatTime,
+      renderSourceReference: renderLibrarySourceReference,
+    });
+  };
 
   const renderProfiles = (): string => state.profiles.length === 0
     ? renderEmpty('暂无画像增量', '画像必须满足证据重复门槛或高情绪显著度，并且每条声明都引用 Trace。')
@@ -1749,9 +1929,20 @@ export function renderMemoryWorkbench(
     }
   };
 
+  const updateGaugeZonePreview = (zone: HTMLElement, strength: number): void => {
+    const traceId = zone.dataset.traceId ?? '';
+    const factId = zone.dataset.factId ?? '';
+    const trace = state.actorTraces.find(item => item.id === traceId);
+    const fact = state.facts.find(item => item.id === factId);
+    if (!trace || !fact) return;
+    updateActorMemoryGaugeZone(zone, trace, fact, strength);
+  };
+
   root.addEventListener('click', (event) => {
     const target = event.target as HTMLElement;
     const actionNode = target.closest<HTMLElement>('[data-action]');
+    const clickedMemoryZone = target.closest<HTMLElement>('[data-actor-memory-zone]');
+    if (!clickedMemoryZone) root.querySelectorAll<HTMLElement>('[data-actor-memory-zone].is-open').forEach(zone => zone.classList.remove('is-open'));
     const clickedFilter = target.closest<HTMLElement>('[data-multi-filter]');
     const closeOpenFilter = Boolean(state.openFilter && !clickedFilter);
     if (closeOpenFilter) state.openFilter = '';
@@ -1857,6 +2048,77 @@ export function renderMemoryWorkbench(
       state.sceneFilter = '';
       if (first) state.selectedObservationId = first.id;
       rerender();
+      return;
+    }
+    if (action === 'actor-memory-select-owner') {
+      state.actorMemorySelectedOwnerId = actionNode.dataset.ownerId ?? '';
+      state.actorMemorySelectedTraceId = '';
+      state.actorMemoryTab = 'overview';
+      rerender();
+      return;
+    }
+    if (action === 'actor-memory-toggle-group') {
+      const group = actionNode.dataset.group;
+      if (group !== 'people' && group !== 'system') return;
+      state.actorMemoryCollapsedGroups = state.actorMemoryCollapsedGroups.includes(group)
+        ? state.actorMemoryCollapsedGroups.filter(item => item !== group)
+        : [...state.actorMemoryCollapsedGroups, group];
+      rerender(`[data-action="actor-memory-toggle-group"][data-group="${group}"]`);
+      return;
+    }
+    if (action === 'actor-memory-select-trace') {
+      state.actorMemorySelectedTraceId = actionNode.dataset.traceId ?? '';
+      state.actorMemoryTab = 'overview';
+      rerender();
+      if (window.matchMedia?.('(max-width: 760px)').matches) {
+        window.setTimeout(() => root.querySelector<HTMLElement>('#stx-memory-actor-memory-inspector')?.scrollIntoView?.({ block: 'start' }), 0);
+      }
+      return;
+    }
+    if (action === 'actor-memory-set-tab') {
+      const tab = actionNode.dataset.tab;
+      if (tab !== 'overview' && tab !== 'source' && tab !== 'technical') return;
+      state.actorMemoryTab = tab;
+      rerender();
+      return;
+    }
+    if (action === 'actor-memory-open-fact') {
+      const factId = actionNode.dataset.factId ?? '';
+      if (!factId) return;
+      void loadPage('library').then(() => {
+        if (disposed) return;
+        state.query = '';
+        state.selectedKinds = Object.keys(FACT_KIND_LABELS);
+        state.selectedStatuses = Object.keys(FACT_STATUS_LABELS);
+        state.libraryResults = state.facts;
+        state.selectedFactId = factId;
+        normalizeLibrarySelection();
+        rerender();
+      });
+      return;
+    }
+    if (action === 'actor-memory-open-owner') {
+      const ownerId = actionNode.dataset.ownerId ?? '';
+      if (!ownerId) return;
+      void loadPage('actors').then(() => {
+        if (disposed) return;
+        state.actorView = 'people';
+        state.selectedActorId = ownerId;
+        rerender();
+      });
+      return;
+    }
+    if (action === 'actor-memory-refresh') {
+      void loadPage('actor-memory').then(() => {
+        if (!disposed && !state.pageError) toast('success', '角色记忆已刷新', '人物、事实、观察和认知痕迹已经重新读取。', 'MEMORY_ACTOR_MEMORY_REFRESHED');
+      });
+      return;
+    }
+    if (action === 'actor-memory-toggle-gauge-zone') {
+      event.stopPropagation();
+      const open = actionNode.classList.contains('is-open');
+      root.querySelectorAll<HTMLElement>('[data-actor-memory-zone].is-open').forEach(zone => zone.classList.remove('is-open'));
+      if (!open) actionNode.classList.add('is-open');
       return;
     }
     if (action === 'dream-dry-run') {
@@ -2242,6 +2504,11 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('input', (event) => {
     const input = event.target as HTMLInputElement;
+    if (input.dataset.actorMemoryInput === 'query') {
+      state.actorMemoryQuery = input.value;
+      rerender('', true);
+      return;
+    }
     if (input.dataset.sceneInput === 'query') {
       state.sceneQuery = input.value;
       rerender('', true);
@@ -2284,6 +2551,29 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('change', (event) => {
     const input = event.target as HTMLInputElement | HTMLSelectElement;
+    if (input.dataset.actorMemorySelect === 'knowledge') {
+      state.actorMemoryKnowledgeMode = input.value as WorkbenchState['actorMemoryKnowledgeMode'];
+      state.actorMemorySelectedTraceId = '';
+      rerender();
+      return;
+    }
+    if (input.dataset.actorMemorySelect === 'privacy') {
+      state.actorMemoryPrivacy = input.value as WorkbenchState['actorMemoryPrivacy'];
+      state.actorMemorySelectedTraceId = '';
+      rerender();
+      return;
+    }
+    if (input.dataset.actorMemorySelect === 'level') {
+      state.actorMemoryLevel = input.value as WorkbenchState['actorMemoryLevel'];
+      state.actorMemorySelectedTraceId = '';
+      rerender();
+      return;
+    }
+    if (input.dataset.actorMemorySelect === 'sort') {
+      state.actorMemorySort = input.value as ActorMemorySort;
+      rerender();
+      return;
+    }
     if (input.dataset.sceneSelect === 'filter') {
       state.sceneFilter = input.value;
       rerender();
@@ -2354,6 +2644,31 @@ export function renderMemoryWorkbench(
     }
     if (input.dataset.sourceKind) { const selected = (input as HTMLInputElement).checked; state.selectedSourceKinds = selected ? [...new Set([...state.selectedSourceKinds, input.dataset.sourceKind])] : state.selectedSourceKinds.filter((kind) => kind !== input.dataset.sourceKind); void controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory }).then((estimate) => { if (!disposed) { state.estimate = estimate; rerender(); } }).catch((error) => toast('error', '估算失败', '无法更新初始化成本估算。', safeErrorCode(error, 'MEMORY_ESTIMATE_FAILED'))); return; }
   }, { signal: abortController.signal });
+  root.addEventListener('pointermove', (event) => {
+    const zone = (event.target as HTMLElement).closest<HTMLElement>('[data-actor-memory-zone]');
+    if (!zone || state.page !== 'actor-memory') return;
+    const start = Number(zone.dataset.start);
+    const end = Number(zone.dataset.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+    const rect = zone.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
+    const upper = end >= 100 ? 100 : end - 0.01;
+    updateGaugeZonePreview(zone, start + (upper - start) * ratio);
+  }, { signal: abortController.signal });
+  root.addEventListener('pointerout', (event) => {
+    const zone = (event.target as HTMLElement).closest<HTMLElement>('[data-actor-memory-zone]');
+    if (!zone || zone.contains(event.relatedTarget as Node | null)) return;
+    const start = Number(zone.dataset.start);
+    const end = Number(zone.dataset.end);
+    if (Number.isFinite(start) && Number.isFinite(end)) updateGaugeZonePreview(zone, start + (end - start) / 2);
+  }, { signal: abortController.signal });
+  root.addEventListener('focusin', (event) => {
+    const zone = (event.target as HTMLElement).closest<HTMLElement>('[data-actor-memory-zone]');
+    if (!zone) return;
+    const start = Number(zone.dataset.start);
+    const end = Number(zone.dataset.end);
+    if (Number.isFinite(start) && Number.isFinite(end)) updateGaugeZonePreview(zone, start + (end - start) / 2);
+  }, { signal: abortController.signal });
   root.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if (state.actorOperation) {
@@ -2388,7 +2703,7 @@ export function renderMemoryWorkbench(
     rerender();
   }, { signal: abortController.signal });
 
-  removeOverviewChanged = controller.onOverviewChanged?.(() => { void refreshOverviewSnapshot(); });
+  removeOverviewChanged = controller.onOverviewChanged?.(() => { void refreshLiveSnapshot(); });
   render();
   void document.fonts?.ready.then(() => refreshGraphMarquees(root));
   traceMemoryStartup('workbench:initial-rendered');
@@ -2409,7 +2724,7 @@ export function renderMemoryWorkbench(
     }
   });
   return () => {
-    disposed = true; pageRequestId += 1; progressRequestId += 1; abortController.abort();
+    disposed = true; pageRequestId += 1; backgroundPageRequestId += 1; progressRequestId += 1; librarySearchRequestId += 1; overviewRequestId += 1; abortController.abort();
     if (searchTimer) window.clearTimeout(searchTimer);
     if (graphSearchTimer) window.clearTimeout(graphSearchTimer);
     if (progressTimer) window.clearTimeout(progressTimer);

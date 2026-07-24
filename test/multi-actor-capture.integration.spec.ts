@@ -6,9 +6,9 @@ import type { SourceBlock, StructuredCaptureResult } from '../src/application/in
 const rows = readFileSync(new URL('./fixtures/multi-actor-story.jsonl', import.meta.url), 'utf8').trim().split(/\r?\n/).map(line => JSON.parse(line) as SourceBlock);
 const extractor = { extract: async (): Promise<StructuredCaptureResult> => ({
   actorCandidates: [
-    { localId: 'a', displayName: 'A', sourceRefs: ['m1'], evidenceExcerpts: ['A说：我找到了铜钥匙。'], confidence: 0.95, status: 'confirmed' },
-    { localId: 'b', displayName: 'B', sourceRefs: ['m2'], evidenceExcerpts: ['B站在门外'], confidence: 0.95, status: 'confirmed' },
-    { localId: 'p', displayName: '玩家', sourceRefs: ['m4'], evidenceExcerpts: ['玩家在第五层'], confidence: 0.9, status: 'confirmed' },
+    { localId: 'a', displayName: 'A', sourceRefs: ['m1'], evidenceExcerpts: ['A说：我找到了铜钥匙。'], confidence: 0.95 },
+    { localId: 'b', displayName: 'B', sourceRefs: ['m2'], evidenceExcerpts: ['B站在门外'], confidence: 0.95 },
+    { localId: 'p', displayName: '玩家', sourceRefs: ['m4'], evidenceExcerpts: ['玩家在第五层'], confidence: 0.9 },
   ],
   episodes: [{ localId: 'e1', sourceRefs: ['m1', 'm2', 'm3'], participantRefs: ['a', 'b'], presentRefs: ['a', 'b'], mentionedRefs: ['a', 'b'], floorStart: 1, floorEnd: 3 }],
   observations: [
@@ -41,7 +41,7 @@ describe('multi-actor capture fixture', () => {
     };
     const capabilityExtractor = {
       extract: async (): Promise<StructuredCaptureResult> => ({
-        actorCandidates: [{ localId: 'z', displayName: '紫罗', sourceRefs: [source.id], evidenceExcerpts: [source.content], confidence: 1, status: 'confirmed' }],
+        actorCandidates: [{ localId: 'z', displayName: '紫罗', sourceRefs: [source.id], evidenceExcerpts: [source.content], confidence: 1 }],
         episodes: [], observations: [],
         facts: [{ localId: 'f-capability', kind: 'capability', sourceRef: source.id, subjectKey: '紫罗', predicateKey: '发射', objectKey: '紫色尖刺', content: '紫罗可以发射紫色尖刺。', entityKeys: ['紫罗'], ownerRefs: [], confidence: 0.95, privacy: 'public', knowledgeMode: 'asserted', evidenceExcerpt: source.content }],
       }),
@@ -67,8 +67,8 @@ describe('multi-actor capture fixture', () => {
     const newSource: SourceBlock = { id: 'new', chatKey: 'chat', kind: 'message', role: 'assistant', content: '新楼层确认紫罗拥有一把银钥匙。', createdAt: 2, floor: 2 };
     const extract = vi.fn(async (): Promise<StructuredCaptureResult> => ({
       actorCandidates: [
-        { localId: 'old-actor', displayName: '旧人物', sourceRefs: ['old'], evidenceExcerpts: ['旧楼层只提供上下文。'], confidence: 1, status: 'confirmed' },
-        { localId: 'new-actor', displayName: '紫罗', sourceRefs: ['new'], evidenceExcerpts: ['紫罗拥有一把银钥匙'], confidence: 1, status: 'confirmed' },
+        { localId: 'old-actor', displayName: '旧人物', sourceRefs: ['old'], evidenceExcerpts: ['旧楼层只提供上下文。'], confidence: 1 },
+        { localId: 'new-actor', displayName: '紫罗', sourceRefs: ['new'], evidenceExcerpts: ['紫罗拥有一把银钥匙'], confidence: 1 },
       ],
       episodes: [
         { localId: 'old-episode', sourceRefs: ['old'], floorStart: 1, floorEnd: 1 },
@@ -162,5 +162,111 @@ describe('multi-actor capture fixture', () => {
         candidateSnapshot: expect.objectContaining({ localId: 'invalid', kind: 'action' }),
       }),
     ]);
+  });
+
+  it('quarantines unknown fields and model-confirmed actors while committing valid rows', async () => {
+    const source: SourceBlock = {
+      id: 'strict', chatKey: 'chat', kind: 'message', role: 'assistant',
+      content: '紫罗正在守卫城门，白岚站在她身旁。', createdAt: 1,
+    };
+    const strictExtractor = { extract: async (): Promise<StructuredCaptureResult> => ({
+      actorCandidates: [
+        { localId: 'valid-actor', displayName: '紫罗', sourceRefs: [source.id], evidenceExcerpts: ['紫罗正在守卫城门'], confidence: 0.96 },
+        { localId: 'forged-confirmed', displayName: '白岚', sourceRefs: [source.id], evidenceExcerpts: ['白岚站在她身旁'], confidence: 0.96, status: 'confirmed' },
+      ],
+      episodes: [], observations: [],
+      facts: [
+        { localId: 'valid-fact', kind: 'state', sourceRef: source.id, subjectKey: '紫罗', predicateKey: '守卫', objectKey: '城门', content: '紫罗正在守卫城门。', confidence: 0.9, evidenceExcerpt: '紫罗正在守卫城门' },
+        { localId: 'forged-scope', kind: 'state', sourceRef: source.id, subjectKey: '白岚', predicateKey: '在场', content: '白岚站在紫罗身旁。', confidence: 0.9, evidenceExcerpt: '白岚站在她身旁', scope: { worldKeys: ['forged'] } },
+        { localId: 'bad-confidence', kind: 'state', sourceRef: source.id, subjectKey: '白岚', predicateKey: '在场', content: '白岚站在紫罗身旁。', confidence: 2, evidenceExcerpt: '白岚站在她身旁' },
+      ],
+    }) };
+
+    const result = await new MultiActorCaptureService(new ActorRegistry('strict-workspace'), strictExtractor).capture({
+      workspaceId: 'strict-workspace', chatKey: source.chatKey, sources: [source],
+    });
+
+    expect(result.outcome).toBe('partial');
+    expect(result.pendingCandidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ displayName: '紫罗', status: 'pending' }),
+    ]));
+    expect(result.pendingCandidates.map(item => item.displayName)).not.toContain('白岚');
+    expect(result.facts.map(item => item.content)).toEqual(['紫罗正在守卫城门。']);
+    expect(result.rejections).toEqual(expect.arrayContaining([
+      expect.objectContaining({ recordType: 'actor', code: 'unknown_field', fieldPath: 'status' }),
+      expect.objectContaining({ recordType: 'fact', code: 'unknown_field', fieldPath: 'scope' }),
+      expect.objectContaining({ recordType: 'fact', code: 'invalid_confidence', fieldPath: 'confidence' }),
+    ]));
+  });
+
+  it('enforces repair type and localId in code instead of trusting the repair prompt', async () => {
+    const source: SourceBlock = {
+      id: 'repair', chatKey: 'chat', kind: 'message', role: 'assistant',
+      content: '紫罗正在守卫城门。', createdAt: 1,
+    };
+    const repairExtractor = { extract: async (): Promise<StructuredCaptureResult> => ({
+      actorCandidates: [{ localId: 'unexpected-actor', displayName: '紫罗', sourceRefs: [source.id], evidenceExcerpts: [source.content], confidence: 0.9 }],
+      episodes: [], observations: [],
+      facts: [{ localId: 'new-local-id', kind: 'state', sourceRef: source.id, subjectKey: '紫罗', predicateKey: '守卫', content: '紫罗正在守卫城门。', confidence: 0.9, evidenceExcerpt: source.content }],
+    }) };
+
+    const result = await new MultiActorCaptureService(new ActorRegistry('repair-workspace'), repairExtractor).capture({
+      workspaceId: 'repair-workspace', chatKey: source.chatKey, sources: [source],
+      repairRequest: {
+        recordType: 'fact',
+        items: [{ rejectionId: 'rejection:1', localId: 'expected-fact', code: 'invalid_shape', message: '修复事实' }],
+      },
+    });
+
+    expect(result.facts).toEqual([]);
+    expect(result.envelope.actorCandidates).toEqual([]);
+    expect(result.outcome).toBe('partial');
+    expect(result.rejections).toEqual(expect.arrayContaining([
+      expect.objectContaining({ recordType: 'actor', code: 'invalid_shape' }),
+      expect.objectContaining({ recordType: 'fact', code: 'invalid_reference', fieldPath: 'localId' }),
+    ]));
+  });
+
+  it('keeps a new AI actor on a stable pending owner through observations and traces', async () => {
+    const source: SourceBlock = {
+      id: 'pending-owner-source', chatKey: 'chat', kind: 'message', role: 'assistant', floor: 8,
+      content: '洛青说：“我会守住北门。”', createdAt: 8,
+    };
+    const extractor = { extract: async (): Promise<StructuredCaptureResult> => ({
+      actorCandidates: [{
+        localId: 'actor-luo', displayName: '洛青', sourceRefs: [source.id],
+        evidenceExcerpts: ['洛青说'], confidence: 0.97,
+      }],
+      episodes: [{
+        localId: 'episode-luo', sourceRefs: [source.id], floorStart: 8, floorEnd: 8,
+        participantRefs: ['actor-luo'], presentRefs: ['actor-luo'], occurredAt: 8,
+      }],
+      observations: [{
+        localId: 'observation-luo', sourceRef: source.id, episodeLocalId: 'episode-luo',
+        speakerRef: 'actor-luo', viewpointRef: 'actor-luo', observerRefs: ['actor-luo'],
+        channel: 'public_speech', privacy: 'public', knowledgeMode: 'self_reported',
+        excerpt: '我会守住北门', presentRefs: ['actor-luo'], factLocalIds: ['fact-luo'], occurredAt: 8,
+      }],
+      facts: [{
+        localId: 'fact-luo', kind: 'commitment', sourceRef: source.id,
+        subjectKey: '洛青', predicateKey: '承诺', objectKey: '守住北门',
+        content: '洛青承诺守住北门。', confidence: 0.95, evidenceExcerpt: '我会守住北门',
+        observationLocalIds: ['observation-luo'],
+      }],
+    }) };
+
+    const result = await new MultiActorCaptureService(new ActorRegistry('pending-owner-workspace'), extractor).capture({
+      workspaceId: 'pending-owner-workspace', chatKey: source.chatKey, sources: [source],
+    });
+
+    const pending = result.pendingCandidates.find(candidate => candidate.displayName === '洛青');
+    const owner = result.owners.find(candidate => candidate.id === pending?.ownerRef);
+    expect(owner).toMatchObject({ kind: 'actor', status: 'pending' });
+    expect(owner?.id).not.toBe('owner:unknown');
+    expect(result.observations[0]).toMatchObject({ speakerOwnerId: owner?.id, viewpointOwnerId: owner?.id });
+    expect(result.traces).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ownerId: owner?.id, factId: result.facts[0]?.id }),
+    ]));
+    expect(result.traces.map(trace => trace.ownerId)).not.toContain('owner:unknown');
   });
 });

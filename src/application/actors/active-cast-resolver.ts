@@ -128,7 +128,11 @@ export class ActiveCastResolver {
       if (speakerId) {
         speakers.add(speakerId);
         addMember(speakerId, speakerId === FIXED_OWNER_IDS.narrator ? 'narrator' : 'speaker', source, 0.96);
-        if (speakerId !== FIXED_OWNER_IDS.narrator) viewpointOwnerId = speakerId;
+        if (speakerId !== FIXED_OWNER_IDS.narrator) {
+          present.add(speakerId);
+          addMember(speakerId, 'present', source, 0.96);
+          viewpointOwnerId = speakerId;
+        }
       }
 
       const found = namesInContent(this.registry, source);

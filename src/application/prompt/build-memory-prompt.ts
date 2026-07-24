@@ -67,7 +67,7 @@ function resolveAnswerMode(result: RecallResult, mode: MemoryPromptAnswerMode | 
 
 function promptIntro(answerMode: 'roleplay' | 'diagnostic', identity?: MemoryPromptOptions['currentIdentity']): string[] {
   const common = '以下是有原文证据支持的历史记忆。当前对话内容优先于历史记忆；如有冲突，以当前对话为准。不得补造缺失细节。'
-  const identityLine = identity?.name ? [`当前回复用户：${identity.name}${identity.description ? `；Persona：${identity.description}` : ''}`] : []
+  const identityLine = identity?.name ? [`当前回复用户：${xmlEscape(identity.name)}${identity.description ? `；Persona：${xmlEscape(identity.description)}` : ''}`] : []
   if (answerMode === 'roleplay') return [...identityLine, common]
   return [
     ...identityLine,
@@ -139,10 +139,11 @@ export function buildMemoryPromptResult(
         continue
       }
 
+      const factLine = `- ${xmlEscape(item.fact.content)}`
       const candidateLines = [
         ...includedLines,
         ...(sectionStarted ? [] : [`【${section.title}】`]),
-        `- ${item.fact.content}`,
+        factLine,
         closing,
       ]
       if (serializedLength(candidateLines) > maxChars) {
@@ -155,7 +156,7 @@ export function buildMemoryPromptResult(
         includedLines.push(`【${section.title}】`)
         sectionStarted = true
       }
-      includedLines.push(`- ${item.fact.content}`)
+      includedLines.push(factLine)
       includedFactIds.push(item.fact.id)
     }
   }
@@ -225,13 +226,20 @@ function partitionBudget(total: number, partition: ActorMemoryPartition, current
   if (partition.role === 'world') return Math.floor(total * 0.2)
   if (partition.role === 'narrator') return Math.floor(total * 0.1)
   if (currentCount === 0) return Math.floor(total * (0.7 / Math.max(1, actorCount)))
-  return Math.floor(total * ((current ? 0.65 / currentCount : 0.35 / Math.max(1, otherCount))))
+  // World + narrator reserve 30% of the envelope. Split the remaining 70%
+  // between current and other in-scene actors; otherwise the previous 130%
+  // aggregate budget let early partitions consume the global cap and starve
+  // later actors.
+  return Math.floor(total * 0.7 * (current ? 0.65 / currentCount : 0.35 / Math.max(1, otherCount)))
 }
 
 /** Builds the multi-owner XML envelope used by the single native Tavern call. */
 export function buildActorMemoryPromptResult(response: ActorRecallResponse, options: ActorMemoryPromptOptions = {}): ActorMemoryPromptResult {
   const maxChars = normalizeMaxChars(options.maxChars)
-  const currentActorIds = new Set([response.request.scene.viewpointOwnerId, ...response.request.scene.speakerOwnerIds])
+  const currentActorIds = new Set([
+    options.currentViewpointOwnerId ?? response.request.scene.viewpointOwnerId,
+    ...response.request.scene.speakerOwnerIds,
+  ].filter(Boolean))
   const actors = [...response.actors].sort((left, right) => Number(currentActorIds.has(right.ownerId)) - Number(currentActorIds.has(left.ownerId)) || left.ownerId.localeCompare(right.ownerId))
   const partitions = [response.world, response.narrator, ...actors]
   if (partitions.every(partition => partition.packets.length === 0)) {

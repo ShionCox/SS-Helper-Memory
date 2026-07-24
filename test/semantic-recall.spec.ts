@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRecallIndex, type RecallFact } from '../src/application/recall/memory-recall-index';
 import { SemanticRecallService, semanticRecallLimits } from '../src/application/recall/semantic-recall-service';
 import type { MemoryLlmApi } from '../src/application/ingest/llm-extractor';
@@ -22,6 +22,8 @@ function fact(id: string, content: string, overrides: Partial<RecallFact> = {}):
     ...overrides,
   };
 }
+
+afterEach(() => vi.useRealTimers());
 
 function vectorResult(scores: Array<[string, number]>, extra: Partial<VectorSearchResult['audit']> = {}): VectorSearchResult {
   return {
@@ -284,6 +286,32 @@ describe('语义、混合召回与 LLM rerank', () => {
       resourceId: 'Rerank',
       error: '资源 gitee_Rerank 未配置 API Key',
     });
+  });
+
+  it('rerank 路由预检耗时会从 19 秒总预算中扣除', async () => {
+    vi.useFakeTimers();
+    const rerank = vi.fn(async (input: { docs: string[]; budget?: { maxLatencyMs?: number } }) => ({
+      ok: true as const,
+      results: input.docs.map((_, index) => ({ index, score: 1 - index / 10 })),
+      meta: { resourceId: 'Rerank', model: 'budget-model' },
+    }));
+    const previewRoute = vi.fn(() => new Promise<{ resourceId: string; model: string }>((resolve) => {
+      setTimeout(() => resolve({ resourceId: 'Rerank', model: 'budget-model' }), 14_000);
+    }));
+    const llm = { rerank, inspect: { previewRoute } } as unknown as MemoryLlmApi;
+    const vectors = { search: vi.fn(async () => vectorResult([['first', 0.9], ['second', 0.8]])) };
+    const pending = new SemanticRecallService(
+      new MemoryRecallIndex([fact('first', '泳池战斗记录。'), fact('second', '危险核心记录。')]),
+      vectors as never,
+      () => llm,
+    ).recall({ chatKey: 'chat-a', query: '战斗记录', now: NOW }, 'hybrid', 'always');
+
+    await vi.advanceTimersByTimeAsync(14_000);
+    const result = await pending;
+    const requestBudget = rerank.mock.calls[0]?.[0].budget?.maxLatencyMs ?? Number.POSITIVE_INFINITY;
+    expect(requestBudget).toBeGreaterThan(0);
+    expect(requestBudget).toBeLessThanOrEqual(5_000);
+    expect(result.diagnostics.rerank).toMatchObject({ requested: true, success: true });
   });
 
   it('embedding 路由失败时自动退回关键词且不阻塞召回', async () => {

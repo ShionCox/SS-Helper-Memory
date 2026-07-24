@@ -65,6 +65,51 @@ interface CaptureCommit {
   readonly traces: readonly ActorMemoryTrace[];
   readonly sceneCasts?: readonly SceneCast[];
 }
+
+function replaceMigrationIdentifiers(value: string, replacements: ReadonlyMap<string, string>): string {
+  let next = value;
+  for (const [from, to] of [...replacements.entries()].sort(([left], [right]) => right.length - left.length)) {
+    if (from && next.includes(from)) next = next.replaceAll(from, to);
+  }
+  return next;
+}
+
+function remapPlainData(value: PlainData, replacements: ReadonlyMap<string, string>): PlainData {
+  if (typeof value === 'string') return replaceMigrationIdentifiers(value, replacements);
+  if (Array.isArray(value)) return value.map(item => remapPlainData(item, replacements));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, remapPlainData(child, replacements)])) as PlainData;
+  }
+  return value;
+}
+
+function mergeMigratedPlainData(existing: PlainData, incoming: PlainData): PlainData {
+  if (Array.isArray(existing) && Array.isArray(incoming)) {
+    const values = new Map<string, PlainData>();
+    for (const item of [...existing, ...incoming]) values.set(JSON.stringify(item), item);
+    return [...values.values()];
+  }
+  if (existing && incoming && typeof existing === 'object' && typeof incoming === 'object' && !Array.isArray(existing) && !Array.isArray(incoming)) {
+    const merged: Record<string, PlainData> = { ...(existing as Record<string, PlainData>) };
+    for (const [key, value] of Object.entries(incoming as Record<string, PlainData>)) {
+      merged[key] = key in merged ? mergeMigratedPlainData(merged[key]!, value) : value;
+    }
+    if (typeof (existing as Record<string, PlainData>).createdAt === 'number' && typeof (incoming as Record<string, PlainData>).createdAt === 'number') {
+      merged.createdAt = Math.min(Number((existing as Record<string, PlainData>).createdAt), Number((incoming as Record<string, PlainData>).createdAt));
+    }
+    if (typeof (existing as Record<string, PlainData>).updatedAt === 'number' && typeof (incoming as Record<string, PlainData>).updatedAt === 'number') {
+      merged.updatedAt = Math.max(Number((existing as Record<string, PlainData>).updatedAt), Number((incoming as Record<string, PlainData>).updatedAt));
+    }
+    return merged;
+  }
+  return incoming;
+}
+
+function migrationTooLargeError(operationCount: number): Error & { code: string } {
+  return Object.assign(new Error(`人物迁移需要 ${operationCount} 个原子操作，超过 SDK 上限 ${ATOMIC_TRANSACTION_MAX_OPERATIONS}；未写入任何数据。`), {
+    code: 'ACTOR_MIGRATION_TOO_LARGE',
+  });
+}
 interface ChangeEntry { collection: string; recordId: string; before?: PlainData; after?: PlainData; }
 export interface ChangeAudit { id: string; workspaceId: string; chatKey: string; kind: 'capture-change-set-v0' | 'derived-change-set-v0' | 'actor-registry-change-set-v0' | 'dream-change-set-v0'; createdAt: number; entries: readonly ChangeEntry[]; metadata?: PlainData; rolledBackAt?: number; }
 
@@ -82,6 +127,15 @@ function stableKey(value: string): string {
 
 const KNOWLEDGE_MODE_RANK: Readonly<Record<ActorMemoryTrace['knowledgeMode'], number>> = Object.freeze({ unknown: 0, suspected: 1, believed: 2, inferred: 3, heard: 4, experienced: 5, self_reported: 6, asserted: 7 });
 const PRIVACY_RANK: Readonly<Record<ActorMemoryTrace['privacy'], number>> = Object.freeze({ public: 0, limited: 1, private: 2, secret: 3 });
+const QUERY_PAGE_SIZE = 500;
+const TRANSACTION_BATCH_SIZE = 500;
+const ATOMIC_TRANSACTION_MAX_OPERATIONS = 5_000;
+
+function paginationStalledError(collection: string): Error & { code: string } {
+  return Object.assign(new Error(`多角色 Memory 集合 ${collection} 的分页游标未推进，已停止读取。`), {
+    code: 'WORKSPACE_PAGINATION_STALLED',
+  });
+}
 
 /** New v0 persistence surface; it never reads or migrates the retired model. */
 export class MultiActorMemoryRepository {
@@ -120,12 +174,26 @@ export class MultiActorMemoryRepository {
   private async list(collection: string, filter?: Readonly<Record<string, PlainData>>): Promise<WorkspaceRecord[]> {
     const records: WorkspaceRecord[] = [];
     let cursor: string | undefined;
+    const seenCursors = new Set<string>();
     do {
-      const page = await this.workspace.query({ workspaceId: this.workspaceId, collection, filter, cursor, limit: 500 });
+      const page = await this.workspace.query({ workspaceId: this.workspaceId, collection, filter, ...(cursor ? { cursor } : {}), limit: QUERY_PAGE_SIZE });
       records.push(...rows(page));
-      cursor = page.nextCursor ?? undefined;
+      const nextCursor = page.nextCursor ?? undefined;
+      if (nextCursor !== undefined && seenCursors.has(nextCursor)) throw paginationStalledError(collection);
+      if (nextCursor !== undefined) seenCursors.add(nextCursor);
+      cursor = nextCursor;
     } while (cursor);
     return records;
+  }
+
+  private async transactInBatches(operations: readonly WorkspaceTransactionOperation[], idempotencyPrefix: string): Promise<void> {
+    for (let offset = 0; offset < operations.length; offset += TRANSACTION_BATCH_SIZE) {
+      await this.workspace.transaction({
+        workspaceId: this.workspaceId,
+        idempotencyKey: `${idempotencyPrefix}:${offset / TRANSACTION_BATCH_SIZE}`,
+        operations: operations.slice(offset, offset + TRANSACTION_BATCH_SIZE),
+      });
+    }
   }
 
   async listOwners(): Promise<MemoryOwner[]> { return (await this.list('actors', { workspaceId: this.workspaceId })).map(record => record.value as unknown as MemoryOwner); }
@@ -161,12 +229,13 @@ export class MultiActorMemoryRepository {
   async listChangeAudits(): Promise<Record<string, unknown>[]> { return (await this.list('change-audits', { workspaceId: this.workspaceId, chatKey: this.chatKey })).map(record => record.value as unknown as Record<string, unknown>); }
   async getChangeAudit(auditId: string): Promise<ChangeAudit | undefined> {
     const record = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
-    return record?.value as unknown as ChangeAudit | undefined;
+    const audit = record?.value as unknown as ChangeAudit | undefined;
+    return audit?.workspaceId === this.workspaceId && audit.chatKey === this.chatKey ? audit : undefined;
   }
   async updateCaptureAuditRejections(auditId: string, rejections: readonly AutomaticIngestRejection[]): Promise<void> {
     const current = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
     const audit = current?.value as unknown as ChangeAudit | undefined;
-    if (!current || !audit || audit.kind !== 'capture-change-set-v0') throw new Error('找不到 Capture 审计记录。');
+    if (!current || !audit || audit.kind !== 'capture-change-set-v0' || audit.workspaceId !== this.workspaceId || audit.chatKey !== this.chatKey) throw new Error('找不到当前聊天的 Capture 审计记录。');
     const metadata = audit.metadata && typeof audit.metadata === 'object' && !Array.isArray(audit.metadata)
       ? audit.metadata as Record<string, PlainData>
       : {};
@@ -181,13 +250,17 @@ export class MultiActorMemoryRepository {
     const captureJobId = String(metadata.captureJobId ?? '').trim();
     if (captureJobId) {
       const captureJob = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'capture-jobs', recordId: captureJobId });
-      if (captureJob?.value && typeof captureJob.value === 'object') operations.push({
-        action: 'upsert',
-        collection: 'capture-jobs',
-        recordId: captureJobId,
-        value: asPlain({ ...(captureJob.value as Record<string, unknown>), outcome, rejectionCount: rejections.length, rejections: [...rejections], updatedAt: Date.now() }),
-        expectedVersion: captureJob.version,
-      });
+      if (captureJob?.value && typeof captureJob.value === 'object') {
+        const jobValue = captureJob.value as Record<string, unknown>;
+        if (String(jobValue.workspaceId ?? '') !== this.workspaceId || String(jobValue.chatKey ?? '') !== this.chatKey) throw new Error('Capture job 不属于当前聊天。');
+        operations.push({
+          action: 'upsert',
+          collection: 'capture-jobs',
+          recordId: captureJobId,
+          value: asPlain({ ...jobValue, outcome, rejectionCount: rejections.length, rejections: [...rejections], updatedAt: Date.now() }),
+          expectedVersion: captureJob.version,
+        });
+      }
     }
     await this.workspace.transaction({ workspaceId: this.workspaceId, idempotencyKey: `capture-rejections:${auditId}:${crypto.randomUUID()}`, operations });
   }
@@ -235,9 +308,12 @@ export class MultiActorMemoryRepository {
   }
   async listTraces(ownerId?: string): Promise<ActorMemoryTrace[]> {
     const records = await this.list('memory-traces', { workspaceId: this.workspaceId, ...(ownerId ? { ownerId } : {}) });
-    return records
-      .map(record => record.value as unknown as ActorMemoryTrace & { readonly chatKey?: string })
-      .filter(trace => !trace.chatKey || trace.chatKey === this.chatKey);
+    const traces = records.map(record => record.value as unknown as ActorMemoryTrace & { readonly chatKey?: string });
+    const needsLegacyScopeResolution = traces.some(trace => !trace.chatKey);
+    const currentFactIds = needsLegacyScopeResolution
+      ? new Set((await this.list('facts', { workspaceId: this.workspaceId, chatKey: this.chatKey })).map(record => record.recordId))
+      : new Set<string>();
+    return traces.filter(trace => trace.chatKey === this.chatKey || (!trace.chatKey && currentFactIds.has(trace.factId)));
   }
   async getFact(factId: string): Promise<MemoryFact | undefined> {
     const record = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'facts', recordId: factId });
@@ -381,12 +457,15 @@ export class MultiActorMemoryRepository {
     if (!target || target.chatKey !== chatKey || !targetRecord) return false;
     const entries: ChangeEntry[] = [{ collection: 'facts', recordId: factId, before: asPlain(target) }];
     const operations: WorkspaceTransactionOperation[] = [{ action: 'delete', collection: 'facts', recordId: factId, expectedVersion: targetRecord.version }];
-    const relatedIds = [target.supersedesId, target.supersededById].filter((value): value is string => Boolean(value));
-    const related = await Promise.all(relatedIds.map(recordId => this.workspace.get({ workspaceId: this.workspaceId, collection: 'facts', recordId })));
+    const declaredRelatedIds = [...new Set([target.supersedesId, target.supersededById].filter((value): value is string => Boolean(value)))];
+    const related = (await Promise.all(declaredRelatedIds.map(async recordId => {
+      const record = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'facts', recordId });
+      const value = record?.value as unknown as MemoryFact | undefined;
+      return record && value?.chatKey === chatKey ? { record, value } : undefined;
+    }))).filter((entry): entry is { record: WorkspaceRecord; value: MemoryFact } => Boolean(entry));
+    const relatedIds = related.map(entry => entry.record.recordId);
     const replacementFacts: MemoryFact[] = [];
-    for (const record of related) {
-      if (!record) continue;
-      const value = record.value as unknown as MemoryFact;
+    for (const { record, value } of related) {
       const restored = { ...value, revision: value.revision + 1, updatedAt: Date.now() } as MemoryFact & { supersedesId?: string; supersededById?: string };
       if (restored.supersededById === factId) { delete restored.supersededById; restored.status = 'active'; }
       if (restored.supersedesId === factId) delete restored.supersedesId;
@@ -581,7 +660,7 @@ export class MultiActorMemoryRepository {
   async rollbackChangeSet(auditId: string): Promise<void> {
     const auditRecord = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
     const audit = auditRecord?.value as unknown as ChangeAudit | undefined;
-    if (!audit || !['capture-change-set-v0', 'derived-change-set-v0', 'actor-registry-change-set-v0', 'dream-change-set-v0'].includes(audit.kind)) throw new Error('找不到可回滚的多角色 ChangeSet。');
+    if (!audit || audit.workspaceId !== this.workspaceId || audit.chatKey !== this.chatKey || !['capture-change-set-v0', 'derived-change-set-v0', 'actor-registry-change-set-v0', 'dream-change-set-v0'].includes(audit.kind)) throw new Error('找不到当前聊天可回滚的多角色 ChangeSet。');
     const operations: WorkspaceTransactionOperation[] = [];
     const auditedKeys = new Set(audit.entries.map(entry => `${entry.collection}:${entry.recordId}`));
     const captureTraceIds = new Set(audit.kind === 'capture-change-set-v0'
@@ -637,8 +716,10 @@ export class MultiActorMemoryRepository {
     for (const record of records) {
       const recordId = String(record.id ?? '');
       if (!recordId) throw new Error(`派生记录缺少 id：${collection}`);
+      if (record.workspaceId !== undefined && String(record.workspaceId) !== this.workspaceId) throw new Error(`派生记录不属于当前工作区：${collection}`);
+      if (record.chatKey !== undefined && String(record.chatKey) !== this.chatKey) throw new Error(`派生记录不属于当前聊天：${collection}`);
       const current = await this.workspace.get({ workspaceId: this.workspaceId, collection, recordId });
-      const persisted = { ...record, workspaceId: record.workspaceId ?? this.workspaceId, chatKey: record.chatKey ?? this.chatKey };
+      const persisted = { ...record, workspaceId: this.workspaceId, chatKey: this.chatKey };
       operations.push({ action: 'upsert', collection, recordId, value: asPlain(persisted), expectedVersion: current?.version ?? 0 });
     }
     await this.workspace.transaction({ workspaceId: this.workspaceId, idempotencyKey: `derived:${collection}:${Date.now()}`, operations });
@@ -656,8 +737,10 @@ export class MultiActorMemoryRepository {
       for (const record of group.records) {
         const recordId = String(record.id ?? '');
         if (!recordId) throw new Error(`派生记录缺少 id：${group.collection}`);
+        if (record.workspaceId !== undefined && String(record.workspaceId) !== this.workspaceId) throw new Error(`派生记录不属于当前工作区：${group.collection}`);
+        if (record.chatKey !== undefined && String(record.chatKey) !== this.chatKey) throw new Error(`派生记录不属于当前聊天：${group.collection}`);
         const before = await this.workspace.get({ workspaceId: this.workspaceId, collection: group.collection, recordId });
-        const persisted = { ...record, workspaceId: record.workspaceId ?? this.workspaceId, chatKey: record.chatKey ?? this.chatKey, sourceChangeSetId: record.sourceChangeSetId ?? auditId };
+        const persisted = { ...record, workspaceId: this.workspaceId, chatKey: this.chatKey, sourceChangeSetId: record.sourceChangeSetId ?? auditId };
         entries.push({ collection: group.collection, recordId, ...(before ? { before: before.value } : {}), after: asPlain(persisted) });
         operations.push({ action: 'upsert', collection: group.collection, recordId, value: asPlain(persisted), expectedVersion: before?.version ?? 0 });
       }
@@ -676,15 +759,17 @@ export class MultiActorMemoryRepository {
   ): Promise<void> {
     const auditRecord = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
     const audit = auditRecord?.value as unknown as ChangeAudit | undefined;
-    if (!audit) throw new Error('找不到要附加派生记录的 ChangeSet。');
+    if (!audit || audit.workspaceId !== this.workspaceId || audit.chatKey !== this.chatKey) throw new Error('找不到当前聊天要附加派生记录的 ChangeSet。');
     const entries = [...audit.entries];
     const operations: WorkspaceTransactionOperation[] = [];
     for (const group of recordsByCollection) {
       for (const record of group.records) {
         const recordId = String(record.id ?? '');
         if (!recordId) throw new Error(`派生记录缺少 id：${group.collection}`);
+        if (record.workspaceId !== undefined && String(record.workspaceId) !== this.workspaceId) throw new Error(`派生记录不属于当前工作区：${group.collection}`);
+        if (record.chatKey !== undefined && String(record.chatKey) !== this.chatKey) throw new Error(`派生记录不属于当前聊天：${group.collection}`);
         const before = await this.workspace.get({ workspaceId: this.workspaceId, collection: group.collection, recordId });
-        const persisted = { ...record, workspaceId: record.workspaceId ?? this.workspaceId, chatKey: record.chatKey ?? this.chatKey, sourceChangeSetId: record.sourceChangeSetId ?? auditId };
+        const persisted = { ...record, workspaceId: this.workspaceId, chatKey: this.chatKey, sourceChangeSetId: record.sourceChangeSetId ?? auditId };
         entries.push({ collection: group.collection, recordId, ...(before ? { before: before.value } : {}), after: asPlain(persisted) });
         operations.push({ action: 'upsert', collection: group.collection, recordId, value: asPlain(persisted), expectedVersion: before?.version ?? 0 });
       }
@@ -742,11 +827,14 @@ export class MultiActorMemoryRepository {
       }
     }
     if (migration) {
+      if (migration.fromOwnerId === migration.toOwnerId) throw new Error('人物迁移源和目标不能相同。');
+      const traceIdReplacements = new Map<string, string>();
       for (const trace of await this.listTraces(migration.fromOwnerId)) {
         const current = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'memory-traces', recordId: trace.id });
         const next = { ...trace, id: `trace:${migration.toOwnerId}:${trace.factId}`, ownerId: migration.toOwnerId, chatKey: trace.chatKey ?? this.chatKey, traceRevision: trace.traceRevision + 1, updatedAt: Date.now() };
         const target = await this.workspace.get({ workspaceId: this.workspaceId, collection: 'memory-traces', recordId: next.id });
         const targetValue = target?.value as unknown as ActorMemoryTrace | undefined;
+        if (targetValue?.chatKey && targetValue.chatKey !== this.chatKey) throw new Error('人物迁移目标 Trace 不属于当前聊天。');
         const merged = targetValue ? {
           ...targetValue,
           ...next,
@@ -767,10 +855,61 @@ export class MultiActorMemoryRepository {
         entries.push({ collection: 'memory-traces', recordId: next.id, ...(target ? { before: target.value } : {}), after: asPlain(merged) });
         operations.push({ action: 'delete', collection: 'memory-traces', recordId: trace.id, ...(current ? { expectedVersion: current.version } : {}) });
         operations.push({ action: 'upsert', collection: 'memory-traces', recordId: next.id, value: asPlain(merged), expectedVersion: target?.version ?? 0 });
+        traceIdReplacements.set(trace.id, next.id);
+      }
+
+      const replacements = new Map<string, string>([
+        [migration.fromOwnerId, migration.toOwnerId],
+        [encodeURIComponent(migration.fromOwnerId), encodeURIComponent(migration.toOwnerId)],
+        ...traceIdReplacements.entries(),
+      ]);
+      const queueRecordMigration = async (collection: string, record: WorkspaceRecord): Promise<void> => {
+        const migratedValue = remapPlainData(record.value, replacements);
+        const migratedRecordId = replaceMigrationIdentifiers(record.recordId, replacements);
+        if (migratedRecordId === record.recordId && JSON.stringify(migratedValue) === JSON.stringify(record.value)) return;
+        if (migratedRecordId === record.recordId) {
+          entries.push({ collection, recordId: record.recordId, before: record.value, after: migratedValue });
+          operations.push({ action: 'upsert', collection, recordId: record.recordId, value: migratedValue, expectedVersion: record.version });
+          return;
+        }
+        const target = await this.workspace.get({ workspaceId: this.workspaceId, collection, recordId: migratedRecordId });
+        const targetChatKey = target?.value && typeof target.value === 'object' && !Array.isArray(target.value)
+          ? String((target.value as Record<string, PlainData>).chatKey ?? '')
+          : '';
+        if (targetChatKey && targetChatKey !== this.chatKey) throw new Error(`人物迁移目标记录不属于当前聊天：${collection}/${migratedRecordId}`);
+        const mergedValue = target ? mergeMigratedPlainData(target.value, migratedValue) : migratedValue;
+        entries.push({ collection, recordId: record.recordId, before: record.value });
+        entries.push({ collection, recordId: migratedRecordId, ...(target ? { before: target.value } : {}), after: mergedValue });
+        operations.push({ action: 'delete', collection, recordId: record.recordId, expectedVersion: record.version });
+        operations.push({ action: 'upsert', collection, recordId: migratedRecordId, value: mergedValue, expectedVersion: target?.version ?? 0 });
+      };
+
+      const episodeRecords = await this.list('episodes', { workspaceId: this.workspaceId, chatKey: this.chatKey });
+      const episodeIds = new Set(episodeRecords.map(record => record.recordId));
+      const observationRecords = (await this.list('observations', { workspaceId: this.workspaceId }))
+        .filter(record => episodeIds.has(String((record.value as Record<string, PlainData>).episodeId ?? '')));
+      const chatScopedCollections = [
+        'facts', 'scene-casts', 'capture-jobs', 'change-audits',
+        'memory-details', 'memory-links', 'vector-index', 'graph-nodes', 'graph-edges',
+        'recall-exposures', 'dream-jobs', 'dream-audits', 'dream-narratives',
+      ] as const;
+      const workspaceScopedDerivedCollections = ['profiles', 'profile-claims', 'relationship-claims'] as const;
+      for (const record of episodeRecords) await queueRecordMigration('episodes', record);
+      for (const record of observationRecords) await queueRecordMigration('observations', record);
+      for (const collection of chatScopedCollections) {
+        for (const record of await this.list(collection, { workspaceId: this.workspaceId, chatKey: this.chatKey })) {
+          await queueRecordMigration(collection, record);
+        }
+      }
+      for (const collection of workspaceScopedDerivedCollections) {
+        const records = (await this.list(collection, { workspaceId: this.workspaceId }))
+          .filter(record => String((record.value as Record<string, PlainData>).chatKey ?? '') === this.chatKey);
+        for (const record of records) await queueRecordMigration(collection, record);
       }
     }
     const audit: ChangeAudit = { id: `change-audit:${crypto.randomUUID()}`, workspaceId: this.workspaceId, chatKey: this.chatKey, kind: 'actor-registry-change-set-v0', createdAt: Date.now(), entries, ...(metadata ? { metadata: asPlain(metadata) } : {}) };
     operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
+    if (operations.length > ATOMIC_TRANSACTION_MAX_OPERATIONS) throw migrationTooLargeError(operations.length);
     await this.workspace.transaction({ workspaceId: this.workspaceId, idempotencyKey: audit.id, operations });
     return audit;
   }
@@ -788,8 +927,8 @@ export class MultiActorMemoryRepository {
         : await this.list(collection, { workspaceId: this.workspaceId, chatKey: this.chatKey });
       for (const record of records) operations.push({ action: 'delete', collection, recordId: record.recordId, expectedVersion: record.version });
     }
-    if (operations.length > 0) await this.workspace.transaction({ workspaceId: this.workspaceId, idempotencyKey: `multi-actor-clear:${this.chatKey}:${Date.now()}`, operations });
-    await this.workspace.vectorClear({ workspaceId: this.workspaceId, collection: 'facts', metadata: { chatKey: this.chatKey } }).catch(() => 0);
+    if (operations.length > 0) await this.transactInBatches(operations, `multi-actor-clear:${this.chatKey}:${Date.now()}`);
+    await this.workspace.vectorClear({ workspaceId: this.workspaceId, collection: 'facts', metadata: { chatKey: this.chatKey } });
   }
 
   async clearAllData(): Promise<void> {
@@ -799,8 +938,8 @@ export class MultiActorMemoryRepository {
         operations.push({ action: 'delete', collection, recordId: record.recordId, expectedVersion: record.version });
       }
     }
-    if (operations.length > 0) await this.workspace.transaction({ workspaceId: this.workspaceId, idempotencyKey: `multi-actor-clear-all:${this.workspaceId}:${Date.now()}`, operations });
-    await this.workspace.vectorClear({ workspaceId: this.workspaceId, collection: 'facts' }).catch(() => 0);
+    if (operations.length > 0) await this.transactInBatches(operations, `multi-actor-clear-all:${this.workspaceId}:${Date.now()}`);
+    await this.workspace.vectorClear({ workspaceId: this.workspaceId, collection: 'facts' });
   }
 
   async upsertTraces(records: readonly ActorMemoryTrace[]): Promise<void> {

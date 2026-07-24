@@ -15,8 +15,11 @@ function hash(value: string): string {
 }
 function stringArray(value: unknown): string[] { return Array.isArray(value) ? value.map(String).map(item => item.trim()).filter(Boolean) : []; }
 function numberValue(value: unknown, fallback: number): number { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : fallback; }
-function privacy(value: unknown, fallback: MemoryPrivacy = 'public'): MemoryPrivacy { return value === 'private' || value === 'secret' || value === 'limited' || value === 'public' ? value : fallback; }
-function knowledgeMode(value: unknown, fallback: MemoryKnowledgeMode = 'asserted'): MemoryKnowledgeMode { return ['asserted', 'self_reported', 'heard', 'experienced', 'inferred', 'believed', 'suspected', 'unknown'].includes(String(value)) ? value as MemoryKnowledgeMode : fallback; }
+const ALLOWED_PRIVACY = ['public', 'limited', 'private', 'secret'] as const satisfies readonly MemoryPrivacy[];
+const ALLOWED_KNOWLEDGE_MODES = ['asserted', 'self_reported', 'heard', 'experienced', 'inferred', 'believed', 'suspected', 'unknown'] as const satisfies readonly MemoryKnowledgeMode[];
+function privacy(value: unknown, fallback: MemoryPrivacy = 'public'): MemoryPrivacy { return ALLOWED_PRIVACY.includes(value as MemoryPrivacy) ? value as MemoryPrivacy : fallback; }
+function knowledgeMode(value: unknown, fallback: MemoryKnowledgeMode = 'asserted'): MemoryKnowledgeMode { return ALLOWED_KNOWLEDGE_MODES.includes(value as MemoryKnowledgeMode) ? value as MemoryKnowledgeMode : fallback; }
+function validConfidence(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1; }
 
 export interface MultiActorCaptureResult {
   readonly envelope: CaptureEnvelope;
@@ -149,12 +152,36 @@ export class MultiActorCaptureService {
       observation: [],
       fact: [],
     };
+    const actorFields = new Set(['localId', 'displayName', 'aliases', 'sourceRefs', 'evidenceExcerpts', 'confidence']);
+    const episodeFields = new Set([
+      'localId', 'sourceRef', 'sourceRefs', 'floorStart', 'floorEnd',
+      'participantRefs', 'participantIds', 'presentRefs', 'presentOwnerIds',
+      'mentionedRefs', 'mentionedOwnerIds', 'location', 'occurredAt', 'summary',
+    ]);
+    const observationFields = new Set([
+      'localId', 'sourceRef', 'sourceRefs', 'episodeLocalId', 'episodeId',
+      'speakerRef', 'speakerOwnerId', 'speaker', 'viewpointRef', 'viewpointOwnerId', 'viewpoint',
+      'observerRefs', 'observerOwnerIds', 'observers', 'channel', 'privacy', 'knowledgeMode',
+      'excerpt', 'mentionedRefs', 'mentionedOwnerIds', 'presentRefs', 'presentOwnerIds',
+      'factLocalIds', 'factRefs', 'occurredAt',
+    ]);
+    const factFields = new Set([
+      'localId', 'sourceRef', 'sourceRefs', 'kind', 'subjectKey', 'predicateKey', 'objectKey',
+      'content', 'entityKeys', 'ownerRefs', 'confidence', 'evidenceExcerpt',
+      'observationLocalIds', 'observationRefs', 'observationIds', 'privacy', 'knowledgeMode',
+      'validFrom', 'validUntil', 'stableAnchor',
+    ]);
     const snapshotKeys = new Set([
+      ...actorFields,
+      ...episodeFields,
+      ...observationFields,
+      ...factFields,
       'localId', 'displayName', 'aliases', 'sourceRefs', 'evidenceExcerpts',
       'sourceRef', 'episodeLocalId', 'speakerRef', 'viewpointRef', 'observerRefs',
       'channel', 'privacy', 'knowledgeMode', 'excerpt', 'mentionedRefs', 'presentRefs',
       'factRefs', 'kind', 'subjectKey', 'predicateKey', 'objectKey', 'content',
-      'entityKeys', 'ownerRefs', 'confidence', 'evidenceExcerpt',
+      'entityKeys', 'ownerRefs', 'confidence', 'evidenceExcerpt', 'status',
+      'validFrom', 'validUntil', 'stableAnchor',
     ]);
     const candidateSnapshot = (value: Record<string, unknown>): Record<string, unknown> => Object.fromEntries(
       Object.entries(value)
@@ -190,27 +217,72 @@ export class MultiActorCaptureService {
         repairAttempts: 0,
       });
     };
+    const rejectUnknownFields = (
+      recordType: 'actor' | 'episode' | 'observation' | 'fact',
+      index: number,
+      value: Record<string, unknown>,
+      allowed: ReadonlySet<string>,
+    ): boolean => {
+      const unknownFields = Object.keys(value).filter(key => !allowed.has(key)).sort();
+      if (unknownFields.length === 0) return false;
+      reject(
+        recordType,
+        index,
+        'unknown_field',
+        `${recordType} 包含未声明字段：${unknownFields.join('、')}。`,
+        unknownFields[0]!,
+        value,
+        [...allowed].sort(),
+      );
+      return true;
+    };
+    const repairLocalIds = new Set(input.repairRequest?.items.map(item => item.localId) ?? []);
+    const repairAllows = (
+      recordType: 'actor' | 'episode' | 'observation' | 'fact',
+      index: number,
+      value: Record<string, unknown>,
+    ): boolean => {
+      const repair = input.repairRequest;
+      if (!repair) return true;
+      if (repair.recordType !== recordType) {
+        reject(recordType, index, 'invalid_shape', `定向修复只允许输出 ${repair.recordType}，不得写入 ${recordType}。`, 'recordType', value, [repair.recordType]);
+        return false;
+      }
+      const localId = String(value.localId ?? '').trim();
+      if (!localId || !repairLocalIds.has(localId)) {
+        reject(recordType, index, 'invalid_reference', '定向修复必须保留 repairRequest 中已有的 localId。', 'localId', value, [...repairLocalIds].sort());
+        return false;
+      }
+      return true;
+    };
     const ownerByLocalId = new Map<string, string>();
     const acceptedActorCandidates: ActorCandidate[] = [];
     for (const [index, value] of structured.actorCandidates.entries()) {
+      if (!repairAllows('actor', index, value)) continue;
+      if (rejectUnknownFields('actor', index, value, actorFields)) continue;
+      if (value.confidence !== undefined && !validConfidence(value.confidence)) {
+        reject('actor', index, 'invalid_confidence', '人物 confidence 必须是 0 到 1 之间的数字。', 'confidence', value);
+        continue;
+      }
       const candidate = {
         localId: String(value.localId ?? `actor:${index}`).trim(),
         displayName: String(value.displayName ?? '').trim(),
         aliases: stringArray(value.aliases).slice(0, 12),
         sourceRefs: stringArray(value.sourceRefs).slice(0, 16),
         evidenceExcerpts: stringArray(value.evidenceExcerpts).slice(0, 8),
-        confidence: Math.max(0, Math.min(1, numberValue(value.confidence, 0.5))),
-        status: value.status === 'confirmed' || value.status === 'unknown' ? value.status : 'pending',
+        confidence: value.confidence === undefined ? 0.5 : value.confidence,
+        status: 'pending' as const,
       } satisfies ActorCandidate;
       if (!candidate.displayName || !candidate.localId) {
         reject('actor', index, 'invalid_shape', '人物缺少 localId 或 displayName。', !candidate.localId ? 'localId' : 'displayName', value);
         continue;
       }
       const candidateSources = candidate.sourceRefs.map(ref => sources.find(source => source.id === ref)).filter((source): source is SourceBlock => Boolean(source));
+      const writableCandidateSources = candidateSources.filter(source => isWritableSource(source.id));
       const sourceRefsValid = candidate.sourceRefs.length > 0 && candidate.sourceRefs.every(ref => sources.some(source => source.id === ref));
       const excerptsValid = candidate.evidenceExcerpts.length > 0
-        && candidate.evidenceExcerpts.every(excerpt => candidateSources.some(source => source.content.includes(excerpt)));
-      if (!sourceRefsValid || !excerptsValid || !candidate.sourceRefs.some(isWritableSource)) {
+        && candidate.evidenceExcerpts.every(excerpt => writableCandidateSources.some(source => source.content.includes(excerpt)));
+      if (!sourceRefsValid || !excerptsValid || writableCandidateSources.length === 0) {
         // A model-provided identity without source evidence remains isolated as
         // unknown; it must never silently become a confirmed actor.
         ownerByLocalId.set(candidate.localId, FIXED_OWNER_IDS.unknown);
@@ -230,7 +302,19 @@ export class MultiActorCaptureService {
       const sourceType = candidateSources.some(source => source.kind === 'host_card')
         ? 'host_card'
         : candidateSources.some(source => source.kind === 'worldbook') ? 'worldbook' : 'message';
-      const resolution = this.registry.discoverCandidate(candidate as ActorCandidate, sourceType);
+      const deterministicExisting = this.registry.resolveMention(candidate.displayName);
+      const resolution = deterministicExisting?.owner.kind === 'actor'
+        && deterministicExisting.owner.status === 'confirmed'
+        && !deterministicExisting.ambiguous
+        ? this.registry.discover({
+          displayName: candidate.displayName,
+          aliases: candidate.aliases,
+          sourceRef: candidate.sourceRefs[0]!,
+          sourceType,
+          excerpt: candidate.evidenceExcerpts[0],
+          confidence: candidate.confidence,
+        })
+        : this.registry.discoverCandidate(candidate as ActorCandidate, sourceType);
       ownerByLocalId.set(candidate.localId, resolution.owner.id);
     }
     const resolveOwner = (value: unknown, source?: SourceBlock): string => {
@@ -248,10 +332,23 @@ export class MultiActorCaptureService {
     const episodeEntries: Array<{ localId: string; episode: MemoryEpisode }> = [];
     for (const [index, value] of structured.episodes.entries()) {
       const row = value as Record<string, unknown>;
+      if (!repairAllows('episode', index, row)) continue;
+      if (rejectUnknownFields('episode', index, row, episodeFields)) continue;
+      let invalidNumericField = false;
+      for (const field of ['floorStart', 'floorEnd', 'occurredAt'] as const) {
+        const raw = row[field];
+        const integerRequired = field === 'floorStart' || field === 'floorEnd';
+        if (raw !== undefined && (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0 || (integerRequired && !Number.isInteger(raw)))) {
+          reject('episode', index, 'invalid_shape', `事件 ${field} 必须是${integerRequired ? '非负整数' : '非负有限数字'}。`, field, row);
+          invalidNumericField = true;
+          break;
+        }
+      }
+      if (invalidNumericField) continue;
       const sourceRefScalar = String(row.sourceRef ?? '').trim();
       const declaredSourceRefs = stringArray(row.sourceRefs);
       if (declaredSourceRefs.length === 0 && sourceRefScalar) declaredSourceRefs.push(sourceRefScalar);
-      const sourceRefs = declaredSourceRefs.filter(ref => sources.some(source => source.id === ref));
+      const sourceRefs = [...new Set(declaredSourceRefs.filter(ref => sources.some(source => source.id === ref)))];
       // Local references are part of the structured Capture contract. Do not
       // silently drop an invalid ref and attach the episode to an unrelated
       // source; quarantine the whole malformed episode instead.
@@ -267,6 +364,10 @@ export class MultiActorCaptureService {
       const id = `episode:${encodedChatKey}:${localId}:${hash(sourceRefs.join('|'))}`;
       const floorStart = numberValue(row.floorStart, Math.min(...sourceRefs.map(ref => sources.find(source => source.id === ref)?.floor ?? 0)));
       const floorEnd = numberValue(row.floorEnd, Math.max(...sourceRefs.map(ref => sources.find(source => source.id === ref)?.floor ?? floorStart)));
+      if (floorEnd < floorStart) {
+        reject('episode', index, 'invalid_shape', '事件 floorEnd 不能小于 floorStart。', 'floorEnd', row);
+        continue;
+      }
       const episode: MemoryEpisode = { id, workspaceId: input.workspaceId, chatKey: input.chatKey, floorStart, floorEnd, sourceRefs, participantIds: stringArray(row.participantRefs ?? row.participantIds).map(ref => resolveOwner(ref)), presentOwnerIds: stringArray(row.presentRefs ?? row.presentOwnerIds).map(ref => resolveOwner(ref)), mentionedOwnerIds: stringArray(row.mentionedRefs ?? row.mentionedOwnerIds).map(ref => resolveOwner(ref)), ...(String(row.location ?? '').trim() ? { location: String(row.location).trim() } : {}), occurredAt: numberValue(row.occurredAt, Date.now()), ...(String(row.summary ?? '').trim() ? { summary: String(row.summary).trim() } : {}), createdAt: Date.now() };
       episodeEntries.push({ localId, episode });
       acceptedLocalIds.episode.push(localId);
@@ -279,6 +380,12 @@ export class MultiActorCaptureService {
     const observationLocalIdById = new Map<string, string>();
     const observations: MemoryObservation[] = structured.observations.flatMap((value, index) => {
       const row = value as Record<string, unknown>;
+      if (!repairAllows('observation', index, row)) return [];
+      if (rejectUnknownFields('observation', index, row, observationFields)) return [];
+      if (row.occurredAt !== undefined && (typeof row.occurredAt !== 'number' || !Number.isFinite(row.occurredAt) || row.occurredAt < 0)) {
+        reject('observation', index, 'invalid_shape', '观察 occurredAt 必须是非负有限数字。', 'occurredAt', row);
+        return [];
+      }
       const sourceRef = String(row.sourceRef ?? stringArray(row.sourceRefs)[0] ?? '').trim();
       const source = sources.find(item => item.id === sourceRef);
       if (!source || !isWritableSource(sourceRef)) {
@@ -307,16 +414,14 @@ export class MultiActorCaptureService {
         return [];
       }
       const channel = channelValue as MemoryObservation['channel'];
-      const allowedPrivacy: MemoryPrivacy[] = ['public', 'limited', 'private', 'secret'];
       const privacyValue = String(row.privacy ?? '').trim();
-      if (privacyValue && !allowedPrivacy.includes(privacyValue as MemoryPrivacy)) {
-        reject('observation', index, 'invalid_enum', '观察 privacy 不在允许范围内。', 'privacy', row, allowedPrivacy);
+      if (privacyValue && !ALLOWED_PRIVACY.includes(privacyValue as MemoryPrivacy)) {
+        reject('observation', index, 'invalid_enum', '观察 privacy 不在允许范围内。', 'privacy', row, ALLOWED_PRIVACY);
         return [];
       }
-      const allowedKnowledgeModes: MemoryKnowledgeMode[] = ['asserted', 'self_reported', 'heard', 'experienced', 'inferred', 'believed', 'suspected', 'unknown'];
       const knowledgeModeValue = String(row.knowledgeMode ?? '').trim();
-      if (knowledgeModeValue && !allowedKnowledgeModes.includes(knowledgeModeValue as MemoryKnowledgeMode)) {
-        reject('observation', index, 'invalid_enum', '观察 knowledgeMode 不在允许范围内。', 'knowledgeMode', row, allowedKnowledgeModes);
+      if (knowledgeModeValue && !ALLOWED_KNOWLEDGE_MODES.includes(knowledgeModeValue as MemoryKnowledgeMode)) {
+        reject('observation', index, 'invalid_enum', '观察 knowledgeMode 不在允许范围内。', 'knowledgeMode', row, ALLOWED_KNOWLEDGE_MODES);
         return [];
       }
       const hostSpeakerRef = source.author?.kind === 'user'
@@ -357,8 +462,10 @@ export class MultiActorCaptureService {
     const factKinds = new Set<MemoryFact['kind']>(['identity', 'relationship', 'location', 'world_rule', 'state', 'goal', 'commitment', 'preference', 'capability', 'event', 'other']);
     for (const [index, value] of structured.facts.entries()) {
       const row = value as Record<string, unknown>;
+      if (!repairAllows('fact', index, row)) continue;
+      if (rejectUnknownFields('fact', index, row, factFields)) continue;
       const content = normalizeFactContent(String(row.content ?? ''));
-      const declaredFactSourceRefs = stringArray(row.sourceRefs);
+      const declaredFactSourceRefs = [...new Set(stringArray(row.sourceRefs))];
       const sourceRef = String(row.sourceRef ?? declaredFactSourceRefs[0] ?? '').trim();
       const factSourceRefs = declaredFactSourceRefs.length > 0 ? declaredFactSourceRefs : sourceRef ? [sourceRef] : [];
       const factSources = factSourceRefs
@@ -366,8 +473,34 @@ export class MultiActorCaptureService {
         .filter((item): item is SourceBlock => Boolean(item));
       const source = sources.find(item => item.id === sourceRef);
       const evidenceExcerpt = String(row.evidenceExcerpt ?? '').trim();
-      if (content.length < 6 || content.length > 240) {
+      if (Array.from(content).length < 6 || Array.from(content).length > 240) {
         reject('fact', index, 'invalid_shape', '事实 content 长度必须为 6 到 240 个字符。', 'content', row);
+        continue;
+      }
+      if (!validConfidence(row.confidence)) {
+        reject('fact', index, 'invalid_confidence', '事实 confidence 必须是 0 到 1 之间的数字。', 'confidence', row);
+        continue;
+      }
+      const factPrivacyValue = row.privacy === undefined ? 'public' : String(row.privacy).trim();
+      if (!ALLOWED_PRIVACY.includes(factPrivacyValue as MemoryPrivacy)) {
+        reject('fact', index, 'invalid_enum', '事实 privacy 不在允许范围内。', 'privacy', row, ALLOWED_PRIVACY);
+        continue;
+      }
+      const factKnowledgeValue = row.knowledgeMode === undefined ? undefined : String(row.knowledgeMode).trim();
+      if (factKnowledgeValue !== undefined && !ALLOWED_KNOWLEDGE_MODES.includes(factKnowledgeValue as MemoryKnowledgeMode)) {
+        reject('fact', index, 'invalid_enum', '事实 knowledgeMode 不在允许范围内。', 'knowledgeMode', row, ALLOWED_KNOWLEDGE_MODES);
+        continue;
+      }
+      if (row.validFrom !== undefined && (typeof row.validFrom !== 'number' || !Number.isFinite(row.validFrom))) {
+        reject('fact', index, 'invalid_shape', '事实 validFrom 必须是有限数字。', 'validFrom', row);
+        continue;
+      }
+      if (row.validUntil !== undefined && (typeof row.validUntil !== 'number' || !Number.isFinite(row.validUntil))) {
+        reject('fact', index, 'invalid_shape', '事实 validUntil 必须是有限数字。', 'validUntil', row);
+        continue;
+      }
+      if (row.stableAnchor !== undefined && typeof row.stableAnchor !== 'boolean') {
+        reject('fact', index, 'invalid_shape', '事实 stableAnchor 必须是布尔值。', 'stableAnchor', row);
         continue;
       }
       if (!source || !isWritableSource(sourceRef) || factSourceRefs.length === 0 || !factSourceRefs.includes(sourceRef) || factSourceRefs.some(ref => !sources.some(item => item.id === ref))) {
@@ -399,17 +532,24 @@ export class MultiActorCaptureService {
         ...(subjectEntityId ? [subjectEntityId] : []),
         ...(objectEntityId ? [objectEntityId] : []),
       ])];
-      const status = numberValue(row.confidence, 0) >= 0.75 ? 'active' : 'pending';
+      const status = row.confidence >= 0.75 ? 'active' : 'pending';
       const kindValue = String(row.kind ?? '').trim() as MemoryFact['kind'];
       if (!factKinds.has(kindValue)) {
         reject('fact', index, 'invalid_enum', '事实 kind 不在允许范围内；只有模型明确输出 other 时才接受 other。', 'kind', row, [...factKinds]);
         continue;
       }
-      const fact: MemoryFact = { id, chatKey: input.chatKey, kind: kindValue, subjectKey, ...(subjectEntityId ? { subjectEntityId } : {}), predicateKey, ...(objectKey ? { objectKey } : {}), ...(objectEntityId ? { objectEntityId } : {}), canonicalKey, slotKey: createFactSlotKey(subjectKey, predicateKey), content, entityKeys, confidence: Math.max(0, Math.min(1, numberValue(row.confidence, 0.5))), status, sourceRefs: [...factSourceRefs], evidenceIds: [`evidence:${id}:${hash(evidenceExcerpt)}`], freshestEvidenceAt: Math.max(...factSources.map(item => item.createdAt)), ...(source.kind === 'host_card' || source.kind === 'worldbook' || source.kind === 'state' ? { scope: { hostCardKeys: source.kind === 'host_card' ? [source.id] : undefined, worldKeys: source.entityKeys?.length ? [...source.entityKeys] : [source.id] } } : {}), origin: 'automatic', revision: 1, createdAt: Date.now(), updatedAt: Date.now() };
+      const hostCardKeys = factSources.filter(item => item.kind === 'host_card').map(item => item.id);
+      const worldKeys = factSources
+        .filter(item => item.kind === 'worldbook' || item.kind === 'state')
+        .flatMap(item => item.entityKeys?.length ? item.entityKeys : [item.id]);
+      const factScope: MemoryFact['scope'] | undefined = hostCardKeys.length > 0 || worldKeys.length > 0
+        ? {
+          ...(hostCardKeys.length > 0 ? { hostCardKeys: [...new Set(hostCardKeys)] } : {}),
+          ...(worldKeys.length > 0 ? { worldKeys: [...new Set(worldKeys)] } : {}),
+        }
+        : undefined;
+      const fact: MemoryFact = { id, chatKey: input.chatKey, kind: kindValue, subjectKey, ...(subjectEntityId ? { subjectEntityId } : {}), predicateKey, ...(objectKey ? { objectKey } : {}), ...(objectEntityId ? { objectEntityId } : {}), canonicalKey, slotKey: createFactSlotKey(subjectKey, predicateKey), content, entityKeys, confidence: row.confidence, status, sourceRefs: [...factSourceRefs], evidenceIds: [`evidence:${id}:${hash(evidenceExcerpt)}`], freshestEvidenceAt: Math.max(...factSources.map(item => item.createdAt)), ...(factScope ? { scope: factScope } : {}), ...(row.validFrom === undefined ? {} : { validFrom: row.validFrom }), ...(row.validUntil === undefined ? {} : { validUntil: row.validUntil }), ...(row.stableAnchor === undefined ? {} : { stableAnchor: row.stableAnchor }), origin: 'automatic', revision: 1, createdAt: Date.now(), updatedAt: Date.now() };
       const localId = String(row.localId ?? index);
-      const validFrom = Number(row.validFrom);
-      const validUntil = Number(row.validUntil);
-      const rawScope = row.scope && typeof row.scope === 'object' ? row.scope as MemoryFact['scope'] : undefined;
       factEntries.push({
         localId,
         fact,
@@ -418,11 +558,11 @@ export class MultiActorCaptureService {
           localId,
           ownerRefs: stringArray(row.ownerRefs).length > 0 ? stringArray(row.ownerRefs) : entityKeys.filter(key => key.startsWith('owner:')),
           observationLocalIds: stringArray(row.observationLocalIds ?? row.observationRefs ?? row.observationIds),
-          ...(privacy(row.privacy, 'public') ? { privacy: privacy(row.privacy, 'public') } : {}),
-          ...(row.knowledgeMode !== undefined ? { knowledgeMode: knowledgeMode(row.knowledgeMode) } : {}),
-          ...(rawScope ? { scope: rawScope } : fact.scope ? { scope: fact.scope } : {}),
-          ...(Number.isFinite(validFrom) ? { validFrom } : {}),
-          ...(Number.isFinite(validUntil) ? { validUntil } : {}),
+          privacy: factPrivacyValue as MemoryPrivacy,
+          ...(factKnowledgeValue !== undefined ? { knowledgeMode: factKnowledgeValue as MemoryKnowledgeMode } : {}),
+          ...(fact.scope ? { scope: fact.scope } : {}),
+          ...(fact.validFrom === undefined ? {} : { validFrom: fact.validFrom }),
+          ...(fact.validUntil === undefined ? {} : { validUntil: fact.validUntil }),
           ...(typeof row.stableAnchor === 'boolean' ? { stableAnchor: row.stableAnchor } : {}),
         },
       });

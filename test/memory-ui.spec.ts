@@ -98,6 +98,115 @@ describe('Memory UI 展示适配', () => {
     dispose();
   });
 
+  it('工作台通用刷新动作会重新读取当前页面而不是只刷新记忆块', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    let displayName = '刷新前人物';
+    const listActors = vi.fn(async () => [{
+      id: 'owner-refresh', workspaceId: 'workspace-refresh', kind: 'actor' as const,
+      displayName, canonicalName: displayName, aliases: [], status: 'confirmed' as const,
+      discoverySources: ['message' as const], confidence: .9, createdAt: 1, updatedAt: 1,
+    }]);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listActors,
+      listActorAliases: async () => [],
+      listPendingActorCandidates: async () => [],
+      listActorCorrectionReviews: async () => [],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="actors"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(container.textContent).toContain('刷新前人物');
+
+    displayName = '刷新后人物';
+    const refreshTrigger = document.createElement('button');
+    refreshTrigger.dataset.action = 'refresh';
+    container.querySelector('.stx-memory-workbench')?.append(refreshTrigger);
+    refreshTrigger.click();
+    await vi.waitFor(() => expect(container.textContent).toContain('刷新后人物'));
+
+    expect(listActors.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(container.textContent).not.toContain('刷新前人物');
+    dispose();
+  });
+
+  it('较慢的首次未绑定快照不会覆盖稍后完成的聊天绑定数据', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    let notifyOverviewChanged: (() => void) | undefined;
+    let overviewCall = 0;
+    let releaseInitialOverview: (() => void) | undefined;
+    const liveFact: MemoryUiFact = {
+      id: 'fact-bind-race', kind: 'state', status: 'active', content: '聊天绑定后的实时事实。', confidence: .93,
+      sourceRefs: ['message:12'], evidence: [], updatedAt: 12,
+    };
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getOverview: async () => {
+        overviewCall += 1;
+        if (overviewCall === 1) {
+          await new Promise<void>((resolve) => { releaseInitialOverview = resolve; });
+          return { status: 'unselected', bound: false, factCount: 0, lastOrganizedAt: null, pendingJobs: 0, llmAvailable: true };
+        }
+        return { status: 'ready', bound: true, factCount: 1, lastOrganizedAt: 12, pendingJobs: 0, llmAvailable: true };
+      },
+      listFacts: async () => [liveFact],
+      onOverviewChanged: (listener) => { notifyOverviewChanged = listener; return () => undefined; },
+    }));
+    await vi.waitFor(() => expect(releaseInitialOverview).toBeTypeOf('function'));
+
+    notifyOverviewChanged?.();
+    await vi.waitFor(() => expect(container.textContent).toContain(liveFact.content));
+    releaseInitialOverview?.();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(container.textContent).toContain(liveFact.content);
+    expect(container.querySelector('[data-fact-id="fact-bind-race"]')?.getAttribute('aria-selected')).toBe('true');
+    expect(container.textContent).not.toContain('当前聊天还没有记忆块');
+    dispose();
+  });
+
+  it('连续数据通知会合并刷新并以最新快照覆盖较早请求', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    let notifyOverviewChanged: (() => void) | undefined;
+    let listCall = 0;
+    let releaseFirstRefresh: (() => void) | undefined;
+    const oldFact: MemoryUiFact = {
+      id: 'fact-live-old', kind: 'state', status: 'active', content: '较早后台快照。', confidence: .8,
+      sourceRefs: ['message:1'], evidence: [], updatedAt: 1,
+    };
+    const latestFact: MemoryUiFact = {
+      id: 'fact-live-latest', kind: 'state', status: 'active', content: '连续通知后的最新快照。', confidence: .95,
+      sourceRefs: ['message:2'], evidence: [], updatedAt: 2,
+    };
+    const listFacts = vi.fn(async () => {
+      listCall += 1;
+      if (listCall === 1) return [];
+      if (listCall === 2) {
+        await new Promise<void>((resolve) => { releaseFirstRefresh = resolve; });
+        return [oldFact];
+      }
+      return [latestFact];
+    });
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getOverview: async () => ({ status: 'ready', bound: true, factCount: 1, lastOrganizedAt: 2, pendingJobs: 0, llmAvailable: true }),
+      listFacts,
+      onOverviewChanged: (listener) => { notifyOverviewChanged = listener; return () => undefined; },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    notifyOverviewChanged?.();
+    await vi.waitFor(() => expect(releaseFirstRefresh).toBeTypeOf('function'));
+    notifyOverviewChanged?.();
+    releaseFirstRefresh?.();
+    await vi.waitFor(() => expect(container.textContent).toContain(latestFact.content));
+
+    expect(listFacts.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(container.textContent).not.toContain(oldFact.content);
+    expect(container.querySelector('[data-fact-id="fact-live-latest"]')?.getAttribute('aria-selected')).toBe('true');
+    dispose();
+  });
+
   it('将内部来源标识格式化为中文审阅标签', () => {
     expect(formatSourceReference('message:272')).toBe('聊天消息 #272');
     expect(formatSourceReference('state:272:hash')).toBe('聊天状态 · 消息 #272');
@@ -854,6 +963,44 @@ describe('Memory UI 展示适配', () => {
     expect(unsubscribed).toBe(true);
   });
 
+  it('聊天稍后绑定或后台 Capture 完成时自动刷新当前页面数据', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    let bound = false;
+    let dataReady = false;
+    let notifyOverviewChanged: (() => void) | undefined;
+    const liveFact: MemoryUiFact = {
+      id: 'fact-live-refresh',
+      kind: 'state',
+      status: 'active',
+      content: '无需进入初始化页面即可实时显示的新记忆。',
+      confidence: .92,
+      sourceRefs: ['message:9'],
+      evidence: [{ sourceRef: 'message:9', excerpt: '实时刷新证据' }],
+      updatedAt: 20,
+    };
+    const listFacts = vi.fn(async () => dataReady ? [liveFact] : []);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getOverview: async () => bound
+        ? { status: 'ready', bound: true, factCount: dataReady ? 1 : 0, lastOrganizedAt: 20, pendingJobs: 0, llmAvailable: true }
+        : { status: 'unselected', bound: false, factCount: 0, lastOrganizedAt: null, pendingJobs: 0, llmAvailable: true },
+      listFacts,
+      onOverviewChanged: (listener) => { notifyOverviewChanged = listener; return () => undefined; },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(container.textContent).not.toContain(liveFact.content);
+
+    bound = true;
+    dataReady = true;
+    notifyOverviewChanged?.();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(listFacts).toHaveBeenCalled();
+    expect(container.textContent).toContain(liveFact.content);
+    expect(container.querySelector('[data-fact-id="fact-live-refresh"]')?.getAttribute('aria-selected')).toBe('true');
+    dispose();
+  });
+
   it('初始化开关默认关闭、实时刷新计数，并把本次选项传给控制器', async () => {
     const container = document.createElement('div');
     document.body.append(container);
@@ -1295,6 +1442,8 @@ describe('Memory UI 展示适配', () => {
       getOverview: async () => ({ status: 'unselected', bound: false, factCount: 0, lastOrganizedAt: null, pendingJobs: 0, llmAvailable: false }),
       listFacts: async () => { listCalls += 1; throw new Error('chat key required'); },
       listActors: async () => { actorCalls += 1; throw new Error('chat key required'); },
+      listActorTraces: async () => { actorCalls += 1; throw new Error('chat key required'); },
+      listObservations: async () => { actorCalls += 1; throw new Error('chat key required'); },
       listPendingActorCandidates: async () => { actorCalls += 1; throw new Error('chat key required'); },
       listActorCorrectionReviews: async () => { actorCalls += 1; throw new Error('chat key required'); },
     });
@@ -1314,6 +1463,12 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).toContain('尚未进入聊天');
     expect(container.textContent).toContain('请先选择一个角色或加入群聊');
     expect(container.textContent).not.toContain('PAYLOAD_INVALID');
+
+    (container.querySelector('[data-page="actor-memory"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(actorCalls).toBe(0);
+    expect(listCalls).toBe(0);
+    expect(container.textContent).toContain('暂无记忆主体');
     dispose();
   });
 
@@ -1385,6 +1540,95 @@ describe('Memory UI 展示适配', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(container.textContent).not.toContain('大语言模型服务不可用');
     expect(container.textContent).not.toContain('当前聊天的记忆工作区初始化失败');
+    dispose();
+  });
+
+  it('角色记忆页面读取真实人物、事实、观察和痕迹，并联动记忆块与人物主档', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const updatedAt = Date.now();
+    const roleFacts: MemoryUiFact[] = [{
+      id: 'fact-role-memory', kind: 'state', status: 'active',
+      content: '加油站有三台加油机，其中一台被汽车残骸压垮。', confidence: .94,
+      sourceRefs: ['message:88'], evidence: [{ sourceRef: 'message:88', excerpt: '三台加油机里有一台已经被汽车压垮。' }], updatedAt,
+    }];
+    const listActors = vi.fn(async () => [{
+      id: 'owner-su', workspaceId: 'workspace:1', kind: 'actor' as const, displayName: '苏九媚', canonicalName: '苏九媚', aliases: ['九媚'],
+      status: 'confirmed' as const, discoverySources: ['message' as const], confidence: .98, createdAt: updatedAt - 1000, updatedAt,
+    }]);
+    const listActorAliases = vi.fn(async () => []);
+    const listActorTraces = vi.fn(async () => [{
+      id: 'trace-su-station', workspaceId: 'workspace:1', chatKey: 'chat:1', ownerId: 'owner-su', factId: 'fact-role-memory',
+      sourceObservationIds: ['observation-88'], knowledgeMode: 'experienced' as const, privacy: 'public' as const,
+      strength: 90, clarity: 96, beliefConfidence: .95, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1,
+      floor: 88, createdAt: updatedAt - 500, updatedAt,
+    }]);
+    const listObservations = vi.fn(async () => [{
+      id: 'observation-88', workspaceId: 'workspace:1', episodeId: 'episode-88', sourceRef: 'message:88',
+      speakerOwnerId: 'owner-su', viewpointOwnerId: 'owner-su', observerOwnerIds: ['owner-su'], channel: 'public_speech' as const,
+      privacy: 'public' as const, knowledgeMode: 'experienced' as const, excerpt: '三台加油机里有一台已经被汽车压垮。',
+      mentionedOwnerIds: [], presentOwnerIds: ['owner-su'], factLocalIds: ['fact-role-memory'], occurredAt: updatedAt - 100, createdAt: updatedAt - 100,
+    }]);
+    const listFacts = vi.fn(async () => roleFacts);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listActors,
+      listActorAliases,
+      listActorTraces,
+      listObservations,
+      listFacts,
+      listPendingActorCandidates: async () => [],
+      listActorCorrectionReviews: async () => [],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    (container.querySelector('[data-page="actor-memory"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(listActors).toHaveBeenCalled();
+    expect(listActorAliases).toHaveBeenCalled();
+    expect(listActorTraces).toHaveBeenCalled();
+    expect(listObservations).toHaveBeenCalled();
+    expect(container.querySelector('.stx-memory-actor-memory-shell')).not.toBeNull();
+    expect(container.textContent).toContain('苏九媚');
+    expect(container.textContent).toContain('加油站有三台加油机');
+    expect(container.querySelectorAll('[data-actor-memory-zone]')).toHaveLength(5);
+    expect(container.querySelector('.stx-memory-actor-memory-detail-actions')?.textContent).toContain('记忆块');
+    expect(container.querySelector('.stx-memory-actor-memory-detail-actions')?.textContent).toContain('人物主档');
+
+    const peopleGroup = container.querySelector('[data-action="actor-memory-toggle-group"][data-group="people"]') as HTMLButtonElement;
+    expect(peopleGroup.getAttribute('aria-expanded')).toBe('true');
+    peopleGroup.click();
+    expect(container.querySelector('[data-action="actor-memory-toggle-group"][data-group="people"]')?.getAttribute('aria-expanded')).toBe('false');
+    expect(container.querySelector('#stx-memory-owner-group-people')?.hasAttribute('hidden')).toBe(true);
+    (container.querySelector('[data-action="actor-memory-toggle-group"][data-group="people"]') as HTMLButtonElement).click();
+
+    (container.querySelector('[data-action="actor-memory-set-tab"][data-tab="source"]') as HTMLButtonElement).click();
+    expect(container.textContent).toContain('三台加油机里有一台已经被汽车压垮');
+    expect(container.textContent).toContain('公开发言');
+
+    const privacy = container.querySelector<HTMLSelectElement>('[data-actor-memory-select="privacy"]')!;
+    privacy.value = 'private';
+    privacy.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(container.textContent).toContain('没有匹配的角色记忆');
+    const resetPrivacy = container.querySelector<HTMLSelectElement>('[data-actor-memory-select="privacy"]')!;
+    resetPrivacy.value = '';
+    resetPrivacy.dispatchEvent(new Event('change', { bubbles: true }));
+
+    (container.querySelector('[data-action="actor-memory-open-fact"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(container.querySelector('.stx-memory-page-heading h2')?.textContent).toBe('记忆块');
+    expect(container.querySelector('[data-fact-id="fact-role-memory"]')?.getAttribute('aria-selected')).toBe('true');
+
+    (container.querySelector('[data-page="actor-memory"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-action="actor-memory-open-owner"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(container.querySelector('.stx-memory-page-heading h2')?.textContent).toBe('人物与别名');
+    expect(container.querySelector('[data-owner-id="owner-su"]')?.getAttribute('aria-selected')).toBe('true');
     dispose();
   });
 

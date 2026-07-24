@@ -181,6 +181,32 @@ export class ActorRegistry {
 
   clearAudits(): void { this.audits.clear(); }
 
+  private upsertPendingCandidate(input: {
+    readonly displayName: string;
+    readonly aliases?: readonly string[];
+    readonly sourceRef: string;
+    readonly excerpt?: string;
+    readonly confidence?: number;
+    readonly ownerRef?: string;
+  }): ActorCandidate {
+    const normalized = normalizeActorName(input.displayName);
+    const existing = [...this.pending.values()].find(candidate =>
+      normalizeActorName(candidate.displayName) === normalized
+      && (candidate.ownerRef ?? '') === (input.ownerRef ?? ''));
+    const candidate: ActorCandidate = {
+      localId: existing?.localId ?? (input.ownerRef ? `candidate:${input.ownerRef}` : `candidate:${crypto.randomUUID()}`),
+      displayName: existing?.displayName ?? input.displayName.trim(),
+      aliases: [...new Set([...(existing?.aliases ?? []), ...(input.aliases ?? [])].map(value => value.trim()).filter(Boolean))],
+      sourceRefs: [...new Set([...(existing?.sourceRefs ?? []), input.sourceRef].filter(Boolean))],
+      evidenceExcerpts: [...new Set([...(existing?.evidenceExcerpts ?? []), input.excerpt ?? ''].filter(Boolean))],
+      confidence: Math.max(existing?.confidence ?? 0, clamp(input.confidence, 0.45)),
+      status: 'pending',
+      ...(input.ownerRef ? { ownerRef: input.ownerRef } : {}),
+    };
+    this.pending.set(candidate.localId, candidate);
+    return structuredClone(candidate);
+  }
+
   private addAlias(owner: MemoryOwner, value: string, sourceRef: string, confidence: number, status: ActorAlias['status'] = 'confirmed', sourceType: ActorDiscoverySource = 'message'): ActorAlias {
     const normalizedValue = normalizeActorName(value);
     // Workspace record IDs only accept the SDK v0 safe alphabet. Normalized
@@ -241,16 +267,7 @@ export class ActorRegistry {
     if (existing && existing.owner.kind !== 'actor') return existing;
     const normalized = normalizeActorName(displayName);
     if (GENERIC_ACTOR_NAMES.has(normalized) && input.sourceType !== 'manual') {
-      const candidate: ActorCandidate = {
-        localId: `candidate:${crypto.randomUUID()}`,
-        displayName,
-        aliases: [...(input.aliases ?? [])],
-        sourceRefs: [input.sourceRef],
-        evidenceExcerpts: input.excerpt ? [input.excerpt] : [],
-        confidence: clamp(input.confidence, 0.35),
-        status: 'pending',
-      };
-      this.pending.set(candidate.localId, candidate);
+      const candidate = this.upsertPendingCandidate({ ...input, confidence: clamp(input.confidence, 0.35) });
       return { owner: structuredClone(this.ownersById.get(FIXED_OWNER_IDS.unknown)!), method: 'pending', confidence: candidate.confidence, ambiguous: true };
     }
     const forcePending = input.confirmed === false || (input.sourceType === 'prompt' && input.confidence !== undefined && input.confidence < 0.65);
@@ -265,25 +282,22 @@ export class ActorRegistry {
     }
 
     const sameNormalized = this.listOwners().filter(owner => owner.kind === 'actor' && normalizeActorName(ownerName(owner)) === normalized);
-    if (sameNormalized.length > 0 || existing?.ambiguous || forcePending) {
-      const owner = forcePending || Boolean(existing?.ambiguous) || sameNormalized.length > 1
-        ? this.ownersById.get(FIXED_OWNER_IDS.unknown)!
-        : sameNormalized[0] ?? this.ownersById.get(FIXED_OWNER_IDS.unknown)!;
-      const candidate: ActorCandidate = {
-        // Pending rows can survive a chat switch and multiple captures. A
-        // counter based on the current map size would reuse an id after a
-        // confirmation; use an immutable local id instead.
-        localId: `candidate:${crypto.randomUUID()}`,
-        displayName,
-        aliases: [...(input.aliases ?? [])],
-        sourceRefs: [input.sourceRef],
-        evidenceExcerpts: input.excerpt ? [input.excerpt] : [],
-        confidence: clamp(input.confidence, 0.45),
-        status: 'pending',
-        ...(!forcePending && owner.kind === 'actor' ? { ownerRef: owner.id } : {}),
-      };
-      this.pending.set(candidate.localId, candidate);
-      return { owner: structuredClone(owner), method: 'pending', confidence: candidate.confidence, ambiguous: true };
+    if (existing?.ambiguous || sameNormalized.length > 1) {
+      const candidate = this.upsertPendingCandidate(input);
+      return { owner: structuredClone(this.ownersById.get(FIXED_OWNER_IDS.unknown)!), method: 'pending', confidence: candidate.confidence, ambiguous: true };
+    }
+    if (sameNormalized.length === 1) {
+      const owner = sameNormalized[0]!;
+      if (owner.status === 'pending' || forcePending) {
+        const updated = this.updateOwner(owner, {
+          confidence: Math.max(owner.confidence, clamp(input.confidence, owner.confidence)),
+          discoverySources: [...new Set([...owner.discoverySources, input.sourceType])],
+        });
+        this.addAlias(updated, displayName, input.sourceRef, input.confidence ?? updated.confidence, updated.status === 'confirmed' ? 'confirmed' : 'pending', input.sourceType);
+        for (const alias of input.aliases ?? []) this.addAlias(updated, alias, input.sourceRef, input.confidence ?? updated.confidence, updated.status === 'confirmed' ? 'confirmed' : 'pending', input.sourceType);
+        const candidate = this.upsertPendingCandidate({ ...input, ownerRef: updated.id });
+        return { owner: structuredClone(updated), method: 'pending', confidence: candidate.confidence, ambiguous: true };
+      }
     }
 
     const timestamp = now();
@@ -305,16 +319,7 @@ export class ActorRegistry {
     this.addAlias(owner, displayName, input.sourceRef, owner.confidence, owner.status, input.sourceType);
     for (const alias of input.aliases ?? []) this.addAlias(owner, alias, input.sourceRef, owner.confidence, owner.status, input.sourceType);
     if (owner.status === 'pending') {
-      this.pending.set(`candidate:${owner.id}`, {
-        localId: `candidate:${owner.id}`,
-        displayName,
-        aliases: [...(input.aliases ?? [])],
-        sourceRefs: [input.sourceRef],
-        evidenceExcerpts: input.excerpt ? [input.excerpt] : [],
-        confidence: owner.confidence,
-        status: 'pending',
-        ownerRef: owner.id,
-      });
+      this.upsertPendingCandidate({ ...input, confidence: owner.confidence, ownerRef: owner.id });
     }
     return { owner: structuredClone(owner), method: 'created', confidence: owner.confidence, ambiguous: owner.status !== 'confirmed' };
   }
@@ -335,6 +340,7 @@ export class ActorRegistry {
     const pending = this.pending.get(candidateId);
     if (!pending) return undefined;
     const before = this.snapshot();
+    const provisionalOwner = pending.ownerRef ? this.ownersById.get(pending.ownerRef) : undefined;
     let owner: MemoryOwner | undefined;
     if (resolution?.mode === 'existing') {
       owner = this.ownersById.get(resolution.ownerId);
@@ -346,18 +352,23 @@ export class ActorRegistry {
       const duplicate = this.listOwners().some(candidate =>
         candidate.kind === 'actor'
         && !candidate.mergedIntoId
+        && candidate.id !== provisionalOwner?.id
         && normalizeActorName(ownerName(candidate)) === normalizedCanonical);
       if (duplicate) throw new Error('该人物名称已存在，请改为归入已有人物。');
-      const created = this.discover({
-        displayName: canonicalName,
-        aliases: [pending.displayName, ...(pending.aliases ?? [])],
-        sourceRef: pending.sourceRefs[0] ?? `manual:${candidateId}`,
-        sourceType: 'manual',
-        excerpt: pending.evidenceExcerpts[0],
-        confidence: Math.max(pending.confidence, 0.8),
-        confirmed: true,
-      });
-      owner = created.owner;
+      if (provisionalOwner?.kind === 'actor' && provisionalOwner.status === 'pending' && normalizeActorName(ownerName(provisionalOwner)) === normalizedCanonical) {
+        owner = this.updateOwner(provisionalOwner, { displayName: canonicalName, canonicalName, status: 'confirmed', confidence: Math.max(provisionalOwner.confidence, pending.confidence) });
+      } else {
+        const created = this.discover({
+          displayName: canonicalName,
+          aliases: [pending.displayName, ...(pending.aliases ?? [])],
+          sourceRef: pending.sourceRefs[0] ?? `manual:${candidateId}`,
+          sourceType: 'manual',
+          excerpt: pending.evidenceExcerpts[0],
+          confidence: Math.max(pending.confidence, 0.8),
+          confirmed: true,
+        });
+        owner = created.owner;
+      }
     } else {
       owner = pending.ownerRef ? this.ownersById.get(pending.ownerRef) : this.resolveMention(pending.displayName)?.owner;
     }
@@ -378,7 +389,10 @@ export class ActorRegistry {
     }
     if (owner.kind !== 'actor') return undefined;
     const updated = this.updateOwner(owner, { status: 'confirmed', confidence: Math.max(owner.confidence, pending.confidence) });
-    const aliasValues = [...new Set([pending.displayName, ...(pending.aliases ?? [])].map(value => value.trim()).filter(Boolean))];
+    if (provisionalOwner?.kind === 'actor' && provisionalOwner.status === 'pending' && provisionalOwner.id !== updated.id) {
+      this.updateOwner(provisionalOwner, { status: 'merged', mergedIntoId: updated.id });
+    }
+    const aliasValues = [...new Set([pending.displayName, ...(pending.aliases ?? []), ...(provisionalOwner?.aliases ?? [])].map(value => value.trim()).filter(Boolean))];
     for (const aliasValue of aliasValues) {
       const normalizedValue = normalizeActorName(aliasValue);
       for (const [aliasId, alias] of this.aliasesById.entries()) {
@@ -411,7 +425,11 @@ export class ActorRegistry {
       }
     }
     this.rebuildAliasIndex();
-    this.pending.delete(candidateId);
+    for (const [id, candidate] of this.pending.entries()) {
+      if (id === candidateId
+        || candidate.ownerRef === provisionalOwner?.id
+        || normalizeActorName(candidate.displayName) === normalizeActorName(pending.displayName)) this.pending.delete(id);
+    }
     this.recordAudit('confirm', before);
     return structuredClone(updated);
   }
@@ -428,6 +446,9 @@ export class ActorRegistry {
     for (const alias of fromAliases) this.aliasesById.delete(alias.id);
     this.rebuildAliasIndex();
     for (const alias of fromAliases) this.addAlias(merged, alias.value, sourceRef, from.confidence, 'confirmed', 'manual');
+    for (const [candidateId, candidate] of this.pending.entries()) {
+      if (candidate.ownerRef === fromOwnerId) this.pending.set(candidateId, { ...candidate, ownerRef: intoOwnerId });
+    }
     this.recordAudit('merge', before);
     return structuredClone(merged);
   }

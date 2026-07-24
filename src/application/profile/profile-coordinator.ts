@@ -59,24 +59,32 @@ export class ProfileCoordinator {
     for (const group of groups.values()) {
       if (group.observationIds.size < this.options.minProfileEvidenceCount && group.salience < this.options.salienceBypass && !group.seeded) continue;
       const existing = existingClaims.find(claim => claim.ownerId === ownerId && claim.claim === group.content && claim.status === 'active');
-      const conflicting = existingClaims.find(claim => claim.ownerId === ownerId && claim.status === 'active' && claim.claim !== group.content);
-      const action: ProfileIncrement['action'] = existing ? 'reinforce' : conflicting ? 'supersede' : 'add';
+      // ProfileClaim currently has no slot/canonical key that can prove two
+      // natural-language claims are mutually exclusive. Treating every other
+      // active claim as a conflict incorrectly superseded unrelated identity,
+      // relationship and preference statements. Objective fact reconciliation
+      // already owns proposition conflicts; the derived profile only adds or
+      // reinforces trace-backed claims and weakens claims whose evidence is no
+      // longer present.
+      const action: ProfileIncrement['action'] = existing ? 'reinforce' : 'add';
       increments.push({ action, ownerId, claim: group.content, level: group.level, supportingTraceIds: [...new Set(group.traceIds)], confidence: group.confidence });
       const timestamp = Date.now();
       claims.push({ id: existing?.id ?? id(`${ownerId}:${group.content}`), ownerId, claim: group.content, level: group.level, supportingTraceIds: [...new Set(group.traceIds)], confidence: group.confidence, status: 'active', createdAt: existing?.createdAt ?? timestamp, updatedAt: timestamp });
-      if (conflicting) claims.push({ ...conflicting, status: 'superseded', updatedAt: timestamp });
     }
     // Existing claims with no supporting evidence are explicitly weakened rather than silently dropped.
     const ownerTraceIds = new Set(traces.filter(trace => trace.ownerId === ownerId).map(trace => trace.id));
     for (const prior of existingClaims.filter(claim => claim.ownerId === ownerId && claim.status === 'active')) {
       if (!claims.some(claim => claim.id === prior.id || claim.claim === prior.claim)) {
         const supportingTraceIds = prior.supportingTraceIds.filter(traceId => ownerTraceIds.has(traceId));
-        // A profile mutation must remain trace-backed. If the caller did not
-        // hydrate the prior claim's source traces, leave it untouched rather
-        // than emitting an ungrounded weaken operation.
-        if (supportingTraceIds.length === 0) continue;
-        increments.push({ action: 'weaken', ownerId, claim: prior.claim, level: prior.level, supportingTraceIds, confidence: Math.max(0, prior.confidence * 0.5) });
-        claims.push({ ...prior, confidence: Math.max(0, prior.confidence * 0.5), status: 'invalid', updatedAt: Date.now() });
+        if (supportingTraceIds.length > 0) {
+          // The claim may not have reached the promotion threshold again in
+          // this update window, but its original trace evidence still exists.
+          // Keep it active instead of invalidating a supported profile fact.
+          claims.push({ ...prior, supportingTraceIds });
+          continue;
+        }
+        increments.push({ action: 'weaken', ownerId, claim: prior.claim, level: prior.level, supportingTraceIds: [], confidence: Math.max(0, prior.confidence * 0.5) });
+        claims.push({ ...prior, supportingTraceIds: [], confidence: Math.max(0, prior.confidence * 0.5), status: 'invalid', updatedAt: Date.now() });
       }
     }
     const relationships: RelationshipClaim[] = [];

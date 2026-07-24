@@ -6,6 +6,7 @@ import type {
   WorldbookSnapshot,
 } from '@ss-helper/sdk';
 import type { SourceBlock } from '../application/ingest/types';
+import { containsSensitiveCredential, isSensitiveStatePath } from '../application/ingest/source-blocks';
 
 export interface MemorySourceGroup {
   id: string;
@@ -77,7 +78,9 @@ const MAX_STATE_VALUE_CHARS = 800;
 
 function flattenStateSnapshot(value: unknown, path: string[], lines: string[], depth = 0): void {
   if (lines.length >= MAX_STATE_LEAVES || depth > 8 || value == null) return;
+  if (isSensitiveStatePath(path)) return;
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    if (containsSensitiveCredential(value)) return;
     const serialized = typeof value === 'string' ? value : JSON.stringify(value);
     const normalized = text(serialized).slice(0, MAX_STATE_VALUE_CHARS);
     if (path.length > 0 && normalized) lines.push(`状态快照\t${path.join(' / ')}\t${normalized}`);
@@ -90,7 +93,7 @@ function flattenStateSnapshot(value: unknown, path: string[], lines: string[], d
   }
   if (typeof value !== 'object') return;
   for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    if (SKIPPED_STATE_KEYS.has(key)) continue;
+    if (SKIPPED_STATE_KEYS.has(key) || isSensitiveStatePath([...path, key])) continue;
     flattenStateSnapshot(child, [...path, key], lines, depth + 1);
     if (lines.length >= MAX_STATE_LEAVES) break;
   }

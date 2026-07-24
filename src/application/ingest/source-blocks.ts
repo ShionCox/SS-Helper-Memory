@@ -15,6 +15,15 @@ const CONTROL_ANALYSIS_CUE_PATTERN = /(?:\b(?:fate\s*branches?|option|prompt|ins
 const CONTROL_PATCH_PATH_PATTERN = /(?:^|\/)(?:命运分支|选项[^/]*|fate(?:_|\s|-)*branches?|options?|prompt|instruction|system|tool|debug|reasoning|analysis|nsfw)(?:\/|$)/iu;
 const UNSAFE_PATCH_PATH_PATTERN = /(?:^|\/)(?:__proto__|prototype|constructor)(?:\/|$)/u;
 const SENSITIVE_CONTROL_TAG_PATTERN = /<\/?(?:think|analysis|tool|debug|memory|UpdateVariable|JSONPatch|StatusPlaceHolderImpl)\b/iu;
+const SENSITIVE_STATE_SEGMENT_PATTERN = /^(?:api(?:key)?|apikey|access(?:token)?|refreshtoken|authtoken|authorization|bearer|password|passwd|pwd|secretkey|clientsecret|privatekey|cookie|session(?:id|token)?|credential|credentials|密钥|令牌|密码|口令|凭据|认证信息|授权信息|会话令牌)$/iu;
+const SENSITIVE_STATE_SEGMENT_SUFFIX_PATTERN = /(?:apikey|accesstoken|refreshtoken|authtoken|authorization|password|passwd|secretkey|clientsecret|privatekey|sessiontoken|credential|credentials|密钥|令牌|密码|口令|凭据|认证信息|授权信息|会话令牌)$/iu;
+const SENSITIVE_STATE_VALUE_PATTERNS = [
+  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/u,
+  /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+\/-]{12,}={0,2}\b/iu,
+  /\b(?:sk|rk|pk|ghp|github_pat|glpat|xox[baprs])-?[A-Za-z0-9_-]{16,}\b/u,
+  /\bAIza[0-9A-Za-z_-]{20,}\b/u,
+  /\bAKIA[0-9A-Z]{16}\b/u,
+] as const;
 const OOC_INSTRUCTION_PATTERN = /(?:^|[\n(（\[])[ \t]*(?:ooc|out[- ]of[- ]character|幕后指令|系统指令)[ \t]*[:：]/imu;
 const MAX_PRESERVED_STATE_VALUE_CHARS = 1_000;
 
@@ -32,6 +41,32 @@ interface JsonPatchOperation {
   op?: unknown;
   path?: unknown;
   value?: unknown;
+}
+
+function normalizeStateSegment(value: string): string {
+  return value.trim().replace(/[\s_.\-:/\\]+/gu, '').toLocaleLowerCase();
+}
+
+/** Security boundary shared by variable snapshots and UpdateVariable patches. */
+export function isSensitiveStatePath(value: string | readonly string[]): boolean {
+  const segments: readonly string[] = typeof value === 'string'
+    ? value.split('/').filter(Boolean).map((segment: string) => segment.replace(/~1/gu, '/').replace(/~0/gu, '~'))
+    : value;
+  return segments.some((segment) => {
+    const normalized = normalizeStateSegment(segment);
+    return SENSITIVE_STATE_SEGMENT_PATTERN.test(normalized) || SENSITIVE_STATE_SEGMENT_SUFFIX_PATTERN.test(normalized);
+  });
+}
+
+/** Reject recognizable credential material even when stored under an innocent key. */
+export function containsSensitiveCredential(value: unknown): boolean {
+  let serialized: string;
+  try {
+    serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  } catch {
+    return true;
+  }
+  return Boolean(serialized) && SENSITIVE_STATE_VALUE_PATTERNS.some(pattern => pattern.test(serialized));
 }
 
 function extractStateAnalysis(content: string): string[] {
@@ -62,8 +97,13 @@ function decodeJsonPointerPath(path: string): string {
 
 function formatPatchValue(value: unknown): string | undefined {
   if (value === undefined) return undefined;
-  const serialized = typeof value === 'string' ? value : JSON.stringify(value);
-  if (!serialized || SENSITIVE_CONTROL_TAG_PATTERN.test(serialized)) return undefined;
+  let serialized: string;
+  try {
+    serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+  if (!serialized || SENSITIVE_CONTROL_TAG_PATTERN.test(serialized) || containsSensitiveCredential(serialized)) return undefined;
   return serialized.length > MAX_PRESERVED_STATE_VALUE_CHARS
     ? `${serialized.slice(0, MAX_PRESERVED_STATE_VALUE_CHARS)}…`
     : serialized;
@@ -97,7 +137,7 @@ function extractJsonPatchState(content: string): string[] {
       const op = typeof operation.op === 'string' ? operation.op.toLowerCase() : '';
       const path = typeof operation.path === 'string' ? operation.path : '';
       if (!['add', 'replace', 'remove'].includes(op) || !path.startsWith('/')) continue;
-      if (CONTROL_PATCH_PATH_PATTERN.test(path) || UNSAFE_PATCH_PATH_PATTERN.test(path)) continue;
+      if (CONTROL_PATCH_PATH_PATTERN.test(path) || UNSAFE_PATCH_PATH_PATTERN.test(path) || isSensitiveStatePath(path)) continue;
       const readablePath = decodeJsonPointerPath(path);
       if (!readablePath) continue;
       if (op === 'remove') {

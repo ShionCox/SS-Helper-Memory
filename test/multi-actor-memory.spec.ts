@@ -39,6 +39,7 @@ describe('卡内多角色认知模型', () => {
     expect(actor?.kind).toBe('actor');
     expect(actor?.status).toBe('confirmed');
     expect(cast.speakerOwnerIds).toContain(actor?.id);
+    expect(cast.presentOwnerIds).toContain(actor?.id);
     expect(registry.resolveMention('assistant')).toBeUndefined();
   });
 
@@ -67,6 +68,19 @@ describe('卡内多角色认知模型', () => {
     expect(projected.traces.find(trace => trace.ownerId === a)?.knowledgeMode).toBe('believed');
     expect(projected.traces.find(trace => trace.ownerId === b)?.knowledgeMode).toBe('believed');
     expect(projected.traces.map(trace => trace.ownerId)).not.toContain('owner:world');
+  });
+
+  it('合并同一主体的多来源认知时保留最严格隐私并合并全部观察', () => {
+    const ownerId = 'owner:actor:a';
+    const memory = fact('f-privacy-merge', 'A知道地下室的银钥匙位置');
+    const observations: MemoryObservation[] = [
+      { id: 'o-public', workspaceId: 'w', episodeId: 'e', sourceRef: 'm-public', speakerOwnerId: ownerId, viewpointOwnerId: ownerId, observerOwnerIds: [ownerId], channel: 'public_speech', privacy: 'public', knowledgeMode: 'self_reported', excerpt: 'A知道地下室的银钥匙位置', mentionedOwnerIds: [], presentOwnerIds: [ownerId], factLocalIds: [memory.id], occurredAt: 1, createdAt: 1 },
+      { id: 'o-secret', workspaceId: 'w', episodeId: 'e', sourceRef: 'm-secret', speakerOwnerId: ownerId, viewpointOwnerId: ownerId, observerOwnerIds: [], channel: 'private_thought', privacy: 'secret', knowledgeMode: 'experienced', excerpt: 'A在心中确认银钥匙位置', mentionedOwnerIds: [], presentOwnerIds: [ownerId], factLocalIds: [memory.id], occurredAt: 2, createdAt: 2 },
+    ];
+    const projected = new KnowledgeProjector().project({ workspaceId: 'w', facts: [memory], episodes: [], observations });
+    const trace = projected.traces.find(item => item.ownerId === ownerId && item.factId === memory.id);
+    expect(trace).toMatchObject({ knowledgeMode: 'self_reported', privacy: 'secret' });
+    expect(new Set(trace?.sourceObservationIds)).toEqual(new Set(['o-public', 'o-secret']));
   });
 
   it('卡片/世界书明确绑定主体时只播种该主体的画像', () => {
@@ -99,6 +113,34 @@ describe('卡内多角色认知模型', () => {
     expect(prompt).toContain('A的秘密');
     const bSection = prompt.slice(prompt.indexOf(`owner="B"`));
     expect(bSection).not.toContain('A的秘密');
+  });
+
+  it('多主体 Prompt 分区预算不超过全局上限，并尊重显式当前视角', () => {
+    const a = 'owner:actor:a';
+    const b = 'owner:actor:b';
+    const traceA: ActorMemoryTrace = { id: 'budget-trace-a', workspaceId: 'w', ownerId: a, factId: 'budget-fact-a', sourceObservationIds: ['oa'], knowledgeMode: 'experienced', privacy: 'public', strength: 90, clarity: 90, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, createdAt: 1, updatedAt: 1 };
+    const traceB: ActorMemoryTrace = { ...traceA, id: 'budget-trace-b', ownerId: b, factId: 'budget-fact-b', sourceObservationIds: ['ob'] };
+    const packetA = buildMemoryRecallPacket(traceA, fact('budget-fact-a', 'A记得北门附近有一条安全通道'), 1, 'budget-scene')!;
+    const packetB = buildMemoryRecallPacket(traceB, fact('budget-fact-b', 'B记得南侧仓库仍保存着维修工具'), 1, 'budget-scene')!;
+    const response = {
+      request: {
+        workspaceId: 'w', chatKey: 'chat', query: '路线和工具', mode: 'multi_actor' as const,
+        scene: { id: 'budget-scene', workspaceId: 'w', chatKey: 'chat', floor: 1, members: [], viewpointOwnerId: a, speakerOwnerIds: [], presentOwnerIds: [a, b], mentionedOwnerIds: [a, b], createdAt: 1 },
+      },
+      world: { ownerId: 'owner:world', ownerName: '世界', role: 'world' as const, packets: [] },
+      narrator: { ownerId: 'owner:narrator', ownerName: '旁白', role: 'narrator' as const, packets: [] },
+      actors: [
+        { ownerId: a, ownerName: 'A', role: 'actor' as const, packets: [packetA] },
+        { ownerId: b, ownerName: 'B', role: 'actor' as const, packets: [packetB] },
+      ],
+      diagnostics: { candidateCount: 2, selectedCount: 2, partitions: 2, mode: 'multi_actor' as const, elapsedMs: 1 },
+    } satisfies import('../src/domain').ActorRecallResponse;
+
+    const result = buildActorMemoryPromptResult(response, { maxChars: 1_000, currentViewpointOwnerId: b });
+    const budgetTotal = Object.values(result.diagnostics.partitionBudgets).reduce((sum, value) => sum + value, 0);
+    expect(budgetTotal).toBeLessThanOrEqual(1_000);
+    expect(result.diagnostics.partitionBudgets[b]).toBeGreaterThan(result.diagnostics.partitionBudgets[a]!);
+    expect(result.includedTraceIds).toEqual(expect.arrayContaining([traceA.id, traceB.id]));
   });
 
   it('强度衰减与模糊包使用稳定种子，候选曝光不会自动 rehearsal', () => {
@@ -174,6 +216,36 @@ describe('卡内多角色认知模型', () => {
     expect(result.claims[0]?.supportingTraceIds.every(id => traces.some(trace => trace.id === id))).toBe(true);
     expect(result.relationships[0]?.fromOwnerId).toBe('owner:actor:a');
     expect(result.relationships[0]?.toOwnerId).toBe('owner:actor:b');
+  });
+
+  it('画像新增无关声明时不会错误替代已有活跃声明', () => {
+    const coordinator = new ProfileCoordinator();
+    const ownerId = 'owner:actor:a';
+    const oldClaim = {
+      id: 'claim-old', ownerId, claim: 'A是守门人', level: 3 as const,
+      supportingTraceIds: ['trace-old'], confidence: 0.9, status: 'active' as const,
+      createdAt: 1, updatedAt: 1,
+    };
+    const oldFact = { ...fact('profile-old', oldClaim.claim), kind: 'identity' as const, predicateKey: '身份', canonicalKey: 'profile-old::身份' };
+    const oldTrace: ActorMemoryTrace = {
+      id: 'trace-old', workspaceId: 'w', ownerId, factId: oldFact.id,
+      sourceObservationIds: ['profile-old-observation'], knowledgeMode: 'experienced', privacy: 'public',
+      strength: 80, clarity: 80, beliefConfidence: 0.9, emotionalSalience: 0,
+      rehearsalCount: 0, traceRevision: 1, createdAt: 1, updatedAt: 1,
+    };
+    const newFact = { ...fact('profile-new', 'A长期偏好先观察再行动'), kind: 'preference' as const, predicateKey: '行动偏好', canonicalKey: 'profile-new::行动偏好' };
+    const newTraces: ActorMemoryTrace[] = [1, 2, 3].map(index => ({
+      id: `profile-new-trace-${index}`, workspaceId: 'w', ownerId, factId: newFact.id,
+      sourceObservationIds: [`profile-new-observation-${index}`], knowledgeMode: 'experienced', privacy: 'public',
+      strength: 80, clarity: 80, beliefConfidence: 0.9, emotionalSalience: 20,
+      rehearsalCount: 0, traceRevision: 1, createdAt: index, updatedAt: index,
+    }));
+    const result = coordinator.update(ownerId, [oldTrace, ...newTraces], [oldFact, newFact], [oldClaim], 'w');
+    expect(result.claims.find(item => item.id === oldClaim.id)?.status).toBe('active');
+    expect(result.claims).toEqual(expect.arrayContaining([
+      expect.objectContaining({ claim: oldClaim.claim, status: 'active' }),
+      expect.objectContaining({ claim: newFact.content, status: 'active' }),
+    ]));
   });
 
   it('Dream 默认按主体自动 Apply，文学梦境强制 fictional 且可回滚', async () => {

@@ -75,8 +75,22 @@ export class KnowledgeProjector {
         if (!ownerId) return;
         const current = ownerModes.get(ownerId);
         const rank: Record<MemoryKnowledgeMode, number> = { unknown: 0, suspected: 1, believed: 2, inferred: 3, heard: 4, experienced: 5, self_reported: 6, asserted: 7 };
-        if (!current || rank[mode] > rank[current.mode]) ownerModes.set(ownerId, { mode, privacy, reason, observations: [...observationIds] });
-        else current.observations = addUnique(current.observations, observationIds[0] ?? '');
+        const privacyRank: Record<MemoryPrivacy, number> = { public: 0, limited: 1, private: 2, secret: 3 };
+        if (!current) {
+          ownerModes.set(ownerId, { mode, privacy, reason, observations: [...new Set(observationIds.filter(Boolean))] });
+          return;
+        }
+        const observations = observationIds.reduce<string[]>((values, observationId) => observationId ? addUnique(values, observationId) : values, current.observations);
+        const strongerKnowledge = rank[mode] > rank[current.mode];
+        ownerModes.set(ownerId, {
+          mode: strongerKnowledge ? mode : current.mode,
+          reason: strongerKnowledge ? reason : current.reason,
+          // Privacy is an independent leakage boundary. Combining two sources
+          // must retain the most restrictive classification, regardless of
+          // which source supplied the strongest knowledge mode.
+          privacy: privacyRank[privacy] > privacyRank[current.privacy] ? privacy : current.privacy,
+          observations,
+        });
       };
       const observationFloors = observations
         .map(observation => episodeById.get(observation.episodeId)?.floorEnd ?? episodeById.get(observation.episodeId)?.floorStart)

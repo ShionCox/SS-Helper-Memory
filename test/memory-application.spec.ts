@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { MemoryFact, MemoryJob, MemoryRecallLog } from '../src/domain';
+import type { ActorMemoryTrace, MemoryFact, MemoryJob, MemoryRecallLog } from '../src/domain';
 import type { ExistingMemoryContextItem, SourceBlock } from '../src/application/ingest/types';
 import { MEMORY_DEFAULT_SETTINGS } from '../src/ss-helper/settings';
 
@@ -125,6 +125,144 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
 
     await expect(app.listEpisodes()).resolves.toEqual([currentEpisode]);
     await expect(app.listObservations()).resolves.toEqual([currentObservation]);
+  });
+
+  it('当前聊天完成绑定后通知已打开的工作台刷新数据', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    const listener = vi.fn();
+    const remove = app.onOverviewChanged(listener);
+
+    await app.start();
+
+    expect(listener).toHaveBeenCalled();
+    remove();
+    app.stop();
+  });
+
+  it('多角色仓库关键读取失败时报告绑定错误而不是伪装成健康空数据', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    await app.start();
+    (app as unknown as {
+      multiActorRepository: {
+        bind(workspaceId: string, chatKey: string): void;
+        listFacts(): Promise<MemoryFact[]>;
+        listTraces(): Promise<ActorMemoryTrace[]>;
+        listDerived(): Promise<Record<string, unknown>[]>;
+      };
+    }).multiActorRepository = {
+      bind: () => undefined,
+      listFacts: async () => { throw new Error('actor facts read failed'); },
+      listTraces: async () => [],
+      listDerived: async () => [],
+    };
+
+    await app.bindCurrentChat();
+    const overview = await app.getOverview();
+
+    expect(overview.status).toBe('error');
+    expect(overview.bound).toBe(false);
+    expect(overview.errorCode).toMatch(/^MEMORY_/u);
+    expect(overview.error).not.toContain('actor facts read failed');
+    app.stop();
+  });
+
+  it('Dream Apply 失败后持久化 failed job，避免重启后丢失失败状态', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    const ownerId = 'owner:actor:a';
+    const memory = fact('dream-fact', 'A记得地下室的银钥匙');
+    const trace: ActorMemoryTrace = {
+      id: 'dream-trace', workspaceId: 'w', chatKey: 'chat-a', ownerId, factId: memory.id,
+      sourceObservationIds: ['dream-observation'], knowledgeMode: 'experienced', privacy: 'private',
+      strength: 90, clarity: 90, beliefConfidence: 1, emotionalSalience: 0.4,
+      rehearsalCount: 0, traceRevision: 1, createdAt: 1, updatedAt: 1,
+    };
+    const derived = new Map<string, Record<string, unknown>[]>();
+    const upsertDerived = vi.fn(async (collection: string, records: readonly Record<string, unknown>[]) => {
+      const current = derived.get(collection) ?? [];
+      const byId = new Map(current.map(item => [String(item.id ?? ''), item]));
+      records.forEach(record => byId.set(String(record.id ?? ''), structuredClone(record)));
+      derived.set(collection, [...byId.values()]);
+    });
+    (app as unknown as {
+      multiActorRepository: {
+        boundWorkspaceId: string;
+        boundChatKey: string;
+        listTraces(ownerId?: string): Promise<ActorMemoryTrace[]>;
+        listFacts(): Promise<MemoryFact[]>;
+        listDerived(collection: string): Promise<Record<string, unknown>[]>;
+        upsertDerived(collection: string, records: readonly Record<string, unknown>[]): Promise<void>;
+        upsertDerivedWithAudit(): Promise<never>;
+      };
+    }).multiActorRepository = {
+      boundWorkspaceId: 'w',
+      boundChatKey: 'chat-a',
+      listTraces: async () => [trace],
+      listFacts: async () => [memory],
+      listDerived: async (collection) => structuredClone(derived.get(collection) ?? []),
+      upsertDerived,
+      upsertDerivedWithAudit: async () => { throw new Error('dream write failed'); },
+    };
+
+    const job = await app.enqueueActorDream(ownerId, [trace.id]);
+    await expect(app.runActorDream(job.id)).rejects.toThrow('dream write failed');
+
+    expect(upsertDerived).toHaveBeenLastCalledWith('dream-jobs', [expect.objectContaining({ id: job.id, status: 'failed' })]);
+  });
+
+  it('候选归入其他人物时把临时 owner 迁移参数交给仓库并重新绑定', async () => {
+    const [{ MemoryApplication }, { ActorRegistry }] = await Promise.all([
+      import('../src/application/memory-application'),
+      import('../src/application/actors/actor-registry'),
+    ]);
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    const registry = new ActorRegistry('character:c1');
+    const provisional = registry.discover({ displayName: '店长', sourceRef: 'message:1', sourceType: 'prompt', excerpt: '店长站在门口。', confidence: 0.9, confirmed: false }).owner;
+    const target = registry.discover({ displayName: '艾琳', sourceRef: 'host-card:1', sourceType: 'host_card', confidence: 1, confirmed: true }).owner;
+    const candidate = registry.listPending()[0]!;
+    const upsertActorRegistryState = vi.fn(async () => ({
+      id: 'actor-registry-change', workspaceId: 'character:c1', chatKey: 'chat-a',
+      kind: 'actor-registry-change-set-v0' as const, createdAt: 1, entries: [],
+    }));
+    (app as unknown as { actorRegistry: ActorRegistry }).actorRegistry = registry;
+    (app as unknown as { multiActorRepository: { upsertActorRegistryState: typeof upsertActorRegistryState } }).multiActorRepository = { upsertActorRegistryState };
+    const bind = vi.spyOn(app, 'bindCurrentChat').mockResolvedValue();
+
+    await app.confirmActorCandidate(candidate.localId, { mode: 'existing', ownerId: target.id });
+
+    expect(upsertActorRegistryState).toHaveBeenCalledWith(
+      expect.any(Array),
+      expect.any(Array),
+      expect.objectContaining({ operation: 'confirm' }),
+      { fromOwnerId: provisional.id, toOwnerId: target.id },
+      [],
+    );
+    expect(bind).toHaveBeenCalled();
+  });
+
+  it('Capture 结束和清空当前聊天都会发布工作台数据变更通知', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    await app.start();
+    const listener = vi.fn();
+    const remove = app.onOverviewChanged(listener);
+
+    await app.capture.flush();
+    expect(listener).toHaveBeenCalled();
+
+    listener.mockClear();
+    await app.clearCurrentChatData();
+    expect(listener).toHaveBeenCalled();
+
+    remove();
+    app.stop();
   });
 
   it('旧设置缺失时启用旧记忆参考默认值，并收敛损坏的持久化范围', async () => {

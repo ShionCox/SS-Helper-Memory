@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { WorkspacePort, WorkspaceRecord } from '@ss-helper/sdk';
 import { MultiActorMemoryRepository, type CaptureCommit } from '../src/infrastructure/multi-actor-memory-repository';
 
@@ -213,5 +213,135 @@ describe('multi-actor repository transaction semantics', () => {
     expect(await repository.removeFact(fact.id)).toBe(true);
     expect(await repository.listFacts()).toEqual([]);
     expect(await workspace.get({ workspaceId: 'w', collection: 'fact-heads', recordId: headId })).toBeNull();
+  });
+
+  it('legacy traces without chatKey are visible only when their fact belongs to the current chat', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat-a');
+    await repository.open();
+    const base = commit(40, 0);
+    const factA = { ...base.facts[0]!, id: 'fact:a', chatKey: 'chat-a' };
+    const factB = { ...base.facts[0]!, id: 'fact:b', chatKey: 'chat-b' };
+    const { chatKey: _traceChatKey, ...legacyTrace } = base.traces[0]!;
+    await workspace.upsert({ workspaceId: 'w', collection: 'facts', recordId: factA.id, value: factA as never });
+    await workspace.upsert({ workspaceId: 'w', collection: 'facts', recordId: factB.id, value: factB as never });
+    await workspace.upsert({ workspaceId: 'w', collection: 'memory-traces', recordId: 'trace:a', value: { ...legacyTrace, id: 'trace:a', factId: factA.id } as never });
+    await workspace.upsert({ workspaceId: 'w', collection: 'memory-traces', recordId: 'trace:b', value: { ...legacyTrace, id: 'trace:b', factId: factB.id } as never });
+
+    expect((await repository.listTraces()).map(item => item.id)).toEqual(['trace:a']);
+  });
+
+  it('rejects foreign-chat audits and derived records at the repository boundary', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat-a');
+    await repository.open();
+    const foreignAudit = { id: 'audit:foreign', workspaceId: 'w', chatKey: 'chat-b', kind: 'derived-change-set-v0', createdAt: 1, entries: [] };
+    await workspace.upsert({ workspaceId: 'w', collection: 'change-audits', recordId: foreignAudit.id, value: foreignAudit });
+
+    await expect(repository.getChangeAudit(foreignAudit.id)).resolves.toBeUndefined();
+    await expect(repository.rollbackChangeSet(foreignAudit.id)).rejects.toThrow('当前聊天');
+    await expect(repository.upsertDerivedForChangeSet(foreignAudit.id, [{
+      collection: 'memory-details', records: [{ id: 'detail:foreign', workspaceId: 'w', chatKey: 'chat-a' }],
+    }])).rejects.toThrow('当前聊天');
+    await expect(repository.upsertDerived('memory-details', [{ id: 'detail:wrong-chat', workspaceId: 'w', chatKey: 'chat-b' }])).rejects.toThrow('当前聊天');
+  });
+
+  it('does not mutate a foreign-chat fact referenced by a forged version link', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat-a');
+    await repository.open();
+    const base = commit(0, 0).facts[0]!;
+    const target = { ...base, id: 'fact:target', chatKey: 'chat-a', supersededById: 'fact:foreign' };
+    const foreign = { ...base, id: 'fact:foreign', chatKey: 'chat-b', supersedesId: target.id, content: '另一聊天的事实' };
+    await workspace.upsert({ workspaceId: 'w', collection: 'facts', recordId: target.id, value: target as never });
+    await workspace.upsert({ workspaceId: 'w', collection: 'facts', recordId: foreign.id, value: foreign as never });
+
+    expect(await repository.removeFact(target.id)).toBe(true);
+    expect(await workspace.get({ workspaceId: 'w', collection: 'facts', recordId: target.id })).toBeNull();
+    expect(await workspace.get({ workspaceId: 'w', collection: 'facts', recordId: foreign.id })).toMatchObject({ value: foreign });
+  });
+
+  it('atomically migrates every current-chat owner reference and rolls the migration back', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    const fromOwnerId = 'owner:actor:pending';
+    const toOwnerId = 'owner:actor:confirmed';
+    const factId = 'fact:migration';
+    const oldTraceId = `trace:${fromOwnerId}:${factId}`;
+    const newTraceId = `trace:${toOwnerId}:${factId}`;
+    const oldNodeId = `graph-node:w:${encodeURIComponent('chat')}:${encodeURIComponent(fromOwnerId)}`;
+    const newNodeId = `graph-node:w:${encodeURIComponent('chat')}:${encodeURIComponent(toOwnerId)}`;
+    const sourceOwner = { id: fromOwnerId, workspaceId: 'w', kind: 'actor', displayName: '临时人物', canonicalName: '临时人物', aliases: ['临时人物'], status: 'pending', discoverySources: ['prompt'], confidence: 0.8, createdAt: 1, updatedAt: 1 };
+    const targetOwner = { ...sourceOwner, id: toOwnerId, displayName: '正式人物', canonicalName: '正式人物', aliases: ['正式人物'], status: 'confirmed' };
+    await workspace.upsert({ workspaceId: 'w', collection: 'actors', recordId: fromOwnerId, value: sourceOwner as never });
+    await workspace.upsert({ workspaceId: 'w', collection: 'actors', recordId: toOwnerId, value: targetOwner as never });
+    await workspace.upsert({ workspaceId: 'w', collection: 'episodes', recordId: 'episode:migration', value: { id: 'episode:migration', workspaceId: 'w', chatKey: 'chat', sourceRefs: ['m1'], participantIds: [fromOwnerId], presentOwnerIds: [fromOwnerId], mentionedOwnerIds: [fromOwnerId], occurredAt: 1, createdAt: 1 } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'observations', recordId: 'observation:migration', value: { id: 'observation:migration', workspaceId: 'w', episodeId: 'episode:migration', sourceRef: 'm1', speakerOwnerId: fromOwnerId, viewpointOwnerId: fromOwnerId, observerOwnerIds: [fromOwnerId], channel: 'public_speech', privacy: 'public', knowledgeMode: 'self_reported', excerpt: '临时人物说话', mentionedOwnerIds: [fromOwnerId], presentOwnerIds: [fromOwnerId], factLocalIds: [factId], occurredAt: 1, createdAt: 1 } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'facts', recordId: factId, value: { ...commit(0, 0).facts[0]!, id: factId, subjectEntityId: fromOwnerId, entityKeys: [fromOwnerId] } as never });
+    await workspace.upsert({ workspaceId: 'w', collection: 'memory-traces', recordId: oldTraceId, value: { ...commit(40, 1).traces[0]!, id: oldTraceId, ownerId: fromOwnerId, factId } as never });
+    await workspace.upsert({ workspaceId: 'w', collection: 'scene-casts', recordId: 'scene:migration', value: { id: 'scene:migration', workspaceId: 'w', chatKey: 'chat', floor: 1, members: [{ ownerId: fromOwnerId, role: 'speaker', confidence: 1, sourceRefs: ['m1'] }], viewpointOwnerId: fromOwnerId, speakerOwnerIds: [fromOwnerId], presentOwnerIds: [fromOwnerId], mentionedOwnerIds: [fromOwnerId], createdAt: 1 } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'profile-claims', recordId: 'claim:migration', value: { id: 'claim:migration', workspaceId: 'w', chatKey: 'chat', ownerId: fromOwnerId, claim: '临时人物是守门人', level: 3, supportingTraceIds: [oldTraceId], confidence: 1, status: 'active', createdAt: 1, updatedAt: 1 } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'relationship-claims', recordId: 'relationship:migration', value: { id: 'relationship:migration', workspaceId: 'w', chatKey: 'chat', fromOwnerId, toOwnerId: fromOwnerId, claim: '自我关系', supportingTraceIds: [oldTraceId], confidence: 1, status: 'active', createdAt: 1, updatedAt: 1 } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'dream-jobs', recordId: 'dream:migration', value: { id: 'dream:migration', workspaceId: 'w', chatKey: 'chat', ownerId: fromOwnerId, status: 'queued', phase: 'gather', trigger: 'manual', traceIds: [oldTraceId], createdAt: 1, updatedAt: 1 } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'recall-exposures', recordId: 'exposure:migration', value: { id: 'exposure:migration', workspaceId: 'w', chatKey: 'chat', ownerId: fromOwnerId, traceId: oldTraceId, sceneEpoch: '1', included: true, used: false, confidence: 1, createdAt: 1 } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'memory-details', recordId: `detail:${oldTraceId}:gist`, value: { id: `detail:${oldTraceId}:gist`, workspaceId: 'w', chatKey: 'chat', traceId: oldTraceId, sourceFactId: factId } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'memory-links', recordId: `memory-link:${oldTraceId}`, value: { id: `memory-link:${oldTraceId}`, workspaceId: 'w', chatKey: 'chat', ownerId: fromOwnerId, traceIds: [oldTraceId], factId } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'graph-nodes', recordId: oldNodeId, value: { id: oldNodeId, workspaceId: 'w', chatKey: 'chat', entityKey: fromOwnerId, updatedAt: 1 } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'graph-edges', recordId: 'graph-edge:migration', value: { id: 'graph-edge:migration', workspaceId: 'w', chatKey: 'chat', fromNodeId: oldNodeId, toNodeId: oldNodeId, backingFactId: factId, updatedAt: 1 } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'change-audits', recordId: 'audit:old', value: { id: 'audit:old', workspaceId: 'w', chatKey: 'chat', kind: 'capture-change-set-v0', createdAt: 1, entries: [], metadata: { ownerId: fromOwnerId, traceId: oldTraceId } } });
+
+    const audit = await repository.upsertActorRegistryState([targetOwner as never], [], { operation: 'confirm' }, { fromOwnerId, toOwnerId }, []);
+
+    expect(await workspace.get({ workspaceId: 'w', collection: 'memory-traces', recordId: oldTraceId })).toBeNull();
+    expect(await workspace.get({ workspaceId: 'w', collection: 'memory-traces', recordId: newTraceId })).toMatchObject({ value: { ownerId: toOwnerId } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'episodes', recordId: 'episode:migration' })).toMatchObject({ value: { participantIds: [toOwnerId], presentOwnerIds: [toOwnerId] } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'observations', recordId: 'observation:migration' })).toMatchObject({ value: { speakerOwnerId: toOwnerId, viewpointOwnerId: toOwnerId } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'facts', recordId: factId })).toMatchObject({ value: { subjectEntityId: toOwnerId, entityKeys: [toOwnerId] } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'scene-casts', recordId: 'scene:migration' })).toMatchObject({ value: { viewpointOwnerId: toOwnerId, members: [{ ownerId: toOwnerId, role: 'speaker', confidence: 1, sourceRefs: ['m1'] }] } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'profile-claims', recordId: 'claim:migration' })).toMatchObject({ value: { ownerId: toOwnerId, supportingTraceIds: [newTraceId] } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'relationship-claims', recordId: 'relationship:migration' })).toMatchObject({ value: { fromOwnerId: toOwnerId, toOwnerId } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'dream-jobs', recordId: 'dream:migration' })).toMatchObject({ value: { ownerId: toOwnerId, traceIds: [newTraceId] } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'recall-exposures', recordId: 'exposure:migration' })).toMatchObject({ value: { ownerId: toOwnerId, traceId: newTraceId } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'memory-details', recordId: `detail:${newTraceId}:gist` })).not.toBeNull();
+    expect(await workspace.get({ workspaceId: 'w', collection: 'memory-links', recordId: `memory-link:${newTraceId}` })).not.toBeNull();
+    expect(await workspace.get({ workspaceId: 'w', collection: 'graph-nodes', recordId: newNodeId })).toMatchObject({ value: { entityKey: toOwnerId } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'graph-edges', recordId: 'graph-edge:migration' })).toMatchObject({ value: { fromNodeId: newNodeId, toNodeId: newNodeId } });
+    expect(await workspace.get({ workspaceId: 'w', collection: 'change-audits', recordId: 'audit:old' })).toMatchObject({ value: { metadata: { ownerId: toOwnerId, traceId: newTraceId } } });
+
+    await repository.rollbackChangeSet(audit.id);
+    expect(await workspace.get({ workspaceId: 'w', collection: 'memory-traces', recordId: oldTraceId })).not.toBeNull();
+    expect(await workspace.get({ workspaceId: 'w', collection: 'memory-traces', recordId: newTraceId })).toBeNull();
+    expect(await workspace.get({ workspaceId: 'w', collection: 'facts', recordId: factId })).toMatchObject({ value: { subjectEntityId: fromOwnerId } });
+  });
+
+  it('stops on a repeated pagination cursor and batches large destructive clears', async () => {
+    const stalledWorkspace = port();
+    const originalQuery = stalledWorkspace.query.bind(stalledWorkspace);
+    stalledWorkspace.query = async (request) => request.collection === 'facts'
+      ? { records: [], nextCursor: 'same-cursor' }
+      : originalQuery(request);
+    const stalledRepository = new MultiActorMemoryRepository(stalledWorkspace);
+    stalledRepository.bind('w', 'chat');
+    await stalledRepository.open();
+    await expect(stalledRepository.listFacts()).rejects.toMatchObject({ code: 'WORKSPACE_PAGINATION_STALLED' });
+
+    const workspace = port();
+    const transaction = vi.fn(workspace.transaction.bind(workspace));
+    workspace.transaction = transaction;
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    for (let index = 0; index < 501; index += 1) {
+      await workspace.upsert({ workspaceId: 'w', collection: 'facts', recordId: `fact:${index}`, value: { ...commit(0, 0).facts[0]!, id: `fact:${index}` } as never });
+    }
+    transaction.mockClear();
+    await repository.clearCurrentChatData();
+    expect(transaction).toHaveBeenCalledTimes(2);
+    expect(transaction.mock.calls.every(call => call[0].operations.length <= 500)).toBe(true);
   });
 });

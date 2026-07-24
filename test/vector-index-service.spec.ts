@@ -119,6 +119,46 @@ describe('事实向量索引服务', () => {
     expect(status.coverage).toMatchObject({ ready: 2, missing: 0, stale: 0 });
   });
 
+  it('publishes rebuilding and ready states without allowing a listener to break indexing', async () => {
+    const repository = new FakeVectorRepository(1);
+    const embed = vi.fn(async ({ texts }: { texts: string[] }) => ({ ok: true as const, vectors: texts.map(() => [1, 0]), model: 'BAAI/bge-m3' }));
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const states: boolean[] = [];
+    service.onStatusChanged((_chatKey, status) => states.push(status.rebuilding));
+    service.onStatusChanged(() => { throw new Error('UI listener failure'); });
+    service.start();
+
+    await service.rebuild('chat-a');
+
+    expect(states).toContain(true);
+    expect(states.at(-1)).toBe(false);
+    expect(repository.upsertFactVector).toHaveBeenCalledTimes(1);
+  });
+
+  it('caches query vectors by the actual fallback embedding target', async () => {
+    const repository = new FakeVectorRepository(1);
+    repository.vectors.push({
+      factId: 'fact-0', chatKey: 'chat-a', contentHash: 'hash', resourceId: 'fallback-resource', model: 'fallback-model',
+      dimensions: 2, vector: new Float32Array([1, 0]).buffer, createdAt: 1, updatedAt: 1,
+    });
+    const embed = vi.fn(async () => ({
+      ok: true as const,
+      vectors: [[1, 0]],
+      model: 'fallback-model',
+      meta: { resourceId: 'fallback-resource', model: 'fallback-model' },
+    }));
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    service.start();
+
+    const first = await service.search('chat-a', '备用路由查询');
+    const second = await service.search('chat-a', '备用路由查询');
+
+    expect(embed).toHaveBeenCalledTimes(1);
+    expect(first.audit).toMatchObject({ resourceId: 'fallback-resource', model: 'fallback-model', cached: false });
+    expect(second.audit).toMatchObject({ resourceId: 'fallback-resource', model: 'fallback-model', cached: true });
+    expect(second.candidates[0]?.factId).toBe('fact-0');
+  });
+
   it('64 项 LRU 查询缓存会复用十分钟内的查询向量', async () => {
     const repository = new FakeVectorRepository(1);
     repository.vectors.push({
@@ -164,6 +204,22 @@ describe('事实向量索引服务', () => {
     release?.({ ok: true, vectors: [[1, 0]], model: 'BAAI/bge-m3' });
     await rebuilding;
 
+    expect(repository.upsertFactVector).not.toHaveBeenCalled();
+  });
+
+  it('stop 后也丢弃 selective rebuildFacts 的在途结果', async () => {
+    const repository = new FakeVectorRepository(1);
+    let release: ((value: { ok: true; vectors: number[][]; model: string }) => void) | undefined;
+    const embed = vi.fn(() => new Promise<{ ok: true; vectors: number[][]; model: string }>((resolve) => { release = resolve; }));
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    service.start();
+
+    const rebuilding = service.rebuildFacts('chat-a', ['fact-0']);
+    await Promise.resolve();
+    service.stop();
+    release?.({ ok: true, vectors: [[1, 0]], model: 'BAAI/bge-m3' });
+
+    await expect(rebuilding).rejects.toMatchObject({ code: 'VECTOR_INDEX_REPAIR_PENDING' });
     expect(repository.upsertFactVector).not.toHaveBeenCalled();
   });
 });
