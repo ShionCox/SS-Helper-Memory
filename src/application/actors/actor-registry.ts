@@ -145,7 +145,10 @@ export class ActorRegistry {
   }
 
   private updateOwner(owner: MemoryOwner, patch: Partial<MemoryOwner>): MemoryOwner {
-    const updated = { ...owner, ...patch, updatedAt: now() };
+    const candidate = { ...owner, ...patch };
+    const semantic = (value: MemoryOwner): string => JSON.stringify({ ...value, updatedAt: 0 });
+    if (semantic(candidate) === semantic(owner)) return owner;
+    const updated = { ...candidate, updatedAt: now() };
     this.ownersById.set(updated.id, updated);
     return updated;
   }
@@ -233,17 +236,26 @@ export class ActorRegistry {
     // normalized value unchanged in the record body.
     const id = `actor-alias:${owner.id}:${stableMemoryRecordKey(normalizedValue)}`;
     const timestamp = now();
+    const existing = this.aliasesById.get(id);
+    const nextStatus = existing?.status === 'confirmed' || status === 'confirmed' ? 'confirmed' : status;
     const alias: ActorAlias = {
       id,
       workspaceId: this.workspaceId,
       ownerId: owner.id,
       value: value.trim(),
       normalizedValue,
-      sourceRef,
-      confidence: clamp(confidence),
-      status,
-      createdAt: this.aliasesById.get(id)?.createdAt ?? timestamp,
-      updatedAt: timestamp,
+      sourceRef: existing?.sourceRef ?? sourceRef,
+      confidence: Math.max(existing?.confidence ?? 0, clamp(confidence)),
+      status: nextStatus,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: existing
+        && existing.ownerId === owner.id
+        && existing.value === value.trim()
+        && existing.normalizedValue === normalizedValue
+        && existing.status === nextStatus
+        && existing.confidence >= clamp(confidence)
+          ? existing.updatedAt
+          : timestamp,
     };
     this.aliasesById.set(id, alias);
     const ids = this.aliasIdsByNormalized.get(normalizedValue) ?? [];

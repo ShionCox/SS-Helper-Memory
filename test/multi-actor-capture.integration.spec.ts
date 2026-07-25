@@ -136,6 +136,45 @@ describe('Claim-based multi actor capture', () => {
     expect(capture.traces.find(trace => trace.factId === rumorFact.id)?.knowledgeMode).toBe('believed');
   });
 
+  it('fail-closes private memory when the model incorrectly marks every present actor as a knower', async () => {
+    const row: SourceBlock = {
+      id: 'message:private-boundary', chatKey: 'chat', kind: 'message', role: 'assistant', floor: 3, createdAt: 3_000,
+      content: '艾达心想：绝不能让贝拉知道密钥。贝拉仍站在房间里。',
+      actorRefs: ['艾达', '贝拉'],
+    };
+    const extractor = { extract: async (input: any): Promise<StructuredCaptureResult> => {
+      const ada = input.knownActorContext.find((item: any) => item.canonicalName === '艾达').referenceId;
+      const bella = input.knownActorContext.find((item: any) => item.canonicalName === '贝拉').referenceId;
+      return {
+        ...empty(),
+        claims: [{
+          localId: 'private-boundary', sourceRef: row.id, kind: 'state', subjectRef: ada,
+          predicateKey: '知道', objectText: '密钥', content: '艾达独自知道密钥。',
+          evidenceExcerpt: '绝不能让贝拉知道密钥',
+          knowledge: {
+            mode: 'experienced', privacy: 'private', ownerRefs: [ada, bella], speakerRef: ada,
+            viewpointRef: ada, observerRefs: [ada, bella], presentRefs: [ada, bella], mentionedRefs: [bella],
+          },
+          confidence: 0.98, stableAnchor: false,
+        }],
+      };
+    } };
+    const capture = await service('private-boundary-w', extractor).capture({
+      workspaceId: 'private-boundary-w', chatKey: 'chat', sources: [row],
+    });
+    const adaId = capture.owners.find(owner => owner.canonicalName === '艾达')!.id;
+    const bellaId = capture.owners.find(owner => owner.canonicalName === '贝拉')!.id;
+    expect(capture.rejections).toEqual([]);
+    expect(capture.traces.map(trace => trace.ownerId)).toEqual([adaId]);
+    expect(capture.traces.map(trace => trace.ownerId)).not.toContain(bellaId);
+    expect(capture.observations[0]).toMatchObject({
+      speakerOwnerId: adaId,
+      viewpointOwnerId: adaId,
+      observerOwnerIds: [adaId],
+      privacy: 'private',
+    });
+  });
+
   it('uses trusted cast names and rejects descriptor/template text as actors', async () => {
     const row = source({
       content: '白夕琴乃（重构体）与白夕小时站在加油站。',

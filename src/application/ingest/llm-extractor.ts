@@ -26,6 +26,15 @@ export interface MemoryLlmMeta {
   fallbackUsed?: boolean;
 }
 
+function stableDiagnosticKey(value: string): string {
+  let result = 2166136261;
+  for (const character of value.normalize('NFKC')) {
+    result ^= character.codePointAt(0) ?? 0;
+    result = Math.imul(result, 16777619);
+  }
+  return (result >>> 0).toString(36);
+}
+
 export interface MemoryLlmUsage {
   promptTokens: number;
   completionTokens: number;
@@ -545,7 +554,7 @@ export function normalizeStructuredCapture(value: unknown, sources: readonly Sou
     const limit = limits[field];
     if (values.length <= limit) continue;
     overflowRejections.push({
-      id: `capture-schema-overflow:${field}:${values.length}`,
+      id: `capture-schema-overflow:${field}:${stableDiagnosticKey(sources.map(source => source.id).join('|'))}:${values.length}`,
       index: -1,
       recordType: 'batch',
       code: 'invalid_shape',

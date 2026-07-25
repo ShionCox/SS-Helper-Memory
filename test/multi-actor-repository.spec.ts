@@ -368,6 +368,23 @@ describe('multi-actor repository transaction semantics', () => {
     expect((await repository.getChangeAudit(replay.id))?.rolledBackAt).toBeUndefined();
   });
 
+  it('rejects an active idempotency-key replay whose semantic payload changed', async () => {
+    const repository = new MultiActorMemoryRepository(port());
+    repository.bind('w', 'chat');
+    await repository.open();
+    const original = { ...commit(40, 0), idempotencyKey: 'capture:stable-payload' };
+    await repository.commitCapture(original);
+
+    const changedFact = {
+      ...original.facts[0]!,
+      content: '同一个幂等键下出现了不同的模型事实内容',
+      canonicalKey: 'A::不同内容',
+    };
+    await expect(repository.commitCapture({ ...original, facts: [changedFact] }))
+      .rejects.toMatchObject({ code: 'CAPTURE_IDEMPOTENCY_MISMATCH' });
+    expect((await repository.listFacts()).map(fact => fact.content)).toEqual(['A知道铜钥匙位置']);
+  });
+
   it('requires newest-first rollback for batches in the same Capture job', async () => {
     const repository = new MultiActorMemoryRepository(port());
     repository.bind('w', 'chat');
