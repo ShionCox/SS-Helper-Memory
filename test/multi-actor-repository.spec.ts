@@ -78,6 +78,20 @@ function legacyStableKey(value: string): string {
   return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
+function currentStableKey(value: string): string {
+  const normalized = value.normalize('NFKC');
+  const words: string[] = [];
+  for (let variant = 0; variant < 4; variant += 1) {
+    let hash = 2_166_136_261;
+    for (const character of `${variant}\0${normalized}`) {
+      hash ^= character.codePointAt(0) ?? 0;
+      hash = Math.imul(hash, 16_777_619);
+    }
+    words.push((hash >>> 0).toString(16).padStart(8, '0'));
+  }
+  return words.join('');
+}
+
 describe('multi-actor repository transaction semantics', () => {
   it('persists and clears the additive scene, cast, coverage and usage records', async () => {
     const repository = new MultiActorMemoryRepository(port());
@@ -470,6 +484,37 @@ describe('multi-actor repository transaction semantics', () => {
     expect(second).toEqual(first);
     expect(transaction).toHaveBeenCalledTimes(1);
     expect((await repository.listChangeAudits()).filter(audit => audit.kind === 'capture-change-set-v0')).toHaveLength(1);
+  });
+
+  it('rejects an active legacy audit without a semantic digest instead of blindly reusing it', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    const input = { ...commit(40, 0), captureJobId: 'job:legacy-digest', idempotencyKey: 'capture:legacy-digest' };
+    const auditId = `change-audit:${currentStableKey(input.idempotencyKey)}`;
+    await workspace.upsert({
+      workspaceId: 'w',
+      collection: 'change-audits',
+      recordId: auditId,
+      value: {
+        id: auditId,
+        workspaceId: 'w',
+        chatKey: 'chat',
+        kind: 'capture-change-set-v0',
+        createdAt: 1,
+        entries: [],
+        metadata: {
+          transactionKey: input.idempotencyKey,
+          sourceRefs: input.envelope.sourceRefs,
+          captureJobId: input.captureJobId,
+        },
+      } as never,
+    });
+
+    await expect(repository.commitCapture(input)).rejects.toMatchObject({
+      code: 'CAPTURE_IDEMPOTENCY_UNVERIFIABLE',
+    });
   });
 
   it('does not overwrite an unrelated audit that occupies the legacy short-hash id', async () => {

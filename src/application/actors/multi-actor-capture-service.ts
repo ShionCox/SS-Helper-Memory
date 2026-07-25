@@ -1468,7 +1468,15 @@ export class MultiActorCaptureService {
       const objectEntityId = actorObjectId ?? locationObject?.id;
       const canonicalKey = createCanonicalKey(subjectKey, claim.predicateKey, objectKey);
       const factId = `fact:${encodedChatKey}:${hash(`${canonicalKey}\0${claim.content}\0${claim.sourceRef}\0${claim.evidenceExcerpt}`)}`;
-      const ownerIds = unique(claim.knowledge.ownerRefs.map(resolveOwner).filter((value): value is string => Boolean(value)));
+      const declaredOwnerIds = unique(claim.knowledge.ownerRefs.map(resolveOwner).filter((value): value is string => Boolean(value)));
+      const privateKnowledge = claim.knowledge.privacy === 'private' || claim.knowledge.privacy === 'secret';
+      const privateSpeakerOwnerId = privateKnowledge ? resolveOwner(claim.knowledge.speakerRef) : undefined;
+      // Presence is not knowledge. For private/secret material, even a model
+      // that incorrectly lists every present actor as owner/observer must be
+      // constrained to the private speaker before projection creates traces.
+      const ownerIds = privateKnowledge
+        ? (privateSpeakerOwnerId ? [privateSpeakerOwnerId] : [])
+        : declaredOwnerIds;
       const entityKeys = unique([
         subjectKey,
         ...(objectKey ? [objectKey] : []),
@@ -1511,10 +1519,12 @@ export class MultiActorCaptureService {
       const speakerOwnerId = resolveOwner(claim.knowledge.speakerRef)
         ?? (claim.knowledge.mode === 'self_reported' ? actorSubjectId : undefined)
         ?? (channel === 'narration' ? FIXED_OWNER_IDS.narrator : FIXED_OWNER_IDS.unknown);
-      const observerOwnerIds = unique([
-        ...ownerIds,
-        ...claim.knowledge.observerRefs.map(resolveOwner),
-      ].filter((value): value is string => Boolean(value)));
+      const observerOwnerIds = privateKnowledge
+        ? [...ownerIds]
+        : unique([
+          ...ownerIds,
+          ...claim.knowledge.observerRefs.map(resolveOwner),
+        ].filter((value): value is string => Boolean(value)));
       const observation: MemoryObservation = {
         id: `observation:${encodedChatKey}:${promptRecordSegment(claim.localId)}:${hash(claim.sourceRef)}`,
         workspaceId: input.workspaceId,

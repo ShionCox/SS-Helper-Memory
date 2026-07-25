@@ -86,6 +86,19 @@ function stableRecordHash(value: string): string {
   return words.join('');
 }
 
+const VOLATILE_CAPTURE_FIELDS = new Set(['createdAt', 'updatedAt', 'capturedAt']);
+
+function captureSemanticPlain(value: PlainData): PlainData {
+  if (Array.isArray(value)) return value.map(captureSemanticPlain);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value)
+      .filter(([key]) => !VOLATILE_CAPTURE_FIELDS.has(key))
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, captureSemanticPlain(item)]));
+  }
+  return value;
+}
+
 function captureBatchOrdinal(audit: ChangeAudit): number | undefined {
   const metadata = audit.metadata && typeof audit.metadata === 'object' && !Array.isArray(audit.metadata)
     ? audit.metadata as Record<string, unknown>
@@ -864,6 +877,24 @@ export class MultiActorMemoryRepository {
     }
     const baseTransactionKey = commit.idempotencyKey?.trim()
       || `capture:${commit.captureJobId ?? this.chatKey}:${commit.envelope.sourceRefs.join('|')}`;
+    const requestDigest = stableRecordHash(JSON.stringify(captureSemanticPlain(asPlain({
+      envelope: commit.envelope,
+      parentChangeSetId: commit.parentChangeSetId ?? null,
+      outcome: commit.outcome ?? 'complete',
+      rejections: commit.rejections ?? [],
+      owners: commit.owners,
+      aliases: commit.aliases,
+      pendingCandidates: commit.pendingCandidates ?? [],
+      locations: commit.locations,
+      locationAliases: commit.locationAliases,
+      pendingLocationCandidates: commit.pendingLocationCandidates ?? [],
+      episodes: commit.episodes,
+      observations: commit.observations,
+      facts: commit.facts,
+      evidence: commit.evidence,
+      traces: commit.traces,
+      sceneCasts: commit.sceneCasts ?? [],
+    }))));
     let retryAttempt = 0;
     let collisionAttempt = 0;
     let transactionKey = baseTransactionKey;
@@ -904,7 +935,23 @@ export class MultiActorMemoryRepository {
       const existingAudit = existingRecord?.value as unknown as ChangeAudit | undefined;
       if (!existingAudit) break;
       if (auditMatchesRequest(existingAudit, auditId)) {
-        if (!existingAudit.rolledBackAt) return structuredClone(existingAudit);
+        if (!existingAudit.rolledBackAt) {
+          const metadata = existingAudit.metadata && typeof existingAudit.metadata === 'object' && !Array.isArray(existingAudit.metadata)
+            ? existingAudit.metadata as Record<string, PlainData>
+            : {};
+          const persistedDigest = String(metadata.requestDigest ?? '');
+          if (!persistedDigest) {
+            throw Object.assign(new Error('现有 Capture 审计缺少语义摘要，无法安全确认本次请求与旧事务一致。'), {
+              code: 'CAPTURE_IDEMPOTENCY_UNVERIFIABLE',
+            });
+          }
+          if (persistedDigest !== requestDigest) {
+            throw Object.assign(new Error('同一 Capture 幂等键对应的语义载荷发生变化，已拒绝复用旧事务。'), {
+              code: 'CAPTURE_IDEMPOTENCY_MISMATCH',
+            });
+          }
+          return structuredClone(existingAudit);
+        }
         retryAttempt += 1;
         collisionAttempt = 0;
         transactionKey = `${baseTransactionKey}:retry:${retryAttempt}`;
@@ -1083,6 +1130,7 @@ export class MultiActorMemoryRepository {
         captureJobId,
         transactionKey,
         baseTransactionKey,
+        requestDigest,
         ...(parentChangeSetId ? { parentChangeSetId, attachmentKind: 'capture-repair-v0' } : {}),
         ...(retryAttempt > 0 ? { retryAttempt, retriedTransactionKey: baseTransactionKey } : {}),
         sourceRefs: [...commit.envelope.sourceRefs],
