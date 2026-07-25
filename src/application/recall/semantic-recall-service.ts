@@ -16,6 +16,7 @@ import {
 } from './memory-recall-index';
 import type { GraphRecallCandidateProvider, GraphRecallSearchResult } from '../graph';
 import { MemoryVectorIndexService, type VectorSearchResult } from './vector-index-service';
+import { planRecallIntentByRules } from './recall-intent-planner';
 
 export type MemoryRecallMode = 'auto' | 'lexical' | 'vector' | 'hybrid';
 export type MemoryRerankMode = 'off' | 'adaptive' | 'always';
@@ -24,12 +25,102 @@ export interface MemoryGraphRecallOptions {
   maxEdges: number;
 }
 
-const RERANK_TIMEOUT_MS = 15_000;
-const TOTAL_EXTRA_RECALL_BUDGET_MS = 19_000;
-const MAX_RERANK_DOCUMENTS = 4;
+function sourceFloor(item: RecallItem): number | undefined {
+  const values = [...(item.fact.sourceRefs ?? []), ...(item.fact.evidenceRefs ?? [])]
+    .map(value => Number(value.match(/message:floor-(\d+)/u)?.[1]))
+    .filter(Number.isFinite);
+  return values.length > 0 ? Math.min(...values) : undefined;
+}
+
+function rerankDocument(item: RecallItem): string {
+  const floor = sourceFloor(item);
+  return [
+    `[${item.fact.kind}]`,
+    item.fact.subjectKey,
+    item.fact.predicateKey,
+    item.fact.objectKey ?? '',
+    floor === undefined ? '' : `floor=${floor}`,
+    item.fact.content,
+  ].filter(Boolean).join('｜');
+}
+
+function rerankDocumentLimit(query: string): number {
+  const intent = planRecallIntentByRules(query);
+  // The configured Qwen3 endpoint consistently completes eight long memory
+  // documents in about 24s, while twelve can exceed the 30s provider deadline.
+  if (intent.complexity === 'multi_hop' || intent.complexity === 'multi_topic') return 8;
+  if (intent.requestedKinds.length > 0 || intent.timeMode !== 'unknown') return 8;
+  return 4;
+}
+
+function buildRerankQuery(query: string): string {
+  const intent = planRecallIntentByRules(query);
+  const priorities: string[] = [
+    'Rank roleplay memory facts by whether they directly answer the user query.',
+    'Prefer exact entity matches and concrete evidence over merely related facts.',
+  ];
+  if (intent.requestedKinds.includes('capability')) {
+    priorities.push('For ability questions, rank capability facts above plans, assignments, or commitments.');
+  }
+  if (intent.timeMode === 'current') {
+    priorities.push('For current-state questions, prefer the latest exact numeric or state value.');
+  }
+  if (intent.timeMode === 'historical' || intent.timeMode === 'timeline') {
+    priorities.push('For historical questions, prefer facts from the requested time or earliest matching event, not later related actions.');
+  }
+  if (intent.requestedKinds.length > 0) priorities.push(`Requested fact types: ${intent.requestedKinds.join(', ')}.`);
+  return `${priorities.join(' ')}\nUser query: ${query}`;
+}
+
+function selectRerankItems(items: readonly RecallItem[], query: string, temporalHeadSize: number, limit: number): RecallItem[] {
+  const candidates = items.slice(temporalHeadSize);
+  if (candidates.length <= limit) return [...candidates];
+  const intent = planRecallIntentByRules(query);
+  const requestedKinds = new Set(intent.requestedKinds.map(value => value.trim().toLocaleLowerCase()).filter(Boolean));
+  const selected: RecallItem[] = [];
+  const append = (item: RecallItem | undefined): void => {
+    if (item && selected.length < limit && !selected.some(current => current.fact.id === item.fact.id)) selected.push(item);
+  };
+
+  // Preserve broad retrieval quality while reserving slots for candidates that
+  // directly answer the requested memory type. This prevents a capability or
+  // historical event at rank 9–20 from being invisible to the cross-encoder.
+  // Keep several fusion leaders while reserving space for temporal/type/entity
+  // candidates. Qwen3-Reranker supports long contexts; a query-adaptive pool is
+  // more robust than a fixed top-four gate without paying the cost on generic
+  // direct lookups.
+  candidates.slice(0, Math.min(4, Math.max(2, Math.ceil(limit / 3)))).forEach(append);
+  if (EARLIEST_QUERY_PATTERN.test(query)) {
+    append([...candidates]
+      .filter(item => requestedKinds.size === 0 || requestedKinds.has(item.fact.kind.toLocaleLowerCase()))
+      .sort((left, right) => (sourceFloor(left) ?? Number.MAX_SAFE_INTEGER) - (sourceFloor(right) ?? Number.MAX_SAFE_INTEGER)
+        || left.fact.updatedAt - right.fact.updatedAt)[0]);
+  }
+  candidates
+    .filter(item => requestedKinds.has(item.fact.kind.toLocaleLowerCase()))
+    .forEach(append);
+  const normalizedQuery = query.normalize('NFKC').toLocaleLowerCase();
+  candidates
+    .filter(item => {
+      const names = [item.fact.subjectKey, item.fact.objectKey ?? '', ...item.fact.entityKeys]
+        .map(value => value.trim().normalize('NFKC').toLocaleLowerCase())
+        .filter(value => value.length >= 2);
+      return names.some(name => normalizedQuery.includes(name));
+    })
+    .forEach(append);
+  candidates.forEach(append);
+  return selected;
+}
+
+// The configured Qwen3 cross-encoder needs about 15–19s for 8–12 long memory
+// candidates. Keep enough headroom for route inspection and provider jitter.
+const RERANK_TIMEOUT_MS = 30_000;
+const TOTAL_EXTRA_RECALL_BUDGET_MS = 40_000;
 const HISTORICAL_QUERY_PATTERN = /(?:曾经|当时|之前|历史|过程|最早|最初|一开始|中段|先后|一路|变化|如何发展|起初|后来)/u;
 const CURRENT_STATE_QUERY_PATTERN = /(?:最新状态|最后确认|当前|现在|目前|还剩|剩余|还能|现有|最终确认)/u;
 const STATE_HISTORY_TOPIC_PATTERN = /(?:状态|数量|多少|几次|次数|弹药|剩余|还剩|变化|一路|先后)/u;
+const EARLIEST_QUERY_PATTERN = /(?:最早|最初|一开始|起初|起先|初次)/u;
+const DIRECTIVE_QUERY_PATTERN = /(?:指挥|指令|命令|下令|安排|分工|应对|调度)/u;
 
 function clampRequestedItems(value: number | undefined): number {
   if (!Number.isFinite(value)) return recallLimits.default;
@@ -143,7 +234,10 @@ export class SemanticRecallService {
       }
     }
 
-    const vectorScores = new Map((vectorResult?.candidates ?? []).map(item => [item.factId, item.score]));
+    const allowedFactIds = query.allowedFactIds ? new Set(query.allowedFactIds) : undefined;
+    const vectorScores = new Map((vectorResult?.candidates ?? [])
+      .filter(item => !allowedFactIds || allowedFactIds.has(item.factId))
+      .map(item => [item.factId, item.score]));
     const initial = this.index.recall(query, {
       mode: resolvedMode,
       vectorScores,
@@ -166,7 +260,9 @@ export class SemanticRecallService {
           maxHops: graphOptions.maxHops,
           maxEdges: graphOptions.maxEdges,
         });
-        graphScores = new Map(graphResult.candidates.map((item) => [item.factId, item.score]));
+        graphScores = new Map(graphResult.candidates
+          .filter(item => !allowedFactIds || allowedFactIds.has(item.factId))
+          .map((item) => [item.factId, item.score]));
       } catch {
         // Do not persist graph labels, query text, or evidence in diagnostics.
         graphDegradedReason = '关系图谱候选不可用，已回退到原有召回。';
@@ -183,14 +279,24 @@ export class SemanticRecallService {
       : initial;
     if (graphDegradedReason) degradedReason = degradedReason || graphDegradedReason;
     let orderedItems = [...base.items];
-    const temporalHeadSize = HISTORICAL_QUERY_PATTERN.test(query.query)
+    const temporalHeadSize = EARLIEST_QUERY_PATTERN.test(query.query) && DIRECTIVE_QUERY_PATTERN.test(query.query)
+      ? Math.min(6, orderedItems.length)
+      : HISTORICAL_QUERY_PATTERN.test(query.query)
       && STATE_HISTORY_TOPIC_PATTERN.test(query.query)
       ? 2
       : CURRENT_STATE_QUERY_PATTERN.test(query.query)
         ? 1
         : 0;
     const preservedTemporalItems = orderedItems.slice(0, temporalHeadSize);
-    const rerankItems = orderedItems.slice(temporalHeadSize, temporalHeadSize + MAX_RERANK_DOCUMENTS);
+    // The fused pool remains broad (up to 120). Generic lookups keep the old
+    // four-document fast path, while typed/temporal and complex questions get
+    // eight intent-aware candidates to stay within the real provider SLA.
+    const rerankItems = selectRerankItems(
+      orderedItems,
+      query.query,
+      temporalHeadSize,
+      rerankDocumentLimit(query.query),
+    );
     const shouldRerank = rerankMode === 'always'
       || (rerankMode === 'adaptive' && adaptiveRerankRequired(rerankItems));
     let rerankDiagnostic: RecallDiagnostics['rerank'];
@@ -244,8 +350,8 @@ export class SemanticRecallService {
                 consumer: MEMORY_PLUGIN_ID,
                 taskKey: MEMORY_RERANK_TASK,
                 taskDescription: '记忆候选重排',
-                query: query.query,
-                docs: rerankItems.map(item => item.fact.content),
+                query: buildRerankQuery(query.query),
+                docs: rerankItems.map(rerankDocument),
                 topK: rerankItems.length,
                 budget: { maxLatencyMs: rerankTimeoutMs },
                 enqueue: { displayMode: 'silent' },
@@ -269,11 +375,12 @@ export class SemanticRecallService {
                 score: result.score,
                 rerankScore: result.score,
               }));
+              const rerankIds = new Set(rerankItems.map(item => item.fact.id));
               orderedItems = [
                 ...preservedTemporalItems,
                 ...reranked,
                 ...rerankItems.filter((_, index) => !rankedIndexes.has(index)),
-                ...orderedItems.slice(temporalHeadSize + rerankItems.length),
+                ...orderedItems.filter(item => !preservedTemporalItems.some(preserved => preserved.fact.id === item.fact.id) && !rerankIds.has(item.fact.id)),
               ];
               rerankDiagnostic = {
                 requested: true,

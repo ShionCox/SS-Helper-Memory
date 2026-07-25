@@ -4,6 +4,7 @@ import {
   MIN_FACT_CONTENT_LENGTH,
   type AutomaticFactProposal,
   type AutomaticProposalValidation,
+  type MemoryFactKind,
   type MemorySourceBlock,
 } from './memory-types';
 
@@ -15,8 +16,19 @@ export function createCanonicalKey(subjectKey: string, predicateKey: string, obj
   return [subjectKey, predicateKey, objectKey].map(normalizeKeyPart).join('::');
 }
 
-export function createFactSlotKey(subjectKey: string, predicateKey: string): string {
-  return [subjectKey, predicateKey].map(normalizeKeyPart).join('::');
+export function createFactSlotKey(
+  subjectKey: string,
+  predicateKey: string,
+  objectKey?: string,
+  kind?: MemoryFactKind,
+): string {
+  // These fact classes describe a relation to one specific object. Keeping the
+  // object in their slot prevents an update about B from superseding the same
+  // subject's independent relation/preference/capability concerning A.
+  const objectScoped = kind === 'relationship' || kind === 'preference' || kind === 'capability';
+  return [subjectKey, predicateKey, ...(objectScoped ? [objectKey] : [])]
+    .map(normalizeKeyPart)
+    .join('::');
 }
 
 export function normalizeFactContent(content: string): string {
@@ -96,7 +108,7 @@ export function validateAutomaticProposal(
       entityKeys: [...new Set((proposal.entityKeys ?? []).map(normalizeKeyPart).filter(Boolean))],
       evidence: proposal.evidence.map(item => ({ sourceRef: item.sourceRef, excerpt: item.excerpt.trim() })),
       canonicalKey: createCanonicalKey(subjectKey, predicateKey, proposal.objectKey),
-      slotKey: createFactSlotKey(subjectKey, predicateKey),
+      slotKey: createFactSlotKey(subjectKey, predicateKey, proposal.objectKey, proposal.kind),
       status: proposal.confidence >= ACTIVE_CONFIDENCE_THRESHOLD ? 'active' : 'pending',
       sourceRefs,
       freshestEvidenceAt,

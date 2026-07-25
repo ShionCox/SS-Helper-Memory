@@ -48,8 +48,15 @@ describe('SS-Helper Memory typed adapters', () => {
     expect(settings).toEqual(MEMORY_DEFAULT_SETTINGS);
   });
 
-  it('exposes 基础、总结、召回、高级、当前聊天 tabs and graph controls without a chat', async () => {
-    expect(MEMORY_SETTINGS_SCHEMA.fields.map((field) => field.id)).toEqual(['basic', 'summary', 'recall', 'advanced', 'currentChat']);
+  it('exposes 基础、总结、多角色选角、召回、高级、当前聊天 tabs and graph controls without a chat', async () => {
+    expect(MEMORY_SETTINGS_SCHEMA.fields.map((field) => field.id)).toEqual(['basic', 'summary', 'castPlanning', 'recall', 'advanced', 'currentChat']);
+    const castPlanning = MEMORY_SETTINGS_SCHEMA.fields.find((field) => field.id === 'castPlanning');
+    expect(castPlanning).toMatchObject({ label: '多角色选角' });
+    expect(castPlanning?.kind === 'section' ? castPlanning.children.map((field) => field.id) : []).toEqual([
+      'castPlanningMode', 'focusLookbackFloors', 'actorScanLookbackFloors', 'persistPresenceUntilTransition',
+      'plannerCandidateThreshold', 'plannerConfidenceThreshold', 'likelyActorRecall', 'backgroundActorRecall',
+      'provisionalActorEnabled', 'plannerCanProposeActors', 'unplannedActorPolicy', 'maxPlannerCallsPerTurn',
+    ]);
     const advanced = MEMORY_SETTINGS_SCHEMA.fields.find((field) => field.id === 'advanced');
     expect(advanced).toMatchObject({ label: '高级' });
     const groups = advanced?.kind === 'section' ? advanced.children : [];

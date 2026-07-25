@@ -223,6 +223,7 @@ export class MemoryRuntime {
     }
     const leakage = this.application.auditActorOutput(latestText);
     if (leakage && leakage.violationCount > 0) logger.warn('多角色记忆泄漏审计发现跨主体标记。', { violationCount: leakage.violationCount, outputHash: leakage.outputHash });
+    await this.application.reconcileGeneratedMessage().catch((error) => logger.warn('生成后角色核对失败，已保留原回复并等待下一轮降级恢复。', error));
     if (this.application.getEffectiveSettings().autoOrganize && this.application.captureActors) {
       void this.application.captureActors().catch((error) => logger.warn('多角色 Capture 失败，已保留原有聊天。', error));
     }

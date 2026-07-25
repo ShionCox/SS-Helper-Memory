@@ -106,6 +106,70 @@ describe('宿主聊天来源适配', () => {
     expect(filterSourceBlocks(blocks)).toEqual([]);
   });
 
+  it('把酒馆尾部角色清单变成可信种子、删除未来剧情选项并保留当前状态', () => {
+    const [block] = buildVisibleChatSourceBlocks('chat', [{
+      mesid: 'tavern-sections',
+      mes: [
+        '白夕小时与白夕琴乃（重构体）返回豪宅地下车库，并确认车辆仍可使用。',
+        '',
+        '目前已出场角色：',
+        '白夕小时、白夕琴乃（重构体）、紫罗',
+        '',
+        '系统商店：未出现',
+        '',
+        '物品栏：',
+        '武器: 叶的电击枪（有效射程10米）、折叠式短刀（刃长12cm）',
+        '食物: 高热量压缩口粮（约30天份）、瓶装水x24',
+        '特殊道具: 白夕科技AI核心访问权限、隔离箱',
+        '低级核心: 0',
+        '',
+        '状态栏：',
+        '姓名：白夕小时',
+        '动作姿势：站在车辆旁',
+        '心情状态：警觉',
+        '所在位置：豪宅地下车库',
+        '',
+        '姓名：白夕琴乃（重构体）',
+        '动作姿势：检查车辆',
+        '心情状态：专注',
+        '',
+        '---',
+        '',
+        '剧情选项：',
+        '(顺着该剧情) 立刻前往加油站',
+        '(意想不到的反转) 地下车库发生爆炸',
+      ].join('\n'),
+    }]);
+
+    expect(block?.actorRefs).toEqual(['白夕小时', '白夕琴乃（重构体）', '紫罗']);
+    // The explicit 状态栏 location is trusted; the same text appearing in
+    // narrative prose alone would still be left to Claim extraction.
+    expect(block?.locationRefs).toEqual(['豪宅地下车库']);
+    expect(block?.content).toContain('返回豪宅地下车库');
+    expect(block?.content).toContain('【当前物资快照】');
+    expect(block?.content).toContain('食物: 高热量压缩口粮（约30天份）、瓶装水x24');
+    expect(block?.content).toContain('【当前状态快照】');
+    expect(block?.content).toContain('心情状态：警觉');
+    expect(block?.content).not.toMatch(/目前已出场角色|系统商店|物品栏|剧情选项|立刻前往加油站|地下车库发生爆炸/u);
+    expect(block?.actorRefs).not.toEqual(expect.arrayContaining(['叶的电击枪（有效射程10米）', '瓶装水x24', '白夕科技AI核心访问权限']));
+  });
+
+  it('角色清单采用通用身份边界，允许数字名并拒绝结构化物品行', () => {
+    const [block] = buildVisibleChatSourceBlocks('chat', [{
+      mesid: 'generic-cast',
+      mes: [
+        '队伍完成了集合。',
+        '目前已出场角色：',
+        '2B、R2-D2、核心',
+        '物品栏：',
+        '特殊道具：导航核心 x2',
+      ].join('\n'),
+    }]);
+
+    expect(block?.actorRefs).toEqual(['2B', 'R2-D2', '核心']);
+    expect(block?.actorRefs).not.toContain('特殊道具：导航核心 x2');
+  });
+
   it('把最后一条 stat_data 变量快照独立为当前状态来源并排除命运分支', () => {
     const [block] = buildLatestVariableStateBlock('chat', [{
       mesid: 'last',

@@ -43,6 +43,23 @@ describe('卡内多角色认知模型', () => {
     expect(registry.resolveMention('assistant')).toBeUndefined();
   });
 
+  it('单字中文别名不会在普通名词中误命中，并能用实际别名识别在场', () => {
+    const registry = new ActorRegistry('character:c1');
+    const leaf = registry.discover({ displayName: '白夕叶', aliases: ['叶'], sourceRef: 'card:1', sourceType: 'host_card', confidence: 0.95 }).owner;
+
+    const nounOnly = new ActiveCastResolver(registry).resolve([
+      source('m-leaf-noun', '桌上放着一片叶片，没有其他人。', 1, { author: { kind: 'narrator', displayName: '旁白' } }),
+    ]).scene;
+    expect(nounOnly.mentionedOwnerIds).not.toContain(leaf.id);
+    expect(nounOnly.presentOwnerIds).not.toContain(leaf.id);
+
+    const presentAlias = new ActiveCastResolver(registry).resolve([
+      source('m-leaf-present', '叶站在门口，保持警戒。', 2, { author: { kind: 'narrator', displayName: '旁白' } }),
+    ]).scene;
+    expect(presentAlias.mentionedOwnerIds).toContain(leaf.id);
+    expect(presentAlias.presentOwnerIds).toContain(leaf.id);
+  });
+
   it('私密思想只投影给对应主体，世界书只写入世界主体', () => {
     const registry = new ActorRegistry('character:c1');
     const a = registry.discover({ displayName: 'A', sourceRef: 'm1', sourceType: 'message', confidence: 0.95 });
@@ -93,6 +110,32 @@ describe('卡内多角色认知模型', () => {
     expect(projected.traces.map(trace => trace.ownerId)).toEqual(expect.arrayContaining(['owner:world', a.owner.id]));
     const profile = new ProfileCoordinator().update(a.owner.id, projected.traces.filter(trace => trace.ownerId === a.owner.id), [seededFact], [], 'character:c1');
     expect(profile.claims[0]?.claim).toBe(seededFact.content);
+  });
+
+  it('世界书关系只播种主语角色，并保留最严格隐私', () => {
+    const a = 'owner:actor:a';
+    const b = 'owner:actor:b';
+    const relation = {
+      ...fact('f-world-secret', 'A暗中监视B'),
+      kind: 'relationship' as const,
+      subjectEntityId: a,
+      objectEntityId: b,
+      entityKeys: [a, b],
+      scope: { worldKeys: ['world:secret'] },
+    };
+    const observation: MemoryObservation = {
+      id: 'o-world-secret', workspaceId: 'w', episodeId: 'e-world-secret', sourceRef: 'worldbook:secret',
+      speakerOwnerId: 'owner:world', viewpointOwnerId: 'owner:narrator', observerOwnerIds: [],
+      channel: 'worldbook', privacy: 'secret', knowledgeMode: 'asserted', excerpt: relation.content,
+      mentionedOwnerIds: [a, b], presentOwnerIds: [], factLocalIds: [relation.id], occurredAt: 1, createdAt: 1,
+    };
+
+    const projected = new KnowledgeProjector().project({ workspaceId: 'w', facts: [relation], episodes: [], observations: [observation] });
+    const owners = projected.traces.map(trace => trace.ownerId);
+    expect(owners).toEqual(expect.arrayContaining(['owner:world', a]));
+    expect(owners).not.toContain(b);
+    expect(projected.traces.find(trace => trace.ownerId === 'owner:world')).toMatchObject({ privacy: 'secret' });
+    expect(projected.traces.find(trace => trace.ownerId === a)).toMatchObject({ privacy: 'secret' });
   });
 
   it('单次分区 Prompt 不把 A 的私密记忆复制到 B', async () => {

@@ -92,7 +92,8 @@ export class ProfileCoordinator {
       if (group.fact.kind !== 'relationship' || group.observationIds.size < this.options.minProfileEvidenceCount && group.salience < this.options.salienceBypass && !group.seeded) continue;
       const fromOwnerId = group.fact.subjectEntityId ?? ownerId;
       const toOwnerId = group.fact.objectEntityId;
-      if (!toOwnerId || fromOwnerId === toOwnerId) continue;
+      const isOwnerId = (value: string | undefined): value is string => Boolean(value && (value.startsWith('owner:') || value.startsWith('provisional:')));
+      if (!isOwnerId(fromOwnerId) || !isOwnerId(toOwnerId) || fromOwnerId === toOwnerId) continue;
       const timestamp = Date.now();
       relationships.push({ id: id(`relationship:${fromOwnerId}:${toOwnerId}:${group.content}`), workspaceId, fromOwnerId, toOwnerId, claim: group.content, supportingTraceIds: [...new Set(group.traceIds)], confidence: group.confidence, status: 'active', createdAt: timestamp, updatedAt: timestamp });
     }

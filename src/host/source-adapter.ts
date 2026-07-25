@@ -7,6 +7,7 @@ import type {
 } from '@ss-helper/sdk';
 import type { SourceBlock } from '../application/ingest/types';
 import { containsSensitiveCredential, isSensitiveStatePath } from '../application/ingest/source-blocks';
+import { classifyActorName, classifyLocationName } from '../domain';
 
 export interface MemorySourceGroup {
   id: string;
@@ -14,6 +15,122 @@ export interface MemorySourceGroup {
   label: string;
   count: number;
   charCount: number;
+}
+
+interface SillyTavernMemorySections {
+  content: string;
+  actorRefs: string[];
+  locationRefs: string[];
+}
+
+const CAST_HEADER = /^目前已出场角色\s*[：:]\s*(.*)$/u;
+const STATE_HEADER = /^状态栏\s*[：:]\s*$/u;
+const PLOT_HEADER = /^剧情选项\s*[：:]\s*$/u;
+const INVENTORY_HEADER = /^(?:系统商店|物品栏)\s*[：:]/u;
+const INVENTORY_ROW = /^(?:武器|药品|食物|防具|特殊道具|低级核心|中级核心|高级核心|顶级核心|特殊核心)\s*[：:]/u;
+const STATE_ROW = /^(?:姓名|动作姿势|心情状态|是否发情|所在位置|位置|健康状态|伤势|当前目标|关系状态|装备状态)\s*[：:]/u;
+const SECTION_SEPARATOR = /^-{3,}$/u;
+
+function isStrictCastName(value: string): boolean {
+  // A cast manifest is an explicit identity declaration. Do not reject valid
+  // future names such as 2B/R2-D2 or a character whose name is also a common
+  // noun; structural and quantified rows are still rejected by the shared
+  // entity-boundary policy.
+  return classifyActorName(value, { trust: 'trusted' }).accepted;
+}
+
+function splitCastNames(value: string): string[] {
+  return [...new Set(value
+    .split(/[，,、;；\n]/u)
+    .map(item => item.trim().replace(/^[-*•]\s*/u, ''))
+    .filter(isStrictCastName))];
+}
+
+/**
+ * SillyTavern assistant messages often append cast manifests, future plot
+ * choices and status panels to the actual prose. Only prose and the current
+ * status snapshot are evidence; cast names become trusted directory seeds and
+ * future choices are removed completely.
+ */
+function parseSillyTavernMemorySections(value: string): SillyTavernMemorySections {
+  const normalized = value.replace(/\r\n?/gu, '\n').trim();
+  const lines = normalized.split('\n');
+  const actorRefs = new Set<string>();
+  const locationRefs = new Set<string>();
+  const inventoryRows: string[] = [];
+  const stateRows: string[] = [];
+  let metadataStart = lines.length;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!.trim();
+    const cast = line.match(CAST_HEADER);
+    if (cast) {
+      metadataStart = Math.min(metadataStart, index);
+      for (const name of splitCastNames(cast[1] ?? '')) actorRefs.add(name);
+      // A cast manifest is intentionally tiny: consume only consecutive
+      // comma-separated name lines, and stop before inventory/status prose.
+      for (let cursor = index + 1; cursor < Math.min(lines.length, index + 4); cursor += 1) {
+        const next = lines[cursor]!.trim();
+        if (!next || SECTION_SEPARATOR.test(next) || STATE_HEADER.test(next) || PLOT_HEADER.test(next)
+          || INVENTORY_HEADER.test(next) || INVENTORY_ROW.test(next)) break;
+        const names = splitCastNames(next);
+        if (names.length === 0) break;
+        names.forEach(name => actorRefs.add(name));
+      }
+      continue;
+    }
+    if (STATE_HEADER.test(line) || PLOT_HEADER.test(line) || INVENTORY_HEADER.test(line) || INVENTORY_ROW.test(line)) {
+      metadataStart = Math.min(metadataStart, index);
+    }
+    if (INVENTORY_ROW.test(line)) inventoryRows.push(line);
+  }
+
+  const stateIndex = lines.findIndex(line => STATE_HEADER.test(line.trim()));
+  if (stateIndex >= 0) {
+    for (let index = stateIndex + 1; index < lines.length; index += 1) {
+      const line = lines[index]!.trim();
+      if (PLOT_HEADER.test(line) || (SECTION_SEPARATOR.test(line) && lines.slice(index + 1, index + 4).some(next => PLOT_HEADER.test(next.trim())))) break;
+      if (!line) {
+        if (stateRows.at(-1) !== '') stateRows.push('');
+        continue;
+      }
+      if (!STATE_ROW.test(line)) continue;
+      stateRows.push(line);
+      const name = line.match(/^姓名\s*[：:]\s*(.+)$/u)?.[1]?.trim();
+      if (name && isStrictCastName(name)) actorRefs.add(name);
+      const location = line.match(/^(?:所在位置|位置)\s*[：:]\s*(.+)$/u)?.[1]?.trim();
+      if (location) {
+        const decision = classifyLocationName(location, { trust: 'trusted' });
+        if (decision.accepted) locationRefs.add(decision.canonicalName);
+      }
+    }
+  }
+
+  const narrativeLines = lines.slice(0, metadataStart);
+  while (narrativeLines.length > 0 && (!narrativeLines.at(-1)!.trim() || SECTION_SEPARATOR.test(narrativeLines.at(-1)!.trim()))) narrativeLines.pop();
+  let narrative = narrativeLines.join('\n').replace(/\n{3,}/gu, '\n\n').trim();
+  if (inventoryRows.length > 0) narrative = `${narrative}\n\n【当前物资快照】\n${uniqueLines(inventoryRows).join('\n')}`.trim();
+  const compactState = trimBlankLines(stateRows);
+  if (compactState.length > 0) narrative = `${narrative}\n\n【当前状态快照】\n${compactState.join('\n')}`.trim();
+  return {
+    content: narrative,
+    actorRefs: [...actorRefs],
+    // Free prose is intentionally not regex-mined for locations. Arbitrary
+    // worlds and languages are handled by Claim locationCandidates with exact
+    // evidence, while explicit host/state location fields remain trusted.
+    locationRefs: [...locationRefs],
+  };
+}
+
+function uniqueLines(lines: readonly string[]): string[] {
+  return [...new Set(lines.map(line => line.trim()).filter(Boolean))];
+}
+
+function trimBlankLines(lines: readonly string[]): string[] {
+  const result = [...lines];
+  while (result[0] === '') result.shift();
+  while (result.at(-1) === '') result.pop();
+  return result;
 }
 
 export interface MemorySourceReader {
@@ -131,8 +248,11 @@ export function buildVisibleChatSourceBlocks(chatKey: string, rawMessages: reado
   return rawMessages.flatMap((value, index): SourceBlock[] => {
     if (!value || typeof value !== 'object') return [];
     const message = value as Record<string, unknown>;
-    const content = text(message.mes ?? message.content ?? message.text);
-    if (!content) return [];
+    const rawContent = text(message.mes ?? message.content ?? message.text);
+    if (!rawContent) return [];
+    const sections = parseSillyTavernMemorySections(rawContent);
+    const content = sections.content;
+    if (!content && sections.actorRefs.length === 0) return [];
     const extra = message.extra && typeof message.extra === 'object' ? message.extra as Record<string, unknown> : undefined;
     const messageType: ChatMessageType = message.messageType === 'tool' || message.role === 'tool' || extra?.type === 'tool'
       ? 'tool'
@@ -152,7 +272,10 @@ export function buildVisibleChatSourceBlocks(chatKey: string, rawMessages: reado
       || message.hidden === true
       || Boolean(extra?.hidden === true);
     const hidden = messageType !== 'system' && (explicitHidden || message.visibleToAi === false || messageType === 'tool' || messageType === 'reasoning');
-    const actorRefs = textList(message.actorRefs ?? message.actor_refs ?? extra?.actorRefs ?? extra?.actor_refs);
+    const actorRefs = [...new Set([
+      ...textList(message.actorRefs ?? message.actor_refs ?? extra?.actorRefs ?? extra?.actor_refs),
+      ...sections.actorRefs,
+    ])];
     const speakerOwnerRef = text(message.speakerActorId ?? message.speakerOwnerId ?? message.speakerName ?? extra?.speakerActorId ?? extra?.speakerOwnerId);
     const viewpointOwnerRef = text(message.perspectiveActorId ?? message.viewpointOwnerId ?? extra?.perspectiveActorId ?? extra?.viewpointOwnerId);
     const observerOwnerRefs = textList(message.observerActorIds ?? message.observerOwnerIds ?? extra?.observerActorIds ?? extra?.observerOwnerIds);
@@ -169,6 +292,26 @@ export function buildVisibleChatSourceBlocks(chatKey: string, rawMessages: reado
       }
       : undefined;
     const sceneRefs = textList(message.sceneRefs ?? message.sceneIds ?? extra?.sceneRefs ?? extra?.sceneIds);
+    const enteredOwnerRefs = textList(message.enteredActorIds ?? message.enteredOwnerIds ?? extra?.enteredActorIds ?? extra?.enteredOwnerIds);
+    const exitedOwnerRefs = textList(message.exitedActorIds ?? message.exitedOwnerIds ?? extra?.exitedActorIds ?? extra?.exitedOwnerIds);
+    const nearbyOwnerRefs = textList(message.nearbyActorIds ?? message.nearbyOwnerIds ?? extra?.nearbyActorIds ?? extra?.nearbyOwnerIds);
+    const locationKeys = [...new Set([
+      ...textList(message.locationKeys ?? message.locationKey ?? message.location ?? extra?.locationKeys ?? extra?.locationKey ?? extra?.location),
+      ...sections.locationRefs,
+    ])];
+    const timeJump = message.timeJump === true || extra?.timeJump === true;
+    const sceneReset = message.sceneReset === true || extra?.sceneReset === true;
+    const transition = enteredOwnerRefs.length > 0 || exitedOwnerRefs.length > 0 || nearbyOwnerRefs.length > 0 || locationKeys.length > 0 || timeJump || sceneReset
+      ? {
+        ...(enteredOwnerRefs.length > 0 ? { enteredOwnerRefs } : {}),
+        ...(exitedOwnerRefs.length > 0 ? { exitedOwnerRefs } : {}),
+        ...(nearbyOwnerRefs.length > 0 ? { nearbyOwnerRefs } : {}),
+        ...(locationKeys.length > 0 ? { locationKeys } : {}),
+        ...(timeJump ? { timeJump: true } : {}),
+        ...(sceneReset ? { sceneReset: true } : {}),
+        confidence: 1,
+      }
+      : undefined;
     return [{
       id: `message:${messageId(message, index)}`,
       chatKey,
@@ -182,7 +325,10 @@ export function buildVisibleChatSourceBlocks(chatKey: string, rawMessages: reado
       author: sourceAuthor(message, messageType),
       visibility: messageType === 'system' ? 'control' : hidden ? 'hidden' : 'visible',
       ...(actorRefs.length > 0 ? { actorRefs } : {}),
+      ...(locationKeys.length > 0 ? { locationRefs: locationKeys } : {}),
+      semanticSection: 'narrative',
       ...(perspective ? { perspective } : {}),
+      ...(transition ? { transition } : {}),
       ...(sceneRefs.length > 0 ? { sceneRefs } : {}),
     }];
   });

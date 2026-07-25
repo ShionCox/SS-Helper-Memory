@@ -48,7 +48,7 @@ function service(
 
 describe('语义、混合召回与 LLM rerank', () => {
   it('为真实 rerank 保留 15 秒窗口及完整额外召回预算', () => {
-    expect(semanticRecallLimits).toEqual({ rerankTimeoutMs: 15_000, totalExtraBudgetMs: 19_000 });
+    expect(semanticRecallLimits).toEqual({ rerankTimeoutMs: 30_000, totalExtraBudgetMs: 40_000 });
   });
 
   it('纯向量能召回没有关键词重叠的同义改写', async () => {
@@ -199,20 +199,123 @@ describe('语义、混合召回与 LLM rerank', () => {
     expect(result.diagnostics.rerank).toMatchObject({ requested: true, success: true, resourceId: 'Rerank', usage: null });
   });
 
-  it('只重排融合头部四条并保留未重排尾部', async () => {
+  it('从宽融合池中意图补齐八条重排候选并保留未重排尾部', async () => {
     const rerank = vi.fn(async (input: { docs: string[] }) => ({
       ok: true as const,
       results: input.docs.map((_, index) => ({ index, score: 1 - index / 10 })),
       meta: { resourceId: 'Rerank', model: 'Qwen3-Reranker-4B', latencyMs: 40 },
     }));
-    const facts = Array.from({ length: 8 }, (_, index) => fact(`fact-${index}`, `泳池战斗相关记忆 ${index}。`));
+    const facts = Array.from({ length: 16 }, (_, index) => fact(`fact-${index}`, `泳池战斗相关记忆 ${index}。`));
     const scores = facts.map((item, index): [string, number] => [item.id, 0.9 - index / 100]);
     const result = await service(facts, scores, rerank)
-      .recall({ chatKey: 'chat-a', query: '泳池战斗', maxItems: 8, now: NOW }, 'hybrid', 'always');
+      .recall({ chatKey: 'chat-a', query: '泳池战斗', maxItems: 12, now: NOW }, 'hybrid', 'always');
 
-    expect(rerank).toHaveBeenCalledWith(expect.objectContaining({ docs: expect.any(Array), topK: 4 }));
-    expect(rerank.mock.calls[0]?.[0].docs).toHaveLength(4);
-    expect(result.items).toHaveLength(8);
+    expect(rerank).toHaveBeenCalledWith(expect.objectContaining({ docs: expect.any(Array), topK: 8 }));
+    expect(rerank.mock.calls[0]?.[0].docs).toHaveLength(8);
+    expect(result.items).toHaveLength(12);
+  });
+
+  it('能力类查询在八条候选中保留直接能力并给 reranker 注入类型优先指令', async () => {
+    const target = fact('capability-target', '琴乃能够通过紫罗根系感知地面震动与能量波动。', {
+      kind: 'capability', subjectKey: '白夕琴乃（重构体）', predicateKey: '感知外界', entityKeys: ['白夕琴乃（重构体）', '紫罗'],
+    });
+    const distractors = Array.from({ length: 12 }, (_, index) => fact(`goal-${index}`, `小时安排琴乃执行后续任务 ${index}。`, {
+      kind: 'goal', subjectKey: '白夕小时', predicateKey: '安排任务',
+    }));
+    const rerank = vi.fn(async (input: { query: string; docs: string[] }) => {
+      const preferred = input.docs.findIndex(doc => doc.includes('地面震动与能量波动'));
+      return {
+        ok: true as const,
+        results: input.docs.map((_, index) => ({ index, score: index === preferred ? 1 : 0.1 })),
+        meta: { resourceId: 'Rerank', model: 'Qwen3-Reranker-4B', latencyMs: 40 },
+      };
+    });
+    const scores = [...distractors, target].map((item, index): [string, number] => [item.id, 0.99 - index / 100]);
+    const result = await service([...distractors, target], scores, rerank)
+      .recall({ chatKey: 'chat-a', query: '白夕琴乃可以怎样感知外界并协助侦察？', maxItems: 12, now: NOW }, 'hybrid', 'always');
+
+    expect(rerank.mock.calls[0]?.[0].docs).toHaveLength(8);
+    expect(rerank.mock.calls[0]?.[0].query).toContain('capability facts above plans');
+    expect(result.items[0]?.fact.id).toBe(target.id);
+  });
+
+  it('“最初”事件按来源楼层而不是批处理写入时间保护最早事实', async () => {
+    const initialDirective = fact('initial-directive', '白夕小时下达应对指令：所有人留在室内，叶监控外部，莲保护音乃，琴乃继续分析信号。', {
+      kind: 'event', predicateKey: '下达应对指令', sourceRefs: ['message:floor-0'], evidenceRefs: [], updatedAt: NOW + 10_000,
+    });
+    const laterAction = fact('later-action', '白夕小时后来在巷中使用电击器应对紫骸。', {
+      kind: 'event', predicateKey: '使用', sourceRefs: ['message:floor-38'], evidenceRefs: [], updatedAt: NOW,
+    });
+    const goal = fact('ration-goal', '白夕小时决定实行配给制。', {
+      kind: 'goal', predicateKey: '决策', sourceRefs: ['message:floor-4'], evidenceRefs: [], updatedAt: NOW - 1_000,
+    });
+    const result = await service(
+      [initialDirective, laterAction, goal],
+      [['later-action', 0.99], ['ration-goal', 0.98], ['initial-directive', 0.75]],
+    ).recall({
+      chatKey: 'chat-a',
+      query: '紫色晶雨最初发生时，白夕小时如何指挥大家应对？',
+      entityKeys: ['白夕小时'],
+      maxItems: 4,
+      now: NOW + 20_000,
+    }, 'hybrid', 'off');
+
+    expect(result.items[0]?.fact.id).toBe(initialDirective.id);
+  });
+
+  it('“最初如何指挥”会把同一最早来源中的人员分工作为一个事件组置顶', async () => {
+    const directives = [
+      fact('stay-inside', '白夕小时下令所有人留在室内。', {
+        kind: 'goal', subjectKey: '白夕小时', predicateKey: '下令', sourceRefs: ['message:floor-0'], evidenceRefs: [],
+      }),
+      fact('leaf-monitor', '白夕叶持续监控外部环境变化。', {
+        kind: 'goal', subjectKey: '白夕叶', predicateKey: '持续监控', sourceRefs: ['message:floor-0'], evidenceRefs: [],
+      }),
+      fact('lotus-protect', '白夕莲负责保护白夕音乃。', {
+        kind: 'goal', subjectKey: '白夕莲', predicateKey: '保护', sourceRefs: ['message:floor-0'], evidenceRefs: [],
+      }),
+      fact('kotono-analyze', '白夕琴乃继续分析信号并立即报告。', {
+        kind: 'goal', subjectKey: '白夕琴乃（重构体）', predicateKey: '分析信号', sourceRefs: ['message:floor-0'], evidenceRefs: [],
+      }),
+    ];
+    const later = Array.from({ length: 8 }, (_, index) => fact(`later-${index}`, `白夕小时后来安排普通任务 ${index}。`, {
+      kind: 'goal', sourceRefs: [`message:floor-${20 + index}`], evidenceRefs: [], updatedAt: NOW + index,
+    }));
+    const scores = [...later, ...directives].map((item, index): [string, number] => [item.id, 0.99 - index / 100]);
+    const result = await service([...directives, ...later], scores)
+      .recall({
+        chatKey: 'chat-a',
+        query: '紫色晶雨最初发生时，白夕小时如何指挥大家应对？',
+        entityKeys: ['白夕小时', '紫色晶雨'],
+        maxItems: 6,
+        now: NOW + 100,
+      }, 'hybrid', 'off');
+
+    expect(new Set(result.items.slice(0, 4).map(item => item.fact.id))).toEqual(new Set(directives.map(item => item.id)));
+  });
+
+  it('能力问题会把直接 capability 候选保留到意图补齐重排池中', async () => {
+    const target = fact('direct-capability', '琴乃可通过紫罗根系感知地面震动和外部生物活动。', {
+      kind: 'capability', subjectKey: '白夕琴乃（重构体）', predicateKey: '感知外界', entityKeys: ['白夕琴乃（重构体）', '紫罗'],
+    });
+    const distractors = Array.from({ length: 15 }, (_, index) => fact(`task-${index}`, `小时安排琴乃执行侦察任务 ${index}。`, {
+      kind: index % 2 === 0 ? 'goal' : 'commitment',
+      subjectKey: index % 2 === 0 ? '白夕小时' : '白夕琴乃（重构体）',
+    }));
+    const rerank = vi.fn(async (input: { docs: string[] }) => {
+      const preferred = input.docs.findIndex(doc => doc.includes('通过紫罗根系感知地面震动'));
+      return {
+        ok: true as const,
+        results: input.docs.map((_, index) => ({ index, score: index === preferred ? 1 : 0.1 - index / 1_000 })),
+        meta: { resourceId: 'Rerank', model: 'Qwen3-Reranker-4B', latencyMs: 40 },
+      };
+    });
+    const scores = [...distractors, target].map((item, index): [string, number] => [item.id, 0.99 - index / 100]);
+    const result = await service([...distractors, target], scores, rerank)
+      .recall({ chatKey: 'chat-a', query: '白夕琴乃可以怎样感知外界并协助侦察？', maxItems: 12, now: NOW }, 'hybrid', 'always');
+
+    expect(rerank.mock.calls[0]?.[0].docs.some(doc => doc.includes('[capability]'))).toBe(true);
+    expect(result.items[0]?.fact.id).toBe(target.id);
   });
 
   it('rerank 不会把显式最新状态排到旧事实之后', async () => {
@@ -288,7 +391,7 @@ describe('语义、混合召回与 LLM rerank', () => {
     });
   });
 
-  it('rerank 路由预检耗时会从 19 秒总预算中扣除', async () => {
+  it('rerank 路由预检耗时会从 40 秒总预算中扣除', async () => {
     vi.useFakeTimers();
     const rerank = vi.fn(async (input: { docs: string[]; budget?: { maxLatencyMs?: number } }) => ({
       ok: true as const,
@@ -296,7 +399,7 @@ describe('语义、混合召回与 LLM rerank', () => {
       meta: { resourceId: 'Rerank', model: 'budget-model' },
     }));
     const previewRoute = vi.fn(() => new Promise<{ resourceId: string; model: string }>((resolve) => {
-      setTimeout(() => resolve({ resourceId: 'Rerank', model: 'budget-model' }), 14_000);
+      setTimeout(() => resolve({ resourceId: 'Rerank', model: 'budget-model' }), 29_000);
     }));
     const llm = { rerank, inspect: { previewRoute } } as unknown as MemoryLlmApi;
     const vectors = { search: vi.fn(async () => vectorResult([['first', 0.9], ['second', 0.8]])) };
@@ -306,11 +409,11 @@ describe('语义、混合召回与 LLM rerank', () => {
       () => llm,
     ).recall({ chatKey: 'chat-a', query: '战斗记录', now: NOW }, 'hybrid', 'always');
 
-    await vi.advanceTimersByTimeAsync(14_000);
+    await vi.advanceTimersByTimeAsync(29_000);
     const result = await pending;
     const requestBudget = rerank.mock.calls[0]?.[0].budget?.maxLatencyMs ?? Number.POSITIVE_INFINITY;
     expect(requestBudget).toBeGreaterThan(0);
-    expect(requestBudget).toBeLessThanOrEqual(5_000);
+    expect(requestBudget).toBeLessThanOrEqual(11_000);
     expect(result.diagnostics.rerank).toMatchObject({ requested: true, success: true });
   });
 

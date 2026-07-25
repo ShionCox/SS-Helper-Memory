@@ -14,7 +14,7 @@ import {
   type ChatNavigationTarget,
 } from '@ss-helper/sdk';
 import type { SummaryInitializationEstimate } from '../application/ingest/summary-strategy';
-import { DEFAULT_MEMORY_TRAITS, type MemoryGraphPreview, type MemoryGraphStatus } from '../domain';
+import { DEFAULT_MEMORY_TRAITS, type CastPlanningSettings, type MemoryGraphPreview, type MemoryGraphStatus } from '../domain';
 import { describeMemoryError, type MemoryErrorDiagnostic } from '../diagnostics/memory-error';
 import { traceMemoryStartup } from '../host/runtime-feedback';
 import { mountRelationshipGraphThree, type RelationshipGraphCommand, type RelationshipGraphRenderer } from './relationship-graph-three';
@@ -51,7 +51,7 @@ import {
   type ActorMemoryViewState,
 } from './actor-memory-view';
 
-export interface MemoryUiSettings {
+export interface MemoryUiSettings extends CastPlanningSettings {
   enabled: boolean;
   autoOrganize: boolean;
   summaryBatchMode: 'floors' | 'chars';
@@ -282,6 +282,14 @@ export interface MemoryUiController {
   listActors?(): Promise<readonly import('../domain').MemoryOwner[]>;
   listActorAliases?(): Promise<readonly import('../domain').ActorAlias[]>;
   listSceneCasts?(): Promise<readonly import('../domain').SceneCast[]>;
+  getCurrentSceneState?(): Promise<import('../domain').SceneState | null>;
+  listSceneTransitions?(): Promise<readonly import('../domain').SceneTransition[]>;
+  correctCurrentSceneState?(input: { readonly ownerId: string; readonly placement: 'present' | 'nearby' | 'exited' | 'viewpoint' }): Promise<void>;
+  listGenerationCastPlans?(): Promise<readonly import('../domain').GenerationCastPlan[]>;
+  listCastPlanAudits?(): Promise<readonly import('../domain').CastPlanAudit[]>;
+  listRecallCoverageLogs?(): Promise<readonly import('../domain').RecallCoverageLog[]>;
+  listMemoryUsageLogs?(): Promise<readonly import('../domain').MemoryUsageLog[]>;
+  getActorRecallDiagnostics?(): Promise<import('../domain').ActorRecallResponse | null>;
   listEpisodes?(): Promise<readonly import('../domain').MemoryEpisode[]>;
   listObservations?(): Promise<readonly import('../domain').MemoryObservation[]>;
   listActorTraces?(ownerId?: string): Promise<readonly import('../domain').ActorMemoryTrace[]>;
@@ -518,6 +526,13 @@ interface WorkbenchState {
   candidateTargetOwnerId: string;
   candidateCanonicalName: string;
   scenes: Array<import('../domain').SceneCast>;
+  currentSceneState?: import('../domain').SceneState;
+  sceneTransitions: Array<import('../domain').SceneTransition>;
+  generationCastPlans: Array<import('../domain').GenerationCastPlan>;
+  castPlanAudits: Array<import('../domain').CastPlanAudit>;
+  recallCoverageLogs: Array<import('../domain').RecallCoverageLog>;
+  memoryUsageLogs: Array<import('../domain').MemoryUsageLog>;
+  actorRecallDiagnostics?: import('../domain').ActorRecallResponse;
   episodes: Array<import('../domain').MemoryEpisode>;
   observations: Array<import('../domain').MemoryObservation>;
   sceneCategory: SceneEventCategory;
@@ -651,7 +666,7 @@ export function renderMemoryWorkbench(
   let sceneRendererToken = 0;
   const requestedGraphPage = initialActionId === 'open-relationship-graph' || initialActionId === 'rebuild-relationship-graph';
   const state: WorkbenchState = {
-    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', scenes: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
+    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
     selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeInvisibleHistory: false, reinitializeOpen: false, audits: [], usages: [], integrityText: '尚未执行完整性检查。', confirmBatchKey: '', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
   };
   const sceneEventsState = (): SceneEventsState => ({
@@ -663,6 +678,10 @@ export function renderMemoryWorkbench(
     observations: state.observations,
     actors: state.actors,
     actorAliases: state.actorAliases,
+    ...(state.currentSceneState ? { currentSceneState: state.currentSceneState } : {}),
+    sceneTransitions: state.sceneTransitions,
+    generationCastPlans: state.generationCastPlans,
+    castPlanAudits: state.castPlanAudits,
     selectedSceneId: state.selectedSceneId,
     selectedEpisodeId: state.selectedEpisodeId,
     selectedObservationId: state.selectedObservationId,
@@ -1011,12 +1030,16 @@ export function renderMemoryWorkbench(
           if (state.pendingActors.length === 0 && state.actorView === 'pending') state.actorView = 'people';
         }
       } else if (page === 'scenes') {
-        const [scenes, episodes, observations, actors, aliases] = await Promise.all([
+        const [scenes, episodes, observations, actors, aliases, currentSceneState, transitions, plans, planAudits] = await Promise.all([
           controller.listSceneCasts ? controller.listSceneCasts() : Promise.resolve([]),
           controller.listEpisodes ? controller.listEpisodes() : Promise.resolve([]),
           controller.listObservations ? controller.listObservations() : Promise.resolve([]),
           controller.listActors ? controller.listActors() : Promise.resolve([]),
           controller.listActorAliases ? controller.listActorAliases() : Promise.resolve([]),
+          controller.getCurrentSceneState ? controller.getCurrentSceneState() : Promise.resolve(null),
+          controller.listSceneTransitions ? controller.listSceneTransitions() : Promise.resolve([]),
+          controller.listGenerationCastPlans ? controller.listGenerationCastPlans() : Promise.resolve([]),
+          controller.listCastPlanAudits ? controller.listCastPlanAudits() : Promise.resolve([]),
         ]);
         if (!isCurrent()) return;
         state.scenes = [...scenes];
@@ -1024,6 +1047,11 @@ export function renderMemoryWorkbench(
         state.observations = [...observations];
         state.actors = [...actors];
         state.actorAliases = [...aliases];
+        if (currentSceneState) state.currentSceneState = currentSceneState;
+        else delete state.currentSceneState;
+        state.sceneTransitions = [...transitions];
+        state.generationCastPlans = [...plans];
+        state.castPlanAudits = [...planAudits];
         const normalized = sceneEventsState();
         normalizeSceneEventsSelection(normalized);
         syncSceneSelection(normalized);
@@ -1086,9 +1114,24 @@ export function renderMemoryWorkbench(
         const recall = await controller.getRecallStatus();
         if (!isCurrent()) return;
         state.recall = recall;
-        const diagnostics = state.overview?.bound === false ? null : await controller.getLastRecall();
+        const [diagnostics, actorRecall, plans, planAudits, coverageLogs, usageLogs] = state.overview?.bound === false
+          ? [null, null, [], [], [], []] as const
+          : await Promise.all([
+            controller.getLastRecall(),
+            controller.getActorRecallDiagnostics ? controller.getActorRecallDiagnostics() : Promise.resolve(null),
+            controller.listGenerationCastPlans ? controller.listGenerationCastPlans() : Promise.resolve([]),
+            controller.listCastPlanAudits ? controller.listCastPlanAudits() : Promise.resolve([]),
+            controller.listRecallCoverageLogs ? controller.listRecallCoverageLogs() : Promise.resolve([]),
+            controller.listMemoryUsageLogs ? controller.listMemoryUsageLogs() : Promise.resolve([]),
+          ]);
         if (!isCurrent()) return;
         state.diagnostics = diagnostics;
+        if (actorRecall) state.actorRecallDiagnostics = actorRecall;
+        else delete state.actorRecallDiagnostics;
+        state.generationCastPlans = [...plans];
+        state.castPlanAudits = [...planAudits];
+        state.recallCoverageLogs = [...coverageLogs];
+        state.memoryUsageLogs = [...usageLogs];
         if (state.overview?.bound === false) {
           state.graph = { nodes: [], edges: [] };
           state.graphStatus = controller.getGraphStatus();
@@ -1538,6 +1581,37 @@ export function renderMemoryWorkbench(
       reinitializeOpen: state.reinitializeOpen,
     });
   };
+  const renderGenerationRecallDiagnostics = (): string => {
+    const response = state.actorRecallDiagnostics;
+    const plan = [...state.generationCastPlans].sort((left, right) => right.basedOnFloor - left.basedOnFloor || right.createdAt - left.createdAt)[0] ?? response?.request.castPlan;
+    const coverageLog = plan
+      ? [...state.recallCoverageLogs].filter((item) => item.planId === plan.id).sort((left, right) => right.createdAt - left.createdAt)[0]
+      : [...state.recallCoverageLogs].sort((left, right) => right.createdAt - left.createdAt)[0];
+    const audit = plan
+      ? [...state.castPlanAudits].filter((item) => item.planId === plan.id).sort((left, right) => right.createdAt - left.createdAt)[0]
+      : undefined;
+    if (!plan && !response && !coverageLog) return `<section class="stx-memory-panel stx-memory-recall-owner-panel">${renderEmpty('暂无逐角色召回诊断', '完成一次正式生成后，这里会显示选角计划、每个主体的独立候选池与覆盖验证。')}</section>`;
+    const fixedNames: Readonly<Record<string, string>> = { 'owner:world': '世界', 'owner:narrator': '旁白', 'owner:player': '玩家', 'owner:unknown': '未知主体' };
+    const ownerName = (ownerId: string): string => state.actors.find((actor) => actor.id === ownerId)?.displayName ?? fixedNames[ownerId] ?? ownerId;
+    const permissionLabels: Readonly<Record<string, string>> = { full: '完整', focused: '聚焦', public_only: '仅公开', identity_only: '仅身份', none: '不召回' };
+    const partitions = response ? [response.world, response.narrator, ...response.actors] : [];
+    const ownerRows = partitions.map((partition) => {
+      const permission = plan?.permissionByOwner[partition.ownerId] ?? response?.diagnostics.permissionByOwner?.[partition.ownerId] ?? 'none';
+      const candidates = response?.diagnostics.ownerCandidateCounts?.[partition.ownerId] ?? partition.packets.length;
+      const strength = partition.packets.length > 0 ? Math.round(partition.packets.reduce((sum, packet) => sum + packet.effectiveStrength, 0) / partition.packets.length) : 0;
+      const retrievalLevel = response?.diagnostics.retrievalLevelByOwner?.[partition.ownerId];
+      const retrievalStages = response?.diagnostics.retrievalStagesByOwner?.[partition.ownerId] ?? [];
+      return `<div class="stx-memory-recall-owner-row"><span><strong>${escapeHtml(partition.ownerName || ownerName(partition.ownerId))}</strong><small>${escapeHtml(partition.role)}${retrievalLevel ? ` · Level ${retrievalLevel}` : ''}</small>${retrievalStages.length ? `<small title="${escapeHtml(retrievalStages.join(' → '))}">${escapeHtml(retrievalStages.join(' → '))}</small>` : ''}</span><span>${renderStatusChip(permissionLabels[permission] ?? permission, permission === 'none' ? 'neutral' : permission === 'full' ? 'success' : 'warning')}</span><span><small>候选</small><strong>${formatNumber(candidates)}</strong></span><span><small>入选</small><strong>${formatNumber(partition.packets.length)}</strong></span><span><small>平均强度</small><strong>${strength}</strong></span></div>`;
+    }).join('');
+    const explicitUsage = state.memoryUsageLogs.filter((item) => item.usage === 'explicit').length;
+    const implicitUsage = state.memoryUsageLogs.filter((item) => item.usage === 'implicit').length;
+    const notUsed = state.memoryUsageLogs.filter((item) => item.usage === 'not_used').length;
+    const requiredNames = plan?.requiredOwnerIds.map(ownerName).join('、') || '无';
+    const likelyNames = plan?.likelyOwnerIds.map(ownerName).join('、') || '无';
+    const backgroundNames = plan?.backgroundOwnerIds.map(ownerName).join('、') || '无';
+    const missing = coverageLog ? [...coverageLog.missingSubQueryIds, ...coverageLog.missingOwnerIds.map(ownerName), ...coverageLog.missingTimeDimensions] : [];
+    return `<section class="stx-memory-panel stx-memory-recall-owner-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">生成前闭环</span><h3>逐角色召回诊断</h3></div>${coverageLog ? renderStatusChip(coverageLog.covered ? '覆盖完整' : '保留不确定', coverageLog.covered ? 'success' : 'warning') : renderStatusChip('等待覆盖验证')}</div><div class="stx-memory-recall-plan-summary"><div><small>计划模式</small><strong>${escapeHtml(plan?.plannerMode ?? '未记录')}</strong></div><div><small>确定参与</small><strong>${escapeHtml(requiredNames)}</strong></div><div><small>可能参与</small><strong>${escapeHtml(likelyNames)}</strong></div><div><small>背景在场</small><strong>${escapeHtml(backgroundNames)}</strong></div><div><small>计划置信度</small><strong>${plan ? `${Math.round(plan.confidence * 100)}%` : '未记录'}</strong></div><div><small>二次扩展</small><strong>${coverageLog?.expanded ? '已执行一次' : '未执行'}</strong></div></div><div class="stx-memory-recall-owner-table"><div class="stx-memory-recall-owner-row is-head"><span>主体</span><span>权限</span><span>候选</span><span>入选</span><span>平均强度</span></div>${ownerRows || '<p class="stx-memory-muted">本次计划尚未形成可展示的角色分区。</p>'}</div><div class="stx-memory-recall-audit-grid"><article><span class="stx-memory-kicker">覆盖验证</span><strong>${coverageLog?.covered ? '全部子问题已覆盖' : missing.length ? `缺失：${escapeHtml(missing.join('、'))}` : '尚无覆盖日志'}</strong><small>隐私违规 ${coverageLog?.privacyViolations.length ?? 0} · 时间冲突 ${coverageLog?.temporalConflicts.length ?? 0}</small></article><article><span class="stx-memory-kicker">计划与实际</span><strong>${audit ? audit.result === 'matched' ? '完全一致' : audit.result === 'partial' ? '部分一致' : '存在偏差' : '尚未核对'}</strong><small>意外角色 ${audit?.unplannedOwnerIds.length ?? 0} · 未出现 ${audit?.missingOwnerIds.length ?? 0}</small></article><article><span class="stx-memory-kicker">实际使用</span><strong>${explicitUsage} 明确 · ${implicitUsage} 隐含</strong><small>${notUsed} 条已注入但未使用，不会强化</small></article></div></section>`;
+  };
   const renderRecall = (): string => {
     const recall = state.recall;
     if (!recall) return renderEmpty('暂无召回状态', '点击刷新或稍后重试。');
@@ -1547,7 +1621,7 @@ export function renderMemoryWorkbench(
     const diagnostic = state.diagnostics == null
       ? renderEmpty('暂无召回诊断', '完成一次召回后，这里会显示诊断摘要。')
       : `<pre class="stx-memory-code">${escapeHtml(formatJson(state.diagnostics))}</pre>`;
-    return `<div class="stx-memory-card-grid"><section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">当前策略</span><h3>${escapeHtml(translateRecallMode(recall.resolvedMode))}</h3></div>${renderStatusChip(recall.rebuilding ? '重建中' : '运行正常', recall.rebuilding ? 'warning' : 'success')}</div><div class="stx-memory-route-grid">${renderRoute('向量模型', recall.embedding)}${renderRoute('重排序模型', recall.rerank)}</div><div class="stx-memory-metric-grid"><div><span>已建立索引</span><strong>${formatNumber(recall.indexedFacts)}</strong></div><div><span>可索引事实</span><strong>${formatNumber(recall.eligibleFacts)}</strong></div><div><span>待处理</span><strong>${formatNumber(recall.pendingFacts)}</strong></div></div><div class="stx-memory-progress-copy"><span>向量覆盖率</span><strong>${coverage}%</strong></div><progress ${uiControl('progress')} max="100" value="${coverage}">${coverage}%</progress>${recallError ? `<p class="stx-memory-inline-alert" role="alert">错误码：${escapeHtml(safeInlineError(recallError, 'MEMORY_RECALL_DEGRADED'))}</p>` : ''}<div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="rebuild-index" ${rebuildDisabled ? 'disabled' : ''}><ss-helper-icon name="arrows-rotate" decorative></ss-helper-icon>重建向量索引</button></div>${recall.embedding.available ? '' : '<p class="stx-memory-muted">请先在 LLM 中配置可用的向量模型，再重建索引。</p>'}</section><section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近召回</span><h3>诊断摘要</h3></div></div>${diagnostic}${recall.batches.length ? `<div class="stx-memory-batch-table"><div class="stx-memory-table-row stx-memory-table-head"><span>批次</span><span>输入</span><span>延迟</span><span>接受</span></div>${recall.batches.map((batch) => `<div class="stx-memory-table-row"><span>#${batch.batchIndex + 1}</span><span>${formatNumber(batch.inputCount)}</span><span>${formatNumber(batch.latencyMs)} 毫秒</span><span>${formatNumber(batch.accepted)} / ${formatNumber(batch.rejected)}</span></div>`).join('')}</div>` : '<p class="stx-memory-muted">暂无向量批次记录。</p>'}</section></div>`;
+    return `<div class="stx-memory-card-grid"><section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">当前策略</span><h3>${escapeHtml(translateRecallMode(recall.resolvedMode))}</h3></div>${renderStatusChip(recall.rebuilding ? '重建中' : '运行正常', recall.rebuilding ? 'warning' : 'success')}</div><div class="stx-memory-route-grid">${renderRoute('向量模型', recall.embedding)}${renderRoute('重排序模型', recall.rerank)}</div><div class="stx-memory-metric-grid"><div><span>已建立索引</span><strong>${formatNumber(recall.indexedFacts)}</strong></div><div><span>可索引事实</span><strong>${formatNumber(recall.eligibleFacts)}</strong></div><div><span>待处理</span><strong>${formatNumber(recall.pendingFacts)}</strong></div></div><div class="stx-memory-progress-copy"><span>向量覆盖率</span><strong>${coverage}%</strong></div><progress ${uiControl('progress')} max="100" value="${coverage}">${coverage}%</progress>${recallError ? `<p class="stx-memory-inline-alert" role="alert">错误码：${escapeHtml(safeInlineError(recallError, 'MEMORY_RECALL_DEGRADED'))}</p>` : ''}<div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="rebuild-index" ${rebuildDisabled ? 'disabled' : ''}><ss-helper-icon name="arrows-rotate" decorative></ss-helper-icon>重建向量索引</button></div>${recall.embedding.available ? '' : '<p class="stx-memory-muted">请先在 LLM 中配置可用的向量模型，再重建索引。</p>'}</section><section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近召回</span><h3>客观检索诊断</h3></div></div><details><summary>查看原始召回日志</summary>${diagnostic}</details>${recall.batches.length ? `<div class="stx-memory-batch-table"><div class="stx-memory-table-row stx-memory-table-head"><span>批次</span><span>输入</span><span>延迟</span><span>接受</span></div>${recall.batches.map((batch) => `<div class="stx-memory-table-row"><span>#${batch.batchIndex + 1}</span><span>${formatNumber(batch.inputCount)}</span><span>${formatNumber(batch.latencyMs)} 毫秒</span><span>${formatNumber(batch.accepted)} / ${formatNumber(batch.rejected)}</span></div>`).join('')}</div>` : '<p class="stx-memory-muted">暂无向量批次记录。</p>'}</section>${renderGenerationRecallDiagnostics()}</div>`;
   };
   const graphView = (): ReturnType<typeof selectGraphView> => {
     const graph = localizeLegacyGraphPreview(state.graph ?? { nodes: [], edges: [] });
@@ -1993,6 +2067,21 @@ export function renderMemoryWorkbench(
         state.actorView = 'people';
         state.selectedActorId = ownerId;
         rerender();
+      });
+      return;
+    }
+    if (action === 'scene-correct-state') {
+      const ownerId = actionNode.dataset.ownerId ?? '';
+      const placement = actionNode.dataset.placement;
+      if (!controller.correctCurrentSceneState || !ownerId || (placement !== 'present' && placement !== 'nearby' && placement !== 'exited' && placement !== 'viewpoint')) return;
+      state.busyAction = `scene-correct:${ownerId}:${placement}`;
+      rerender();
+      void controller.correctCurrentSceneState({ ownerId, placement }).then(() => loadPage('scenes')).then(() => {
+        if (!disposed) toast('success', '场景状态已纠正', '人工纠正已写入场景转移记录，并优先于低置信度推断。', 'MEMORY_SCENE_CORRECTED');
+      }).catch((error: unknown) => {
+        if (!disposed) toast('error', '场景纠正失败', '无法保存当前场景纠正。', safeErrorCode(error, 'MEMORY_SCENE_CORRECTION_FAILED'));
+      }).finally(() => {
+        if (!disposed) { state.busyAction = ''; rerender(); }
       });
       return;
     }
@@ -2576,6 +2665,11 @@ export function renderMemoryWorkbench(
     }
     if (input.dataset.sceneSelect === 'filter') {
       state.sceneFilter = input.value;
+      rerender();
+      return;
+    }
+    if (input.dataset.sceneSelect === 'correction-owner') {
+      state.selectedSceneOwnerId = input.value;
       rerender();
       return;
     }

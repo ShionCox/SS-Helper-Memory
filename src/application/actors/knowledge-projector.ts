@@ -26,12 +26,16 @@ export interface ProjectionResult {
 const clamp = (value: number): number => Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0));
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
 const normalizedSalience = (value: number): number => clamp01(value > 1 ? value / 100 : value);
+const PRIVACY_RANK: Record<MemoryPrivacy, number> = { public: 0, limited: 1, private: 2, secret: 3 };
 
 function traceId(ownerId: string, factId: string): string { return `trace:${ownerId}:${factId}`; }
 function addUnique(values: readonly string[], value: string): string[] { return values.includes(value) ? [...values] : [...values, value]; }
 
 function isWorldSource(observation: MemoryObservation): boolean {
-  return observation.channel === 'worldbook' || observation.channel === 'state';
+  return observation.channel === 'worldbook'
+    || (observation.channel === 'state'
+      && observation.observerOwnerIds.length === 0
+      && observation.speakerOwnerId === FIXED_OWNER_IDS.unknown);
 }
 
 /** Converts source-grounded observations into one trace per permitted owner. */
@@ -50,11 +54,11 @@ export class KnowledgeProjector {
     }
     const timestamp = Date.now();
     for (const fact of input.facts) {
+      const observations = observationsByFact.get(fact.id) ?? [];
       // Historical predecessors remain queryable and keep their prior traces,
       // but a new Capture must not manufacture an `unknown` trace merely
       // because the superseded record is included in the reconciliation set.
-      if (fact.status === 'superseded' || fact.status === 'invalid') continue;
-      const observations = observationsByFact.get(fact.id) ?? [];
+      if (fact.status === 'invalid' || (fact.status === 'superseded' && observations.length === 0)) continue;
       const ownerModes = new Map<string, { mode: MemoryKnowledgeMode; privacy: MemoryPrivacy; reason: ProjectionDecision['reason']; observations: string[] }>();
       // `world_rule` is a semantic label, not proof of canon.  A character's
       // speech may describe a rule, a rumour or a mistaken belief.  Only an
@@ -68,14 +72,18 @@ export class KnowledgeProjector {
       // Entity references in an ordinary message describe who/what a fact is
       // about; they do not prove that the referenced actor knows it. Only a
       // card/world/state fact may explicitly seed a bounded actor trace.
-      const explicitOwners = worldScoped
-        ? new Set<string>(fact.entityKeys.filter(key => key.startsWith('owner:') && key !== FIXED_OWNER_IDS.world && key !== FIXED_OWNER_IDS.narrator && key !== FIXED_OWNER_IDS.player && key !== FIXED_OWNER_IDS.unknown))
-        : new Set<string>();
+      const actorEntityKeys = [...new Set(fact.entityKeys.filter(key => key.startsWith('owner:actor:')))];
+      const subjectOwnerId = fact.subjectEntityId?.startsWith('owner:actor:')
+        ? fact.subjectEntityId
+        // Compatibility for older card facts that predate subjectEntityId:
+        // seed only when exactly one actor reference exists. Multiple actor
+        // entities could be subject/object and must not all receive knowledge.
+        : actorEntityKeys.length === 1 ? actorEntityKeys[0] : undefined;
+      const explicitOwners = worldScoped && subjectOwnerId ? new Set<string>([subjectOwnerId]) : new Set<string>();
       const add = (ownerId: string, mode: MemoryKnowledgeMode, privacy: MemoryPrivacy, reason: ProjectionDecision['reason'], observationIds: readonly string[]): void => {
         if (!ownerId) return;
         const current = ownerModes.get(ownerId);
         const rank: Record<MemoryKnowledgeMode, number> = { unknown: 0, suspected: 1, believed: 2, inferred: 3, heard: 4, experienced: 5, self_reported: 6, asserted: 7 };
-        const privacyRank: Record<MemoryPrivacy, number> = { public: 0, limited: 1, private: 2, secret: 3 };
         if (!current) {
           ownerModes.set(ownerId, { mode, privacy, reason, observations: [...new Set(observationIds.filter(Boolean))] });
           return;
@@ -88,7 +96,7 @@ export class KnowledgeProjector {
           // Privacy is an independent leakage boundary. Combining two sources
           // must retain the most restrictive classification, regardless of
           // which source supplied the strongest knowledge mode.
-          privacy: privacyRank[privacy] > privacyRank[current.privacy] ? privacy : current.privacy,
+          privacy: PRIVACY_RANK[privacy] > PRIVACY_RANK[current.privacy] ? privacy : current.privacy,
           observations,
         });
       };
@@ -98,8 +106,11 @@ export class KnowledgeProjector {
       const floor = observationFloors.length > 0 ? Math.max(...observationFloors) : undefined;
 
       if (worldScoped) {
-        add(FIXED_OWNER_IDS.world, 'asserted', 'public', 'world-canon', observations.map(observation => observation.id));
-        for (const ownerId of explicitOwners) add(ownerId, 'asserted', 'limited', 'experienced', observations.map(observation => observation.id));
+        const worldPrivacy = observations.reduce<MemoryPrivacy>((current, observation) =>
+          PRIVACY_RANK[observation.privacy] > PRIVACY_RANK[current] ? observation.privacy : current, 'public');
+        add(FIXED_OWNER_IDS.world, 'asserted', worldPrivacy, 'world-canon', observations.map(observation => observation.id));
+        const actorPrivacy: MemoryPrivacy = PRIVACY_RANK[worldPrivacy] > PRIVACY_RANK.limited ? worldPrivacy : 'limited';
+        for (const ownerId of explicitOwners) add(ownerId, 'asserted', actorPrivacy, 'experienced', observations.map(observation => observation.id));
       }
       if (worldScoped) {
         // Canonical card/world/state facts are available to World/Narrator as
@@ -107,12 +118,16 @@ export class KnowledgeProjector {
         // observation in the same Capture.
         for (const [ownerId, value] of ownerModes.entries()) {
           const baseStrength = value.mode === 'asserted' ? 90 : 25;
+          const learnedAt = value.observations
+            .map(observationId => input.observations.find(observation => observation.id === observationId)?.occurredAt)
+            .filter((value): value is number => Number.isFinite(value))
+            .sort((left, right) => left - right)[0] ?? fact.validFrom ?? fact.freshestEvidenceAt;
           const trace: ActorMemoryTrace = {
             id: traceId(ownerId, fact.id), workspaceId: input.workspaceId, ownerId, factId: fact.id,
             sourceObservationIds: [...new Set(value.observations.filter(Boolean))], knowledgeMode: value.mode, privacy: value.privacy,
             strength: clamp(baseStrength * (0.7 + clamp01(fact.confidence) * 0.3)), clarity: clamp(baseStrength),
             beliefConfidence: clamp01(fact.confidence), emotionalSalience: normalizedSalience(Number((fact as MemoryFact & { emotionalSalience?: number }).emotionalSalience ?? 0)),
-            rehearsalCount: 0, traceRevision: 1, ...(floor === undefined ? {} : { floor }), createdAt: timestamp, updatedAt: timestamp,
+            rehearsalCount: 0, traceRevision: 1, ...(floor === undefined ? {} : { floor }), ...(learnedAt === undefined ? {} : { learnedAt }), createdAt: timestamp, updatedAt: timestamp,
           };
           traces.push(trace);
           decisions.push({ factId: fact.id, ownerId, mode: value.mode, privacy: value.privacy, reason: value.reason, observationIds: trace.sourceObservationIds });
@@ -151,7 +166,12 @@ export class KnowledgeProjector {
           // actor is not silently granted first-hand knowledge by the prose.
           add(FIXED_OWNER_IDS.narrator, 'asserted', observation.privacy, 'experienced', observationIds);
         } else {
-          for (const ownerId of observation.observerOwnerIds) add(ownerId, 'experienced', observation.privacy, 'experienced', observationIds);
+          const mode = observation.knowledgeMode === 'asserted'
+            ? 'experienced'
+            : observation.knowledgeMode === 'unknown'
+              ? 'experienced'
+              : observation.knowledgeMode;
+          for (const ownerId of observation.observerOwnerIds) add(ownerId, mode, observation.privacy, 'experienced', observationIds);
         }
       }
       if (ownerModes.size === 0) add(FIXED_OWNER_IDS.unknown, 'unknown', 'limited', 'inference', []);
@@ -159,6 +179,10 @@ export class KnowledgeProjector {
       for (const [ownerId, value] of ownerModes.entries()) {
         const baseStrength = value.mode === 'asserted' ? 90 : value.mode === 'experienced' ? 82 : value.mode === 'self_reported' ? 76 : value.mode === 'heard' ? 62 : value.mode === 'believed' ? 48 : value.mode === 'suspected' ? 35 : 25;
         const baseConfidence = clamp01(fact.confidence);
+        const learnedAt = value.observations
+          .map(observationId => input.observations.find(observation => observation.id === observationId)?.occurredAt)
+          .filter((value): value is number => Number.isFinite(value))
+          .sort((left, right) => left - right)[0] ?? fact.validFrom ?? fact.freshestEvidenceAt;
         const trace: ActorMemoryTrace = {
           id: traceId(ownerId, fact.id),
           workspaceId: input.workspaceId,
@@ -174,6 +198,7 @@ export class KnowledgeProjector {
           rehearsalCount: 0,
           traceRevision: 1,
           ...(floor === undefined ? {} : { floor }),
+          ...(learnedAt === undefined ? {} : { learnedAt }),
           createdAt: timestamp,
           updatedAt: timestamp,
         };

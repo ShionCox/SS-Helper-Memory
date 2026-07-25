@@ -1,8 +1,11 @@
 import {
   actorOwnerId,
+  canonicalActorDisplayName,
+  classifyActorName,
   DEFAULT_MEMORY_TRAITS,
   FIXED_OWNER_IDS,
   normalizeActorName,
+  stableMemoryRecordKey,
   type ActorAlias,
   type ActorCandidate,
   type ActorCandidateResolution,
@@ -19,12 +22,14 @@ export interface ActorDiscoveryInput {
   readonly excerpt?: string;
   readonly confidence?: number;
   readonly confirmed?: boolean;
+  /** Reserved for scene-local provisional actors; normal discovery derives a stable id. */
+  readonly preferredOwnerId?: string;
 }
 
 export interface ActorResolution {
   readonly owner: MemoryOwner;
   readonly alias?: ActorAlias;
-  readonly method: 'fixed' | 'exact' | 'normalized' | 'fuzzy' | 'created' | 'pending' | 'unknown';
+  readonly method: 'fixed' | 'exact' | 'normalized' | 'created' | 'pending' | 'unknown';
   readonly confidence: number;
   readonly ambiguous: boolean;
 }
@@ -44,34 +49,37 @@ function clamp(value: number | undefined, fallback = 0.5): number {
   return Math.max(0, Math.min(1, Number.isFinite(value) ? Number(value) : fallback));
 }
 
-function editDistance(left: string, right: string): number {
-  const row = Array.from({ length: right.length + 1 }, (_, index) => index);
-  for (let i = 1; i <= left.length; i += 1) {
-    let diagonal = row[0]!;
-    row[0] = i;
-    for (let j = 1; j <= right.length; j += 1) {
-      const previous = row[j]!;
-      row[j] = Math.min(row[j]! + 1, row[j - 1]! + 1, diagonal + (left[i - 1] === right[j - 1] ? 0 : 1));
-      diagonal = previous;
-    }
-  }
-  return row[right.length]!;
-}
-
-function similarity(left: string, right: string): number {
-  if (!left || !right) return 0;
-  if (left === right) return 1;
-  const distance = editDistance(left, right);
-  return 1 - distance / Math.max(left.length, right.length);
-}
-
 function ownerName(owner: MemoryOwner): string { return owner.canonicalName ?? owner.displayName; }
 
-const GENERIC_ACTOR_NAMES = new Set([
-  '某人', '有人', '这个人', '那个人', '一名男子', '一名女子', '男子', '女子',
-  '他', '她', '他们', '她们', '它', '它们', '角色', '人物', '路人', '陌生人',
-  'assistant', 'user', 'system', 'narrator', 'ai', 'character', 'character card', '角色卡',
-].map(normalizeActorName));
+function safeActorAliases(values: readonly string[]): string[] {
+  const aliases: string[] = [];
+  for (const value of values) {
+    const decision = classifyActorName(value, { trust: 'trusted' });
+    if (decision.accepted && !aliases.includes(decision.canonicalName)) aliases.push(decision.canonicalName);
+  }
+  return aliases;
+}
+
+export function isPlausibleActorName(
+  value: string,
+  options: { readonly trusted?: boolean; readonly evidence?: string; readonly aliases?: readonly string[] } = {},
+): boolean {
+  return classifyActorName(value, {
+    trust: options.trusted ? 'trusted' : 'candidate',
+    evidence: options.evidence,
+    aliases: options.aliases,
+  }).accepted;
+}
+
+export function deriveActorAliases(value: string): string[] {
+  const displayName = canonicalActorDisplayName(value);
+  if (!displayName) return [];
+  // Alias inference is intentionally conservative. Family-name removal and
+  // arbitrary parenthetical stripping are story-specific and can merge two
+  // genuinely different identities. Explicit aliases come from the host,
+  // user confirmation, or the model candidate evidence instead.
+  return [displayName];
+}
 
 /**
  * Workspace-local in-world identity registry. It intentionally never creates
@@ -112,6 +120,12 @@ export class ActorRegistry {
 
   /** Rehydrates persisted v0 identities without treating the workspace/card id as an actor. */
   hydrate(owners: readonly MemoryOwner[], aliases: readonly ActorAlias[] = []): void {
+    const fixedOwnerIds = new Set<string>(Object.values(FIXED_OWNER_IDS));
+    for (const ownerId of [...this.ownersById.keys()]) {
+      if (!fixedOwnerIds.has(ownerId)) this.ownersById.delete(ownerId);
+    }
+    this.aliasesById.clear();
+    this.aliasIdsByNormalized.clear();
     for (const owner of owners) {
       if (owner.workspaceId !== this.workspaceId) continue;
       this.ownersById.set(owner.id, structuredClone(owner));
@@ -176,6 +190,7 @@ export class ActorRegistry {
   }
 
   hydrateAudits(audits: readonly ActorRegistryChangeAudit[]): void {
+    this.audits.clear();
     for (const audit of audits) this.audits.set(audit.id, structuredClone(audit));
   }
 
@@ -191,8 +206,10 @@ export class ActorRegistry {
   }): ActorCandidate {
     const normalized = normalizeActorName(input.displayName);
     const existing = [...this.pending.values()].find(candidate =>
-      normalizeActorName(candidate.displayName) === normalized
-      && (candidate.ownerRef ?? '') === (input.ownerRef ?? ''));
+      input.ownerRef
+        ? candidate.ownerRef === input.ownerRef
+        : normalizeActorName(candidate.displayName) === normalized
+          && (candidate.ownerRef ?? '') === '');
     const candidate: ActorCandidate = {
       localId: existing?.localId ?? (input.ownerRef ? `candidate:${input.ownerRef}` : `candidate:${crypto.randomUUID()}`),
       displayName: existing?.displayName ?? input.displayName.trim(),
@@ -208,12 +225,13 @@ export class ActorRegistry {
   }
 
   private addAlias(owner: MemoryOwner, value: string, sourceRef: string, confidence: number, status: ActorAlias['status'] = 'confirmed', sourceType: ActorDiscoverySource = 'message'): ActorAlias {
+    const currentOwner = this.ownersById.get(owner.id) ?? owner;
     const normalizedValue = normalizeActorName(value);
     // Workspace record IDs only accept the SDK v0 safe alphabet. Normalized
     // aliases intentionally retain CJK and other Unicode characters for
     // matching, so encode only the persistence key and keep the searchable
     // normalized value unchanged in the record body.
-    const id = `actor-alias:${owner.id}:${encodeURIComponent(normalizedValue)}`;
+    const id = `actor-alias:${owner.id}:${stableMemoryRecordKey(normalizedValue)}`;
     const timestamp = now();
     const alias: ActorAlias = {
       id,
@@ -231,8 +249,8 @@ export class ActorRegistry {
     const ids = this.aliasIdsByNormalized.get(normalizedValue) ?? [];
     if (!ids.includes(id)) ids.push(id);
     this.aliasIdsByNormalized.set(normalizedValue, ids);
-    const aliases = [...new Set([...owner.aliases, value.trim()])].filter(Boolean);
-    this.updateOwner(owner, { aliases, discoverySources: [...new Set<ActorDiscoverySource>([...owner.discoverySources, sourceType])] });
+    const aliases = [...new Set([...currentOwner.aliases, value.trim()])].filter(Boolean);
+    this.updateOwner(currentOwner, { aliases, discoverySources: [...new Set<ActorDiscoverySource>([...currentOwner.discoverySources, sourceType])] });
     return alias;
   }
 
@@ -253,61 +271,174 @@ export class ActorRegistry {
     if (exactOwners.length === 1) return { owner: structuredClone(exactOwners[0]!), alias: confirmedAliases.find(alias => alias.ownerId === exactOwners[0]!.id), method: 'exact', confidence: 1, ambiguous: false };
     if (exactOwners.length > 1) return { owner: structuredClone(this.ownersById.get(FIXED_OWNER_IDS.unknown)!), method: 'pending', confidence: 0.4, ambiguous: true };
 
-    const candidates = this.listOwners().filter(owner => owner.kind === 'actor' && owner.status === 'confirmed').map(owner => ({ owner, score: similarity(normalized, normalizeActorName(ownerName(owner))) })).filter(item => item.score >= 0.82).sort((left, right) => right.score - left.score || left.owner.id.localeCompare(right.owner.id));
-    if (candidates.length === 1) return { owner: candidates[0]!.owner, method: 'fuzzy', confidence: candidates[0]!.score, ambiguous: false };
-    if (candidates.length > 1 && candidates[0]!.score - candidates[1]!.score >= 0.08) return { owner: candidates[0]!.owner, method: 'fuzzy', confidence: candidates[0]!.score, ambiguous: false };
-    if (candidates.length > 1) return { owner: structuredClone(this.ownersById.get(FIXED_OWNER_IDS.unknown)!), method: 'pending', confidence: candidates[0]!.score, ambiguous: true };
+    // Never auto-link identities by spelling similarity. Near-identical names
+    // are common in roleplay casts and an incorrect merge leaks private memory
+    // across characters. Typos in model-local refs are repaired separately
+    // with source evidence and a unique directory candidate.
     return undefined;
   }
 
   discover(input: ActorDiscoveryInput): ActorResolution {
-    const displayName = input.displayName.trim();
-    if (!displayName) return { owner: this.ownersById.get(FIXED_OWNER_IDS.unknown)!, method: 'unknown', confidence: 0, ambiguous: true };
+    const preliminaryName = canonicalActorDisplayName(input.displayName);
+    const preliminaryNormalized = normalizeActorName(preliminaryName);
+    const preferredOwnerId = input.preferredOwnerId?.trim();
+    // Validate caller-controlled persistence ids before any semantic early
+    // return. An invalid id must never be silently ignored merely because the
+    // accompanying display name also failed the entity boundary.
+    if (preferredOwnerId) {
+      if (!/^provisional:[A-Za-z0-9_.!~*'()%:-]+$/u.test(preferredOwnerId)) {
+        throw Object.assign(new Error('临时人物 preferredOwnerId 格式非法。'), { code: 'ACTOR_PREFERRED_ID_INVALID' });
+      }
+      const occupied = this.ownersById.get(preferredOwnerId);
+      if (occupied && preliminaryNormalized && normalizeActorName(ownerName(occupied)) !== preliminaryNormalized) {
+        throw Object.assign(new Error('临时人物 preferredOwnerId 已被其他人物占用。'), { code: 'ACTOR_PREFERRED_ID_CONFLICT' });
+      }
+    }
+
+    // Once an identity is already in the registry, a later plain mention does
+    // not need to prove agency again. Resolve exact canonical/alias matches
+    // before applying the stricter boundary that governs *new* identities.
+    const exactKnown = preliminaryNormalized
+      ? this.listOwners().filter(owner => owner.kind === 'actor'
+        && !owner.mergedIntoId
+        && [ownerName(owner), ...owner.aliases]
+          .some(alias => normalizeActorName(alias) === preliminaryNormalized))
+      : [];
+    if (exactKnown.length === 1) {
+      const owner = exactKnown[0]!;
+      const promote = owner.status === 'pending' && input.confirmed === true;
+      const updated = this.updateOwner(owner, {
+        confidence: Math.max(owner.confidence, clamp(input.confidence, owner.confidence)),
+        discoverySources: [...new Set([...owner.discoverySources, input.sourceType])],
+        ...(promote ? { status: 'confirmed' as const } : {}),
+      });
+      const aliasStatus = updated.status === 'confirmed' ? 'confirmed' as const : 'pending' as const;
+      this.addAlias(updated, preliminaryName, input.sourceRef, input.confidence ?? updated.confidence, aliasStatus, input.sourceType);
+      for (const alias of safeActorAliases(input.aliases ?? [])) {
+        this.addAlias(updated, alias, input.sourceRef, input.confidence ?? updated.confidence, aliasStatus, input.sourceType);
+      }
+      if (promote) {
+        for (const [candidateId, candidate] of this.pending.entries()) {
+          if (candidate.ownerRef === updated.id
+            || normalizeActorName(candidate.displayName) === preliminaryNormalized) this.pending.delete(candidateId);
+        }
+      } else if (updated.status === 'pending') {
+        this.upsertPendingCandidate({ ...input, displayName: preliminaryName, ownerRef: updated.id });
+      }
+      return {
+        owner: structuredClone(updated),
+        method: updated.status === 'confirmed' ? 'exact' : 'pending',
+        confidence: updated.confidence,
+        ambiguous: updated.status !== 'confirmed',
+      };
+    }
+
+    const boundary = classifyActorName(input.displayName, {
+      trust: input.sourceType === 'manual' ? 'manual' : input.confirmed === true ? 'trusted' : 'candidate',
+      evidence: input.excerpt,
+      aliases: input.aliases,
+    });
+    // A structurally valid name without agency evidence is not discarded: it
+    // may be a legitimate first mention, but it can only enter the quarantine
+    // as pending. Structural/protocol/generic/quantified values still fail
+    // closed and never allocate an owner.
+    const pendingOnly = !boundary.accepted && boundary.reason === 'non_agent_without_evidence';
+    const structuralBoundary = pendingOnly
+      ? classifyActorName(input.displayName, { trust: 'trusted', aliases: input.aliases })
+      : boundary;
+    const displayName = structuralBoundary.canonicalName;
+    if (!structuralBoundary.accepted) return { owner: this.ownersById.get(FIXED_OWNER_IDS.unknown)!, method: 'unknown', confidence: 0, ambiguous: true };
+    const inputAliases = safeActorAliases((input.aliases ?? []).flatMap(alias => deriveActorAliases(alias)));
+    const normalizedInput = { ...input, displayName, aliases: inputAliases };
+    const normalized = normalizeActorName(displayName);
     const existing = this.resolveMention(displayName);
     if (existing && existing.owner.kind !== 'actor') return existing;
-    const normalized = normalizeActorName(displayName);
-    if (GENERIC_ACTOR_NAMES.has(normalized) && input.sourceType !== 'manual') {
-      const candidate = this.upsertPendingCandidate({ ...input, confidence: clamp(input.confidence, 0.35) });
-      return { owner: structuredClone(this.ownersById.get(FIXED_OWNER_IDS.unknown)!), method: 'pending', confidence: candidate.confidence, ambiguous: true };
-    }
-    const forcePending = input.confirmed === false || (input.sourceType === 'prompt' && input.confidence !== undefined && input.confidence < 0.65);
-    if (existing && !existing.ambiguous && !forcePending) {
+    const forcePending = pendingOnly
+      || input.confirmed === false
+      || (input.sourceType === 'prompt' && input.confidence !== undefined && input.confidence < 0.65);
+    if (existing && existing.owner.kind === 'actor' && !existing.ambiguous) {
       const owner = this.updateOwner(existing.owner, {
         confidence: Math.max(existing.owner.confidence, clamp(input.confidence, existing.confidence)),
         discoverySources: [...new Set([...existing.owner.discoverySources, input.sourceType])],
       });
       this.addAlias(owner, displayName, input.sourceRef, input.confidence ?? existing.confidence, 'confirmed', input.sourceType);
-      for (const alias of input.aliases ?? []) this.addAlias(owner, alias, input.sourceRef, input.confidence ?? existing.confidence, 'confirmed', input.sourceType);
+      for (const alias of inputAliases) this.addAlias(owner, alias, input.sourceRef, input.confidence ?? existing.confidence, 'confirmed', input.sourceType);
+      if (input.confirmed === true) {
+        for (const [candidateId, candidate] of this.pending.entries()) {
+          if (candidate.ownerRef === owner.id
+            || normalizeActorName(candidate.displayName) === normalizeActorName(ownerName(owner))) {
+            this.pending.delete(candidateId);
+          }
+        }
+      }
       return { ...existing, owner: structuredClone(this.ownersById.get(owner.id)!), method: existing.method };
+    }
+
+    // A later model candidate may use a shorter alias for an actor already
+    // created as pending earlier in the same Capture batch. Resolve against
+    // pending canonical names and aliases before allocating another owner.
+    const pendingMatches = this.listOwners().filter(owner =>
+      owner.kind === 'actor'
+      && owner.status === 'pending'
+      && !owner.mergedIntoId
+      && [ownerName(owner), ...owner.aliases].some(alias => normalizeActorName(alias) === normalized));
+    if (pendingMatches.length === 1) {
+      const owner = pendingMatches[0]!;
+      const promote = input.confirmed === true;
+      const updated = this.updateOwner(owner, {
+        aliases: [...new Set([...owner.aliases, displayName, ...inputAliases].map(value => value.trim()).filter(Boolean))],
+        confidence: Math.max(owner.confidence, clamp(input.confidence, owner.confidence)),
+        discoverySources: [...new Set([...owner.discoverySources, input.sourceType])],
+        ...(promote ? { status: 'confirmed' as const } : {}),
+      });
+      const aliasStatus = promote ? 'confirmed' as const : 'pending' as const;
+      this.addAlias(updated, displayName, input.sourceRef, input.confidence ?? updated.confidence, aliasStatus, input.sourceType);
+      for (const alias of inputAliases) this.addAlias(updated, alias, input.sourceRef, input.confidence ?? updated.confidence, aliasStatus, input.sourceType);
+      if (promote) {
+        for (const [candidateId, candidate] of this.pending.entries()) {
+          if (candidate.ownerRef === updated.id) this.pending.delete(candidateId);
+        }
+        return { owner: structuredClone(updated), method: 'exact', confidence: updated.confidence, ambiguous: false };
+      }
+      const candidate = this.upsertPendingCandidate({ ...normalizedInput, ownerRef: updated.id });
+      return { owner: structuredClone(updated), method: 'pending', confidence: candidate.confidence, ambiguous: true };
     }
 
     const sameNormalized = this.listOwners().filter(owner => owner.kind === 'actor' && normalizeActorName(ownerName(owner)) === normalized);
     if (existing?.ambiguous || sameNormalized.length > 1) {
-      const candidate = this.upsertPendingCandidate(input);
+      const candidate = this.upsertPendingCandidate(normalizedInput);
       return { owner: structuredClone(this.ownersById.get(FIXED_OWNER_IDS.unknown)!), method: 'pending', confidence: candidate.confidence, ambiguous: true };
     }
     if (sameNormalized.length === 1) {
       const owner = sameNormalized[0]!;
       if (owner.status === 'pending' || forcePending) {
+        const promote = owner.status === 'pending' && input.confirmed === true;
         const updated = this.updateOwner(owner, {
           confidence: Math.max(owner.confidence, clamp(input.confidence, owner.confidence)),
           discoverySources: [...new Set([...owner.discoverySources, input.sourceType])],
+          ...(promote ? { status: 'confirmed' as const } : {}),
         });
         this.addAlias(updated, displayName, input.sourceRef, input.confidence ?? updated.confidence, updated.status === 'confirmed' ? 'confirmed' : 'pending', input.sourceType);
-        for (const alias of input.aliases ?? []) this.addAlias(updated, alias, input.sourceRef, input.confidence ?? updated.confidence, updated.status === 'confirmed' ? 'confirmed' : 'pending', input.sourceType);
-        const candidate = this.upsertPendingCandidate({ ...input, ownerRef: updated.id });
+        for (const alias of inputAliases) this.addAlias(updated, alias, input.sourceRef, input.confidence ?? updated.confidence, updated.status === 'confirmed' ? 'confirmed' : 'pending', input.sourceType);
+        if (promote) {
+          for (const [candidateId, candidate] of this.pending.entries()) {
+            if (candidate.ownerRef === updated.id) this.pending.delete(candidateId);
+          }
+          return { owner: structuredClone(updated), method: 'exact', confidence: updated.confidence, ambiguous: false };
+        }
+        const candidate = this.upsertPendingCandidate({ ...normalizedInput, ownerRef: updated.id });
         return { owner: structuredClone(updated), method: 'pending', confidence: candidate.confidence, ambiguous: true };
       }
     }
 
     const timestamp = now();
     const owner: MemoryOwner = {
-      id: actorOwnerId(this.workspaceId, normalized),
+      id: preferredOwnerId || actorOwnerId(this.workspaceId, normalized),
       workspaceId: this.workspaceId,
       kind: 'actor',
       displayName,
       canonicalName: displayName,
-      aliases: [displayName],
+      aliases: deriveActorAliases(displayName),
       memoryTraits: structuredClone(DEFAULT_MEMORY_TRAITS),
       status: forcePending || (input.confidence !== undefined && input.confidence < 0.65) ? 'pending' : 'confirmed',
       discoverySources: [input.sourceType],
@@ -317,9 +448,9 @@ export class ActorRegistry {
     };
     this.ownersById.set(owner.id, owner);
     this.addAlias(owner, displayName, input.sourceRef, owner.confidence, owner.status, input.sourceType);
-    for (const alias of input.aliases ?? []) this.addAlias(owner, alias, input.sourceRef, owner.confidence, owner.status, input.sourceType);
+    for (const alias of inputAliases) this.addAlias(owner, alias, input.sourceRef, owner.confidence, owner.status, input.sourceType);
     if (owner.status === 'pending') {
-      this.upsertPendingCandidate({ ...input, confidence: owner.confidence, ownerRef: owner.id });
+      this.upsertPendingCandidate({ ...normalizedInput, confidence: owner.confidence, ownerRef: owner.id });
     }
     return { owner: structuredClone(owner), method: 'created', confidence: owner.confidence, ambiguous: owner.status !== 'confirmed' };
   }
@@ -327,12 +458,12 @@ export class ActorRegistry {
   discoverCandidate(candidate: ActorCandidate, sourceType: ActorDiscoverySource = 'prompt'): ActorResolution {
     return this.discover({
       displayName: candidate.displayName,
-      aliases: candidate.aliases,
+      aliases: [...new Set([...deriveActorAliases(candidate.displayName), ...(candidate.aliases ?? [])])],
       sourceRef: candidate.sourceRefs[0] ?? `capture:${candidate.localId}`,
       sourceType,
       excerpt: candidate.evidenceExcerpts[0],
       confidence: candidate.confidence,
-      confirmed: candidate.status === 'confirmed',
+      confirmed: false,
     });
   }
 

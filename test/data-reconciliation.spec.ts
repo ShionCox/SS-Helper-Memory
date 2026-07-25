@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { decideFactReconciliation, type MemoryFact } from '../src/domain/index';
+import { createFactSlotKey, decideFactReconciliation, type MemoryFact } from '../src/domain/index';
 
 const existing: MemoryFact = {
   id: 'fact-old',
@@ -62,5 +62,39 @@ describe('canonical reconciliation', () => {
         freshestEvidenceAt: 90,
       }),
     ).toBe('pending');
+  });
+
+  it('keeps event, goal and commitment rows append-only under the same predicate slot', () => {
+    for (const kind of ['event', 'goal', 'commitment'] as const) {
+      const historical = { ...existing, kind };
+      expect(
+        decideFactReconciliation(historical, {
+          kind,
+          canonicalKey: historical.canonicalKey,
+          content: '白夕小时后来又下达了另一项明确安排。',
+          confidence: 0.99,
+          freshestEvidenceAt: 300,
+        }),
+      ).toBe('insert');
+    }
+  });
+
+  it('scopes relationships, preferences and capabilities by object', () => {
+    for (const kind of ['relationship', 'preference', 'capability'] as const) {
+      const first = {
+        ...existing,
+        kind,
+        objectKey: '对象甲',
+        slotKey: createFactSlotKey(existing.subjectKey, existing.predicateKey, '对象甲', kind),
+      };
+      expect(decideFactReconciliation(first, {
+        kind,
+        canonicalKey: `${existing.canonicalKey}::对象乙`,
+        slotKey: createFactSlotKey(existing.subjectKey, existing.predicateKey, '对象乙', kind),
+        content: '同一主体对另一个对象具有独立事实。',
+        confidence: 0.99,
+        freshestEvidenceAt: 300,
+      })).toBe('insert');
+    }
   });
 });

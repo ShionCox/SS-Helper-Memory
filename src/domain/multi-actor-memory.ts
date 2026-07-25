@@ -11,6 +11,7 @@ export const MEMORY_MODEL_VERSION = 0 as const;
 export type MemoryOwnerKind = 'actor' | 'world' | 'narrator' | 'player' | 'unknown';
 export type ActorResolutionStatus = 'confirmed' | 'pending' | 'unknown' | 'merged';
 export type ActorDiscoverySource = 'host_card' | 'worldbook' | 'message' | 'prompt' | 'manual' | 'system';
+export type LocationResolutionStatus = 'confirmed' | 'pending' | 'merged';
 
 /** Per-owner memory characteristics used by deterministic recall strength. */
 export interface MemoryTraits {
@@ -22,6 +23,58 @@ export interface MemoryTraits {
   readonly emotionalGain?: number;
   /** Fixed interference penalty. */
   readonly interference?: number;
+}
+
+/** Deterministic 128-bit, record-id-safe key for arbitrary Unicode input. */
+export function stableMemoryRecordKey(value: string): string {
+  const parts: string[] = [];
+  for (let variant = 0; variant < 4; variant += 1) {
+    let hash = 2166136261;
+    for (const char of `${variant}\0${value.normalize('NFKC')}`) {
+      hash ^= char.codePointAt(0) ?? 0;
+      hash = Math.imul(hash, 16777619);
+    }
+    parts.push((hash >>> 0).toString(16).padStart(8, '0'));
+  }
+  return parts.join('');
+}
+
+export interface MemoryLocation {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly displayName: string;
+  readonly canonicalName: string;
+  readonly aliases: readonly string[];
+  readonly status: LocationResolutionStatus;
+  readonly confidence: number;
+  readonly sourceRefs: readonly string[];
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly mergedIntoId?: string;
+}
+
+export interface LocationAlias {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly locationId: string;
+  readonly value: string;
+  readonly normalizedValue: string;
+  readonly sourceRef: string;
+  readonly confidence: number;
+  readonly status: LocationResolutionStatus;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface LocationCandidate {
+  readonly localId: string;
+  readonly displayName: string;
+  readonly aliases?: readonly string[];
+  readonly sourceRef: string;
+  readonly evidenceExcerpt: string;
+  readonly confidence: number;
+  readonly status?: LocationResolutionStatus;
+  readonly locationRef?: string;
 }
 
 export const DEFAULT_MEMORY_TRAITS: Readonly<Required<MemoryTraits>> = Object.freeze({
@@ -92,7 +145,10 @@ export interface MemoryEpisode {
   readonly participantIds: readonly string[];
   readonly presentOwnerIds: readonly string[];
   readonly mentionedOwnerIds: readonly string[];
+  readonly locationId?: string;
   readonly location?: string;
+  /** In-world narrative time such as “灾变第十八日黄昏”. */
+  readonly storyTimeText?: string;
   readonly occurredAt: number;
   readonly validFrom?: number;
   readonly validUntil?: number;
@@ -138,6 +194,8 @@ export interface ActorMemoryTrace {
   readonly traceRevision: number;
   /** Source timeline floor used by profile lookback; optional for older v0 rows. */
   readonly floor?: number;
+  /** Earliest point at which this owner could have learned the fact. */
+  readonly learnedAt?: number;
   readonly lastRehearsedAt?: number;
   readonly createdAt: number;
   readonly updatedAt: number;
@@ -195,6 +253,11 @@ export interface ActorRecallRequest {
   readonly maxItems?: number;
   readonly now?: number;
   readonly sceneEpoch?: string;
+  /** Generation-time cast planning is optional for legacy diagnostic calls. */
+  readonly castPlan?: import('./generation-cast').GenerationCastPlan;
+  readonly intentPlan?: import('./recall-plan').GenerationRecallIntentPlan;
+  /** Controlled coverage expansion may raise, but never lower, this level. */
+  readonly minimumRetrievalLevel?: 1 | 2 | 3 | 4;
 }
 
 export interface ActorMemoryPartition {
@@ -215,6 +278,11 @@ export interface ActorRecallResponse {
     readonly partitions: number;
     readonly mode: ActorRecallMode;
     readonly elapsedMs: number;
+    readonly ownerCandidateCounts?: Readonly<Record<string, number>>;
+    readonly permissionByOwner?: Readonly<Record<string, import('./generation-cast').CastRecallPermission>>;
+    readonly retrievalLevelByOwner?: Readonly<Record<string, 1 | 2 | 3 | 4>>;
+    readonly retrievalStagesByOwner?: Readonly<Record<string, readonly string[]>>;
+    readonly coverage?: import('./recall-plan').RecallCoverageResult;
   };
 }
 
@@ -286,20 +354,10 @@ export interface CaptureEnvelope {
   readonly chatKey: string;
   readonly sourceRefs: readonly string[];
   readonly actorCandidates: readonly ActorCandidate[];
+  readonly locationCandidates: readonly LocationCandidate[];
   readonly episodes: readonly (MemoryEpisode & { readonly localId?: string })[];
-  readonly observations: readonly (MemoryObservation & { readonly localId?: string; readonly episodeLocalId?: string })[];
-  readonly facts: readonly (Omit<import('./memory-types').AutomaticFactProposal, 'evidence'> & {
-    readonly localId?: string;
-    readonly ownerRefs?: readonly string[];
-    readonly observationLocalIds?: readonly string[];
-    readonly privacy?: MemoryPrivacy;
-    readonly knowledgeMode?: MemoryKnowledgeMode;
-    readonly scope?: import('./memory-types').FactScope;
-    readonly validFrom?: number;
-    readonly validUntil?: number;
-    readonly stableAnchor?: boolean;
-    readonly evidence: readonly import('./memory-types').FactEvidenceInput[];
-  })[];
+  /** Prompt claims are retained for audit only; server records are derived. */
+  readonly claimLocalIds: readonly string[];
   readonly capturedAt: number;
 }
 
@@ -332,6 +390,61 @@ export function actorOwnerId(workspaceId: string, canonicalName: string): string
   return `owner:actor:${uuid}`;
 }
 
+export function locationEntityId(workspaceId: string, canonicalName: string): string {
+  const normalized = normalizeLocationName(canonicalName);
+  const parts: string[] = [];
+  for (let variant = 0; variant < 4; variant += 1) {
+    let hash = 2166136261;
+    for (const char of `${workspaceId}\0location\0${normalized}\0${variant}`) {
+      hash ^= char.codePointAt(0) ?? 0;
+      hash = Math.imul(hash, 16777619);
+    }
+    parts.push((hash >>> 0).toString(16).padStart(8, '0'));
+  }
+  const hex = parts.join('');
+  const uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-${((Number.parseInt(hex.slice(16, 20), 16) & 0x3fff) | 0x8000).toString(16).padStart(4, '0')}-${hex.slice(20, 32)}`;
+  return `location:${uuid}`;
+}
+
+const TRADITIONAL_NAME_MAP: Readonly<Record<string, string>> = Object.freeze({
+  時: '时', 葉: '叶', 體: '体', 門: '门', 車: '车', 廳: '厅', 樓: '楼', 區: '区',
+  裡: '里', 裏: '里', 間: '间', 廠: '厂', 庫: '库', 館: '馆',
+});
+
+function normalizeCommonChineseVariants(value: string): string {
+  return [...value].map(character => TRADITIONAL_NAME_MAP[character] ?? character).join('');
+}
+
+const TRANSIENT_ACTOR_STATE_SUFFIX = /[（(]\s*(?:在家|离家|外出|在场|不在场|暂离|离队|归队|休眠|沉睡|睡眠|待机|离线|在线|失联|恢复中|已恢复|恢复|受伤|重伤|昏迷|存活|死亡|已死亡|警戒中|战斗中|执行任务中|处理中|观察中)\s*[）)]\s*$/u;
+
+/**
+ * 去掉宿主状态栏附在姓名后的临时状态，但保留“重构体”等稳定身份限定。
+ * 例如：角色甲（休眠）→ 角色甲；角色乙（稳定身份限定）保持不变。
+ */
+export function canonicalActorDisplayName(value: string): string {
+  const original = value.trim();
+  let canonical = original;
+  while (TRANSIENT_ACTOR_STATE_SUFFIX.test(canonical)) {
+    canonical = canonical.replace(TRANSIENT_ACTOR_STATE_SUFFIX, '').trim();
+  }
+  return canonical || original;
+}
+
 export function normalizeActorName(value: string): string {
-  return value.normalize('NFKC').replace(/[\u0000-\u001f\u007f]/gu, '').replace(/[“”‘’「」『』【】()[\]{}<>]/gu, ' ').replace(/\s+/gu, ' ').trim().toLocaleLowerCase();
+  return normalizeCommonChineseVariants(canonicalActorDisplayName(value).normalize('NFKC'))
+    .replace(/[\u0000-\u001f\u007f]/gu, '')
+    .replace(/[“”‘’「」『』【】()[\]{}<>]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLocaleLowerCase();
+}
+
+export function normalizeLocationName(value: string): string {
+  return normalizeCommonChineseVariants(value.normalize('NFKC'))
+    .replace(/[\u0000-\u001f\u007f]/gu, '')
+    .replace(/[“”‘’「」『』【】()[\]{}<>]/gu, ' ')
+    .replace(/[·•]/gu, '·')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLocaleLowerCase();
 }

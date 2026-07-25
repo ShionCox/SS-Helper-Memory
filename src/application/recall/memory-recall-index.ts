@@ -1,3 +1,4 @@
+import { isAppendOnlyFactKind } from '../../domain'
 import { planRecallIntentByRules } from './recall-intent-planner'
 
 export type RecallFactStatus = 'active' | 'pending' | 'superseded' | 'invalid'
@@ -7,6 +8,26 @@ export interface RecallScope {
   readonly characterKeys?: readonly string[]
   readonly worldKeys?: readonly string[]
   readonly sceneKeys?: readonly string[]
+}
+
+function sourceFloorOfFact(fact: RecallFact): number | undefined {
+  const floors = [...(fact.sourceRefs ?? []), ...(fact.evidenceRefs ?? [])]
+    .map(value => Number(value.match(/message:floor-(\d+)/u)?.[1]))
+    .filter(Number.isFinite)
+  return floors.length > 0 ? Math.min(...floors) : undefined
+}
+
+function recallKindAffinity(kind: string, requestedKinds: readonly string[]): number {
+  const normalized = kind.trim().toLocaleLowerCase()
+  const requested = new Set(requestedKinds.map(value => value.trim().toLocaleLowerCase()).filter(Boolean))
+  if (requested.size === 0) return 0
+  if (requested.has(normalized)) return 1
+  if (requested.has('event') && (normalized === 'commitment' || normalized === 'goal')) return 0.45
+  if (requested.has('capability') && normalized === 'state') return 0.35
+  if (requested.has('state') && normalized === 'location') return 0.8
+  if (requested.has('state') && normalized === 'capability') return 0.25
+  if (requested.has('relationship') && normalized === 'identity') return 0.25
+  return 0
 }
 
 /**
@@ -49,6 +70,10 @@ export interface RecallQuery {
   readonly maxItems?: number
   /** Internal objective-candidate pool used by multi-owner recall. */
   readonly candidateLimit?: number
+  /** Fail-closed fact allow-list used before TopK for an owner partition. */
+  readonly allowedFactIds?: readonly string[]
+  /** Progressive retrieval level selected by the owner-aware coordinator. */
+  readonly retrievalLevel?: 1 | 2 | 3 | 4
   readonly now?: number
 }
 
@@ -168,6 +193,8 @@ const TEMPORAL_SLOT_KINDS = new Set(['state', 'status', 'location'])
 const HISTORICAL_QUERY_PATTERN = /(?:曾经|当时|之前|历史|过程|最早|最初|一开始|中段|先后|一路|变化|如何发展|起初|后来)/u
 const CURRENT_STATE_QUERY_PATTERN = /(?:最新状态|最后确认|当前|现在|目前|还剩|剩余|还能|现有|最终确认)/u
 const STATE_HISTORY_TOPIC_PATTERN = /(?:状态|数量|多少|几次|次数|弹药|剩余|还剩|变化|一路|先后)/u
+const EARLIEST_QUERY_PATTERN = /(?:最早|最初|一开始|起初|起先|初次)/u
+const DIRECTIVE_QUERY_PATTERN = /(?:指挥|指令|命令|下令|安排|分工|应对|调度)/u
 
 const CJK_STOP_CHARS = new Set([
   '的', '了', '在', '是', '和', '与', '及', '要', '什', '么', '怎', '样', '吗', '呢', '啊', '今', '天',
@@ -339,6 +366,10 @@ function isEligible(fact: RecallFact, query: RecallQuery, now: number): boolean 
  */
 function temporalSlotKey(fact: RecallFact): string | null {
   const kind = fact.kind.trim().toLocaleLowerCase()
+  // Occurrences and declarations form an event stream. A later command or
+  // goal must not hide an earlier one merely because both share a predicate.
+  // Mutable state/location rows still use temporal heads and validity windows.
+  if (isAppendOnlyFactKind(kind)) return null
   const persistedSlot = fact.slotKey?.trim().toLocaleLowerCase()
   const temporal = Boolean(persistedSlot)
     || fact.validFrom !== undefined
@@ -386,9 +417,15 @@ function normalizedSubject(fact: RecallFact): string {
 
 function isCoveredBySnapshot(fact: RecallFact, snapshot: RecallFact): boolean {
   if (fact.id === snapshot.id || !isNewerTemporalFact(snapshot, fact)) return false
+  // A latest variable snapshot is authoritative for mutable state, not for an
+  // actor's identity, abilities or historical events. The previous broad
+  // entity-based rule could hide every older fact merely because it mentioned
+  // the same subject as one new state row.
+  const kind = fact.kind.trim().toLocaleLowerCase()
+  if (!TEMPORAL_SLOT_KINDS.has(kind)) return false
   const subject = normalizedSubject(snapshot)
   if (!subject) return false
-  return normalizedSubject(fact) === subject || normalizedKeys(fact.entityKeys).has(subject)
+  return normalizedSubject(fact) === subject
 }
 
 function ineligibleReason(fact: RecallFact, query: RecallQuery, now: number): string | null {
@@ -527,6 +564,7 @@ export class MemoryRecallIndex {
     const mode = signals?.mode ?? 'lexical'
     const vectorScores = signals?.vectorScores ?? new Map<string, number>()
     const graphScores = signals?.graphScores ?? new Map<string, number>()
+    const allowedFactIds = query.allowedFactIds ? new Set(query.allowedFactIds) : undefined
     const intentPlan = planRecallIntentByRules(query.query)
     const querySegments = genericQuerySegments(query.query)
     const queryTokens = [...new Set([...tokenize(query.query), ...intentPlan.terms.flatMap(tokenize)])]
@@ -562,6 +600,9 @@ export class MemoryRecallIndex {
     }
     for (const [factId, score] of graphScores) {
       if (Number.isFinite(score) && score > 0) candidateIds.add(factId)
+    }
+    if (allowedFactIds) {
+      for (const factId of [...candidateIds]) if (!allowedFactIds.has(factId)) candidateIds.delete(factId)
     }
     if (mode === 'vector' && needsTemporalSafety) {
       for (const factId of lexicalCandidateIds) {
@@ -664,7 +705,11 @@ export class MemoryRecallIndex {
         omitted.push(Object.freeze({ factId, score: 0, selected: false, reasonCodes: Object.freeze([]), omittedReason: '与本轮查询无相关性' }))
         continue
       }
-      if (indexed.fact.stableAnchor && !matchingAnchor) {
+      // A stable anchor is fail-closed only when it actually declares a
+      // scope. Capture can mark identity/capability facts as long-lived before
+      // a character/world scope is available; those unscoped facts must still
+      // participate in ordinary lexical/entity recall instead of disappearing.
+      if (indexed.fact.stableAnchor && indexed.fact.scope && !matchingAnchor) {
         omitted.push(Object.freeze({ factId, score: 0, selected: false, reasonCodes: Object.freeze([]), omittedReason: '稳定锚点与当前作用域不匹配' }))
         continue
       }
@@ -672,12 +717,14 @@ export class MemoryRecallIndex {
       const age = Math.max(0, createdAt - indexed.fact.updatedAt)
       const recencyScore = Math.pow(0.5, age / RECENCY_HALF_LIFE_MS)
       const temporalScore = indexed.fact.validFrom !== undefined || indexed.fact.validUntil !== undefined ? 1 : 0.5
+      const kindAffinity = recallKindAffinity(indexed.fact.kind, intentPlan.requestedKinds)
       const normalizedLexical = lexicalScore / (lexicalScore + 3)
       const score = normalizedLexical * 0.58
         + entityScore * 0.18
         + contextScore * 0.14
         + temporalScore * 0.05
         + recencyScore * 0.05
+        + kindAffinity * 0.16
         + (matchingAnchor ? 0.04 : 0)
         + (isStateSnapshotFact(indexed.fact) ? 0.12 : 0)
       const item: RecallItem = {
@@ -716,13 +763,15 @@ export class MemoryRecallIndex {
       const lexicalRank = lexicalRanks.get(item.fact.id)
       const vectorRank = vectorRanks.get(item.fact.id)
       const graphRank = graphRanks.get(item.fact.id)
+      const kindAffinity = recallKindAffinity(item.fact.kind, intentPlan.requestedKinds)
       const fusionScore = mode === 'hybrid'
         ? (lexicalRank === undefined ? 0 : 0.4 / (60 + lexicalRank))
           + (vectorRank === undefined ? 0 : 0.4 / (60 + vectorRank))
           + (graphRank === undefined ? 0 : 0.2 / (60 + graphRank))
+          + kindAffinity * 0.004
         : undefined
       const score = mode === 'vector'
-        ? item.vectorScore ?? 0
+        ? (item.vectorScore ?? 0) + kindAffinity * 0.08
         : mode === 'hybrid'
           ? fusionScore ?? 0
           : item.score
@@ -766,8 +815,28 @@ export class MemoryRecallIndex {
       .slice(0, temporalSafetyLimit)
     const temporalSafetyIds = new Set(temporalSafetyItems.map(item => item.fact.id))
     const diversifiedItems: RecallItem[] = []
+    const earliestRankedItems = EARLIEST_QUERY_PATTERN.test(query.query)
+      ? [...relevantRegular]
+          .filter(item => recallKindAffinity(item.fact.kind, intentPlan.requestedKinds) >= 0.8)
+          .sort((left, right) => (sourceFloorOfFact(left.fact) ?? Number.MAX_SAFE_INTEGER) - (sourceFloorOfFact(right.fact) ?? Number.MAX_SAFE_INTEGER)
+            || right.score - left.score
+            || left.fact.updatedAt - right.fact.updatedAt
+            || left.fact.id.localeCompare(right.fact.id))
+      : []
+    const earliestFloor = earliestRankedItems[0] ? sourceFloorOfFact(earliestRankedItems[0].fact) : undefined
+    const earliestIntentItems = earliestRankedItems.length === 0
+      ? []
+      : DIRECTIVE_QUERY_PATTERN.test(query.query) && earliestFloor !== undefined
+        ? earliestRankedItems
+            .filter(item => sourceFloorOfFact(item.fact) === earliestFloor)
+            .slice(0, Math.min(6, maxItems))
+        : earliestRankedItems.slice(0, 1)
+    diversifiedItems.push(...earliestIntentItems)
     if (HISTORICAL_QUERY_PATTERN.test(query.query) && querySegments.length >= 3) {
-      diversifiedItems.push(...[...relevantRegular].sort((left, right) => left.fact.updatedAt - right.fact.updatedAt || left.fact.id.localeCompare(right.fact.id)).slice(0, maxItems))
+      diversifiedItems.push(...[...relevantRegular]
+        .filter(item => !diversifiedItems.some(selected => selected.fact.id === item.fact.id))
+        .sort((left, right) => left.fact.updatedAt - right.fact.updatedAt || left.fact.id.localeCompare(right.fact.id))
+        .slice(0, maxItems))
     } else if (querySegments.length >= 2) {
       for (const segment of querySegments) {
         const best = relevantRegular

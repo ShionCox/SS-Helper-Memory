@@ -64,11 +64,12 @@ export function createMemoryLlmApi(session: PluginSession, signal?: AbortSignal)
     },
     async runTask<T>(input: RunTaskInput) {
       try {
+        const timeoutMs = input.budget.maxLatencyMs ?? 30_000;
         const response = await session.services.call(LLM_STRUCTURED_TASK_V0, {
           task: input.taskKey,
           input: input.input,
           outputSchema: input.schema as Record<string, never>,
-        }, { signal });
+        }, { timeoutMs, signal });
         return {
           ok: true as const,
           data: response.output as T,

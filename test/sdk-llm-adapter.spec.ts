@@ -15,14 +15,14 @@ describe('SDK LLM typed adapter', () => {
     await expect(api.runTask({
       consumer: 'stx_memory', taskKey: 'memory_extract', taskDescription: 'extract', taskKind: 'generation',
       input: { messages: [{ role: 'user', content: 'hello' }] }, schema: { type: 'object' },
-      budget: { maxTokens: 100 }, enqueue: { displayMode: 'silent' },
+      budget: { maxTokens: 100, maxLatencyMs: 4321 }, enqueue: { displayMode: 'silent' },
     })).resolves.toMatchObject({ ok: true, data: { facts: [] }, meta: { model: 'm1' } });
     await expect(api.embed?.({ consumer: 'stx_memory', taskKey: 'memory_embed', texts: ['hello'], budget: { maxLatencyMs: 1234 } }))
       .resolves.toMatchObject({ ok: true, vectors: [[1, 2]], model: 'e1' });
     await expect(api.rerank?.({ consumer: 'stx_memory', taskKey: 'memory_rerank', query: 'q', docs: ['a', 'b'], topK: 1 }))
       .resolves.toMatchObject({ ok: true, results: [{ index: 1, score: 0.9, doc: 'b' }] });
 
-    expect(call).toHaveBeenNthCalledWith(1, LLM_STRUCTURED_TASK_V0, expect.not.objectContaining({ timeoutMs: expect.anything() }), { signal });
+    expect(call).toHaveBeenNthCalledWith(1, LLM_STRUCTURED_TASK_V0, expect.not.objectContaining({ timeoutMs: expect.anything() }), { timeoutMs: 4321, signal });
     expect(call).toHaveBeenNthCalledWith(2, LLM_EMBEDDING_V0, expect.objectContaining({ timeoutMs: 1234 }), { timeoutMs: 1234, signal });
     expect(call).toHaveBeenNthCalledWith(3, LLM_RERANK_V0, expect.objectContaining({ timeoutMs: 30_000 }), { timeoutMs: 30_000, signal });
   });

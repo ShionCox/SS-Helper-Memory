@@ -135,6 +135,35 @@ describe('事实向量索引服务', () => {
     expect(repository.upsertFactVector).toHaveBeenCalledTimes(1);
   });
 
+  it('显式重建会等待已有及待处理同步链完全结束，并最终覆盖全部事实', async () => {
+    const repository = new FakeVectorRepository(3);
+    const releases: Array<() => void> = [];
+    const embed = vi.fn(async ({ texts }: { texts: string[] }) => {
+      await new Promise<void>((resolve) => releases.push(resolve));
+      return { ok: true as const, vectors: texts.map(() => [1, 0]), model: 'BAAI/bge-m3' };
+    });
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    service.start();
+
+    service.scheduleSync('chat-a');
+    service.scheduleSync('chat-a');
+    const rebuilding = service.rebuild('chat-a');
+    let resolved = false;
+    void rebuilding.then(() => { resolved = true; });
+
+    await vi.waitFor(() => expect(releases.length).toBeGreaterThanOrEqual(1));
+    expect(resolved).toBe(false);
+    releases.shift()?.();
+    await vi.waitFor(() => expect(releases.length).toBeGreaterThanOrEqual(1));
+    expect(resolved).toBe(false);
+    releases.shift()?.();
+    await rebuilding;
+
+    const status = await service.getStatus('chat-a');
+    expect(status.coverage).toMatchObject({ ready: 3, missing: 0, stale: 0 });
+    expect(repository.vectors).toHaveLength(3);
+  });
+
   it('caches query vectors by the actual fallback embedding target', async () => {
     const repository = new FakeVectorRepository(1);
     repository.vectors.push({
@@ -178,7 +207,7 @@ describe('事实向量索引服务', () => {
     expect(second.candidates[0]?.factId).toBe('fact-0');
   });
 
-  it('embedding 超过 3 秒会失败并允许上层降级', async () => {
+  it('embedding 超过 15 秒会失败并允许上层降级', async () => {
     vi.useFakeTimers();
     const repository = new FakeVectorRepository(0);
     const embed = vi.fn(() => new Promise<never>(() => undefined));
@@ -186,8 +215,8 @@ describe('事实向量索引服务', () => {
     service.start();
 
     const pending = service.search('chat-a', '超时查询');
-    const rejected = expect(pending).rejects.toThrow('超过 3000ms');
-    await vi.advanceTimersByTimeAsync(3_001);
+    const rejected = expect(pending).rejects.toThrow('超过 15000ms');
+    await vi.advanceTimersByTimeAsync(15_001);
     await rejected;
   });
 

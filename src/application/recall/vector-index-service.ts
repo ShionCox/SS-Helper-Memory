@@ -9,7 +9,10 @@ import {
   type MemoryLlmMeta,
 } from '../ingest/llm-extractor';
 
-const EMBEDDING_TIMEOUT_MS = 3_000;
+// Remote embedding endpoints can legitimately take several seconds for large
+// rebuild batches. A 3s deadline caused healthy Qwen3 requests to be aborted
+// mid-rebuild and left the physical vector table only partially populated.
+const EMBEDDING_TIMEOUT_MS = 15_000;
 const VECTOR_BATCH_SIZE = 32;
 const VECTOR_TOP_K = 60;
 const QUERY_CACHE_SIZE = 64;
@@ -133,6 +136,7 @@ export class MemoryVectorIndexService {
    */
   private readonly resolvedEmbeddingTargets = new Map<string, ResolvedEmbeddingTarget>();
   private syncPromise: Promise<void> | null = null;
+  private rebuildPromise: Promise<void> | null = null;
   private pendingSyncChatKey = '';
   private active = false;
   private lifecycleRevision = 0;
@@ -155,11 +159,32 @@ export class MemoryVectorIndexService {
     });
   }
 
-  private finishSync(): void {
+  private finishSync(completed: Promise<void>): void {
+    // An older task must never clear the pointer of a newer queued task. This
+    // was the source of overlapping vector rebuilds after a pending sync was
+    // scheduled from a `finally` callback.
+    if (this.syncPromise !== completed) return;
     this.syncPromise = null;
+    if (this.rebuildPromise) return;
     const pendingChatKey = this.pendingSyncChatKey;
     this.pendingSyncChatKey = '';
     if (this.active && pendingChatKey) this.scheduleSync(pendingChatKey);
+  }
+
+  private startSync(chatKey: string): Promise<void> {
+    let tracked!: Promise<void>;
+    tracked = this.syncChat(chatKey).finally(() => this.finishSync(tracked));
+    this.syncPromise = tracked;
+    return tracked;
+  }
+
+  private async waitForSyncIdle(): Promise<void> {
+    while (this.syncPromise) {
+      const current = this.syncPromise;
+      await current;
+      // `finishSync` may have promoted a pending task. Loop until the entire
+      // chain is drained instead of awaiting only the promise observed first.
+    }
   }
 
   start(): void {
@@ -177,27 +202,45 @@ export class MemoryVectorIndexService {
 
   scheduleSync(chatKey: string): void {
     if (!this.active || !chatKey) return;
-    if (this.syncPromise) {
+    if (this.rebuildPromise || this.syncPromise) {
       this.pendingSyncChatKey = chatKey;
       return;
     }
-    this.syncPromise = this.syncChat(chatKey).finally(() => this.finishSync());
+    this.startSync(chatKey);
   }
 
   async rebuild(chatKey: string): Promise<void> {
     if (!this.active || !chatKey) return;
-    this.pendingSyncChatKey = '';
-    if (this.syncPromise) await this.syncPromise;
-    await this.repository.clearFactVectors(chatKey);
-    this.queryCache.clear();
-    this.resolvedEmbeddingTargets.delete(chatKey);
-    this.syncPromise = this.syncChat(chatKey).finally(() => this.finishSync());
-    await this.syncPromise;
+    if (this.rebuildPromise) {
+      await this.rebuildPromise;
+      return;
+    }
+    let tracked!: Promise<void>;
+    tracked = (async () => {
+      this.pendingSyncChatKey = '';
+      await this.waitForSyncIdle();
+      await this.repository.clearFactVectors(chatKey);
+      this.queryCache.clear();
+      this.resolvedEmbeddingTargets.delete(chatKey);
+      await this.syncChat(chatKey);
+      // A same-chat sync requested during this exclusive rebuild is already
+      // covered by syncChat's until-empty loop. Do not start a redundant task
+      // after returning to the validation caller.
+      if (this.pendingSyncChatKey === chatKey) this.pendingSyncChatKey = '';
+    })().finally(() => {
+      if (this.rebuildPromise === tracked) this.rebuildPromise = null;
+      const pendingChatKey = this.pendingSyncChatKey;
+      this.pendingSyncChatKey = '';
+      if (this.active && pendingChatKey) this.scheduleSync(pendingChatKey);
+    });
+    this.rebuildPromise = tracked;
+    await tracked;
   }
 
   async rebuildFacts(chatKey: string, factIds: readonly string[]): Promise<void> {
     if (!this.active || !chatKey) throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
-    if (this.syncPromise) await this.syncPromise;
+    if (this.rebuildPromise) await this.rebuildPromise;
+    await this.waitForSyncIdle();
     const operation = (async (): Promise<void> => {
       const lifecycleRevision = this.lifecycleRevision;
       const route = (await this.getRoutes()).embedding;
@@ -246,8 +289,10 @@ export class MemoryVectorIndexService {
         throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
       }
     })();
-    this.syncPromise = operation.finally(() => this.finishSync());
-    await this.syncPromise;
+    let tracked!: Promise<void>;
+    tracked = operation.finally(() => this.finishSync(tracked));
+    this.syncPromise = tracked;
+    await tracked;
   }
 
   async getStatus(chatKey: string): Promise<VectorIndexStatus> {

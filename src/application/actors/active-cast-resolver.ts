@@ -25,7 +25,12 @@ const NARRATOR_CUES = /(?:旁白|叙述|镜头|视角|与此同时|此时此刻)
 function floorOf(source: SourceBlock): number { return source.floor ?? 0; }
 function unique(values: readonly string[]): string[] { return [...new Set(values.filter(Boolean))]; }
 
-function resolveName(registry: ActorRegistry, value: string, source: SourceBlock): ActorResolution | undefined {
+function resolveName(
+  registry: ActorRegistry,
+  value: string,
+  source: SourceBlock,
+  options: { readonly trusted?: boolean } = {},
+): ActorResolution | undefined {
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   const direct = registry.getOwner(trimmed);
@@ -37,6 +42,7 @@ function resolveName(registry: ActorRegistry, value: string, source: SourceBlock
     sourceRef: source.id,
     sourceType: source.kind === 'host_card' ? 'host_card' : source.kind === 'worldbook' ? 'worldbook' : 'message',
     excerpt: source.content.slice(0, 240),
+    confirmed: options.trusted === true,
     confidence: source.kind === 'host_card' || source.kind === 'worldbook'
       ? 0.9
       : source.author?.kind === 'assistant' && source.author.displayName?.trim()
@@ -53,13 +59,38 @@ function explicitSpeakerName(content: string): string | undefined {
   return match?.[1]?.trim() || undefined;
 }
 
-function namesInContent(registry: ActorRegistry, source: SourceBlock): ActorResolution[] {
+interface ContentActorMatch {
+  readonly resolution: ActorResolution;
+  readonly matchedName: string;
+}
+
+function namesInContent(registry: ActorRegistry, source: SourceBlock): ContentActorMatch[] {
   const candidates = registry.listOwners().filter(owner => owner.kind === 'actor').flatMap(owner => [owner.displayName, ...owner.aliases]);
   const containsName = (name: string): boolean => {
-    if (name.length === 1 && /^[A-Za-z0-9]$/u.test(name)) return new RegExp(`(?:^|[^A-Za-z0-9])${name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}(?![A-Za-z0-9])`, 'u').test(source.content);
+    const characterLength = Array.from(name).length;
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+    if (characterLength === 1 && /^[A-Za-z0-9]$/u.test(name)) return new RegExp(`(?:^|[^A-Za-z0-9])${escaped}(?![A-Za-z0-9])`, 'u').test(source.content);
+    if (characterLength === 1) {
+      // Single-Han aliases such as “叶/莲” are common in dialogue, but a raw
+      // substring check also matches nouns such as “叶片/莲藕”. Require a left
+      // boundary and either a right boundary or a speech/presence verb.
+      return new RegExp(
+        `(?:^|[\\s“”‘’，。！？；：、（）()])${escaped}(?=$|[\\s“”‘’，。！？；：、（）()]|说|道|喊|问|答|低声|轻声|心想|想到|暗自|来到|走进|站在|坐在|躺在|跟着|陪同|面对|离开|不在)`,
+        'u',
+      ).test(source.content);
+    }
     return source.content.includes(name);
   };
-  return unique(candidates).filter(name => name.length >= 1 && containsName(name)).map(name => resolveName(registry, name, source)).filter((item): item is ActorResolution => Boolean(item));
+  const byOwner = new Map<string, ContentActorMatch>();
+  for (const name of unique(candidates).filter(candidate => candidate.length >= 1 && containsName(candidate))) {
+    const resolution = resolveName(registry, name, source);
+    if (!resolution || resolution.owner.kind !== 'actor') continue;
+    const current = byOwner.get(resolution.owner.id);
+    if (!current || Array.from(name).length > Array.from(current.matchedName).length) {
+      byOwner.set(resolution.owner.id, { resolution, matchedName: name });
+    }
+  }
+  return [...byOwner.values()];
 }
 
 function hasLocalPresenceCue(content: string, name: string): boolean {
@@ -110,7 +141,7 @@ export class ActiveCastResolver {
       if (source.kind === 'message') {
         if (author?.kind === 'user' || source.role === 'user') speakerId = FIXED_OWNER_IDS.player;
         else if (author?.kind === 'narrator' || source.messageType === 'narrator' || NARRATOR_CUES.test(content)) speakerId = FIXED_OWNER_IDS.narrator;
-        else if (source.perspective?.speakerOwnerRef) speakerId = resolveName(this.registry, source.perspective.speakerOwnerRef, source)?.owner.id;
+        else if (source.perspective?.speakerOwnerRef) speakerId = resolveName(this.registry, source.perspective.speakerOwnerRef, source, { trusted: true })?.owner.id;
         else {
           const explicitName = explicitSpeakerName(content);
           const authorName = author?.displayName;
@@ -122,7 +153,9 @@ export class ActiveCastResolver {
           // registry keeps generic labels pending/unknown rather than creating
           // a fake in-world actor.
           const explicitAuthorName = authorName?.trim() ?? '';
-          speakerId = resolveName(this.registry, explicitName ?? explicitAuthorName, source)?.owner.id;
+          speakerId = explicitName
+            ? resolveName(this.registry, explicitName, source)?.owner.id
+            : resolveName(this.registry, explicitAuthorName, source, { trusted: true })?.owner.id;
         }
       }
       if (speakerId) {
@@ -136,13 +169,13 @@ export class ActiveCastResolver {
       }
 
       const found = namesInContent(this.registry, source);
-      for (const resolution of found) {
+      for (const { resolution, matchedName } of found) {
         resolutions.push(resolution);
         const ownerId = resolution.owner.id;
         mentioned.add(ownerId);
         addMember(ownerId, 'mentioned', source, resolution.confidence);
         if (speakerId === ownerId) addMember(ownerId, 'speaker', source, 0.96);
-        if (hasLocalPresenceCue(content, resolution.owner.displayName) || speakerId === ownerId) {
+        if (hasLocalPresenceCue(content, matchedName) || speakerId === ownerId) {
           present.add(ownerId);
           addMember(ownerId, 'present', source, Math.max(0.7, resolution.confidence));
         }
@@ -153,14 +186,14 @@ export class ActiveCastResolver {
         ...(source.perspective?.mentionedOwnerRefs ?? []),
       ];
       for (const ref of explicitRefs) {
-        const resolution = resolveName(this.registry, ref, source);
+        const resolution = resolveName(this.registry, ref, source, { trusted: true });
         if (!resolution) continue;
         resolutions.push(resolution);
         mentioned.add(resolution.owner.id);
         addMember(resolution.owner.id, 'mentioned', source, resolution.confidence);
       }
       for (const ref of source.perspective?.presentOwnerRefs ?? []) {
-        const resolution = resolveName(this.registry, ref, source);
+        const resolution = resolveName(this.registry, ref, source, { trusted: true });
         if (!resolution) continue;
         resolutions.push(resolution);
         mentioned.add(resolution.owner.id);
@@ -168,14 +201,14 @@ export class ActiveCastResolver {
         addMember(resolution.owner.id, 'present', source, resolution.confidence);
       }
       for (const ref of source.perspective?.observerOwnerRefs ?? []) {
-        const resolution = resolveName(this.registry, ref, source);
+        const resolution = resolveName(this.registry, ref, source, { trusted: true });
         if (!resolution) continue;
         resolutions.push(resolution);
         present.add(resolution.owner.id);
         addMember(resolution.owner.id, 'present', source, resolution.confidence);
       }
       if (source.perspective?.viewpointOwnerRef) {
-        const resolution = resolveName(this.registry, source.perspective.viewpointOwnerRef, source);
+        const resolution = resolveName(this.registry, source.perspective.viewpointOwnerRef, source, { trusted: true });
         if (resolution) {
           viewpointOwnerId = resolution.owner.id;
           addMember(viewpointOwnerId, 'viewpoint', source, source.perspective.confidence ?? resolution.confidence);

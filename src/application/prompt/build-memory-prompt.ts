@@ -1,5 +1,5 @@
 import type { RecallItem, RecallResult } from '../recall/memory-recall-index'
-import type { ActorMemoryPartition, ActorRecallResponse, MemoryRecallPacket } from '../../domain'
+import type { ActorMemoryPartition, ActorRecallResponse, GenerationCastPlan, MemoryRecallPacket } from '../../domain'
 
 const ONGOING_KINDS = new Set([
   'commitment',
@@ -192,6 +192,7 @@ export interface ActorMemoryPromptOptions {
   readonly sceneLabel?: string
   readonly currentViewpointOwnerId?: string
   readonly rules?: readonly string[]
+  readonly castPlan?: GenerationCastPlan
 }
 
 export interface ActorMemoryPromptResult {
@@ -242,7 +243,7 @@ export function buildActorMemoryPromptResult(response: ActorRecallResponse, opti
   ].filter(Boolean))
   const actors = [...response.actors].sort((left, right) => Number(currentActorIds.has(right.ownerId)) - Number(currentActorIds.has(left.ownerId)) || left.ownerId.localeCompare(right.ownerId))
   const partitions = [response.world, response.narrator, ...actors]
-  if (partitions.every(partition => partition.packets.length === 0)) {
+  if (partitions.every(partition => partition.packets.length === 0) && !options.castPlan) {
     return Object.freeze({ prompt: '', includedTraceIds: Object.freeze([]), omittedTraceIds: Object.freeze([]), diagnostics: Object.freeze({ maxChars, usedChars: 0, partitionBudgets: Object.freeze({}), includedCount: 0, omittedCount: 0, mode: response.request.mode ?? 'multi_actor' }) })
   }
   const actorCount = actors.length
@@ -255,12 +256,28 @@ export function buildActorMemoryPromptResult(response: ActorRecallResponse, opti
   const mode = response.request.mode ?? 'multi_actor'
   const sceneLabel = xmlEscape(options.sceneLabel ?? '')
   const lines = [`<memory_context mode="${mode}" scene="${sceneLabel}">`]
+  const castPlan = options.castPlan ?? response.request.castPlan
+  const ownerNameById = new Map(partitions.map(partition => [partition.ownerId, partition.ownerName]))
+  if (castPlan) {
+    const castLine = (label: string, ownerIds: readonly string[]): string => `${label}：${ownerIds.map(ownerId => xmlEscape(ownerNameById.get(ownerId) ?? ownerId)).join('、') || '无'}`
+    lines.push(
+      '<generation_cast>',
+      `本轮视角：${xmlEscape(ownerNameById.get(castPlan.viewpointOwnerId ?? '') ?? castPlan.viewpointOwnerId ?? '旁白')}`,
+      castLine('确定参与', castPlan.requiredOwnerIds),
+      castLine('可能参与', castPlan.likelyOwnerIds),
+      castLine('背景在场', castPlan.backgroundOwnerIds),
+      castLine('仅被提及', castPlan.mentionedOnlyOwnerIds),
+      '</generation_cast>',
+    )
+  }
   const includedPacketLines: Array<{ line: string; traceId: string }> = []
   const rules = [
     '每个角色只能依据自己的 actor_memory 行动和发言。',
     'world_memory 是世界规范参考，不代表任一角色自动知情。',
     '不得补回模糊记忆中被省略的细节。',
     '不得将私密思想、秘密或其他角色记忆转移给当前角色。',
+    '背景角色和仅提及角色不得使用未提供的秘密。',
+    '新角色可以自然出现，但不得凭空拥有未提供的历史记忆。',
     ...(options.rules ?? []).map(rule => xmlEscape(rule)),
   ]
   const closingLines = (): string[] => ['<memory_rules>', ...rules, '</memory_rules>', '</memory_context>']
@@ -271,7 +288,7 @@ export function buildActorMemoryPromptResult(response: ActorRecallResponse, opti
       ? ' audience="narrator"'
       : partition.role === 'narrator'
         ? ''
-        : ` owner_id="${xmlEscape(partition.ownerId)}" owner="${xmlEscape(partition.ownerName)}"`
+        : ` owner_id="${xmlEscape(partition.ownerId)}" owner="${xmlEscape(partition.ownerName)}" permission="${xmlEscape(castPlan?.permissionByOwner[partition.ownerId] ?? 'full')}"`
     const start = `<${tag}${ownerAttr}>`
     const end = `</${tag}>`
     lines.push(start)

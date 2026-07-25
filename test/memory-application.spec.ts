@@ -95,6 +95,67 @@ function connectHost(app: { useHostContext(context: { getChatKey(): string; getW
   app.useHostContext({ getChatKey: () => 'chat-a', getWorkspaceId: () => 'character:c1', collectSources: async () => state.sources });
 }
 
+function attachClaimCapture(
+  app: object,
+  repository: FakeRepository,
+  options: { block?: boolean } = {},
+): void {
+  const actorRepository = {
+    boundWorkspaceId: 'character:c1',
+    boundChatKey: 'chat-a',
+    bind: () => undefined,
+    open: async () => undefined,
+    listFacts: async () => structuredClone(repository.facts),
+    listTraces: async () => [],
+    listOwners: async () => [],
+    listAliases: async () => [],
+    listPendingCandidates: async () => [],
+    listLocations: async () => [],
+    listLocationAliases: async () => [],
+    listPendingLocationCandidates: async () => [],
+    listChangeAudits: async () => [],
+    listCaptureJobs: async () => structuredClone(repository.jobs),
+    listDerived: async () => [],
+    upsertCaptureJob: async (job: MemoryJob) => repository.putJob(job),
+    rollbackChangeSet: async () => undefined,
+    upsertDerived: async () => undefined,
+    upsertDerivedForChangeSet: async () => undefined,
+    clearCurrentChatData: async () => undefined,
+  };
+  const actorCapture = {
+    capture: async (input: {
+      sources: readonly SourceBlock[];
+      existingMemoryContext?: readonly ExistingMemoryContextItem[];
+    }) => {
+      state.extractCalls += 1;
+      state.lastExtractSources = [...input.sources];
+      state.lastExtractExistingMemoryContext = [...(input.existingMemoryContext ?? [])];
+      if (options.block === true) {
+        await new Promise<void>((resolve) => { state.release = resolve; });
+      }
+      const now = Date.now();
+      return {
+        envelope: {
+          workspaceId: 'character:c1', chatKey: 'chat-a', sourceRefs: input.sources.map(source => source.id),
+          actorCandidates: [], locationCandidates: [], episodes: [], claimLocalIds: [], capturedAt: now,
+        },
+        owners: [], pendingCandidates: [], locations: [], locationAliases: [], pendingLocationCandidates: [],
+        episodes: [], observations: [], facts: [], traces: [],
+        sceneCast: {
+          id: `scene:test:${state.extractCalls}`, workspaceId: 'character:c1', chatKey: 'chat-a',
+          floor: Math.max(0, ...input.sources.map(source => source.floor ?? 0)), members: [],
+          viewpointOwnerId: 'owner:unknown', speakerOwnerIds: [], presentOwnerIds: [], mentionedOwnerIds: [], createdAt: now,
+        },
+        outcome: 'complete' as const,
+        rejections: [],
+        acceptedLocalIds: { actor: [], location: [], episode: [], claim: [] },
+      };
+    },
+  };
+  (app as { multiActorRepository: unknown }).multiActorRepository = actorRepository;
+  (app as { actorCapture: unknown }).actorCapture = actorCapture;
+}
+
 describe('MemoryApplication 初始化范围与可取消进度', () => {
   beforeEach(() => {
     state.sources = [];
@@ -229,7 +290,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       id: 'actor-registry-change', workspaceId: 'character:c1', chatKey: 'chat-a',
       kind: 'actor-registry-change-set-v0' as const, createdAt: 1, entries: [],
     }));
-    (app as unknown as { actorRegistry: ActorRegistry }).actorRegistry = registry;
+    (app as unknown as { actorRegistry: typeof registry }).actorRegistry = registry;
     (app as unknown as { multiActorRepository: { upsertActorRegistryState: typeof upsertActorRegistryState } }).multiActorRepository = { upsertActorRegistryState };
     const bind = vi.spyOn(app, 'bindCurrentChat').mockResolvedValue();
 
@@ -251,6 +312,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     const app = new MemoryApplication(repository as never);
     connectHost(app);
     await app.start();
+    attachClaimCapture(app, repository);
     const listener = vi.fn();
     const remove = app.onOverviewChanged(listener);
 
@@ -540,6 +602,54 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     app.stop();
   });
 
+  it('初始化事实全部被拒绝时回滚 ChangeSet 并拒绝写成 completed', async () => {
+    state.sources = [{ ...message(1), floor: 1, content: '白夕小时确认地下储油库仍有约百分之四十五燃油。' }];
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    await app.start();
+
+    const captureJobs: MemoryJob[] = [];
+    const rollbackChangeSet = vi.fn(async () => undefined);
+    const actorRepository = {
+      boundWorkspaceId: 'character:c1',
+      listFacts: vi.fn(async () => []),
+      listTraces: vi.fn(async () => []),
+      upsertCaptureJob: vi.fn(async (job: MemoryJob) => {
+        const index = captureJobs.findIndex(item => item.id === job.id);
+        if (index >= 0) captureJobs[index] = structuredClone(job);
+        else captureJobs.push(structuredClone(job));
+      }),
+      rollbackChangeSet,
+      upsertDerived: vi.fn(async () => undefined),
+    };
+    const now = Date.now();
+    const actorCapture = {
+      capture: vi.fn(async () => ({
+        envelope: { workspaceId: 'character:c1', chatKey: 'chat-a', sourceRefs: ['message:1'], actorCandidates: [], episodes: [], observations: [], facts: [], capturedAt: now },
+        owners: [], pendingCandidates: [], episodes: [], observations: [], facts: [], traces: [],
+        sceneCast: { id: 'scene:failed', workspaceId: 'character:c1', chatKey: 'chat-a', floor: 1, members: [], viewpointOwnerId: 'owner:unknown', speakerOwnerIds: [], presentOwnerIds: [], mentionedOwnerIds: [], createdAt: now },
+        outcome: 'partial' as const,
+        rejections: [{ index: 0, recordType: 'fact' as const, code: 'invalid_confidence' as const, message: '缺少 confidence', status: 'unresolved' as const }],
+        acceptedLocalIds: { actor: [], episode: [], observation: [], fact: [] },
+        changeAudit: { id: 'change-audit:empty-facts' },
+      })),
+    };
+    (app as unknown as { multiActorRepository: unknown }).multiActorRepository = actorRepository;
+    (app as unknown as { actorCapture: unknown }).actorCapture = actorCapture;
+    vi.spyOn(app, 'bindCurrentChat').mockResolvedValue();
+
+    await expect(app.initialize(['message'])).rejects.toThrow('初始化没有生成任何可召回事实');
+    expect(rollbackChangeSet).toHaveBeenCalledWith('change-audit:empty-facts');
+    expect(captureJobs.at(-1)).toMatchObject({
+      status: 'failed',
+      checkpoint: { batchIndex: 0, processedCount: 0 },
+      error: expect.stringContaining('初始化没有生成任何可召回事实'),
+    });
+    app.stop();
+  });
+
   it('默认只统计 AI 可见消息，显式开启后纳入 system 历史正文但仍排除工具输出', async () => {
     state.sources = [
       message(0),
@@ -569,6 +679,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     const app = new MemoryApplication(repository as never);
     connectHost(app);
     await app.start();
+    attachClaimCapture(app, repository, { block: true });
     const initialize = app.initialize(['message'], { includeInvisibleHistory: true });
     for (let index = 0; index < 20 && !state.release; index += 1) await Promise.resolve();
 
@@ -595,6 +706,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     const app = new MemoryApplication(repository as never);
     connectHost(app);
     await app.start();
+    attachClaimCapture(app, repository, { block: true });
 
     const flush = app.capture.flush();
     for (let index = 0; index < 20 && !state.release; index += 1) await Promise.resolve();
@@ -621,6 +733,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     const app = new MemoryApplication(repository as never);
     connectHost(app);
     await app.start();
+    attachClaimCapture(app, repository, { block: true });
 
     const flush = app.capture.flush();
     for (let index = 0; index < 20 && !state.release; index += 1) await Promise.resolve();

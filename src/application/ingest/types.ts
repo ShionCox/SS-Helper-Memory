@@ -11,12 +11,31 @@ export interface SourceAuthor {
   readonly originalAvatar?: string;
 }
 
+export interface KnownLocationContextItem {
+  referenceId: string;
+  /** Internal deterministic mapping; never serialized to the model. */
+  locationId?: string;
+  canonicalName: string;
+  aliases: string[];
+  status: 'confirmed' | 'pending';
+}
+
 export interface SourcePerspective {
   readonly viewpointOwnerRef?: string;
   readonly speakerOwnerRef?: string;
   readonly observerOwnerRefs?: readonly string[];
   readonly mentionedOwnerRefs?: readonly string[];
   readonly presentOwnerRefs?: readonly string[];
+  readonly confidence?: number;
+}
+
+export interface SourceSceneTransition {
+  readonly enteredOwnerRefs?: readonly string[];
+  readonly exitedOwnerRefs?: readonly string[];
+  readonly nearbyOwnerRefs?: readonly string[];
+  readonly locationKeys?: readonly string[];
+  readonly timeJump?: boolean;
+  readonly sceneReset?: boolean;
   readonly confidence?: number;
 }
 
@@ -35,7 +54,13 @@ export interface SourceBlock {
   author?: SourceAuthor;
   /** Prompt-local entity references discovered by ActorRegistry. */
   actorRefs?: string[];
+  /** Prompt-local location references discovered by LocationRegistry. */
+  locationRefs?: string[];
+  /** SillyTavern message section classification used by Capture quality gates. */
+  semanticSection?: 'narrative' | 'cast_manifest' | 'state_snapshot' | 'control';
   perspective?: SourcePerspective;
+  /** Explicit host/model scene metadata. Textual cues are resolved separately. */
+  transition?: SourceSceneTransition;
   visibility?: 'visible' | 'hidden' | 'control';
   sceneRefs?: string[];
 }
@@ -107,24 +132,89 @@ export interface MemoryExtractionResult {
   audit?: MemoryExtractionAudit;
 }
 
-/** One-call structured capture output. All refs are local to the request. */
+export interface StructuredActorCandidate {
+  localId: string;
+  displayName: string;
+  aliases: string[];
+  sourceRef: string;
+  evidenceExcerpt: string;
+  confidence: number;
+}
+
+export interface StructuredLocationCandidate {
+  localId: string;
+  displayName: string;
+  aliases: string[];
+  sourceRef: string;
+  evidenceExcerpt: string;
+  confidence: number;
+}
+
+export interface StructuredEpisode {
+  localId: string;
+  sourceRefs: string[];
+  participantRefs: string[];
+  presentRefs: string[];
+  mentionedRefs: string[];
+  locationRef?: string;
+  storyTimeText?: string;
+  summary: string;
+}
+
+export interface StructuredClaimKnowledge {
+  mode: 'asserted' | 'self_reported' | 'heard' | 'experienced' | 'inferred' | 'believed' | 'suspected' | 'unknown';
+  privacy: 'public' | 'limited' | 'private' | 'secret';
+  ownerRefs: string[];
+  speakerRef?: string;
+  viewpointRef?: string;
+  observerRefs: string[];
+  presentRefs: string[];
+  mentionedRefs: string[];
+}
+
+export interface StructuredClaim {
+  localId: string;
+  sourceRef: string;
+  episodeLocalId?: string;
+  kind: FactKind;
+  /** Stable actor/location reference when the subject belongs to a directory. */
+  subjectRef?: string;
+  /** Natural subject for ordinary objects, groups, rules and unnamed entities. */
+  subjectText?: string;
+  predicateKey: string;
+  /** Stable actor/location reference for a relationship or location object. */
+  objectRef?: string;
+  objectText?: string;
+  content: string;
+  evidenceExcerpt: string;
+  knowledge: StructuredClaimKnowledge;
+  confidence: number;
+  stableAnchor?: boolean;
+}
+
+/** One-call Claim capture output. Machine times and persistence IDs are server-owned. */
 export interface StructuredCaptureResult {
-  actorCandidates: Array<Record<string, unknown>>;
-  episodes: Array<Record<string, unknown>>;
-  observations: Array<Record<string, unknown>>;
-  facts: Array<Record<string, unknown>>;
+  actorCandidates: StructuredActorCandidate[];
+  locationCandidates: StructuredLocationCandidate[];
+  episodes: StructuredEpisode[];
+  claims: StructuredClaim[];
   rejections?: AutomaticIngestRejection[];
   diagnostics?: {
     parser?: string;
     deterministicRepairs?: number;
+    automaticRepairCalls?: number;
+    automaticallyRepaired?: number;
+    firstPassRejections?: number;
+    transportMode?: 'native_strict' | 'json_object_validated' | 'prompt_json' | 'unknown';
   };
   audit?: MemoryExtractionAudit;
 }
 
 export interface CaptureRepairRequest {
-  recordType: 'actor' | 'episode' | 'observation' | 'fact';
+  recordType?: 'actor' | 'location' | 'episode' | 'claim';
   items: Array<{
     rejectionId: string;
+    recordType: 'actor' | 'location' | 'episode' | 'claim';
     localId: string;
     code: string;
     fieldPath?: string;
@@ -151,11 +241,36 @@ export interface ExistingMemoryContextItem {
   stable?: boolean;
 }
 
+/**
+ * Prompt-local actor directory supplied to every structured Capture batch.
+ * It deliberately carries natural names rather than persistence ids so the
+ * model can reuse a stable canonical name without learning database keys.
+ */
+export interface KnownActorContextItem {
+  /** Sequential prompt-local reference, never a persistence record id. */
+  referenceId: string;
+  /** Internal deterministic mapping; never serialized to the model. */
+  ownerId?: string;
+  canonicalName: string;
+  aliases: string[];
+  status: 'confirmed' | 'pending';
+}
+
 export interface MemoryExtractionInput {
   chatKey: string;
   sources: readonly SourceBlock[];
+  /**
+   * Source ids allowed to create new persisted records. Omitted means every
+   * source in this request is writable. Overlap/context sources remain visible
+   * to the model but must never be emitted as new evidence.
+   */
+  writableSourceRefs?: readonly string[];
   /** Read-only facts relevant to this batch; never valid evidence for output. */
   existingMemoryContext?: readonly ExistingMemoryContextItem[];
+  /** Stable actor names/aliases already known by ActorRegistry for this card. */
+  knownActorContext?: readonly KnownActorContextItem[];
+  /** Stable location names/aliases already known by LocationRegistry. */
+  knownLocationContext?: readonly KnownLocationContextItem[];
   /** Enables source-grounded relation-fact guidance in the existing single call. */
   graphLlmRelationEnabled?: boolean;
   /** User-selected failed rows only; never used by automatic background Capture. */

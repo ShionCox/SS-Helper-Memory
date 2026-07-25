@@ -140,6 +140,32 @@ describe('MemoryRecallIndex', () => {
     expect(result.items.map(item => item.fact.id)).toEqual(['matching-anchor'])
   })
 
+  it('recalls unscoped long-lived identity and capability facts by ordinary entity matching', () => {
+    const index = new MemoryRecallIndex([
+      fact({
+        id: 'violet-capability',
+        kind: 'capability',
+        subjectKey: '紫罗',
+        predicateKey: '净化空气',
+        objectKey: '空气',
+        content: '紫罗能够净化空气并吸收紫色晶尘。',
+        entityKeys: ['紫罗', '能力'],
+        stableAnchor: true,
+        scope: undefined,
+      }),
+      fact({ id: 'unrelated', subjectKey: '便利店', content: '便利店储藏室有二十个罐头。', entityKeys: ['便利店'] }),
+    ])
+
+    const result = index.recall({
+      chatKey: 'chat-a',
+      query: '紫罗拥有什么能力？',
+      entityKeys: ['紫罗', '能力'],
+      now: NOW,
+    })
+
+    expect(result.items[0]?.fact.id).toBe('violet-capability')
+  })
+
   it('limits matching stable anchors to three and clamps maxItems to 4..30', () => {
     const anchors = Array.from({ length: 8 }, (_, index) => fact({
       id: `anchor-${index}`,
@@ -342,6 +368,32 @@ describe('MemoryRecallIndex', () => {
 
     const history = index.recall({ chatKey: 'chat-a', query: '紫能高压手枪曾经到现在的变化是什么？', now: NOW })
     expect(history.items.map(item => item.fact.id)).toEqual(expect.arrayContaining(['weapon-current', 'weapon-old']))
+  })
+
+  it('does not let a variable snapshot hide abilities or historical events about the same subject', () => {
+    const index = new MemoryRecallIndex([
+      fact({
+        id: 'violet-capability-before-snapshot', kind: 'capability', subjectKey: '紫罗', predicateKey: '净化空气',
+        content: '紫罗能够净化空气并吸收紫色晶尘。', entityKeys: ['紫罗'], updatedAt: 10,
+      }),
+      fact({
+        id: 'violet-event-before-snapshot', kind: 'event', subjectKey: '紫罗', predicateKey: '保护团队',
+        content: '紫罗曾经用尖刺保护团队。', entityKeys: ['紫罗'], updatedAt: 11,
+      }),
+      fact({
+        id: 'violet-current-snapshot', kind: 'state', subjectKey: '紫罗', predicateKey: '当前状态',
+        content: '最新变量状态确认：紫罗目前能量为百分之八十。', entityKeys: ['紫罗'],
+        sourceRefs: ['state:last:violet'], evidenceRefs: [], validFrom: 20, updatedAt: 20,
+      }),
+    ])
+
+    const capability = index.recall({ chatKey: 'chat-a', query: '紫罗拥有什么能力？', entityKeys: ['紫罗'], now: NOW })
+    expect(capability.items.map(item => item.fact.id)).toContain('violet-capability-before-snapshot')
+    expect(capability.candidates.find(item => item.factId === 'violet-capability-before-snapshot')?.omittedReason)
+      .not.toBe('最新变量状态已覆盖更早事实')
+
+    const event = index.recall({ chatKey: 'chat-a', query: '紫罗如何保护团队？', entityKeys: ['紫罗'], now: NOW })
+    expect(event.items.map(item => item.fact.id)).toContain('violet-event-before-snapshot')
   })
 
   it('adds a lexical temporal safety candidate when pure vector misses the latest snapshot', () => {

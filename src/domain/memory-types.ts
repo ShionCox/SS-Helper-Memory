@@ -322,7 +322,7 @@ export interface AutomaticIngestRejection {
   index: number;
   code: AutomaticProposalErrorCode;
   message: string;
-  recordType?: 'batch' | 'actor' | 'episode' | 'observation' | 'fact';
+  recordType?: 'batch' | 'actor' | 'location' | 'episode' | 'claim' | 'observation' | 'fact';
   fieldPath?: string;
   sourceRefs?: string[];
   allowedValues?: string[];
@@ -359,7 +359,8 @@ export type AutomaticProposalErrorCode =
   | 'empty_excerpt'
   | 'excerpt_mismatch'
   | 'non_chinese_key'
-  | 'duplicate_proposal';
+  | 'duplicate_proposal'
+  | 'quality_below_threshold';
 
 export type AutomaticProposalValidation =
   | { ok: true; value: ValidatedAutomaticFact }
@@ -368,6 +369,8 @@ export type AutomaticProposalValidation =
 export type ReconciliationDecision = 'insert' | 'duplicate' | 'supersede' | 'pending';
 
 export interface ReconciliationCandidate {
+  /** Optional on legacy callers; current Capture always supplies the fact kind. */
+  kind?: MemoryFactKind;
   canonicalKey: string;
   slotKey?: string;
   content: string;

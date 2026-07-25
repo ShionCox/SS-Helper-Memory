@@ -2,3 +2,8 @@ export * from './actor-registry';
 export * from './active-cast-resolver';
 export * from './knowledge-projector';
 export * from './multi-actor-capture-service';
+export * from './scene-state-reducer';
+export * from './cast-candidate-resolver';
+export * from './generation-cast-planner';
+export * from './provisional-actor-service';
+export * from './actual-cast-reconciler';

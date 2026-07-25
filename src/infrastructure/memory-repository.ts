@@ -49,6 +49,10 @@ const SETTINGS_WORKSPACE_ID = 'settings:global';
 const COLLECTIONS = Object.freeze({
   actors: ['workspaceId', 'kind', 'canonicalName', 'status', 'updatedAt'],
   'actor-aliases': ['workspaceId', 'ownerId', 'normalizedValue', 'status', 'updatedAt'],
+  'actor-candidates': ['workspaceId', 'chatKey', 'status', 'confidence', 'updatedAt'],
+  locations: ['workspaceId', 'canonicalName', 'status', 'updatedAt'],
+  'location-aliases': ['workspaceId', 'locationId', 'normalizedValue', 'status', 'updatedAt'],
+  'location-candidates': ['workspaceId', 'chatKey', 'status', 'confidence', 'updatedAt'],
   episodes: ['workspaceId', 'chatKey', 'floorStart', 'occurredAt', 'createdAt'],
   observations: ['workspaceId', 'episodeId', 'sourceRef', 'speakerOwnerId', 'occurredAt'],
   facts: ['workspaceId', 'chatKey', 'status', 'kind', 'updatedAt'],
@@ -1206,7 +1210,7 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async clearAllMemory(): Promise<number> {
-    const removed = await this.workspace.clearOwned({ preserveWorkspaceIds: [SETTINGS_WORKSPACE_ID], idempotencyKey: `memory-clear:${Date.now()}` });
+    const removed = await this.workspace.clearOwned({ preserveWorkspaceIds: [SETTINGS_WORKSPACE_ID], idempotencyKey: `memory-clear:${crypto.randomUUID()}` });
     if (this.workspaceId) await this.ensureCollections(this.workspaceId);
     return removed;
   }

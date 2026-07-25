@@ -14,6 +14,10 @@ import type {
   MemoryOwner,
   SceneCast,
   SceneCastMember,
+  SceneState,
+  SceneTransition,
+  GenerationCastPlan,
+  CastPlanAudit,
 } from '../domain';
 
 export type SceneEventCategory = 'scene' | 'event' | 'observation';
@@ -27,6 +31,10 @@ export interface SceneEventsState {
   observations: MemoryObservation[];
   actors: MemoryOwner[];
   actorAliases: ActorAlias[];
+  currentSceneState?: SceneState;
+  sceneTransitions?: SceneTransition[];
+  generationCastPlans?: GenerationCastPlan[];
+  castPlanAudits?: CastPlanAudit[];
   selectedSceneId: string;
   selectedEpisodeId: string;
   selectedObservationId: string;
@@ -60,6 +68,30 @@ const ROLE_LABELS: Readonly<Record<SceneCastMember['role'], string>> = Object.fr
   mentioned: '仅提及',
   narrator: '旁白',
   world: '世界来源',
+});
+
+const PLANNER_MODE_LABELS: Readonly<Record<GenerationCastPlan['plannerMode'], string>> = Object.freeze({
+  deterministic: '确定性规则',
+  llm_assisted: '轻量导演辅助',
+  host_selected: '宿主已选角色',
+  manual: '人工计划',
+});
+
+const CAST_MODE_LABELS: Readonly<Record<GenerationCastPlan['mode'], string>> = Object.freeze({
+  single_actor: '单角色',
+  multi_actor: '多角色',
+  narrator: '旁白',
+  mixed: '混合',
+});
+
+const TRANSITION_REASON_LABELS: Readonly<Record<SceneTransition['reason'], string>> = Object.freeze({
+  explicit_entry: '明确进入',
+  explicit_exit: '明确离场',
+  location_change: '地点变化',
+  time_jump: '时间跳转',
+  scene_reset: '场景重置',
+  model_inferred: '模型推断',
+  user_corrected: '人工纠正',
 });
 
 const CHANNEL_LABELS: Readonly<Record<MemoryObservation['channel'], string>> = Object.freeze({
@@ -374,6 +406,33 @@ function renderOwnerButton(ownerId: string, owners: OwnerDirectory, tone: UiCont
   return `<button class="stx-memory-scene-owner-chip" ${uiButton(tone, 'xs')} type="button" data-action="scene-open-owner" data-owner-id="${escapeHtml(ownerId)}">${escapeHtml(owners.name(ownerId))}</button>`;
 }
 
+function renderOwnerGroup(ownerIds: readonly string[], owners: OwnerDirectory, tone: UiControlTone = 'neutral'): string {
+  const ids = unique(ownerIds);
+  return ids.length > 0 ? ids.map((ownerId) => renderOwnerButton(ownerId, owners, tone)).join('') : statusChip('无');
+}
+
+function renderScenePlanningSummary(state: SceneEventsState, owners: OwnerDirectory): string {
+  const sceneState = state.currentSceneState;
+  const plan = [...(state.generationCastPlans ?? [])].sort((left, right) => right.basedOnFloor - left.basedOnFloor || right.createdAt - left.createdAt)[0];
+  const audit = plan
+    ? [...(state.castPlanAudits ?? [])].filter((item) => item.planId === plan.id).sort((left, right) => right.createdAt - left.createdAt)[0]
+    : [...(state.castPlanAudits ?? [])].sort((left, right) => right.createdAt - left.createdAt)[0];
+  const transition = [...(state.sceneTransitions ?? [])].sort((left, right) => right.floor - left.floor || right.createdAt - left.createdAt)[0];
+  if (!sceneState && !plan && !audit && !transition) return '';
+  const correctionOwnerIds = sceneState ? unique([
+    ...sceneState.presentOwnerIds,
+    ...sceneState.nearbyOwnerIds,
+    ...sceneState.exitedOwnerIds,
+    ...sceneState.mentionedOwnerIds,
+  ]).filter(ownerId => owners.kind(ownerId) === '人物') : [];
+  const selectedCorrectionOwnerId = correctionOwnerIds.includes(state.selectedSceneOwnerId) ? state.selectedSceneOwnerId : correctionOwnerIds[0] ?? '';
+  const correctionControls = correctionOwnerIds.length > 0 ? `<div class="stx-memory-scene-correction"><label><span>人工纠正角色</span><select ${uiControl('select')} ${UI_CONTROL_SIZE_ATTRIBUTE}="sm" data-scene-select="correction-owner">${correctionOwnerIds.map(ownerId => `<option value="${escapeHtml(ownerId)}" ${ownerId === selectedCorrectionOwnerId ? 'selected' : ''}>${escapeHtml(owners.name(ownerId))}</option>`).join('')}</select></label><div class="stx-memory-scene-correction-actions"><button ${uiButton('primary', 'xs')} type="button" data-action="scene-correct-state" data-placement="present" data-owner-id="${escapeHtml(selectedCorrectionOwnerId)}">标记在场</button><button ${uiButton('neutral', 'xs')} type="button" data-action="scene-correct-state" data-placement="nearby" data-owner-id="${escapeHtml(selectedCorrectionOwnerId)}">标记附近</button><button ${uiButton('neutral', 'xs')} type="button" data-action="scene-correct-state" data-placement="viewpoint" data-owner-id="${escapeHtml(selectedCorrectionOwnerId)}">设为视角</button><button ${uiButton('danger', 'xs')} type="button" data-action="scene-correct-state" data-placement="exited" data-owner-id="${escapeHtml(selectedCorrectionOwnerId)}">标记离场</button></div></div>` : '';
+  const sceneCard = sceneState ? `<article class="stx-memory-scene-live-card"><div class="stx-memory-scene-live-head"><div><span class="stx-memory-kicker">持续场景</span><h3>${escapeHtml(sceneState.locationKeys.join('、') || '当前地点未命名')}</h3></div>${statusChip(`第 ${sceneState.sceneEpoch} 个场景阶段`, 'success')}</div><div class="stx-memory-scene-live-metrics"><span><small>更新楼层</small><strong>${sceneState.updatedAtFloor}</strong></span><span><small>置信度</small><strong>${Math.round(sceneState.confidence * 100)}%</strong></span><span><small>修订</small><strong>${sceneState.revision}</strong></span></div><div class="stx-memory-scene-live-roles"><div><b>当前视角</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(sceneState.viewpointOwnerId ? [sceneState.viewpointOwnerId] : [], owners, 'primary')}</span></div><div><b>明确在场</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(sceneState.presentOwnerIds, owners, 'primary')}</span></div><div><b>附近</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(sceneState.nearbyOwnerIds, owners)}</span></div><div><b>已离场</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(sceneState.exitedOwnerIds, owners)}</span></div><div><b>最近说话者</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(sceneState.recentSpeakerOwnerIds, owners)}</span></div><div><b>仅被提及</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(sceneState.mentionedOwnerIds, owners)}</span></div></div>${correctionControls}${transition ? `<p class="stx-memory-scene-live-note">最近转移：${escapeHtml(TRANSITION_REASON_LABELS[transition.reason])} · 第 ${transition.floor} 层 · ${Math.round(transition.confidence * 100)}%</p>` : ''}</article>` : '';
+  const planCard = plan ? `<article class="stx-memory-scene-live-card"><div class="stx-memory-scene-live-head"><div><span class="stx-memory-kicker">本轮角色计划</span><h3>${escapeHtml(CAST_MODE_LABELS[plan.mode])}</h3></div>${statusChip(`${Math.round(plan.confidence * 100)}%`, plan.confidence >= 0.72 ? 'success' : 'warning')}</div><p class="stx-memory-scene-live-note">${escapeHtml(PLANNER_MODE_LABELS[plan.plannerMode])} · 基于第 ${plan.basedOnFloor} 层 · 每个角色独立召回</p><div class="stx-memory-scene-live-roles"><div><b>确定参与</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(plan.requiredOwnerIds, owners, 'primary')}</span></div><div><b>可能参与</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(plan.likelyOwnerIds, owners)}</span></div><div><b>背景在场</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(plan.backgroundOwnerIds, owners)}</span></div><div><b>仅被提及</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(plan.mentionedOnlyOwnerIds, owners)}</span></div><div><b>明确排除</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(plan.excludedOwnerIds, owners)}</span></div></div></article>` : '';
+  const auditCard = audit ? `<article class="stx-memory-scene-live-card"><div class="stx-memory-scene-live-head"><div><span class="stx-memory-kicker">计划与实际核对</span><h3>${audit.result === 'matched' ? '完全一致' : audit.result === 'partial' ? '部分一致' : '存在偏差'}</h3></div>${statusChip(audit.result === 'matched' ? '已核对' : '需关注', audit.result === 'matched' ? 'success' : 'warning')}</div><div class="stx-memory-scene-live-roles"><div><b>实际出现</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(audit.actualOwnerIds, owners, 'primary')}</span></div><div><b>意外出现</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(audit.unplannedOwnerIds, owners)}</span></div><div><b>计划但未出现</b><span class="stx-memory-scene-owner-list">${renderOwnerGroup(audit.missingOwnerIds, owners)}</span></div></div><p class="stx-memory-scene-live-note">意外角色本轮没有私密记忆分区；${audit.leakageRisk ? '严格策略已标记重生成风险。' : '已记录偏差供下一轮纳入。'}</p></article>` : '';
+  return `<section class="stx-memory-scene-live-grid" aria-label="持续场景与生成选角诊断">${sceneCard}${planCard}${auditCard}</section>`;
+}
+
 function renderRoleCard(title: string, ownerIds: readonly string[], description: string, owners: OwnerDirectory, tone: UiControlTone): string {
   const values = unique(ownerIds);
   return `<article class="stx-memory-scene-role-card"><div class="stx-memory-scene-role-head"><strong>${escapeHtml(title)}</strong><span>${values.length}</span></div><div class="stx-memory-scene-owner-list">${values.length ? values.map((ownerId) => renderOwnerButton(ownerId, owners, tone)).join('') : statusChip('无')}</div><p>${escapeHtml(description)}</p></article>`;
@@ -559,7 +618,7 @@ export function renderSceneEventsPage(state: SceneEventsState): string {
   const title = state.category === 'event' ? '结构化事件' : state.category === 'observation' ? '观察记录' : '即时场景';
   const count = state.category === 'event' ? visible.episodes.length : state.category === 'observation' ? visible.observations.length : visible.scenes.length;
   const listIcon = state.category === 'event' ? 'timeline' : state.category === 'observation' ? 'eye' : 'list';
-  return `<div class="stx-memory-scenes-shell">${renderCategorySwitch(state)}${renderToolbar(state, visible)}<div class="stx-memory-scene-record-grid"><section class="stx-memory-scene-panel stx-memory-scene-list-panel" aria-label="${title}列表"><div class="stx-memory-scene-panel-head"><div><h3>${headingWithIcon(listIcon, title)}</h3></div><span>${count} 条</span></div><div class="stx-memory-scene-record-list">${list}</div></section><section class="stx-memory-scene-panel stx-memory-scene-inspector" aria-label="${title}详情">${inspector}</section><aside class="stx-memory-scene-panel stx-memory-scene-aside" aria-label="辅助信息">${renderAside(state, owners)}</aside></div></div>`;
+  return `<div class="stx-memory-scenes-shell">${renderScenePlanningSummary(state, owners)}${renderCategorySwitch(state)}${renderToolbar(state, visible)}<div class="stx-memory-scene-record-grid"><section class="stx-memory-scene-panel stx-memory-scene-list-panel" aria-label="${title}列表"><div class="stx-memory-scene-panel-head"><div><h3>${headingWithIcon(listIcon, title)}</h3></div><span>${count} 条</span></div><div class="stx-memory-scene-record-list">${list}</div></section><section class="stx-memory-scene-panel stx-memory-scene-inspector" aria-label="${title}详情">${inspector}</section><aside class="stx-memory-scene-panel stx-memory-scene-aside" aria-label="辅助信息">${renderAside(state, owners)}</aside></div></div>`;
 }
 
 export function sceneGraphOwnerLabel(state: SceneEventsState, ownerId: string): string {

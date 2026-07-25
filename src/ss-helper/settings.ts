@@ -13,9 +13,9 @@ import {
   type MemoryCapabilityStatusMap,
   type MemorySettingsAssessment,
 } from './llm-capability-monitor';
-import type { MemoryGraphStatus } from '../domain';
+import { DEFAULT_CAST_SETTINGS, type CastPlanningSettings, type MemoryGraphStatus } from '../domain';
 
-export interface MemorySettings extends MemoryCapabilitySettings {
+export interface MemorySettings extends MemoryCapabilitySettings, CastPlanningSettings {
   summaryBatchMode: 'floors' | 'chars';
   summaryBatchFloors: number;
   summaryBatchChars: number;
@@ -57,6 +57,7 @@ export const MEMORY_DEFAULT_SETTINGS: Readonly<MemorySettings> = Object.freeze({
   graphLlmRelationEnabled: true,
   graphMaxHops: 1,
   graphMaxEdges: 12,
+  ...DEFAULT_CAST_SETTINGS,
   chatMode: 'inherit',
 });
 
@@ -84,6 +85,30 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
       { kind: 'range', id: 'summaryIntervalFloors', label: '自动触发间隔', description: '已总结边界后每积累多少楼层形成一个窗口；会保留下一层等待后续窗口。', min: 1, max: 50, step: 1, defaultValue: 5 },
       { kind: 'range', id: 'summaryOverlapFloors', label: '前置重叠层数', description: '每个总结窗口额外携带的前置上下文楼层数。', min: 0, max: 10, step: 1, defaultValue: 2 },
       { kind: 'status', id: 'summaryProgress', label: '当前聊天总结进度', value: '正在同步', tone: 'neutral' },
+    ] },
+    { kind: 'section', id: 'castPlanning', label: '多角色选角', description: '生成前先确定本轮角色范围，再为每个角色独立召回。混合模式只在角色不明确时额外调用一次轻量导演。', children: [
+      { kind: 'select', id: 'castPlanningMode', label: '选角模式', options: [
+        { value: 'fast', label: '快速模式' }, { value: 'hybrid', label: '混合模式（推荐）' }, { value: 'director', label: '强导演模式' },
+      ], defaultValue: 'hybrid', description: '快速模式零额外模型调用；混合模式按需调用；强导演模式每轮最多调用一次。' },
+      { kind: 'range', id: 'focusLookbackFloors', label: '近焦点窗口', description: '用于判断直接追问、上一发言者与当前对话焦点。', min: 1, max: 12, step: 1, defaultValue: 4 },
+      { kind: 'range', id: 'actorScanLookbackFloors', label: '场景线索窗口', description: '只发现新人物、进入离开和地点变化；不会据此让沉默人物自动离场。', min: 4, max: 40, step: 1, defaultValue: 12 },
+      { kind: 'toggle', id: 'persistPresenceUntilTransition', label: '持续保持在场', description: '角色只有明确离场或场景切换时才从当前场景移除。', defaultValue: true },
+      { kind: 'range', id: 'plannerCandidateThreshold', label: '可能参与人数上限', description: '确定参与者之外，最多保留多少名高分可能参与角色。', min: 1, max: 8, step: 1, defaultValue: 2 },
+      { kind: 'range', id: 'plannerConfidenceThreshold', label: '导演触发置信度', description: '混合模式低于该值时才考虑调用轻量导演。', min: 0.5, max: 0.95, step: 0.01, defaultValue: 0.72 },
+      { kind: 'select', id: 'likelyActorRecall', label: '可能出现角色权限', options: [
+        { value: 'public_only', label: '仅公开信息' }, { value: 'identity_only', label: '仅身份信息' }, { value: 'none', label: '不召回' },
+      ], defaultValue: 'public_only' },
+      { kind: 'select', id: 'backgroundActorRecall', label: '背景在场角色权限', options: [
+        { value: 'public_only', label: '仅公开信息' }, { value: 'identity_only', label: '仅身份信息' }, { value: 'none', label: '不召回' },
+      ], defaultValue: 'identity_only' },
+      { kind: 'toggle', id: 'provisionalActorEnabled', label: '允许临时人物', description: '导演只能提议；必须在正式正文实际出现后才创建待确认人物。', defaultValue: true },
+      { kind: 'toggle', id: 'plannerCanProposeActors', label: '导演可提议新人物', description: '不会直接写入正式人物库。', defaultValue: true },
+      { kind: 'select', id: 'unplannedActorPolicy', label: '意外角色策略', options: [
+        { value: 'allow_public_only', label: '允许出现，仅公开信息' }, { value: 'allow_without_private_memory', label: '允许出现，不提供私密记忆' }, { value: 'regenerate_once', label: '严格模式：重生成一次' },
+      ], defaultValue: 'allow_public_only' },
+      { kind: 'select', id: 'maxPlannerCallsPerTurn', label: '每轮导演调用上限', options: [
+        { value: '0', label: '不调用' }, { value: '1', label: '最多一次' },
+      ], defaultValue: '1' },
     ] },
     { kind: 'section', id: 'recall', label: '召回', children: [
       { kind: 'select', id: 'answerMode', label: '回答模式', options: [
@@ -192,6 +217,19 @@ function fromValues(values: SettingsValues, fallback: MemorySettings): MemorySet
     graphMaxEdges: typeof values.graphMaxEdges === 'number'
       ? Math.min(24, Math.max(4, Math.trunc(values.graphMaxEdges)))
       : fallback.graphMaxEdges,
+    castPlanningMode: values.castPlanningMode === 'fast' || values.castPlanningMode === 'director' ? values.castPlanningMode : 'hybrid',
+    focusLookbackFloors: typeof values.focusLookbackFloors === 'number' ? Math.min(12, Math.max(1, Math.trunc(values.focusLookbackFloors))) : fallback.focusLookbackFloors,
+    actorScanLookbackFloors: typeof values.actorScanLookbackFloors === 'number' ? Math.min(40, Math.max(4, Math.trunc(values.actorScanLookbackFloors))) : fallback.actorScanLookbackFloors,
+    persistPresenceUntilTransition: values.persistPresenceUntilTransition === undefined ? fallback.persistPresenceUntilTransition : values.persistPresenceUntilTransition === true,
+    plannerCandidateThreshold: typeof values.plannerCandidateThreshold === 'number' ? Math.min(8, Math.max(1, Math.trunc(values.plannerCandidateThreshold))) : fallback.plannerCandidateThreshold,
+    plannerConfidenceThreshold: typeof values.plannerConfidenceThreshold === 'number' ? Math.min(0.95, Math.max(0.5, values.plannerConfidenceThreshold)) : fallback.plannerConfidenceThreshold,
+    likelyActorRecall: values.likelyActorRecall === 'identity_only' || values.likelyActorRecall === 'none' ? values.likelyActorRecall : 'public_only',
+    backgroundActorRecall: values.backgroundActorRecall === 'public_only' || values.backgroundActorRecall === 'none' ? values.backgroundActorRecall : 'identity_only',
+    mentionedActorRecall: 'none',
+    provisionalActorEnabled: values.provisionalActorEnabled === undefined ? fallback.provisionalActorEnabled : values.provisionalActorEnabled === true,
+    plannerCanProposeActors: values.plannerCanProposeActors === undefined ? fallback.plannerCanProposeActors : values.plannerCanProposeActors === true,
+    unplannedActorPolicy: values.unplannedActorPolicy === 'allow_without_private_memory' || values.unplannedActorPolicy === 'regenerate_once' ? values.unplannedActorPolicy : 'allow_public_only',
+    maxPlannerCallsPerTurn: values.maxPlannerCallsPerTurn === '0' ? 0 : 1,
     chatMode: values.chatMode === 'enabled' || values.chatMode === 'disabled' ? values.chatMode : 'inherit',
   };
 }

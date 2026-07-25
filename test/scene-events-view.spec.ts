@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { MemoryEpisode, MemoryObservation, MemoryOwner, SceneCast } from '../src/domain';
+import type { CastPlanAudit, GenerationCastPlan, MemoryEpisode, MemoryObservation, MemoryOwner, SceneCast, SceneState, SceneTransition } from '../src/domain';
 import {
   getSceneEventsHeader,
   getVisibleSceneEventRecords,
@@ -159,6 +159,42 @@ describe('场景与事件 v4 视图模型', () => {
     expect(markup).not.toContain('PixiJS');
     expect(markup).not.toContain('回答“这一刻谁在说');
     expect(markup).not.toContain('初始化与重新捕获');
+  });
+
+  it('展示持续场景、生成角色计划、实际核对和人工纠正控件', () => {
+    const model = state();
+    model.currentSceneState = {
+      id: 'state:1', workspaceId: 'workspace:test', chatKey: 'chat:a', sceneId: 'scene:live', sceneEpoch: 2,
+      locationKeys: ['北门'], viewpointOwnerId: 'owner:a', presentOwnerIds: ['owner:a', 'owner:b'], nearbyOwnerIds: [],
+      exitedOwnerIds: ['owner:c'], recentSpeakerOwnerIds: ['owner:a'], mentionedOwnerIds: ['owner:c'],
+      startedAtFloor: 10, updatedAtFloor: 12, confidence: 0.94, revision: 3,
+      sourceRefs: ['message:12'], createdAt: 10, updatedAt: 12,
+    } satisfies SceneState;
+    model.sceneTransitions = [{
+      id: 'transition:12', workspaceId: 'workspace:test', chatKey: 'chat:a', sceneId: 'scene:live', floor: 12,
+      enteredOwnerIds: [], exitedOwnerIds: ['owner:c'], previousLocationKeys: ['北门'], currentLocationKeys: ['北门'],
+      reason: 'explicit_exit', confidence: 1, sourceRefs: ['message:12'], createdAt: 12,
+    } satisfies SceneTransition];
+    model.generationCastPlans = [{
+      id: 'plan:12', workspaceId: 'workspace:test', chatKey: 'chat:a', sceneId: 'scene:live', basedOnFloor: 12,
+      mode: 'multi_actor', viewpointOwnerId: 'owner:a', requiredOwnerIds: ['owner:a'], likelyOwnerIds: ['owner:b'],
+      backgroundOwnerIds: [], mentionedOnlyOwnerIds: ['owner:c'], excludedOwnerIds: [],
+      permissionByOwner: { 'owner:a': 'full', 'owner:b': 'public_only', 'owner:c': 'none' },
+      plannerMode: 'llm_assisted', confidence: 0.84, evidence: [], newActorProposals: [], createdAt: 12,
+    } satisfies GenerationCastPlan];
+    model.castPlanAudits = [{
+      id: 'audit:12', workspaceId: 'workspace:test', chatKey: 'chat:a', planId: 'plan:12',
+      plannedOwnerIds: ['owner:a', 'owner:b'], actualOwnerIds: ['owner:a'], unplannedOwnerIds: [], missingOwnerIds: ['owner:b'],
+      result: 'partial', leakageRisk: false, createdAt: 13,
+    } satisfies CastPlanAudit];
+    const markup = renderSceneEventsPage(model);
+    expect(markup).toContain('持续场景');
+    expect(markup).toContain('本轮角色计划');
+    expect(markup).toContain('计划与实际核对');
+    expect(markup).toContain('轻量导演辅助');
+    expect(markup).toContain('data-scene-select="correction-owner"');
+    expect(markup.match(/data-action="scene-correct-state"/g)).toHaveLength(4);
+    expect(markup).toContain('data-placement="viewpoint"');
   });
 
   it('空数据只显示安全空状态，不注入原型假记录', () => {
