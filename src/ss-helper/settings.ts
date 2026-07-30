@@ -1,4 +1,7 @@
-import type {
+import {
+  createSSHelperError,
+  describeSSHelperFailure,
+  type SSHelperFailureContext,
   SettingsAdapter,
   SettingsFieldStateMap,
   SettingsSchema,
@@ -28,6 +31,10 @@ export interface MemorySettings extends MemoryCapabilitySettings, CastPlanningSe
   preExtractReferenceItems: number;
   preExtractReferenceMode: 'auto' | 'lexical' | 'vector' | 'hybrid';
   preExtractReferenceMaxChars: number;
+  structuredRepairEnabled: boolean;
+  structuredRepairBeforeFloors: number;
+  structuredRepairAfterFloors: number;
+  structuredRepairMaxItems: number;
   graphEnabled: boolean;
   graphLlmRelationEnabled: boolean;
   graphMaxHops: 1 | 2;
@@ -42,7 +49,7 @@ export const MEMORY_DEFAULT_SETTINGS: Readonly<MemorySettings> = Object.freeze({
   summaryBatchMode: 'floors',
   summaryBatchFloors: 5,
   summaryBatchChars: 12_000,
-  summaryIntervalFloors: 5,
+  summaryIntervalFloors: 1,
   summaryOverlapFloors: 2,
   maxRecallItems: 12,
   promptMaxChars: 8_000,
@@ -53,6 +60,10 @@ export const MEMORY_DEFAULT_SETTINGS: Readonly<MemorySettings> = Object.freeze({
   preExtractReferenceItems: 8,
   preExtractReferenceMode: 'auto',
   preExtractReferenceMaxChars: 2_400,
+  structuredRepairEnabled: true,
+  structuredRepairBeforeFloors: 2,
+  structuredRepairAfterFloors: 2,
+  structuredRepairMaxItems: 4,
   graphEnabled: true,
   graphLlmRelationEnabled: true,
   graphMaxHops: 1,
@@ -82,7 +93,7 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
       ], defaultValue: 'floors' },
       { kind: 'range', id: 'summaryBatchFloors', label: '每批楼层数', description: '按楼层时，每次总结最多处理的可见用户和助手消息数。', min: 1, max: 20, step: 1, defaultValue: 5 },
       { kind: 'range', id: 'summaryBatchChars', label: '每批字符数', description: '按字数时，单次总结窗口的最大正文字符数。', min: 2_000, max: 16_000, step: 500, defaultValue: 12_000 },
-      { kind: 'range', id: 'summaryIntervalFloors', label: '自动触发间隔', description: '已总结边界后每积累多少楼层形成一个窗口；会保留下一层等待后续窗口。', min: 1, max: 50, step: 1, defaultValue: 5 },
+      { kind: 'range', id: 'summaryIntervalFloors', label: '自动触发间隔', description: '已总结边界后每积累多少楼层形成一个窗口；默认每轮生成后捕获一次。', min: 1, max: 50, step: 1, defaultValue: 1 },
       { kind: 'range', id: 'summaryOverlapFloors', label: '前置重叠层数', description: '每个总结窗口额外携带的前置上下文楼层数。', min: 0, max: 10, step: 1, defaultValue: 2 },
       { kind: 'status', id: 'summaryProgress', label: '当前聊天总结进度', value: '正在同步', tone: 'neutral' },
     ] },
@@ -134,6 +145,12 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
         ], defaultValue: 'auto' },
         { kind: 'range', id: 'preExtractReferenceMaxChars', label: '上下文字符上限', description: '发送给提取器的旧记忆正文总字符数上限；不会截断单条事实。', min: 500, max: 4_000, step: 100, defaultValue: 2_400 },
       ] },
+      { kind: 'section', id: 'structuredRepair', label: '结构化修复', description: '集中处理格式失败项；只发送安全校验位置和相关楼层，不重发整个失败 JSON。', children: [
+        { kind: 'toggle', id: 'structuredRepairEnabled', label: '自动处理格式失败', description: '普通批次全部扫描后，自动对可定位的失败项进行一次定向修复。', defaultValue: true },
+        { kind: 'range', id: 'structuredRepairBeforeFloors', label: '向前补充楼层', description: '定向修复时在来源楼层前附带的上下文层数。', min: 0, max: 10, step: 1, defaultValue: 2 },
+        { kind: 'range', id: 'structuredRepairAfterFloors', label: '向后补充楼层', description: '定向修复时在来源楼层后附带的上下文层数。', min: 0, max: 10, step: 1, defaultValue: 2 },
+        { kind: 'range', id: 'structuredRepairMaxItems', label: '单次修复项目数', description: '同类型且来源窗口重叠时，每次最多合并的失败项目数。', min: 1, max: 10, step: 1, defaultValue: 4 },
+      ] },
       { kind: 'section', id: 'relationshipGraph', label: '关系图谱', description: '仅从当前聊天中已验证、带证据的事实派生关系；不会把语义相似度当作实体关系。', children: [
         { kind: 'toggle', id: 'graphEnabled', label: '启用关系图谱', description: '在后台回填当前聊天的事实关系图；图谱不可用时，整理和普通召回仍会继续。', defaultValue: true },
         { kind: 'toggle', id: 'graphLlmRelationEnabled', label: '提炼明确关系', description: '仅提示同一次事实提取识别来源中明确说出的关系，仍须通过来源证据与归并校验。', defaultValue: true },
@@ -176,8 +193,7 @@ export interface MemorySettingsController {
   resetSettings(): Promise<void>;
   getCurrentChatInfo(): MemoryCurrentChatInfo;
   getSummaryProgressInfo(): MemorySummaryProgressInfo;
-  /** Optional so older controller adapters remain source-compatible. */
-  getGraphStatus?(): MemoryGraphStatus;
+  getGraphStatus(): MemoryGraphStatus;
   onSettingsChanged(listener: (settings: MemorySettings) => void): () => void;
 }
 
@@ -211,6 +227,16 @@ function fromValues(values: SettingsValues, fallback: MemorySettings): MemorySet
     preExtractReferenceMaxChars: typeof values.preExtractReferenceMaxChars === 'number'
       ? Math.min(4_000, Math.max(500, Math.round(values.preExtractReferenceMaxChars / 100) * 100))
       : fallback.preExtractReferenceMaxChars,
+    structuredRepairEnabled: values.structuredRepairEnabled === undefined ? fallback.structuredRepairEnabled : values.structuredRepairEnabled === true,
+    structuredRepairBeforeFloors: typeof values.structuredRepairBeforeFloors === 'number'
+      ? Math.min(10, Math.max(0, Math.trunc(values.structuredRepairBeforeFloors)))
+      : fallback.structuredRepairBeforeFloors,
+    structuredRepairAfterFloors: typeof values.structuredRepairAfterFloors === 'number'
+      ? Math.min(10, Math.max(0, Math.trunc(values.structuredRepairAfterFloors)))
+      : fallback.structuredRepairAfterFloors,
+    structuredRepairMaxItems: typeof values.structuredRepairMaxItems === 'number'
+      ? Math.min(10, Math.max(1, Math.trunc(values.structuredRepairMaxItems)))
+      : fallback.structuredRepairMaxItems,
     graphEnabled: values.graphEnabled === undefined ? fallback.graphEnabled : values.graphEnabled === true,
     graphLlmRelationEnabled: values.graphLlmRelationEnabled === undefined ? fallback.graphLlmRelationEnabled : values.graphLlmRelationEnabled === true,
     graphMaxHops: values.graphMaxHops === 2 ? 2 : 1,
@@ -234,12 +260,57 @@ function fromValues(values: SettingsValues, fallback: MemorySettings): MemorySet
   };
 }
 
-function toValues(settings: MemorySettings): SettingsValues { return { ...settings }; }
+/**
+ * SettingsHost validates this DTO against MEMORY_SETTINGS_SCHEMA. Do not
+ * spread the domain object: some runtime fields intentionally use different UI
+ * representations, and internal-only fields must not leak into settings.
+ */
+function toValues(settings: MemorySettings): SettingsValues {
+  return {
+    enabled: settings.enabled,
+    autoOrganize: settings.autoOrganize,
+    summaryBatchMode: settings.summaryBatchMode,
+    summaryBatchFloors: settings.summaryBatchFloors,
+    summaryBatchChars: settings.summaryBatchChars,
+    summaryIntervalFloors: settings.summaryIntervalFloors,
+    summaryOverlapFloors: settings.summaryOverlapFloors,
+    castPlanningMode: settings.castPlanningMode,
+    focusLookbackFloors: settings.focusLookbackFloors,
+    actorScanLookbackFloors: settings.actorScanLookbackFloors,
+    persistPresenceUntilTransition: settings.persistPresenceUntilTransition,
+    plannerCandidateThreshold: settings.plannerCandidateThreshold,
+    plannerConfidenceThreshold: settings.plannerConfidenceThreshold,
+    likelyActorRecall: settings.likelyActorRecall,
+    backgroundActorRecall: settings.backgroundActorRecall,
+    provisionalActorEnabled: settings.provisionalActorEnabled,
+    plannerCanProposeActors: settings.plannerCanProposeActors,
+    unplannedActorPolicy: settings.unplannedActorPolicy,
+    maxPlannerCallsPerTurn: String(settings.maxPlannerCallsPerTurn),
+    answerMode: settings.answerMode,
+    maxRecallItems: settings.maxRecallItems,
+    promptMaxChars: settings.promptMaxChars,
+    recallMode: settings.recallMode,
+    rerankMode: settings.rerankMode,
+    preExtractReferenceEnabled: settings.preExtractReferenceEnabled,
+    preExtractReferenceItems: settings.preExtractReferenceItems,
+    preExtractReferenceMode: settings.preExtractReferenceMode,
+    preExtractReferenceMaxChars: settings.preExtractReferenceMaxChars,
+    structuredRepairEnabled: settings.structuredRepairEnabled,
+    structuredRepairBeforeFloors: settings.structuredRepairBeforeFloors,
+    structuredRepairAfterFloors: settings.structuredRepairAfterFloors,
+    structuredRepairMaxItems: settings.structuredRepairMaxItems,
+    graphEnabled: settings.graphEnabled,
+    graphLlmRelationEnabled: settings.graphLlmRelationEnabled,
+    graphMaxHops: settings.graphMaxHops,
+    graphMaxEdges: settings.graphMaxEdges,
+    chatMode: settings.chatMode,
+  };
+}
 
 function chatStatuses(controller: MemorySettingsController): Readonly<Record<string, SettingsStatusSnapshot>> {
   const chat = controller.getCurrentChatInfo();
   const summary = controller.getSummaryProgressInfo();
-  const graph = controller.getGraphStatus?.();
+  const graph = controller.getGraphStatus();
   if (!chat.available) return Object.freeze({
     currentChatIdentity: { value: '不可用', tone: 'warning', description: '请先进入角色或群组聊天。' },
     currentChatEffective: { value: '未生效', tone: 'warning', description: '当前没有可应用聊天级设置的聊天。' },
@@ -320,8 +391,23 @@ export function createMemorySettingsAdapter(
       }
       try { await controller.saveSettings(next); }
       catch (error) {
-        notify(toast, { level: 'error', title: 'Memory 设置保存失败', message: error instanceof Error ? error.message : '设置未能保存，请稍后重试。', code: 'MEMORY_SETTINGS_SAVE_FAILED', durationMs: 0 });
-        throw error;
+        const diagnostic = describeSSHelperFailure(error, {
+          reasonCode: 'INTERNAL_ERROR',
+          stage: 'memory.settings.save',
+        });
+        notify(toast, {
+          level: 'error',
+          title: diagnostic.title,
+          message: `${diagnostic.reason} ${diagnostic.action}`,
+          code: diagnostic.reasonCode,
+          durationMs: 0,
+        });
+        const context: SSHelperFailureContext = {
+          reasonCode: diagnostic.reasonCode,
+          stage: diagnostic.stage,
+          ...(diagnostic.requestId ? { requestId: diagnostic.requestId } : {}),
+        };
+        throw createSSHelperError(context.reasonCode, context);
       }
       for (const warning of assessment.warnings) notify(toast, { level: 'warning', ...warning });
       if (!controller.getCurrentChatInfo().available && !previous.enabled && next.enabled) {

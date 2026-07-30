@@ -105,7 +105,9 @@ describe('记忆块 V3 视图', () => {
     expect(markup).toContain('当前版本');
     expect(markup).toContain('来源与证据');
     expect(markup).toContain('捕获记录');
-    expect(markup).toContain('data-action="refresh-library"');
+    expect(markup).not.toContain('data-action="refresh-library"');
+    expect(markup).toContain('stx-memory-library-scope-scroll');
+    expect(markup).toContain('含可追溯来源的记忆占比。');
     expect(markup).toContain('data-ss-helper-control="select"');
     expect(markup).toContain('data-ss-helper-control="progress"');
     expect(markup).toContain('data-source="message:18"');

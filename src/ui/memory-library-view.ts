@@ -37,6 +37,12 @@ export interface MemoryLibraryViewState {
   confirmFactId: string;
   busyAction: string;
   chatLabel: string;
+  readonly virtualized?: boolean;
+  readonly totalCount?: number;
+  readonly statistics?: MemoryLibrarySelection['metrics'] & {
+    readonly kindCounts: Readonly<Record<string, number>>;
+    readonly statusCounts: Readonly<Record<string, number>>;
+  };
 }
 
 export interface MemoryLibraryViewOptions {
@@ -111,7 +117,7 @@ export function selectMemoryLibraryView(state: MemoryLibraryViewState): MemoryLi
   )), state.sort);
   const selected = visibleFacts.find(fact => fact.id === state.selectedFactId) ?? visibleFacts[0];
   const selectedIndex = selected ? visibleFacts.findIndex(fact => fact.id === selected.id) : -1;
-  const total = state.allFacts.length;
+  const total = state.statistics?.total ?? state.totalCount ?? state.allFacts.length;
   const kindCounts: Record<string, number> = {};
   const statusCounts: Record<string, number> = {};
   for (const fact of state.allFacts) {
@@ -125,14 +131,14 @@ export function selectMemoryLibraryView(state: MemoryLibraryViewState): MemoryLi
     next: selectedIndex >= 0 && selectedIndex < visibleFacts.length - 1 ? visibleFacts[selectedIndex + 1] : undefined,
     metrics: {
       total,
-      active: statusCounts.active ?? 0,
-      pending: statusCounts.pending ?? 0,
-      evidenceCoverage: total === 0
+      active: state.statistics?.active ?? statusCounts.active ?? 0,
+      pending: state.statistics?.pending ?? statusCounts.pending ?? 0,
+      evidenceCoverage: state.statistics?.evidenceCoverage ?? (total === 0
         ? 0
-        : Math.round((state.allFacts.filter(fact => fact.evidence.length > 0).length / total) * 100),
+        : Math.round((state.allFacts.filter(fact => fact.evidence.length > 0).length / Math.max(1, state.allFacts.length)) * 100)),
     },
-    kindCounts,
-    statusCounts,
+    kindCounts: state.statistics?.kindCounts ?? kindCounts,
+    statusCounts: state.statistics?.statusCounts ?? statusCounts,
   };
 }
 
@@ -222,9 +228,9 @@ function renderInspector(
         ? `<textarea id="stx-memory-edit-content" class="stx-memory-library-editor" ${control('textarea')} data-edit-content>${escapeHtml(selected.content)}</textarea><div class="stx-memory-library-actions"><button ${control('button', 'primary')} type="button" data-action="save-fact" data-fact-id="${escapeHtml(selected.id)}" ${state.busyAction === 'save-fact' ? 'disabled' : ''}><ss-helper-icon name="floppy-disk" decorative></ss-helper-icon>保存修改</button><button ${control('button', 'neutral')} type="button" data-action="cancel-edit">取消</button></div>`
         : `<div class="stx-memory-library-content-card"><p>${escapeHtml(selected.content)}</p></div><div class="stx-memory-library-actions"><button ${control('button', 'primary')} type="button" data-action="edit-fact" data-fact-id="${escapeHtml(selected.id)}"><ss-helper-icon name="pen" decorative></ss-helper-icon>编辑内容</button>${confirming ? `<span class="stx-memory-library-delete-confirm"><span>确认删除这条记忆？</span><button ${control('button', 'danger')} type="button" data-action="confirm-delete" data-fact-id="${escapeHtml(selected.id)}">确认</button><button ${control('button', 'neutral')} type="button" data-action="cancel-delete">取消</button></span>` : `<button ${control('button', 'danger')} type="button" data-action="delete-fact" data-fact-id="${escapeHtml(selected.id)}"><ss-helper-icon name="trash" decorative></ss-helper-icon>删除</button>`}</div>`}
     </section>
-    <section class="stx-memory-library-detail-section"><div class="stx-memory-library-section-title"><div><h4>来源与证据</h4><p>核对记忆是否忠于聊天原文</p></div><span>${selected.evidence.length} 条</span></div><div class="stx-memory-library-evidence-list">${selected.evidence.length ? selected.evidence.map(item => `<blockquote class="stx-memory-library-evidence"><p>${escapeHtml(item.excerpt)}</p><footer>${options.formatSource(item.sourceRef, 'evidence')}</footer></blockquote>`).join('') : '<p class="stx-memory-muted">没有可展示的来源证据。</p>'}</div></section>
+    <section class="stx-memory-library-detail-section"><div class="stx-memory-library-section-title"><div><h4>来源与证据</h4><p>核对记忆是否忠于聊天原文</p></div><span>${selected.evidence.length} 条</span></div><div class="stx-memory-library-evidence-list" ${state.virtualized ? 'data-memory-detail-list="fact-evidence"' : ''}>${state.virtualized ? '' : selected.evidence.length ? selected.evidence.map(item => `<blockquote class="stx-memory-library-evidence"><p>${escapeHtml(item.excerpt)}</p><footer>${options.formatSource(item.sourceRef, 'evidence')}</footer></blockquote>`).join('') : '<p class="stx-memory-muted">没有可展示的来源证据。</p>'}</div></section>
     <section class="stx-memory-library-detail-section"><div class="stx-memory-library-section-title"><div><h4>版本关系</h4><p>替代关系来自事实修订链</p></div></div><div class="stx-memory-library-version-flow">${renderVersionNode(prior, '上一版本', options)}<ss-helper-icon name="chevron-right" decorative></ss-helper-icon>${renderVersionNode(selected, '当前版本', options, true)}<ss-helper-icon name="chevron-right" decorative></ss-helper-icon>${renderVersionNode(after, '下一版本', options)}</div></section>
-    <section class="stx-memory-library-detail-section stx-memory-library-reference-grid"><div><h4>来源引用</h4><div class="stx-memory-library-reference-list">${selected.sourceRefs.length ? selected.sourceRefs.map(source => options.formatSource(source)).join('') : '<span>无</span>'}</div></div><div><h4>捕获记录</h4><div class="stx-memory-library-reference-list">${selected.auditBatches?.length ? selected.auditBatches.map(item => `<button ${control('button', 'neutral', 'xs')} type="button" data-action="navigate" data-page="audit"><span>第 ${Math.max(1, Number(item.batchIndex) || 1)} 批 · ${escapeHtml(options.translateRecordStatus(item.status))}</span><small>${escapeHtml(item.jobId)}</small></button>`).join('') : '<span>暂无匹配批次</span>'}</div></div></section>`;
+    <section class="stx-memory-library-detail-section stx-memory-library-reference-grid"><div><h4>来源引用</h4><div class="stx-memory-library-reference-list" ${state.virtualized ? 'data-memory-detail-list="fact-sources"' : ''}>${state.virtualized ? '' : selected.sourceRefs.length ? selected.sourceRefs.map(source => options.formatSource(source)).join('') : '<span>无</span>'}</div></div><div><h4>捕获记录</h4><div class="stx-memory-library-reference-list" ${state.virtualized ? 'data-memory-detail-list="fact-batches"' : ''}>${state.virtualized ? '' : selected.auditBatches?.length ? selected.auditBatches.map(item => `<button ${control('button', 'neutral', 'xs')} type="button" data-action="navigate" data-page="audit"><span>第 ${Math.max(1, Number(item.batchIndex) || 1)} 批 · ${escapeHtml(options.translateRecordStatus(item.status))}</span><small>${escapeHtml(item.jobId)}</small></button>`).join('') : '<span>暂无匹配批次</span>'}</div></div></section>`;
 }
 
 export function renderMemoryLibraryView(
@@ -238,20 +244,28 @@ export function renderMemoryLibraryView(
     confidence_desc: '置信度',
     kind_asc: '类型',
   };
-  const list = selection.visibleFacts.length
-    ? selection.visibleFacts.map(fact => {
-      const confidence = Math.round(fact.confidence * 100);
-      const hasVersion = Boolean(fact.supersedesId || fact.supersededById);
-      return `<button class="stx-memory-library-fact-row" ${control('button', 'neutral')} type="button" data-action="select-fact" data-fact-id="${escapeHtml(fact.id)}" aria-selected="${fact.id === selection.selected?.id}"><span class="stx-memory-library-fact-top"><span class="stx-memory-library-kind">${escapeHtml(options.kindLabels[fact.kind] ?? fact.kind)}</span><time datetime="${new Date(fact.updatedAt).toISOString()}">${escapeHtml(options.formatTime(fact.updatedAt))}</time></span><span class="stx-memory-library-fact-content">${escapeHtml(fact.content)}</span><span class="stx-memory-library-fact-bottom"><span class="stx-memory-library-fact-marks">${statusChip(options.statusLabels[fact.status] ?? fact.status, fact.status)}<span class="stx-memory-library-mini-badge">${fact.evidence.length} 条证据</span>${hasVersion ? '<span class="stx-memory-library-mini-badge">版本链</span>' : ''}</span><span class="stx-memory-library-confidence"><span>置信度</span><progress ${control('progress')} max="100" value="${confidence}">${confidence}%</progress><strong>${confidence}%</strong></span></span></button>`;
-    }).join('')
+  const list = state.virtualized
+    ? ''
+    : selection.visibleFacts.length
+      ? selection.visibleFacts.map(fact => renderMemoryLibraryFactRow(fact, fact.id === selection.selected?.id, options)).join('')
     : `<div class="stx-memory-library-empty"><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><strong>${state.query ? '没有匹配的记忆' : '当前聊天还没有记忆块'}</strong><p>${state.query ? '尝试缩短关键词，或恢复类型和状态筛选。' : '完成初始化或捕获后，可在这里审阅真实事实。'}</p></div>`;
   return `<div class="stx-memory-library-shell">
     <section class="stx-memory-library-metrics" aria-label="记忆统计">${renderMetric('book-open', '全部记忆', metrics.total, '当前聊天')}${renderMetric('circle-check', '有效记忆', metrics.active, '可参与召回')}${renderMetric('list-check', '待审阅', metrics.pending, '待确认状态')}${renderMetric('link', '证据覆盖', `${metrics.evidenceCoverage}%`, '含来源证据')}</section>
-    <div class="stx-memory-library-toolbar"><label class="stx-memory-library-search"><span class="stx-memory-sr-only">搜索记忆</span><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><input ${control('input')} data-filter="query" value="${escapeHtml(state.query)}" placeholder="搜索记忆内容、人物或地点"></label>${renderMultiFilter('kind', '全部类型', state.selectedKinds, options.kindLabels, selection.kindCounts, state.openFilter === 'kind')}${renderMultiFilter('status', '全部状态', state.selectedStatuses, options.statusLabels, selection.statusCounts, state.openFilter === 'status')}<label class="stx-memory-library-sort"><span class="stx-memory-sr-only">记忆排序</span><select ${control('select')} aria-label="记忆排序" data-filter="sort"><option value="updated_desc" ${state.sort === 'updated_desc' ? 'selected' : ''}>最近更新</option><option value="confidence_desc" ${state.sort === 'confidence_desc' ? 'selected' : ''}>置信度</option><option value="kind_asc" ${state.sort === 'kind_asc' ? 'selected' : ''}>类型</option></select></label><button ${control('button', 'neutral')} type="button" data-action="refresh-library" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新</button></div>
+    <div class="stx-memory-library-toolbar"><label class="stx-memory-library-search"><span class="stx-memory-sr-only">搜索记忆</span><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><input ${control('input')} data-filter="query" value="${escapeHtml(state.query)}" placeholder="搜索记忆内容、人物或地点"></label>${renderMultiFilter('kind', '全部类型', state.selectedKinds, options.kindLabels, selection.kindCounts, state.openFilter === 'kind')}${renderMultiFilter('status', '全部状态', state.selectedStatuses, options.statusLabels, selection.statusCounts, state.openFilter === 'status')}<label class="stx-memory-library-sort"><span class="stx-memory-sr-only">记忆排序</span><select ${control('select')} aria-label="记忆排序" data-filter="sort"><option value="updated_desc" ${state.sort === 'updated_desc' ? 'selected' : ''}>最近更新</option><option value="confidence_desc" ${state.sort === 'confidence_desc' ? 'selected' : ''}>置信度</option><option value="kind_asc" ${state.sort === 'kind_asc' ? 'selected' : ''}>类型</option></select></label></div>
     <div class="stx-memory-library-grid">
-      <aside class="stx-memory-library-panel stx-memory-library-scope-panel" aria-label="快速筛选"><div class="stx-memory-library-panel-head"><div><h3>快速范围</h3><p>点击后立即更新记忆列表</p></div><span>${selection.visibleFacts.length} 条</span></div><div class="stx-memory-library-scope-body"><section><div class="stx-memory-library-scope-title"><span>状态</span><span>STATUS</span></div>${renderScopeButtons('status', options.statusLabels, selection.statusCounts, state.selectedStatuses, metrics.total)}</section><section><div class="stx-memory-library-scope-title"><span>事实类型</span><span>KIND</span></div>${renderScopeButtons('kind', options.kindLabels, selection.kindCounts, state.selectedKinds, metrics.total)}</section><section class="stx-memory-library-coverage"><strong>证据覆盖率</strong><p>当前聊天中具有至少一条可追溯证据的记忆比例。</p><progress ${control('progress')} max="100" value="${metrics.evidenceCoverage}">${metrics.evidenceCoverage}%</progress></section></div></aside>
+      <aside class="stx-memory-library-panel stx-memory-library-scope-panel" aria-label="快速筛选"><div class="stx-memory-library-panel-head"><div><h3>快速范围</h3><p>点击后立即更新记忆列表</p></div><span>${selection.visibleFacts.length} 条</span></div><div class="stx-memory-library-scope-body"><div class='stx-memory-library-scope-scroll'><section><div class="stx-memory-library-scope-title"><span>状态</span><span>STATUS</span></div>${renderScopeButtons('status', options.statusLabels, selection.statusCounts, state.selectedStatuses, metrics.total)}</section><section><div class="stx-memory-library-scope-title"><span>事实类型</span><span>KIND</span></div>${renderScopeButtons('kind', options.kindLabels, selection.kindCounts, state.selectedKinds, metrics.total)}</section></div><section class="stx-memory-library-coverage"><strong>证据覆盖率</strong><p>含可追溯来源的记忆占比。</p><progress ${control('progress')} max="100" value="${metrics.evidenceCoverage}">${metrics.evidenceCoverage}%</progress></section></div></aside>
       <section class="stx-memory-library-panel stx-memory-library-list-panel" aria-label="记忆块列表"><div class="stx-memory-library-panel-head"><div><h3>记忆块列表</h3><p>每个块对应一条可追溯事实</p></div><span>${selection.visibleFacts.length} 条</span></div><div class="stx-memory-library-result-line"><span aria-live="polite">共 ${selection.visibleFacts.length} 条记忆</span><span>${sortLabels[state.sort]}</span></div><div class="stx-memory-fact-list stx-memory-library-fact-list">${list}</div></section>
       <section class="stx-memory-library-panel stx-memory-library-inspector-panel" aria-label="记忆块详情"><div class="stx-memory-library-panel-head"><div><h3>记忆审阅</h3><p>内容、证据、版本链和捕获记录</p></div><span>${selection.selected ? escapeHtml(options.statusLabels[selection.selected.status] ?? selection.selected.status) : '未选择'}</span></div><div class="stx-memory-library-inspector">${renderInspector(state, selection, options)}</div></section>
     </div>
   </div>`;
+}
+
+export function renderMemoryLibraryFactRow(
+  fact: MemoryLibraryFact,
+  selected: boolean,
+  options: MemoryLibraryViewOptions,
+): string {
+  const confidence = Math.round(fact.confidence * 100);
+  const hasVersion = Boolean(fact.supersedesId || fact.supersededById);
+  return `<button class="stx-memory-library-fact-row" ${control('button', 'neutral')} type="button" data-action="select-fact" data-fact-id="${escapeHtml(fact.id)}" aria-selected="${selected}"><span class="stx-memory-library-fact-top"><span class="stx-memory-library-kind">${escapeHtml(options.kindLabels[fact.kind] ?? fact.kind)}</span><time datetime="${new Date(fact.updatedAt).toISOString()}">${escapeHtml(options.formatTime(fact.updatedAt))}</time></span><span class="stx-memory-library-fact-content">${escapeHtml(fact.content)}</span><span class="stx-memory-library-fact-bottom"><span class="stx-memory-library-fact-marks">${statusChip(options.statusLabels[fact.status] ?? fact.status, fact.status)}<span class="stx-memory-library-mini-badge">${fact.evidence.length} 条证据</span>${hasVersion ? '<span class="stx-memory-library-mini-badge">版本链</span>' : ''}</span><span class="stx-memory-library-confidence"><span>置信度</span><progress ${control('progress')} max="100" value="${confidence}">${confidence}%</progress><strong>${confidence}%</strong></span></span></button>`;
 }

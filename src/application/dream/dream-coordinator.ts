@@ -1,4 +1,5 @@
 import type { ActorMemoryTrace, DreamJob, DreamNarrative, ProfileClaim } from '../../domain';
+import { createSSHelperError, readSSHelperFailure } from '@ss-helper/sdk';
 
 export interface DreamApplyResult {
   readonly ownerId: string;
@@ -129,9 +130,13 @@ export class DreamCoordinator {
       const narrative = options.narrative ? { id: createId('dream-narrative'), workspaceId: job.workspaceId, dreamJobId: job.id, ownerId: job.ownerId, fictional: true as const, content: `（文学梦境，仅供叙事，不属于事实证据）\n梦境阶段：${phases.join(' → ')}；涉及 ${result.traceIds.length} 条证据。`, createdAt: Date.now() } : undefined;
       return { job: structuredClone(job), audit: structuredClone(audit), ...(narrative ? { narrative } : {}) };
     } catch (error) {
-      job = { ...job, status: 'failed', updatedAt: Date.now(), error: error instanceof Error ? error.message : String(error) };
+      const failure = readSSHelperFailure(error, {
+        reasonCode: 'INTERNAL_ERROR',
+        stage: 'memory.dream.run',
+      })!;
+      job = { ...job, status: 'failed', updatedAt: Date.now(), failure };
       this.jobs.set(job.id, job);
-      throw error;
+      throw createSSHelperError(failure.reasonCode, failure);
     } finally {
       if (!options.dryRun) {
         this.applyLock = false;
@@ -142,7 +147,10 @@ export class DreamCoordinator {
 
   async rollback(auditId: string, rollback: (audit: DreamAudit) => Promise<void> | void): Promise<void> {
     const audit = this.audits.get(auditId);
-    if (!audit) throw new Error('Dream audit 不存在。');
+    if (!audit) throw createSSHelperError('WORKSPACE_NOT_FOUND', {
+      stage: 'memory.dream.rollback',
+      collection: 'dream-audits',
+    });
     await rollback(audit);
     this.audits.set(auditId, { ...audit, rolledBackAt: Date.now() });
     const job = this.jobs.get(audit.jobId);

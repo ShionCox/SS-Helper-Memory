@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRecallIndex, type RecallFact } from '../src/application/recall/memory-recall-index';
 import { SemanticRecallService, semanticRecallLimits } from '../src/application/recall/semantic-recall-service';
-import type { MemoryLlmApi } from '../src/application/ingest/llm-extractor';
+import type { MemoryLlmClient } from '../src/application/ingest/llm-extractor';
 import type { VectorSearchResult } from '../src/application/recall/vector-index-service';
 
 const NOW = Date.parse('2026-07-13T12:00:00+08:00');
@@ -39,10 +39,10 @@ function vectorResult(scores: Array<[string, number]>, extra: Partial<VectorSear
 function service(
   facts: RecallFact[],
   scores: Array<[string, number]>,
-  rerank?: MemoryLlmApi['rerank'],
+  rerank?: MemoryLlmClient['rerank'],
 ): SemanticRecallService {
   const vectors = { search: vi.fn(async () => vectorResult(scores)) };
-  const llm = rerank ? ({ rerank } as MemoryLlmApi) : null;
+  const llm = rerank ? ({ rerank } as MemoryLlmClient) : null;
   return new SemanticRecallService(new MemoryRecallIndex(facts), vectors as never, () => llm);
 }
 
@@ -364,7 +364,7 @@ describe('语义、混合召回与 LLM rerank', () => {
       ok: true as const,
       results: [{ index: 1, score: 0.99 }],
     }));
-    const llm: MemoryLlmApi = {
+    const llm: MemoryLlmClient = {
       rerank,
       inspect: {
         previewRoute: vi.fn(async () => ({
@@ -373,7 +373,7 @@ describe('语义、混合召回与 LLM rerank', () => {
           blockedReason: '资源 gitee_Rerank 未配置 API Key',
         })),
       },
-    } as unknown as MemoryLlmApi;
+    } as unknown as MemoryLlmClient;
     const vectors = { search: vi.fn(async () => vectorResult([['first', 0.9], ['second', 0.8]])) };
     const result = await new SemanticRecallService(
       new MemoryRecallIndex([fact('first', '泳池战斗记录。'), fact('second', '危险核心记录。')]),
@@ -401,7 +401,7 @@ describe('语义、混合召回与 LLM rerank', () => {
     const previewRoute = vi.fn(() => new Promise<{ resourceId: string; model: string }>((resolve) => {
       setTimeout(() => resolve({ resourceId: 'Rerank', model: 'budget-model' }), 29_000);
     }));
-    const llm = { rerank, inspect: { previewRoute } } as unknown as MemoryLlmApi;
+    const llm = { rerank, inspect: { previewRoute } } as unknown as MemoryLlmClient;
     const vectors = { search: vi.fn(async () => vectorResult([['first', 0.9], ['second', 0.8]])) };
     const pending = new SemanticRecallService(
       new MemoryRecallIndex([fact('first', '泳池战斗记录。'), fact('second', '危险核心记录。')]),
@@ -424,6 +424,6 @@ describe('语义、混合召回与 LLM rerank', () => {
       .recall({ chatKey: 'chat-a', query: '紫电枪剩余几次？', now: NOW }, 'auto', 'adaptive');
 
     expect(result.items[0]?.fact.id).toBe('lexical');
-    expect(result.diagnostics).toMatchObject({ resolvedMode: 'lexical', degradedReason: 'embedding route failed' });
+    expect(result.diagnostics).toMatchObject({ resolvedMode: 'lexical', degradedReason: 'INTERNAL_ERROR · 程序内部错误' });
   });
 });

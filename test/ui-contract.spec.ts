@@ -42,8 +42,11 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(styles).toMatch(/\.stx-memory-page-heading\s*>\s*div\s*\{[^}]*display:\s*grid/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-page-heading\s+h2,[^}]*\.stx-memory-page-heading\s+p\s*\{[^}]*margin:\s*0/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-detail-head\s*>\s*div\s*\{[^}]*display:\s*flex[^}]*align-items:\s*center/u);
-    expect(styles).toMatch(/\.stx-memory-page-counter\s*\{[^}]*border-radius:\s*999px/u);
-    expect(styles).toMatch(/\.stx-memory-error-guidance\s*\{[^}]*display:\s*flex/u);
+    expect(source).toContain("class='stx-memory-page-refresh'");
+    expect(source).toContain("data-action='refresh'");
+    expect(source).toContain('memoryPluginConfig.manifest.version');
+    expect(styles).toMatch(/\.stx-memory-error-guidance\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto/u);
+    expect(styles).toMatch(/\.stx-memory-error-request\s*\{[^}]*justify-self:\s*end[^}]*font-size:\s*\.52rem/u);
     expect(styles).toMatch(/\.stx-memory-page-content:has\(> section\.stx-memory-panel\)[^}]*grid-template-columns/u);
     expect(styles).toMatch(/\.stx-memory-audit-list\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit/u);
     expect(styles).toMatch(/\.stx-memory-page-content:has\(> \.stx-memory-card-grid\)[^}]*grid-template-rows/u);
@@ -64,6 +67,11 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-fact-row\[data-ss-helper-control="button"\]\s*\{[^}]*min-height:\s*116px[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)[^}]*align-items:\s*stretch[^}]*border-color:\s*transparent/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-library-fact-list\s*\{[^}]*grid-auto-rows:\s*max-content/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-library-fact-row\[data-ss-helper-control="button"\]\s*\{[^}]*min-height:\s*116px/u);
+    expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-scenes-shell\s*\{[^}]*height:\s*100%[^}]*grid-template-rows:\s*auto\s+minmax\(0,\s*1fr\)[^}]*overflow:\s*hidden/u);
+    expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-scene-record-grid\s*\{[^}]*height:\s*100%[^}]*overflow:\s*hidden/u);
+    expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-scene-record-list\s*\{[^}]*grid-auto-rows:\s*116px[^}]*overflow:\s*auto/u);
+    expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-scene-record-row\s*\{[^}]*height:\s*116px[^}]*overflow:\s*hidden/u);
+    expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-scene-aside\s*\{[^}]*padding:\s*0[^}]*border:\s*0[^}]*background:\s*transparent[^}]*box-shadow:\s*none/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-fact-row\[data-ss-helper-control="button"\]\[aria-selected="true"\]\s*\{[^}]*border-color:\s*color-mix/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-graph-edge-top\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto[^}]*overflow:\s*visible/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-graph-edge-row\[data-ss-helper-control="button"\]\s*\{[^}]*min-height:\s*54px[^}]*overflow:\s*visible/u);

@@ -30,7 +30,6 @@ export function registerMemoryChatIndicator(
   session: Pick<PluginSession, 'workspace' | 'registerChatIndicator'>,
   controller: MemoryChatIndicatorController,
 ): () => void {
-  if (session.registerChatIndicator === undefined) return () => undefined;
   return session.registerChatIndicator({
     label: '记忆',
     icon: 'brain',
@@ -38,12 +37,12 @@ export function registerMemoryChatIndicator(
     order: 10,
     resolve: (targets: readonly ChatIndicatorTarget[]) => mapConcurrent(targets, QUERY_CONCURRENCY, async (target): Promise<ChatIndicatorResolution> => {
       try {
-        const page = await session.workspace.query({
-          workspaceId: target.workspaceId,
-          collection: 'facts',
-          filter: { chatKey: target.chatKey },
-          limit: 1,
+        const workspace = await session.workspace.open({
+          id: target.workspaceId,
+          schema: { collections: [{ name: 'facts', indexes: ['chatKey'] }] },
+          metadata: { kind: 'memory-chat-indicator' },
         });
+        const page = await workspace.query('facts', { filter: { chatKey: target.chatKey }, limit: 1 });
         if (page.records.length === 0) return { targetKey: target.key, state: 'hidden' };
         if (!controller.isChatEnabled(target.workspaceId, target.chatKey)) return { targetKey: target.key, state: 'retained' };
         return { targetKey: target.key, state: 'enabled', activeDependencies: [LLM_PLUGIN_ID] };

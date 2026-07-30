@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeStructuredCapture } from '../src/application/ingest/llm-extractor';
 import type { SourceBlock } from '../src/application/ingest/types';
+import { buildSupportedEvidenceDirectory } from '../src/application/ingest/supported-evidence-directory';
 
 const source: SourceBlock = {
   id: 'message:overflow',
@@ -10,11 +11,12 @@ const source: SourceBlock = {
   content: '测试主体确认测试事实。',
   createdAt: 1,
 };
+const evidenceDirectory = buildSupportedEvidenceDirectory([source]);
+const evidenceSpanId = evidenceDirectory.spans[0]!.evidenceSpanId;
 
 function claim(index: number): Record<string, unknown> {
   return {
     localId: `claim-${index}`,
-    sourceRef: source.id,
     episodeLocalId: '',
     kind: 'state',
     subjectRef: '',
@@ -23,7 +25,7 @@ function claim(index: number): Record<string, unknown> {
     objectRef: '',
     objectText: '测试事实',
     content: `测试主体${index}确认测试事实。`,
-    evidenceExcerpt: source.content,
+    evidenceSpanId,
     knowledge: {
       mode: 'asserted', privacy: 'public', ownerRefs: [], speakerRef: '', viewpointRef: '',
       observerRefs: [], presentRefs: [], mentionedRefs: [],
@@ -33,23 +35,18 @@ function claim(index: number): Record<string, unknown> {
   };
 }
 
-describe('structured Capture normalization boundaries', () => {
-  it('keeps the resource bound but audits array overflow instead of silently dropping records', () => {
+describe('structured Capture strict decode boundaries', () => {
+  it('does not silently truncate an oversized array', () => {
     const result = normalizeStructuredCapture({
       actorCandidates: [], locationCandidates: [], episodes: [],
       claims: Array.from({ length: 33 }, (_, index) => claim(index)),
-    }, [source]);
+    }, [source], evidenceDirectory);
 
-    expect(result.claims).toHaveLength(32);
-    expect(result.rejections).toEqual([
-      expect.objectContaining({
-        recordType: 'batch', code: 'invalid_shape', fieldPath: 'claims',
-        sourceRefs: [source.id], status: 'unresolved',
-      }),
-    ]);
+    expect(result.claims).toHaveLength(33);
+    expect(result.rejections).toBeUndefined();
   });
 
-  it('preserves missing critical fields as invalid so the server can repair them fail-closed', () => {
+  it('does not invent defaults for missing critical fields', () => {
     const result = normalizeStructuredCapture({
       actorCandidates: [], locationCandidates: [], episodes: [],
       claims: [{
@@ -57,26 +54,26 @@ describe('structured Capture normalization boundaries', () => {
         confidence: undefined,
         knowledge: { ownerRefs: [], observerRefs: [], presentRefs: [], mentionedRefs: [] },
       }],
-    }, [source]);
+    }, [source], evidenceDirectory);
 
-    expect(result.claims[0]?.confidence).toBe(0.6);
-    expect(result.claims[0]?.knowledge.mode).toBe('unknown');
-    expect(result.claims[0]?.knowledge.privacy).toBe('limited');
+    expect(result.claims[0]?.confidence).toBeUndefined();
+    expect(result.claims[0]?.knowledge.mode).toBeUndefined();
+    expect(result.claims[0]?.knowledge.privacy).toBeUndefined();
   });
 
-  it('truncates by Unicode code point without producing a lone surrogate', () => {
+  it('does not truncate or normalize strings', () => {
     const longName = `${'甲'.repeat(79)}𠮷乙`;
     const result = normalizeStructuredCapture({
       actorCandidates: [{
-        localId: 'actor-long', displayName: longName, aliases: [], sourceRef: source.id,
-        evidenceExcerpt: source.content, confidence: 0.9,
+        localId: 'actor-long', displayName: longName, aliases: [],
+        evidenceSpanId, confidence: 0.9,
       }],
       locationCandidates: [], episodes: [], claims: [],
-    }, [source]);
+    }, [source], evidenceDirectory);
 
-    const normalized = result.actorCandidates[0]?.displayName ?? '';
-    expect(Array.from(normalized)).toHaveLength(80);
-    expect(normalized.endsWith('𠮷')).toBe(true);
-    expect(normalized.includes('\uFFFD')).toBe(false);
+    const decoded = result.actorCandidates[0]?.displayName ?? '';
+    expect(decoded).toBe(longName);
+    expect(Array.from(decoded)).toHaveLength(81);
+    expect(result.actorCandidates[0]?.sourceRef).toBe(source.id);
   });
 });

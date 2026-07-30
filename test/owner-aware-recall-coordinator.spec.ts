@@ -25,7 +25,7 @@ function directIntent(): GenerationRecallIntentPlan {
 
 function trace(id: string, ownerId: string, factId: string, input: Partial<ActorMemoryTrace> = {}): ActorMemoryTrace {
   return {
-    id, workspaceId: 'workspace', ownerId, factId, sourceObservationIds: [`observation:${id}`],
+    id, workspaceId: 'workspace', chatKey: 'chat', ownerId, factId, sourceObservationIds: [`observation:${id}`],
     knowledgeMode: 'experienced', privacy: 'public', strength: 80, clarity: 100,
     beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1,
     learnedAt: 100, createdAt: 100, updatedAt: 100, ...input,
@@ -124,9 +124,10 @@ describe('OwnerAwareRecallCoordinator', () => {
     const bCall = recallObjective.mock.calls.find(([query]) => query.allowedFactIds?.includes('b-only'))?.[0];
     expect(aCall?.allowedFactIds).toHaveLength(12);
     expect(bCall?.allowedFactIds).toEqual(['b-only']);
-    expect(response.actors.find((partition) => partition.ownerId === A)?.packets).toHaveLength(5);
+    expect(response.actors.find((partition) => partition.ownerId === A)?.packets).toHaveLength(4);
     expect(response.actors.find((partition) => partition.ownerId === B)?.packets.map((packet) => packet.factId)).toEqual(['b-only']);
     expect(response.diagnostics.ownerCandidateCounts?.[B]).toBe(1);
+    expect(response.diagnostics.selectedCount).toBe(5);
   });
 
   it('filters private and future knowledge before retrieval for public-only actors', async () => {
@@ -152,22 +153,112 @@ describe('OwnerAwareRecallCoordinator', () => {
     expect(response.actors.find((partition) => partition.ownerId === B)?.packets.map((packet) => packet.factId)).toEqual(['b-public']);
   });
 
-  it('realizes the same fact differently for owners with strength 50 and 90 without changing the fact', async () => {
+  it('does not retrieve actor memories for background-only cast members', async () => {
+    const aFact = fact('a-action', 'A准备检查入口。');
+    const bFact = fact('b-background', 'B记得仓库密码。');
+    const facts = new Map([[aFact.id, aFact], [bFact.id, bFact]]);
+    const recallObjective = vi.fn((query: RecallQuery) => result(query, facts));
+    const cast = { ...plan({ [A]: 'full', [B]: 'identity_only' }), requiredOwnerIds: [A], backgroundOwnerIds: [B] };
+    const response = await new OwnerAwareRecallCoordinator({
+      recallObjective,
+      listTraces: () => [trace('trace-a-action', A, aFact.id), trace('trace-b-background', B, bFact.id)],
+      getFact: id => facts.get(id), getOwner: id => owner(id),
+    }).recall({ workspaceId: 'workspace', chatKey: 'chat', query: '继续行动', scene: scene(), castPlan: cast, now: 100 });
+    expect(recallObjective.mock.calls.flatMap(([query]) => query.allowedFactIds ?? [])).not.toContain(bFact.id);
+    expect(response.actors.map(partition => partition.ownerId)).not.toContain(B);
+  });
+
+  it('keeps world definitions out of the scene cast and applies the topic gate', async () => {
+    const crystal = fact('world-crystal', '晶尘是紫晶雨后出现的微米级污染颗粒。', 'world_rule');
+    const tangential = fact('world-event', '白夕莲监控空气成分确保晶尘不渗入种植区。', 'world_rule');
+    const spikes = fact('a-spikes', '紫罗能同时发射二十根尖刺。', 'capability');
+    const facts = new Map([[crystal.id, crystal], [tangential.id, tangential], [spikes.id, spikes]]);
+    const recallObjective = vi.fn((query: RecallQuery) => result(query, facts));
+    const intent: GenerationRecallIntentPlan = {
+      query: '晶尘是什么', timeMode: 'unknown', actorMode: 'world', namedOwnerIds: [], entityKeys: [], requestedKinds: ['world_rule'],
+      subQueries: [{ id: 'definition', query: '晶尘是什么', targetOwnerIds: ['owner:world', 'owner:narrator'], targetKinds: ['world_rule'] }],
+      complexity: 'direct', graphHops: 0, requireVerification: false, terms: ['晶尘'], source: 'rules',
+      intentKind: 'world_knowledge', topicTerms: ['晶尘'], ownerScope: { ownerIds: ['owner:world', 'owner:narrator'], requiredOwnerIds: [], fallback: 'none' }, recentContextSatisfied: false,
+    };
+    const response = await new OwnerAwareRecallCoordinator({
+      recallObjective,
+      listTraces: () => [trace('trace-world', 'owner:world', crystal.id), trace('trace-event', 'owner:world', tangential.id), trace('trace-spikes', A, spikes.id)],
+      getFact: id => facts.get(id), getOwner: id => owner(id),
+    }).recall({ workspaceId: 'workspace', chatKey: 'chat', query: intent.query, scene: scene(), castPlan: plan(), intentPlan: intent, maxItems: 8, now: 100 });
+    expect(recallObjective).toHaveBeenCalledTimes(1);
+    expect(recallObjective.mock.calls[0]?.[0].allowedFactIds).toEqual(['world-crystal', 'world-event']);
+    expect(response.world.packets.map(packet => packet.factId)).toEqual(['world-crystal']);
+    expect(response.diagnostics.uniqueCandidateCount).toBe(1);
+    expect(response.actors).toEqual([]);
+    expect(response.diagnostics.selectedCount).toBe(1);
+  });
+
+  it('does not fill a world query with public actor memories when system facts are absent', async () => {
+    const crystal = fact('a-crystal', 'A公开说明晶尘是紫晶雨后的污染颗粒。', 'world_rule');
+    const spikes = fact('b-spikes', 'B能同时发射二十根尖刺。', 'capability');
+    const facts = new Map([[crystal.id, crystal], [spikes.id, spikes]]);
+    const recallObjective = vi.fn((query: RecallQuery) => result(query, facts));
+    const intent: GenerationRecallIntentPlan = {
+      query: '晶尘是什么', timeMode: 'unknown', actorMode: 'world', namedOwnerIds: [], entityKeys: [], requestedKinds: ['world_rule'],
+      subQueries: [{ id: 'definition', query: '晶尘是什么', targetOwnerIds: ['owner:world', 'owner:narrator'], targetKinds: ['world_rule'] }],
+      complexity: 'direct', graphHops: 0, requireVerification: false, terms: ['晶尘'], source: 'rules',
+      intentKind: 'world_knowledge', topicTerms: ['晶尘'], ownerScope: { ownerIds: ['owner:world', 'owner:narrator'], requiredOwnerIds: [], fallback: 'none' }, recentContextSatisfied: false,
+    };
+    const response = await new OwnerAwareRecallCoordinator({
+      recallObjective,
+      listTraces: () => [trace('trace-crystal', A, crystal.id), trace('trace-spikes', B, spikes.id)],
+      getFact: id => facts.get(id), getOwner: id => owner(id),
+    }).recall({ workspaceId: 'workspace', chatKey: 'chat', query: intent.query, scene: scene(), castPlan: plan(), intentPlan: intent, maxItems: 8, coverageExpansion: true, now: 100 });
+    expect(recallObjective).not.toHaveBeenCalled();
+    expect(response.actors).toEqual([]);
+    expect(response.world.packets).toEqual([]);
+    expect(response.narrator.packets).toEqual([]);
+  });
+
+  it('retrieves a shared public fact once and keeps every applicable owner in audit metadata', async () => {
     const shared = fact('shared', '加油站有三台加油机，一台被汽车残骸压垮，另外两台覆盖紫色苔藓，整体破败。');
     const facts = new Map([[shared.id, shared]]);
     const traces = [
       trace('trace-a', A, shared.id, { strength: 50, clarity: 100 }),
       trace('trace-b', B, shared.id, { strength: 90, clarity: 100 }),
     ];
+    const recallObjective = vi.fn((query: RecallQuery) => result(query, facts));
     const response = await new OwnerAwareRecallCoordinator({
-      recallObjective: (query) => result(query, facts), listTraces: () => traces,
+      recallObjective, listTraces: () => traces,
       getFact: (id) => facts.get(id), getOwner: (id) => owner(id),
     }).recall({ workspaceId: 'workspace', chatKey: 'chat', query: '加油站', scene: scene(), castPlan: plan(), now: 100 });
     const aPacket = response.actors.find((partition) => partition.ownerId === A)?.packets[0];
     const bPacket = response.actors.find((partition) => partition.ownerId === B)?.packets[0];
-    expect(bPacket?.effectiveStrength).toBeGreaterThan(aPacket?.effectiveStrength ?? 0);
-    expect(bPacket?.details.length).toBeGreaterThan(aPacket?.details.length ?? 0);
-    expect(bPacket?.omittedDetailCount).toBeLessThan(aPacket?.omittedDetailCount ?? Number.POSITIVE_INFINITY);
+    expect(recallObjective).toHaveBeenCalledTimes(1);
+    expect(aPacket).toBeUndefined();
+    expect(bPacket?.gist).toBe(shared.content);
+    expect(response.actors.flatMap(partition => partition.packets)).toHaveLength(1);
+    const candidate = response.candidatePartitions?.flatMap(partition => partition.candidates).find(item => item.factId === shared.id);
+    expect(candidate?.applicableOwnerIds).toEqual([A, B]);
     expect(shared.content).toContain('三台加油机');
+  });
+
+  it('keeps old fixed-owner system facts complete at strength and clarity 100', async () => {
+    const systemFact = fact('world-old', '晶尘会侵入活体并诱发不可逆晶化。', 'world_rule');
+    const narratorFact = fact('narrator-old', '旁白确认晶尘引发的晶化过程不可逆转。', 'world_rule');
+    const facts = new Map([[systemFact.id, systemFact], [narratorFact.id, narratorFact]]);
+    const intent: GenerationRecallIntentPlan = {
+      query: '晶尘为什么危险', timeMode: 'unknown', actorMode: 'world', namedOwnerIds: [], entityKeys: ['晶尘'], requestedKinds: ['world_rule'],
+      subQueries: [{ id: 'danger', query: '晶尘为什么危险', targetOwnerIds: ['owner:world', 'owner:narrator'], targetKinds: ['world_rule'] }],
+      complexity: 'direct', graphHops: 0, requireVerification: false, terms: ['晶尘'], source: 'rules',
+      intentKind: 'world_knowledge', topicTerms: ['晶尘'], ownerScope: { ownerIds: ['owner:world', 'owner:narrator'], requiredOwnerIds: [], fallback: 'none' }, recentContextSatisfied: false,
+    };
+    const response = await new OwnerAwareRecallCoordinator({
+      recallObjective: query => result(query, facts),
+      listTraces: () => [
+        trace('trace-world-old', 'owner:world', systemFact.id, { strength: 1, clarity: 1, updatedAt: 1 }),
+        trace('trace-narrator-old', 'owner:narrator', narratorFact.id, { strength: 1, clarity: 1, updatedAt: 1 }),
+      ],
+      getFact: id => facts.get(id),
+    }).recall({ workspaceId: 'workspace', chatKey: 'chat', query: intent.query, scene: scene(), castPlan: plan(), intentPlan: intent, now: 10_000_000 });
+    expect(response.world.packets[0]).toMatchObject({ gist: systemFact.content, effectiveStrength: 100, clarity: 100 });
+    expect(response.narrator.packets[0]).toMatchObject({ gist: narratorFact.content, effectiveStrength: 100, clarity: 100 });
+    expect(response.world.packets[0]?.gist).not.toMatch(/模糊|隐约|印象/u);
+    expect(response.narrator.packets[0]?.gist).not.toMatch(/模糊|隐约|印象/u);
   });
 });

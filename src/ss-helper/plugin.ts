@@ -1,4 +1,5 @@
 import {
+  readSSHelperFailure,
   API_VERSION,
   MEMORY_PLUGIN_ID,
   SDK_PACKAGE_VERSION,
@@ -6,21 +7,25 @@ import {
   type PopupUiContext,
   type PluginDescriptor,
   type PluginSession,
-  type WorkspaceRecoveryRepairResult,
 } from '@ss-helper/sdk';
 import { createMemorySettingsAdapter, MEMORY_SETTINGS_SCHEMA, MEMORY_WORKBENCH_POPUP, type MemorySettingsController, type MemorySettingsStatusSource } from './settings';
 import { registerMemoryServices, type MemoryRecallController } from './services';
 import { renderMemoryWorkspaceRecovery, type MemoryWorkspaceRecoveryController } from '../ui/workspace-recovery-ui';
 import { registerMemoryChatIndicator } from './chat-indicator';
+import {
+  registerMemoryMessageRecallAction,
+  type GenerationRecallDetailController,
+} from './message-recall-action';
 import config from '../../plugin.config.json' with { type: 'json' };
 
-export interface MemoryContributionController extends MemorySettingsController, MemoryRecallController {
+export interface MemoryContributionController extends MemorySettingsController, MemoryRecallController, GenerationRecallDetailController {
   isChatEnabled(workspaceId: string, chatKey: string): boolean;
 }
 
 export const MEMORY_HOST_CAPABILITIES = Object.freeze([
   'tavern.context.read',
   'core.ui.notification.v0',
+  'core.ui.chat-message-action.v0',
   'tavern.character.read',
   'tavern.persona.read',
   'tavern.chat.read',
@@ -43,7 +48,7 @@ export const MEMORY_WORKSPACE_RECOVERY_POPUP = Object.freeze({
 });
 
 export interface MemoryRecoveryController extends MemoryWorkspaceRecoveryController {
-  repair(): Promise<WorkspaceRecoveryRepairResult>;
+  repair(): Promise<{ readonly backupId: string; readonly requiresReload: true }>;
 }
 
 export const MEMORY_PLUGIN_DESCRIPTOR: PluginDescriptor<MemoryHostCapability> = Object.freeze({
@@ -63,11 +68,15 @@ export function registerMemoryContributions(
   renderWorkbench: (container: HTMLElement, actionId: string | undefined, popupUi?: PopupUiContext) => void | (() => void),
   statusSource: MemorySettingsStatusSource,
   recovery: MemoryRecoveryController,
+  options: { readonly registerMessageRecallAction?: boolean } = {},
 ): { dispose(): void; publishUpdated: ReturnType<typeof registerMemoryServices>['publishUpdated'] } {
   const services = registerMemoryServices(session, controller);
   const disposers = [
     services.dispose,
     registerMemoryChatIndicator(session, controller),
+    ...(options.registerMessageRecallAction === false
+      ? []
+      : [registerMemoryMessageRecallAction(session, controller, async (floor) => session.host.chat.navigate({ index: floor }))]),
     session.registerSettings(MEMORY_SETTINGS_SCHEMA, createMemorySettingsAdapter(controller, statusSource, (notification) => session.ui.showToast(notification))),
     session.registerPopup({
       token: MEMORY_WORKBENCH_POPUP,
@@ -91,24 +100,26 @@ export function registerMemoryContributions(
       presentation: 'workspace',
       render: (container, input, popupUi) => renderMemoryWorkspaceRecovery(
         container,
-        {
-          errorCode: input && typeof input === 'object' && !Array.isArray(input)
-            && typeof (input as Record<string, unknown>).errorCode === 'string'
-            ? (input as Record<string, string>).errorCode
-            : undefined,
-        },
+        (() => {
+          const failure = readSSHelperFailure(
+            input && typeof input === 'object' && !Array.isArray(input)
+              ? (input as Record<string, unknown>).failure
+              : undefined,
+          );
+          return failure ? { failure } : {};
+        })(),
         recovery,
         (notification) => session.ui.showToast(notification),
         popupUi,
       ),
     }),
-    session.registerExtensionMenuItem?.({
+    session.registerExtensionMenuItem({
       id: 'memory-workbench',
       label: '记忆工作台',
       icon: 'brain',
       order: 100,
       onActivate: () => session.ui.openPopup(MEMORY_WORKBENCH_POPUP, {}),
-    }) ?? (() => undefined),
+    }),
   ];
   return {
     publishUpdated: services.publishUpdated,

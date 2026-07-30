@@ -3,34 +3,43 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => {
   let release: (() => void) | null = null;
   return {
-    instances: [] as Array<{ stop: ReturnType<typeof vi.fn> }>,
-    invokeSession: true,
+    instances: [] as Array<{
+      stop: ReturnType<typeof vi.fn>;
+      registerEarlyMessageRecallAction: ReturnType<typeof vi.fn>;
+    }>,
+    bootstrapFailures: 0,
     waitForStart: () => new Promise<void>((resolve) => { release = resolve; }),
     releaseStart: () => release?.(),
-    reset: () => { release = null; state.invokeSession = true; },
+    reset: () => { release = null; state.bootstrapFailures = 0; },
   };
 });
 
 vi.mock('../src/host/runtime-feedback', () => ({ logger: { error: vi.fn(), warn: vi.fn() }, traceMemoryStartup: vi.fn() }));
 vi.mock('@ss-helper/sdk', () => ({
   bootstrapSSHelper: async (_descriptor: unknown, onSession: (session: unknown) => void) => {
+    if (state.bootstrapFailures > 0) { state.bootstrapFailures -= 1; throw new Error('Core unavailable'); }
     const session = {};
-    if (state.invokeSession) onSession(session);
+    onSession(session);
     return { current: session, closed: new Promise(() => undefined), dispose: vi.fn() };
   },
   API_VERSION: '0.0.1',
   MEMORY_PLUGIN_ID: 'ss-helper.memory',
   SDK_PACKAGE_VERSION: '0.0.1',
   ensureHostedCore: async () => undefined,
-  waitForTavernReady: async () => undefined,
-  SSHelperError: class extends Error {
-    readonly code: string;
-    constructor(code: string, message: string) { super(message); this.code = code; }
-  },
+  describeSSHelperFailure: () => ({
+    reasonCode: 'INTERNAL_ERROR',
+    stage: 'memory.startup',
+    title: '程序内部错误',
+    reason: '当前步骤发生内部异常。',
+    action: '请重试。',
+    retryable: false,
+    transportCode: 'INTERNAL',
+  }),
 }));
 vi.mock('../src/host/memory-runtime', () => ({
   MemoryRuntime: class {
     readonly stop = vi.fn();
+    readonly registerEarlyMessageRecallAction = vi.fn();
     constructor() { state.instances.push(this); }
     start(): Promise<void> { return state.waitForStart(); }
   },
@@ -48,6 +57,7 @@ describe('entry lifecycle', () => {
     const first = entry.start();
     await flushMicrotasks();
     expect(state.instances).toHaveLength(1);
+    expect(state.instances[0]?.registerEarlyMessageRecallAction).toHaveBeenCalledTimes(1);
     entry.stop();
     state.releaseStart();
 
@@ -69,17 +79,11 @@ describe('entry lifecycle', () => {
     expect(state.instances).toHaveLength(3);
   });
 
-  it('rejects a missing first Core callback instead of retaining a permanent start promise', async () => {
-    vi.useFakeTimers();
-    state.invokeSession = false;
+  it('clears a failed bootstrap so the next single Core attempt can retry immediately', async () => {
+    state.bootstrapFailures = 1;
     const entry = await import('../src/entry');
     entry.stop();
-    const pending = entry.start();
-    await flushMicrotasks();
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.advanceTimersByTimeAsync(10_000);
-    await expect(pending).rejects.toMatchObject({ code: 'BOOTSTRAP_CALLBACK_TIMEOUT' });
-    state.invokeSession = true;
+    await expect(entry.start()).rejects.toThrow('Core unavailable');
     const retry = entry.start();
     await flushMicrotasks();
     state.releaseStart();

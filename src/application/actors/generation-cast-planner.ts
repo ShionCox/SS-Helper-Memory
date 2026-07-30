@@ -10,7 +10,8 @@ import {
   type ProvisionalActorProposal,
   type SceneState,
 } from '../../domain';
-import { MEMORY_PLUGIN_ID, readMemoryLlmApi, type MemoryLlmApi } from '../ingest/llm-extractor';
+import { createSSHelperError } from '@ss-helper/sdk';
+import { MEMORY_PLUGIN_ID, readMemoryLlmClient, type MemoryLlmClient } from '../ingest/llm-extractor';
 import type { CastCandidateResolution } from './cast-candidate-resolver';
 
 export const MEMORY_CAST_PLAN_TASK = 'memory_cast_plan';
@@ -72,7 +73,7 @@ function deterministicPlan(input: GenerationCastPlannerInput, plannerMode: Gener
   const likely = exclusiveTarget
     ? []
     : viable
-      .filter(candidate => !required.includes(candidate.ownerId) && candidate.score >= 0.5)
+      .filter(candidate => !required.includes(candidate.ownerId) && candidate.score >= cfg.plannerConfidenceThreshold)
       .slice(0, Math.max(0, cfg.plannerCandidateThreshold))
       .map(candidate => candidate.ownerId);
   const background = exclusiveTarget
@@ -152,7 +153,7 @@ function validateOwnerLists(proposal: Partial<GenerationCastPlan>, allowed: Read
 }
 
 export class LlmCastDirector implements CastDirector {
-  constructor(private readonly getLlm: () => MemoryLlmApi | null = readMemoryLlmApi) {}
+  constructor(private readonly getLlm: () => MemoryLlmClient | null = readMemoryLlmClient) {}
 
   async plan(input: GenerationCastPlannerInput, candidates: readonly GenerationCastCandidate[]): Promise<Partial<GenerationCastPlan>> {
     const llm = this.getLlm();
@@ -200,7 +201,7 @@ export class LlmCastDirector implements CastDirector {
       budget: { maxTokens: 700, maxLatencyMs: 4_000 },
       enqueue: { displayMode: 'silent' },
     });
-    if (!response.ok) throw new Error(response.error || '选角导演失败。');
+    if (!response.ok) throw createSSHelperError(response.failure.reasonCode, response.failure);
     const row = response.data;
     const proposals = Array.isArray(row.newActorProposals) ? row.newActorProposals : [];
     return {
@@ -278,8 +279,13 @@ export class GenerationCastPlanner {
       const allowed = new Set(input.candidateResolution.candidates.map(candidate => candidate.ownerId));
       const validated = validateOwnerLists(proposal, allowed);
       const required = validated.required.length > 0 ? validated.required : [...base.requiredOwnerIds];
-      const likely = validated.likely;
-      const background = validated.background.length > 0 ? validated.background : [...base.backgroundOwnerIds].filter(id => !required.includes(id) && !likely.includes(id));
+      const candidateScore = new Map(input.candidateResolution.candidates.map(candidate => [candidate.ownerId, candidate.score]));
+      const likely = validated.likely.filter(ownerId => (candidateScore.get(ownerId) ?? 0) >= cfg.plannerConfidenceThreshold);
+      const rejectedLikely = validated.likely.filter(ownerId => !likely.includes(ownerId));
+      const background = unique([
+        ...(validated.background.length > 0 ? validated.background : base.backgroundOwnerIds),
+        ...rejectedLikely,
+      ]).filter(id => !required.includes(id) && !likely.includes(id));
       const permissionByOwner: Record<string, 'full' | 'focused' | 'public_only' | 'identity_only' | 'none'> = {};
       for (const ownerId of required) permissionByOwner[ownerId] = 'full';
       for (const ownerId of likely) permissionByOwner[ownerId] = cfg.likelyActorRecall;

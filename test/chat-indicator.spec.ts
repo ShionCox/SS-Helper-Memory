@@ -16,7 +16,11 @@ describe('Memory chat indicator provider', () => {
     }));
     const unregister = vi.fn();
     const session = {
-      workspace: { query },
+      workspace: { open: async ({ id }: { id: string }) => ({
+        id,
+        query: async (_collection: string, options: { filter?: Readonly<Record<string, unknown>> }) =>
+          query({ workspaceId: id, filter: options.filter }),
+      }) },
       registerChatIndicator: (value: ChatIndicatorRegistration) => { registration = value; return unregister; },
     } as unknown as Pick<PluginSession, 'workspace' | 'registerChatIndicator'>;
     const controller = {
@@ -45,11 +49,14 @@ describe('Memory chat indicator provider', () => {
     let registration: ChatIndicatorRegistration | undefined;
     let active = 0; let peak = 0; const releases: Array<() => void> = [];
     const session = {
-      workspace: { query: vi.fn(async () => {
-        active += 1; peak = Math.max(peak, active);
-        await new Promise<void>((resolve) => releases.push(resolve));
-        active -= 1;
-        return { records: [], nextCursor: null };
+      workspace: { open: async ({ id }: { id: string }) => ({
+        id,
+        query: vi.fn(async () => {
+          active += 1; peak = Math.max(peak, active);
+          await new Promise<void>((resolve) => releases.push(resolve));
+          active -= 1;
+          return { records: [], nextCursor: null };
+        }),
       }) },
       registerChatIndicator: (value: ChatIndicatorRegistration) => { registration = value; return () => undefined; },
     } as unknown as Pick<PluginSession, 'workspace' | 'registerChatIndicator'>;
@@ -61,10 +68,5 @@ describe('Memory chat indicator provider', () => {
     releases.splice(0).forEach((release) => release());
     await pending;
     expect(peak).toBe(4);
-  });
-
-  it('gracefully skips registration against an older Core', () => {
-    const session = { workspace: { query: vi.fn() } } as unknown as Pick<PluginSession, 'workspace' | 'registerChatIndicator'>;
-    expect(() => registerMemoryChatIndicator(session, { isChatEnabled: () => true, onSettingsChanged: () => () => undefined })()).not.toThrow();
   });
 });

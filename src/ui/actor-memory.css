@@ -22,7 +22,7 @@
   .stx-memory-workbench .stx-memory-actor-memory-metric > span:last-child { text-align: right; }
 
   .stx-memory-workbench .stx-memory-actor-memory-toolbar {
-    min-width: 0; display: grid; grid-template-columns: minmax(15rem, 1fr) repeat(4, minmax(8rem, .55fr)) auto;
+    min-width: 0; display: grid; grid-template-columns: minmax(15rem, 1fr) repeat(4, minmax(8rem, .55fr));
     align-items: center; gap: 7px;
   }
   .stx-memory-workbench .stx-memory-actor-memory-toolbar > label { min-width: 0; }
@@ -393,6 +393,7 @@
   .stx-memory-workbench .stx-memory-actor-memory-meter.is-info > span { background: #79a7d8; }
   .stx-memory-workbench .stx-memory-actor-memory-meter.is-belief > span { background: #aa82cb; }
   .stx-memory-workbench .stx-memory-actor-memory-content-card p { margin: 0; font-size: .72rem; line-height: 1.65; }
+  .stx-memory-workbench .stx-memory-actor-memory-content-card { min-height: 64px; display: grid; align-items: center; }
   .stx-memory-workbench .stx-memory-actor-memory-updated { display: block; margin-top: 5px; color: var(--ss-theme-muted); font-size: .59rem; }
   .stx-memory-workbench .stx-memory-actor-memory-knowledge-grid h4,
   .stx-memory-workbench .stx-memory-actor-memory-technical-grid h4 { margin: 0 0 7px; font-size: .68rem; }

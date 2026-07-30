@@ -24,6 +24,8 @@ const owners: MemoryOwner[] = [{
 const facts: ActorMemoryFact[] = [{
   id: 'fact:station',
   content: '加油站有三台加油机，其中一台被汽车残骸压垮，另外两台覆盖紫色苔藓。',
+  subjectKey: '加油站',
+  predicateKey: '存在加油机',
   sourceRefs: ['message:88'],
   evidence: [{ sourceRef: 'message:88', excerpt: '三台加油机里有一台已经被翻倒的汽车压垮。' }],
   updatedAt: now,
@@ -33,7 +35,7 @@ const trace: ActorMemoryTrace = {
   id: 'trace:su:station', workspaceId: 'workspace:1', chatKey: 'chat:1', ownerId: 'owner:su', factId: 'fact:station',
   sourceObservationIds: ['observation:88'], knowledgeMode: 'experienced', privacy: 'public',
   strength: 90, clarity: 100, beliefConfidence: .94, emotionalSalience: .4, rehearsalCount: 0, traceRevision: 2,
-  floor: 88, createdAt: now - 5_000, updatedAt: now,
+  floor: 88, learnedAt: now - 5_000, createdAt: now - 5_000, updatedAt: now,
 };
 
 const observation: MemoryObservation = {
@@ -69,18 +71,18 @@ describe('角色记忆视图', () => {
   it('使用生产召回包规则生成各强度阶段预览', () => {
     expect(buildActorMemoryGaugePreview(trace, facts[0]!, 0)).toBeNull();
     const fragment = buildActorMemoryGaugePreview(trace, facts[0]!, 35)!;
-    expect(fragment.gist).toMatch(/模糊记忆|不清晰/u);
-    expect(fragment.details).toHaveLength(1);
-    expect(fragment.details[0]?.sensitivity).toBe('gist');
+    expect(fragment.gist).toBe('隐约记得「加油站」与「存在加油机」有关，细节不清。');
+    expect(fragment.gist).not.toMatch(/三台|汽车残骸|紫色苔藓/u);
+    expect(fragment.details).toHaveLength(0);
     expect(fragment.omittedDetailCount).toBe(1);
 
     const gist = buildActorMemoryGaugePreview(trace, facts[0]!, 55)!;
     expect(gist.gist).toContain('加油站有三台加油机');
-    expect(gist.details.map(item => item.sensitivity)).toEqual(['gist']);
+    expect(gist.details).toHaveLength(0);
 
     const exact = buildActorMemoryGaugePreview(trace, facts[0]!, 92)!;
-    expect(exact.details.map(item => item.sensitivity)).toEqual(['gist', 'exact']);
-    expect(exact.details[1]?.text).toBe(facts[0]?.content);
+    expect(exact.gist).toBe(facts[0]?.content);
+    expect(exact.details).toHaveLength(0);
     expect(exact.omittedDetailCount).toBe(0);
   });
 
@@ -111,7 +113,7 @@ describe('角色记忆视图', () => {
     const zone = host.querySelector<HTMLElement>('[data-actor-memory-zone="exact"]')!;
     updateActorMemoryGaugeZone(zone, trace, facts[0]!, 92);
     expect(zone.querySelector('[data-actor-memory-preview-strength]')?.textContent).toBe('92');
-    expect(zone.querySelector('[data-actor-memory-preview-details]')?.textContent).toContain('完整细节');
+    expect(zone.querySelector('[data-actor-memory-preview-details]')?.textContent).toContain('完整内容');
     expect(zone.querySelector('[data-actor-memory-preview-omitted]')?.textContent).toBe('0 项');
   });
 

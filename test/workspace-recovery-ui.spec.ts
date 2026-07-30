@@ -11,7 +11,7 @@ describe('Memory 工作区恢复界面', () => {
     const notify = vi.fn();
     const dispose = renderMemoryWorkspaceRecovery(
       container,
-      { errorCode: 'WORKSPACE_DATABASE_UNAVAILABLE' },
+      { failure: { reasonCode: 'WORKSPACE_DATABASE_UNAVAILABLE', stage: 'workspace.health' } },
       { repair },
       notify,
       { close, refreshControls } as never,
@@ -39,8 +39,8 @@ describe('Memory 工作区恢复界面', () => {
     const notify = vi.fn();
     const dispose = renderMemoryWorkspaceRecovery(
       container,
-      { errorCode: 'WORKSPACE_DATABASE_UNAVAILABLE' },
-      { repair: async () => { throw { code: 'WORKSPACE_BACKUP_FAILED', message: 'G:\\SillyTavern\\data\\_ss-helper-v0\\secrets.key' }; } },
+      { failure: { reasonCode: 'WORKSPACE_DATABASE_UNAVAILABLE', stage: 'workspace.health' } },
+      { repair: async () => { throw { reasonCode: 'WORKSPACE_RECOVERY_BACKUP_FAILED', stage: 'workspace.recovery.backup' }; } },
       notify,
     );
 
@@ -48,9 +48,9 @@ describe('Memory 工作区恢复界面', () => {
     (container.querySelectorAll('button')[1] as HTMLButtonElement).click();
     await Promise.resolve();
     await Promise.resolve();
-    expect(container.textContent).toContain('WORKSPACE_BACKUP_FAILED');
+    expect(container.textContent).toContain('WORKSPACE_RECOVERY_BACKUP_FAILED');
     expect(container.textContent).not.toContain('secrets.key');
-    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ code: 'WORKSPACE_BACKUP_FAILED' }));
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ code: 'WORKSPACE_RECOVERY_BACKUP_FAILED' }));
     dispose();
   });
 });

@@ -51,7 +51,7 @@ export function registerMemoryServices(
       actors,
     };
   };
-  const disposeRecall = session.services.expose(MEMORY_RECALL_V0, async (request, context) => {
+  const disposeRecall = session.bus.handle(MEMORY_RECALL_V0, async (request, context) => {
     context.signal.throwIfAborted();
     if (request.chatKey !== controller.getChatKey()) return normalizeActorResponse(undefined, request.mode);
     const actorResult = await controller.recallActors({
@@ -67,7 +67,7 @@ export function registerMemoryServices(
     context.signal.throwIfAborted();
     return normalizeActorResponse(actorResult, request.mode);
   });
-  const disposeGraph = session.services.expose(MEMORY_GRAPH_V0, async (request, context) => {
+  const disposeGraph = session.bus.handle(MEMORY_GRAPH_V0, async (request, context) => {
     context.signal.throwIfAborted();
     if (request.chatKey !== controller.getChatKey()) return { nodes: [], edges: [] };
     if (!controller.graph) return { nodes: [], edges: [] };
@@ -90,6 +90,6 @@ export function registerMemoryServices(
   });
   return {
     dispose: () => { disposeGraph(); disposeRecall(); },
-    publishUpdated: (payload) => session.events.publish(MEMORY_UPDATED_V0, payload),
+    publishUpdated: (payload) => session.bus.publish(MEMORY_UPDATED_V0, payload),
   };
 }

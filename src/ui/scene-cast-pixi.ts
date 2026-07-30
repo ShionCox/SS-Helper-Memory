@@ -4,7 +4,6 @@ import {
   primarySceneRole,
   sceneGraphOwnerConfidence,
   sceneGraphOwnerIds,
-  sceneGraphOwnerSources,
   sceneSourceLabel,
 } from './scene-events-view';
 

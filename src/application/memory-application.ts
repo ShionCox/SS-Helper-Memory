@@ -1,7 +1,16 @@
 import { MemoryRepository } from '../infrastructure';
+import {
+  createSSHelperError,
+  describeSSHelperFailure,
+  readSSHelperFailure,
+  SS_HELPER_DIAGNOSTICS,
+  type SSHelperFailureContext,
+  type SSHelperReasonCode,
+  type ChatMessageSnapshot,
+  type FinalPromptSnapshot,
+} from '@ss-helper/sdk';
 import { DEFAULT_CAST_SETTINGS, FIXED_OWNER_IDS, deriveMemoryGraphProjection } from '../domain';
 import type {
-  FactListOptions,
   MainChatUsage,
   ManualFactInput,
   MemoryFact,
@@ -9,11 +18,15 @@ import type {
   MemoryGraphStatus,
   MemoryJob,
   MemoryEpisode,
+  MemoryEvidence,
   MemoryObservation,
   MemoryRecallLog,
   AutomaticIngestRejection,
+  CaptureRepairQueueRecord,
   SceneState,
   GenerationCastPlan,
+  GenerationRecallDetail,
+  GenerationRecallLookupTarget,
 } from '../domain';
 import {
   MemoryRecallIndex,
@@ -24,11 +37,10 @@ import {
   type RecallResult,
   MemoryUsageClassifier,
   RecallCoverageVerifier,
-  planRecallIntentByRules,
 } from './recall';
 import { MemoryGraphRecallIndex, MemoryGraphService } from './graph';
 import {
-  readMemoryLlmApi,
+  readMemoryLlmClient,
   readMemoryLlmRouteDiagnostic,
   readMemoryRecallRouteDiagnostics,
   type MemoryLlmRouteDiagnostic,
@@ -47,8 +59,9 @@ import {
   visibleConversationMessages,
   type SummaryProgress,
 } from './ingest/summary-strategy';
-import type { CaptureRepairRequest, SourceBlock } from './ingest/types';
-import { collectCurrentChatSources, selectSourceGroups, summarizeSourceGroups } from '../host/source-adapter';
+import type { SourceBlock } from './ingest/types';
+import { buildSupportedEvidenceDirectory } from './ingest/supported-evidence-directory';
+import { selectSourceGroups, summarizeSourceGroups } from '../host/source-adapter';
 import type { MemoryPluginApi, MemorySqliteStatus } from '../index';
 import type {
   MemoryCaptureProgress,
@@ -61,8 +74,9 @@ import type {
   MemoryUiOverview,
   MemoryUiSettings,
 } from '../ui/memory-ui';
+import type { MemoryPage, MemoryPageRequest, MemoryPageResource } from '../ui/memory-page';
 import type { MemoryHostContext } from '../host/sdk-host-context';
-import { logger, traceMemoryStartup } from '../host/runtime-feedback';
+import { logger, startMemoryPerformanceSpan, traceMemoryStartup } from '../host/runtime-feedback';
 import { describeMemoryError, type MemoryErrorDiagnostic } from '../diagnostics/memory-error';
 import {
   ActorRegistry,
@@ -83,8 +97,12 @@ import { LocationRegistry } from './locations';
 import { ProfileCoordinator } from './profile';
 import { DreamCoordinator, type DreamApplyResult } from './dream';
 import { buildMemoryRecallPacket } from './recall/memory-strength';
-import type { ActorCandidate, ActorMemoryTrace, ProfileClaim, RelationshipClaim } from '../domain';
-import { GenerationMemoryCoordinator, type PreparedGenerationMemory } from './generation';
+import type { ActorCandidate, ActorMemoryTrace, ProfileClaim } from '../domain';
+import {
+  GenerationMemoryCoordinator,
+  createGenerationRecallDetail,
+  type PreparedGenerationMemory,
+} from './generation';
 
 type MemoryGlobalSettings = Omit<MemoryUiSettings, 'chatMode'>;
 const MAX_AUTOMATIC_DREAM_FAILURES = 6;
@@ -106,6 +124,10 @@ const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   preExtractReferenceItems: 8,
   preExtractReferenceMode: 'auto',
   preExtractReferenceMaxChars: 2_400,
+  structuredRepairEnabled: true,
+  structuredRepairBeforeFloors: 2,
+  structuredRepairAfterFloors: 2,
+  structuredRepairMaxItems: 4,
   graphEnabled: true,
   graphLlmRelationEnabled: true,
   graphMaxHops: 1,
@@ -113,6 +135,19 @@ const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   ...DEFAULT_CAST_SETTINGS,
 });
 const MEMORY_RECALL_ROUTE_CACHE_TTL_MS = 5_000;
+
+export interface GenerationCompletionScope {
+  readonly workspaceId: string;
+  readonly chatKey: string;
+  readonly preparedGeneration: PreparedGenerationMemory | null;
+  readonly recallLogId: string | null;
+  readonly finalPromptSnapshot?: FinalPromptSnapshot;
+}
+
+export interface GenerationCompletionCommit extends GenerationCompletionScope {
+  readonly usage: MainChatUsage;
+  readonly message?: ChatMessageSnapshot;
+}
 
 function createId(prefix: string): string {
   return `${prefix}:${crypto.randomUUID()}`;
@@ -126,6 +161,8 @@ function asUiFact(
   return {
     id: fact.id,
     content: fact.content,
+    subjectKey: fact.subjectKey,
+    predicateKey: fact.predicateKey,
     kind: fact.kind,
     status: fact.status,
     confidence: fact.confidence,
@@ -202,23 +239,12 @@ function summaryStrategyFromSettings(settings: MemoryGlobalSettings) {
   });
 }
 
-class CaptureCancelledError extends Error {
-  constructor() { super('记忆整理已因停止或聊天切换而取消。'); }
-}
-
 function isRetryableCaptureError(error: unknown): boolean {
-  const code = String(
-    error && typeof error === 'object'
-      ? ((error as { details?: { reasonCode?: unknown }; code?: unknown }).details?.reasonCode
-        ?? (error as { code?: unknown }).code
-        ?? '')
-      : '',
-  ).toLocaleLowerCase();
-  return ![
-    'auth_failed', 'credential_missing', 'llm_disabled', 'no_resource',
-    'resource_disabled', 'route_unavailable', 'memory_capture_integrity_failed',
-    '401', '403',
-  ].some((value) => code.includes(value));
+  const failure = readSSHelperFailure(error, {
+    reasonCode: 'INTERNAL_ERROR',
+    stage: 'memory.capture',
+  })!;
+  return SS_HELPER_DIAGNOSTICS[failure.reasonCode].retryable;
 }
 
 /** Memory 唯一应用服务，SQLite 是唯一持久数据源。 */
@@ -272,7 +298,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   private generationMemoryCoordinator: GenerationMemoryCoordinator | null = null;
   private lastSceneCast: SceneCast | null = null;
   private lastSceneState: SceneState | null = null;
-  private lastGenerationCastPlan: GenerationCastPlan | null = null;
   private lastPreparedGeneration: PreparedGenerationMemory | null = null;
   private lastIncludedTraceIds: readonly string[] = [];
   private lastActorRecall: ActorRecallResponse | null = null;
@@ -287,6 +312,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   private readonly settingsListeners = new Set<(settings: MemoryUiSettings) => void>();
   private readonly overviewListeners = new Set<() => void>();
+  private readonly generationRecallDetailListeners = new Set<(kind: 'updated' | 'cleared') => void>();
 
   constructor(readonly repository: MemoryRepository) {
     this.vectorIndex = new MemoryVectorIndexService(repository);
@@ -379,24 +405,33 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const workspace = (this.repository as unknown as { workspace?: unknown }).workspace;
     if (!workspace || typeof workspace !== 'object') return;
     this.repository.bind?.(workspaceId, sourceChatKey);
+    if (!workspaceId.trim()) {
+      this.generationScopeRevision += 1;
+      this.multiActorRepository = null;
+      this.actorRegistry = null;
+      this.locationRegistry = null;
+      this.actorCapture = null;
+      this.sceneStateReducer = null;
+      this.actualCastReconciler = null;
+      this.generationMemoryCoordinator = null;
+      return;
+    }
     const scopeRevision = ++this.generationScopeRevision;
     const repository = new MultiActorMemoryRepository(workspace as import('@ss-helper/sdk').WorkspacePort);
     repository.bind(workspaceId, sourceChatKey);
     const registry = new ActorRegistry(workspaceId);
     const locationRegistry = new LocationRegistry(workspaceId);
     const sceneStateReducer = new SceneStateReducer(registry, repository);
-    const scopeRecallIndex = new MemoryRecallIndex();
-    const scopeSemanticRecall = new SemanticRecallService(scopeRecallIndex, this.vectorIndex, this.graphService);
+    const scopeSemanticRecall = new SemanticRecallService(this.recallIndex, this.vectorIndex, this.graphService);
     const isCurrent = (): boolean => this.generationScopeRevision === scopeRevision
       && this.multiActorRepository === repository
       && this.actorRegistry === registry
       && this.locationRegistry === locationRegistry
       && repository.boundWorkspaceId === workspaceId
       && repository.boundChatKey === sourceChatKey;
-    const staleScopeError = (): Error & { code: string } => Object.assign(
-      new Error('生成前记忆准备所属聊天已变化，已丢弃旧结果。'),
-      { code: 'MEMORY_STALE_GENERATION_SCOPE' },
-    );
+    const staleScopeError = (): Error => createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', {
+      stage: 'memory.generation.scope',
+    });
     this.multiActorRepository = repository;
     this.actorRegistry = registry;
     this.locationRegistry = locationRegistry;
@@ -420,9 +455,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           const resolution = registry.resolveMention(name);
           return resolution && !resolution.ambiguous ? resolution.owner.id : undefined;
         },
-        recall: async ({ query, scene, castPlan, intentPlan, maxItems, now, minimumRetrievalLevel }) => {
-          if (!isCurrent()) throw staleScopeError();
-          scopeRecallIndex.replace(await repository.listFacts());
+        listKnownOwners: () => registry.listOwners().map(owner => ({
+          ownerId: owner.id,
+          names: [...new Set([owner.displayName, owner.canonicalName ?? '', ...owner.aliases].map(value => value.trim()).filter(Boolean))],
+        })),
+        recall: async ({ query, scene, castPlan, intentPlan, maxItems, now, minimumRetrievalLevel, coverageExpansion, excludedFactIds }) => {
           if (!isCurrent()) throw staleScopeError();
           const result = await this.performActorRecall({
             workspaceId,
@@ -434,13 +471,23 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
             maxItems,
             now,
             ...(minimumRetrievalLevel ? { minimumRetrievalLevel } : {}),
+            ...(coverageExpansion ? { coverageExpansion: true } : {}),
+            ...(excludedFactIds?.length ? { excludedFactIds } : {}),
             mode: castPlan.mode === 'single_actor' ? 'strict_pov' : 'multi_actor',
             sceneEpoch: castPlan.sceneId,
           }, repository, scopeSemanticRecall, this.getEffectiveSettings());
           if (!isCurrent()) throw staleScopeError();
           return result;
         },
-        buildPrompt: (response, castPlan, maxChars) => buildActorMemoryPromptResult(response, { maxChars, sceneLabel: castPlan.sceneId, castPlan }),
+        buildPrompt: (response, castPlan, maxChars, intentKind) => buildActorMemoryPromptResult(response, {
+          maxChars,
+          sceneLabel: castPlan.sceneId,
+          castPlan,
+          answerMode: ['world_knowledge', 'actor_entity', 'actor_knowledge', 'relationship', 'timeline'].includes(intentKind) ? 'direct' : 'roleplay',
+          ...(intentKind === 'world_knowledge' || intentKind === 'actor_entity' || intentKind === 'actor_knowledge'
+            ? { rules: ['只使用与当前问题直接相关的记忆，不要为了覆盖召回角色而额外提及人物。'] }
+            : {}),
+        }),
         isCurrent,
         commitPrepared: (prepared) => repository.commitGenerationPreparation(prepared),
       },
@@ -512,7 +559,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         });
       this.llmRouteDiagnosticPending = pending;
     }
-    return this.llmRouteDiagnostic ?? { available: readMemoryLlmApi() !== null, blockedReason: 'LLM 路由状态正在加载' };
+    return this.llmRouteDiagnostic ?? { available: readMemoryLlmClient() !== null, blockedReason: 'LLM 路由状态正在加载' };
   }
 
   private currentRecallRouteDiagnostics(): MemoryRecallRouteDiagnostics | undefined {
@@ -546,6 +593,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   async start(): Promise<void> {
+    const finish = startMemoryPerformanceSpan('application.start');
     this.stopped = false;
     this.llmRouteDiagnostic = undefined;
     this.llmRouteDiagnosticPending = undefined;
@@ -561,12 +609,19 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       await this.loadSettings();
       await this.bindCurrentChat();
     } catch (error) {
+      finish('error');
       this.sqliteAvailable = false;
       this.vectorIndex.stop();
       this.recallIndex.replace([]);
-      this.setRuntimeError(error, 'SQLITE_SERVICE_UNAVAILABLE', 'startup');
+      this.setRuntimeError(error, 'WORKSPACE_DATABASE_UNAVAILABLE', 'startup');
+      const failure = readSSHelperFailure(error, {
+        reasonCode: 'WORKSPACE_DATABASE_UNAVAILABLE',
+        stage: 'memory.startup',
+      })!;
+      logger.error(`Memory 应用启动失败：${failure.reasonCode}`, failure);
       return;
     }
+    finish();
     void this.resumePausedWork().catch(() => undefined);
   }
 
@@ -585,6 +640,18 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   getChatKey(): string {
     return this.hostContext?.getChatKey() ?? '';
+  }
+
+  /**
+   * Makes the lightweight recall-detail lookup path available as soon as the
+   * host context changes. The full actor/fact rebind intentionally continues
+   * in the background and must not delay chat-message actions.
+   */
+  prepareCurrentChatLookupScope(): void {
+    const workspaceId = this.hostContext?.getWorkspaceId() ?? '';
+    const chatKey = this.getChatKey();
+    this.repository.bind?.(workspaceId, chatKey);
+    this.emitOverviewChanged();
   }
 
   /** Host generation is an idle-gate input for automatic Dream Apply. */
@@ -612,24 +679,25 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   private assertStorageAvailable(operation: string): void {
     if (this.sqliteAvailable) return;
-    const error = Object.assign(
-      new Error(this.error || `Memory workspace 不可用，无法执行${operation}。`),
-      { code: this.errorDiagnostic?.code ?? 'SQLITE_SERVICE_UNAVAILABLE' },
+    throw createSSHelperError(
+      this.errorDiagnostic?.reasonCode ?? 'WORKSPACE_DATABASE_UNAVAILABLE',
+      {
+        stage: this.errorDiagnostic?.stage ?? 'memory.workspace.operation',
+      },
     );
-    throw error;
   }
 
   private async executeActorCapture(
     sources: readonly SourceBlock[],
     options: {
-      includeInvisibleHistory?: boolean;
       captureJobId?: string;
+      captureJob?: MemoryJob;
       writableSourceRefs?: readonly string[];
       existingMemoryContext?: readonly import('./ingest/types').ExistingMemoryContextItem[];
       graphLlmRelationEnabled?: boolean;
       idempotencyKey?: string;
-      parentChangeSetId?: string;
-      repairRequest?: import('./ingest/types').CaptureRepairRequest;
+      includeHiddenMessageFloors?: boolean;
+      repair?: import('./ingest/types').MemoryExtractionInput['repair'];
     } = {},
   ): Promise<import('./actors').MultiActorCaptureResult> {
     const capture = this.actorCapture;
@@ -644,14 +712,14 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       chatKey,
       sources,
       currentFloor,
-      includeInvisibleHistory: options.includeInvisibleHistory === true,
+      ...(options.includeHiddenMessageFloors === undefined ? {} : { includeHiddenMessageFloors: options.includeHiddenMessageFloors }),
       ...(options.captureJobId ? { captureJobId: options.captureJobId } : {}),
+      ...(options.captureJob ? { captureJob: options.captureJob as unknown as Record<string, unknown> } : {}),
       ...(options.writableSourceRefs === undefined ? {} : { writableSourceRefs: options.writableSourceRefs }),
       ...(options.existingMemoryContext === undefined ? {} : { existingMemoryContext: options.existingMemoryContext }),
       ...(options.graphLlmRelationEnabled === undefined ? {} : { graphLlmRelationEnabled: options.graphLlmRelationEnabled }),
       ...(options.idempotencyKey === undefined ? {} : { idempotencyKey: options.idempotencyKey }),
-      ...(options.parentChangeSetId === undefined ? {} : { parentChangeSetId: options.parentChangeSetId }),
-      ...(options.repairRequest === undefined ? {} : { repairRequest: options.repairRequest }),
+      ...(options.repair === undefined ? {} : { repair: options.repair }),
     });
     if (this.stopped || this.captureVersion !== captureVersion || this.getChatKey() !== chatKey) {
       if (result.changeAudit?.id) {
@@ -662,15 +730,445 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           // fail and leave committed data in the previous chat.
           await repository.rollbackChangeSet(result.changeAudit.id);
         } catch (error) {
-          throw Object.assign(new Error('聊天已切换，但 Capture ChangeSet 回滚失败，必须人工检查审计记录。'), {
-            code: 'MEMORY_CAPTURE_ROLLBACK_FAILED',
-            cause: error,
+          throw createSSHelperError('MEMORY_CAPTURE_ROLLBACK_FAILED', {
+            stage: 'memory.capture.rollback-after-scope-change',
+            ...(result.audit?.requestId ? { requestId: result.audit.requestId } : {}),
           });
         }
       }
-      throw new Error('聊天已切换，Capture 结果已丢弃。');
+      throw createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', {
+        stage: 'memory.capture.scope',
+      });
     }
     return result;
+  }
+
+  private repairSourceWindow(
+    records: readonly CaptureRepairQueueRecord[],
+    allSources: readonly SourceBlock[],
+    settings: MemoryGlobalSettings,
+  ): SourceBlock[] {
+    const anchorIds = new Set(records.flatMap(record => record.sourceRefs));
+    const fallbackIds = new Set(records.flatMap(record => record.fallbackSourceRefs));
+    const anchorFloors = allSources
+      .filter(source => anchorIds.has(source.id) && Number.isFinite(source.floor))
+      .map(source => source.floor as number);
+    if (anchorFloors.length === 0) return allSources.filter(source => fallbackIds.has(source.id));
+    const start = Math.min(...anchorFloors) - settings.structuredRepairBeforeFloors;
+    const end = Math.max(...anchorFloors) + settings.structuredRepairAfterFloors;
+    return allSources.filter(source =>
+      (Number.isFinite(source.floor) && (source.floor as number) >= start && (source.floor as number) <= end)
+      || (source.floor === undefined && fallbackIds.has(source.id)));
+  }
+
+  private async reconcileHistoricalCaptureRepairs(repository: MultiActorMemoryRepository): Promise<void> {
+    for (const job of await repository.listCaptureJobs()) {
+      const jobId = String(job.id ?? '').trim();
+      const status = String(job.status ?? '');
+      if (!jobId || status === 'queued' || status === 'running') continue;
+      await repository.reconcileCaptureRepairQueue(jobId);
+      if (status !== 'repairing' && status !== 'needs_repair' && status !== 'needs_review') continue;
+      // A persisted `repairing` state has no live worker after a page reload.
+      // Re-project all repair states from the durable queue so the user can
+      // resume instead of seeing an indefinitely frozen task, and so an older
+      // transport failure cannot survive after the queue has been reconciled.
+      const queue = await repository.listCaptureRepairQueue(jobId);
+      const queueByRejectionId = new Map(queue.flatMap(record =>
+        (record.rejectionIds?.length ? record.rejectionIds : record.rejectionId ? [record.rejectionId] : [])
+          .map(rejectionId => [rejectionId, record] as const)));
+      const sourceRejections = Array.isArray(job.rejections)
+        ? job.rejections as AutomaticIngestRejection[]
+        : [];
+      const rejections = sourceRejections.map((rejection) => {
+        const record = rejection.id ? queueByRejectionId.get(rejection.id) : undefined;
+        if (!record || (record.status !== 'resolved' && record.status !== 'ignored')) return rejection;
+        return record.status === 'ignored'
+          ? {
+            ...rejection,
+            status: 'ignored' as const,
+            repairAttempts: record.attemptCount,
+            ignoredAt: record.resolvedAt ?? record.updatedAt,
+          }
+          : {
+            ...rejection,
+            status: 'repaired' as const,
+            repairAttempts: record.attemptCount,
+            repairedAt: record.resolvedAt ?? record.updatedAt,
+          };
+      });
+      const unresolvedCount = rejections.filter(rejection =>
+        (rejection.status ?? 'unresolved') === 'unresolved').length;
+      const counts = this.captureRepairQueueCounts(queue);
+      const reviewRequiredCount = counts.exhausted + counts.dependencyReview + rejections.filter(rejection =>
+        (rejection.status ?? 'unresolved') === 'unresolved'
+        && (!rejection.id || !counts.linkedRejectionIds.has(rejection.id))).length;
+      const recoveredJob = { ...job };
+      delete recoveredJob.failure;
+      await repository.upsertCaptureJob({
+        ...recoveredJob,
+        status: counts.retryable > 0 ? 'needs_repair' : unresolvedCount > 0 ? 'needs_review' : 'completed',
+        outcome: unresolvedCount > 0 ? 'partial' : 'complete',
+        rejectionCount: unresolvedCount,
+        rejections,
+        checkpoint: {
+          ...((job.checkpoint && typeof job.checkpoint === 'object') ? job.checkpoint : {}),
+          phase: 'repair',
+          pendingRepairCount: counts.retryable,
+          retryableRepairCount: counts.retryable,
+          exhaustedRepairCount: counts.exhausted,
+          reviewRequiredCount,
+          unresolvedRejectionCount: unresolvedCount,
+          repairedCount: rejections.filter(rejection => rejection.status === 'repaired').length,
+          degradedCount: queue.filter(record =>
+            record.status === 'resolved' && record.resolutionMode === 'degraded').length,
+          ignoredCount: rejections.filter(rejection => rejection.status === 'ignored').length,
+        },
+        updatedAt: Date.now(),
+      });
+    }
+  }
+
+  private captureRepairQueueCounts(queue: readonly CaptureRepairQueueRecord[]): {
+    retryable: number;
+    exhausted: number;
+    dependencyReview: number;
+    linkedRejectionIds: Set<string>;
+  } {
+    const rank = (collection: CaptureRepairQueueRecord['collection']): number =>
+      ({ actorCandidates: 0, locationCandidates: 1, episodes: 2, claims: 3, batch: 4 })[collection];
+    const blocker = (record: CaptureRepairQueueRecord): CaptureRepairQueueRecord | undefined => {
+      const sources = new Set([...record.sourceRefs, ...record.fallbackSourceRefs]);
+      return queue.find(candidate =>
+        candidate.id !== record.id
+        && rank(candidate.collection) < rank(record.collection)
+        && (candidate.status === 'queued' || candidate.status === 'running' || candidate.status === 'unresolved')
+        && [...candidate.sourceRefs, ...candidate.fallbackSourceRefs].some(sourceRef => sources.has(sourceRef)));
+    };
+    const active = (record: CaptureRepairQueueRecord): boolean =>
+      (record.status === 'queued' || record.status === 'running' || record.status === 'unresolved')
+      && record.attemptCount < (record.maxAttempts ?? 2);
+    return {
+      retryable: queue.filter(record => active(record) && blocker(record) === undefined).length,
+      exhausted: queue.filter(record =>
+        record.status === 'unresolved' && record.attemptCount >= (record.maxAttempts ?? 2)).length,
+      dependencyReview: queue.filter(record => {
+        if (!active(record)) return false;
+        const dependency = blocker(record);
+        return dependency?.status === 'unresolved'
+          && dependency.attemptCount >= (dependency.maxAttempts ?? 2);
+      }).length,
+      linkedRejectionIds: new Set(queue.flatMap(record =>
+        record.rejectionIds?.length ? record.rejectionIds : record.rejectionId ? [record.rejectionId] : [])),
+    };
+  }
+
+  private async resolveCaptureRepairAudit(
+    repository: MultiActorMemoryRepository,
+    jobId: string,
+    record: CaptureRepairQueueRecord,
+    attemptCount: number,
+  ): Promise<void> {
+    const auditRepository = repository as unknown as {
+      listChangeAudits?: MultiActorMemoryRepository['listChangeAudits'];
+      updateCaptureAuditRejections?: MultiActorMemoryRepository['updateCaptureAuditRejections'];
+    };
+    if (typeof auditRepository.listChangeAudits !== 'function'
+      || typeof auditRepository.updateCaptureAuditRejections !== 'function') {
+      await repository.updateCaptureRepairRecord({
+        ...record,
+        status: 'resolved',
+        resolvedAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      return;
+    }
+    const rejectionIds = new Set(record.rejectionIds?.length
+      ? record.rejectionIds
+      : record.rejectionId ? [record.rejectionId] : []);
+    if (rejectionIds.size === 0) {
+      throw createSSHelperError('MEMORY_CAPTURE_INTEGRITY_FAILED', {
+        stage: 'memory.repair.audit-link',
+        batchIndex: record.batchIndex,
+        collection: record.collection,
+      });
+    }
+    const resolvedAt = Date.now();
+    const matched = new Set<string>();
+    for (const audit of await auditRepository.listChangeAudits.call(repository)) {
+      const metadata = audit.metadata && typeof audit.metadata === 'object' && !Array.isArray(audit.metadata)
+        ? audit.metadata as Record<string, unknown>
+        : undefined;
+      if (String(metadata?.captureJobId ?? '') !== jobId || audit.rolledBackAt) continue;
+      const rejections = Array.isArray(metadata?.rejections)
+        ? metadata.rejections.filter((item): item is AutomaticIngestRejection => Boolean(item && typeof item === 'object'))
+        : [];
+      if (!rejections.some(rejection => rejection.id && rejectionIds.has(rejection.id))) continue;
+      const updated = rejections.map((rejection) => {
+        if (!rejection.id || !rejectionIds.has(rejection.id)) return rejection;
+        matched.add(rejection.id);
+        return {
+          ...rejection,
+          status: 'repaired' as const,
+          repairAttempts: attemptCount,
+          repairedAt: resolvedAt,
+        };
+      });
+      await auditRepository.updateCaptureAuditRejections.call(repository, String(audit.id ?? ''), updated);
+    }
+    if ([...rejectionIds].some(rejectionId => !matched.has(rejectionId))) {
+      throw createSSHelperError('MEMORY_CAPTURE_INTEGRITY_FAILED', {
+        stage: 'memory.repair.audit-link',
+        batchIndex: record.batchIndex,
+        collection: record.collection,
+      });
+    }
+  }
+
+  private async runDeferredCaptureRepairs(
+    repository: MultiActorMemoryRepository,
+    jobId: string,
+    allSources: readonly SourceBlock[],
+    settings: MemoryGlobalSettings,
+    captureVersion: number,
+    chatKey: string,
+    includeHiddenMessageFloors = false,
+  ): Promise<{
+    results: import('./actors').MultiActorCaptureResult[];
+    resolvedRejectionIds: Set<string>;
+    remaining: number;
+    degraded: number;
+  }> {
+    if (!settings.structuredRepairEnabled) {
+      const queue = await repository.listCaptureRepairQueue(jobId);
+      const pending = queue
+        .filter(record => record.status === 'queued' || record.status === 'unresolved' || record.status === 'running').length;
+      const degraded = queue.filter(record => record.status === 'resolved' && record.resolutionMode === 'degraded').length;
+      return { results: [], resolvedRejectionIds: new Set(), remaining: pending, degraded };
+    }
+    await repository.reconcileCaptureRepairQueue?.(jobId);
+    const rank = (collection: CaptureRepairQueueRecord['collection']): number =>
+      ({ actorCandidates: 0, locationCandidates: 1, episodes: 2, claims: 3, batch: 4 })[collection];
+    const eligibleQueue = async (): Promise<CaptureRepairQueueRecord[]> =>
+      (await repository.listCaptureRepairQueue(jobId))
+        .filter(record => record.collection !== 'batch')
+        .filter(record => (record.status === 'running' && record.attemptCount < (record.maxAttempts ?? 2))
+          || ((record.status === 'queued' || record.status === 'unresolved')
+            && record.attemptCount < (record.maxAttempts ?? 2)))
+        .sort((left, right) => rank(left.collection) - rank(right.collection)
+          || left.batchIndex - right.batchIndex
+          || left.itemIndex - right.itemIndex);
+    const initialPending = await eligibleQueue();
+    const results: import('./actors').MultiActorCaptureResult[] = [];
+    const resolvedRejectionIds = new Set<string>();
+    let processed = 0;
+    const completedRecordIds = new Set<string>();
+    const total = initialPending.length;
+    let madeProgress = true;
+    while (madeProgress) {
+      madeProgress = false;
+      const pending = await eligibleQueue();
+      if (pending.length === 0) break;
+      for (const record of pending) {
+      const liveQueue = await repository.listCaptureRepairQueue(jobId);
+      const sourceSet = new Set([...record.sourceRefs, ...record.fallbackSourceRefs]);
+      const dependencyPending = liveQueue.some(candidate =>
+        candidate.id !== record.id
+        && rank(candidate.collection) < rank(record.collection)
+        && (candidate.status === 'queued' || candidate.status === 'running' || candidate.status === 'unresolved')
+        && [...candidate.sourceRefs, ...candidate.fallbackSourceRefs].some(ref => sourceSet.has(ref)));
+      if (dependencyPending) continue;
+      const maxAttempts = record.maxAttempts ?? 2;
+      const attemptNo = record.attemptCount + 1;
+      const sources = this.repairSourceWindow([record], allSources, settings);
+      const writableSourceRefs = [...new Set(
+        record.sourceRefs.length > 0 ? record.sourceRefs : record.fallbackSourceRefs,
+      )].filter(ref => sources.some(source => source.id === ref));
+      if (sources.length === 0 || writableSourceRefs.length === 0) {
+        await repository.updateCaptureRepairRecord({
+          ...record,
+          status: 'queued',
+          failure: {
+            reasonCode: 'MEMORY_REPAIR_SOURCE_UNAVAILABLE',
+            stage: 'memory.repair.source-window',
+            batchIndex: record.batchIndex,
+            collection: record.collection,
+          },
+          updatedAt: Date.now(),
+        });
+        continue;
+      }
+      madeProgress = true;
+      const evidenceSetHash = buildSupportedEvidenceDirectory(sources, writableSourceRefs).evidenceSetHash;
+      // Keep attemptCount unchanged while work is in flight. If the process is
+      // interrupted, or the final queue-state write fails, the durable
+      // `running` row remains eligible and reuses the same Capture idempotency
+      // key on the next resume.
+      await repository.updateCaptureRepairRecord({
+        ...record,
+        status: 'running',
+        evidenceSetHash,
+        updatedAt: Date.now(),
+      });
+      this.activeCaptureProgress = {
+        status: 'repairing',
+        jobId,
+        batchIndex: processed,
+        totalBatches: total,
+        processedCount: processed,
+        elapsedMs: Date.now() - this.captureStartedAt,
+        phase: 'repair',
+        pendingRepairCount: Math.max(0, total - processed),
+      };
+      this.emitOverviewChanged();
+
+      let result: import('./actors').MultiActorCaptureResult;
+      try {
+        this.assertCaptureCurrent(captureVersion, chatKey);
+        result = await this.executeActorCapture(sources, {
+          captureJobId: jobId,
+          writableSourceRefs,
+          repair: {
+            collection: record.collection as Exclude<CaptureRepairQueueRecord['collection'], 'batch'>,
+            issues: record.issues.slice(0, 16),
+            attempt: attemptNo,
+            maxAttempts,
+            mode: attemptNo >= maxAttempts ? 'conservative' : 'targeted',
+            ...(record.originalRequestId ? { parentRequestId: record.originalRequestId } : {}),
+            ...(record.originalResourceId ? { resourceId: record.originalResourceId } : {}),
+            ...(record.originalModel ? { model: record.originalModel } : {}),
+            maxItems: 1,
+          },
+          graphLlmRelationEnabled: settings.graphEnabled && settings.graphLlmRelationEnabled,
+          idempotencyKey: `capture:${jobId}:repair:${record.id}:${attemptNo}`,
+          includeHiddenMessageFloors,
+        });
+      } catch (error) {
+        const failure = readSSHelperFailure(error, {
+          reasonCode: 'REPAIR_UNRESOLVED',
+          stage: 'memory.repair.execute',
+        })!;
+        const failureCode = SS_HELPER_DIAGNOSTICS[failure.reasonCode].transportCode;
+        const interrupted = failureCode === 'ABORTED'
+          || failureCode === 'TIMEOUT'
+          || failureCode === 'CORE_UNAVAILABLE'
+          || failureCode === 'CONFLICT';
+        await repository.updateCaptureRepairRecord({
+          ...record,
+          status: interrupted ? 'queued' : 'unresolved',
+          attemptCount: interrupted ? record.attemptCount : attemptNo,
+          maxAttempts,
+          failure: {
+            ...failure,
+            batchIndex: record.batchIndex,
+            collection: record.collection,
+          },
+          updatedAt: Date.now(),
+        });
+        // Cancellation, timeout and Workspace transport/concurrency failures
+        // do not consume a semantic repair attempt. Stop the current
+        // repair phase and let the job resume the same queue record later with
+        // its stable Capture idempotency key.
+        if (interrupted) throw error;
+        if (attemptNo >= maxAttempts) completedRecordIds.add(record.id);
+        processed = completedRecordIds.size;
+        this.activeCaptureProgress = {
+          status: 'repairing',
+          jobId,
+          batchIndex: processed,
+          totalBatches: total,
+          processedCount: processed,
+          elapsedMs: Date.now() - this.captureStartedAt,
+          phase: 'repair',
+          pendingRepairCount: Math.max(0, total - processed),
+        };
+        this.emitOverviewChanged();
+        continue;
+      }
+
+      results.push(result);
+      const recordType = record.collection === 'actorCandidates' ? 'actor'
+        : record.collection === 'locationCandidates' ? 'location'
+          : record.collection === 'episodes' ? 'episode'
+            : 'claim';
+      const succeeded = result.acceptedLocalIds[recordType].length > 0
+        && !result.rejections.some(rejection => (rejection.status ?? 'unresolved') === 'unresolved');
+      const latestIssues = result.rejections.flatMap(rejection =>
+        rejection.issues?.map(issue => ({
+          path: issue.path,
+          keyword: issue.keyword,
+          expected: issue.expected,
+        })) ?? [{
+          path: rejection.fieldPath ?? '$',
+          keyword: rejection.code ?? 'validation',
+          expected: '符合来源支持规则的结构化字段',
+        }]).slice(0, 16);
+      const recordWithoutFailure = { ...record };
+      delete recordWithoutFailure.failure;
+      const nextRecord: CaptureRepairQueueRecord = {
+        ...recordWithoutFailure,
+        status: succeeded ? 'running' : 'unresolved',
+        attemptCount: attemptNo,
+        maxAttempts,
+        ...(result.candidateSetHash ? { candidateSetHash: result.candidateSetHash } : {}),
+        ...(succeeded ? { resolutionMode: result.resolutionMode ?? 'repaired' as const } : {}),
+        ...(succeeded && result.fieldActions?.length ? { fieldActions: [...result.fieldActions] } : {}),
+        ...(!succeeded && latestIssues.length > 0 ? { issues: latestIssues } : {}),
+        ...(result.audit?.requestId ? { repairRequestId: result.audit.requestId } : {}),
+        ...(!succeeded ? {
+          failure: {
+            reasonCode: 'REPAIR_UNRESOLVED',
+            stage: 'memory.repair.validate',
+            batchIndex: record.batchIndex,
+            collection: record.collection,
+          } satisfies SSHelperFailureContext,
+        } : {}),
+        updatedAt: Date.now(),
+      };
+      await repository.updateCaptureRepairRecord(nextRecord);
+      if (succeeded) {
+        try {
+          // The Change Audit is the source of truth for job projections. Updating
+          // it also resolves the linked queue row in the same Workspace commit.
+          await this.resolveCaptureRepairAudit(repository, jobId, nextRecord, attemptNo);
+        } catch (error) {
+          const failure = readSSHelperFailure(error, {
+            reasonCode: 'MEMORY_CAPTURE_INTEGRITY_FAILED',
+            stage: 'memory.repair.audit-writeback',
+          })!;
+          await repository.updateCaptureRepairRecord({
+            ...record,
+            status: 'queued',
+            attemptCount: record.attemptCount,
+            failure,
+            updatedAt: Date.now(),
+          });
+          throw error;
+        }
+        for (const rejectionId of record.rejectionIds?.length
+          ? record.rejectionIds
+          : record.rejectionId ? [record.rejectionId] : []) resolvedRejectionIds.add(rejectionId);
+      }
+      if (succeeded || attemptNo >= maxAttempts) completedRecordIds.add(record.id);
+      processed = completedRecordIds.size;
+      this.activeCaptureProgress = {
+        status: 'repairing',
+        jobId,
+        batchIndex: processed,
+        totalBatches: total,
+        processedCount: processed,
+        elapsedMs: Date.now() - this.captureStartedAt,
+        phase: 'repair',
+        pendingRepairCount: Math.max(0, total - processed),
+      };
+      this.emitOverviewChanged();
+      if (processed % 10 === 0) await new Promise<void>(resolve => setTimeout(resolve, 0));
+      }
+    }
+    const finalQueue = await repository.listCaptureRepairQueue(jobId);
+    const remaining = this.captureRepairQueueCounts(finalQueue).retryable;
+    const degraded = finalQueue
+      .filter(record => record.status === 'resolved' && record.resolutionMode === 'degraded').length;
+    return { results, resolvedRejectionIds, remaining, degraded };
   }
 
   private async rollbackActorCaptureResults(
@@ -688,9 +1186,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       }
     }
     if (failures.length > 0) {
-      throw Object.assign(new Error(`有 ${failures.length} 个 Capture ChangeSet 回滚失败，必须人工检查审计记录。`), {
-        code: 'MEMORY_CAPTURE_ROLLBACK_FAILED',
-        cause: failures[0],
+      throw createSSHelperError('MEMORY_CAPTURE_ROLLBACK_FAILED', {
+        stage: 'memory.capture.rollback',
       });
     }
     await this.reloadActorDirectoryState(repository);
@@ -764,7 +1261,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         const addedTraceCount = changedTraceIds.size;
         const previousFloor = Number(latestApplied?.visibleFloor ?? currentFloor);
         const visibleFloorCount = Math.max(0, currentFloor - (Number.isFinite(previousFloor) ? previousFloor : currentFloor));
-        const salient = Math.max(0, ...persistedTraces.filter(trace => changedTraceIds.has(trace.id)).map(trace => trace.emotionalSalience > 1 ? trace.emotionalSalience / 100 : trace.emotionalSalience));
+        const salient = Math.min(1, Math.max(0, ...persistedTraces.filter(trace => changedTraceIds.has(trace.id)).map(trace => trace.emotionalSalience)));
         if (!this.dreamCoordinator.shouldTrigger({ ownerId: owner.id, addedTraceCount, visibleFloorCount, salient })) continue;
         const trigger: import('../domain').DreamJob['trigger'] = salient >= 0.85 ? 'salience' : addedTraceCount >= this.dreamCoordinator.options.traceThreshold ? 'trace-count' : 'floor-count';
         try {
@@ -811,7 +1308,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     for (const schedule of dreamSchedules) this.scheduleAutomaticDream(schedule.jobId, chatKey, schedule.ownerId);
   }
 
-  private async runActorCapture(sourceOverride?: readonly SourceBlock[], includeInvisibleHistory = false, captureJobId?: string): Promise<import('./actors').MultiActorCaptureResult> {
+  private async runActorCapture(sourceOverride?: readonly SourceBlock[], captureJobId?: string): Promise<import('./actors').MultiActorCaptureResult> {
     const context = this.hostContext;
     if (!this.actorCapture || !context) throw new Error('多角色 Memory 尚未绑定宿主工作区。');
     const chatKey = this.getChatKey();
@@ -840,7 +1337,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     }) : [];
     this.assertCaptureCurrent(captureVersion, chatKey);
     const result = await this.executeActorCapture(sources, {
-      includeInvisibleHistory,
       ...(captureJobId ? { captureJobId } : {}),
       existingMemoryContext,
       graphLlmRelationEnabled: settings.graphEnabled && settings.graphLlmRelationEnabled,
@@ -942,7 +1438,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
    * batches, so recreate those projections from the remaining facts/traces and
    * attach them to the newest surviving root Capture ChangeSet.
    */
-  private async rebuildCaptureDerivationsAfterRollback(
+  private async rebuildCaptureProjections(
     repository: MultiActorMemoryRepository,
   ): Promise<{ readonly facts: readonly MemoryFact[]; readonly traces: readonly ActorMemoryTrace[] }> {
     const registry = this.actorRegistry;
@@ -956,12 +1452,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     ]);
     const latestParent = audits
       .filter(record => String(record.kind ?? '') === 'capture-change-set-v0' && !record.rolledBackAt)
-      .filter(record => {
-        const metadata = record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
-          ? record.metadata as Record<string, unknown>
-          : {};
-        return !String(metadata.parentChangeSetId ?? '');
-      })
       .sort((left, right) => Number(right.createdAt ?? 0) - Number(left.createdAt ?? 0)
         || String(right.id ?? '').localeCompare(String(left.id ?? '')))[0] as unknown as import('../infrastructure').ChangeAudit | undefined;
     const sceneCast = [...sceneCasts]
@@ -1056,10 +1546,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const isCurrent = (): boolean => this.generationScopeRevision === scopeRevision
       && this.multiActorRepository === actorRepository
       && this.actorRegistry === registry;
-    const staleScopeError = (): Error & { code: string } => Object.assign(
-      new Error('角色召回所属聊天已变化，已丢弃旧结果。'),
-      { code: 'MEMORY_STALE_GENERATION_SCOPE' },
-    );
+    const staleScopeError = (): Error => createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', {
+      stage: 'memory.recall.scope',
+    });
     const chatKey = input.chatKey?.trim() || this.getChatKey();
     let scene = input.scene ?? this.lastSceneCast;
     if (scene && (scene.chatKey !== chatKey || scene.workspaceId !== context.getWorkspaceId())) scene = null;
@@ -1090,18 +1579,18 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return result;
   }
 
-  auditActorOutput(output: string): KnowledgeLeakageAudit | null {
+  async auditActorOutput(output: string): Promise<KnowledgeLeakageAudit | null> {
     if (!this.lastActorRecall) return null;
     const response = this.lastActorRecall;
     const repository = this.multiActorRepository;
-    if (repository) void (async () => {
+    if (repository) await (async () => {
       const traces = await repository.listTraces();
       const classified = new MemoryUsageClassifier().classify({
         output,
         response,
         traces,
         includedTraceIds: this.lastIncludedTraceIds,
-        planId: response.request.castPlan?.id,
+        planId: response.request.castPlan.id,
       });
       const usedExposures: import('../domain').RecallExposure[] = [];
       for (const item of classified.evidence.filter(item => item.usage !== 'not_used')) {
@@ -1118,7 +1607,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       if (usedExposures.length > 0) await repository.upsertDerived('recall-exposures', usedExposures.map(exposure => ({ ...exposure })));
     })().catch(error => logger.warn('角色记忆使用分类持久化失败。', error));
     const audit = auditKnowledgeLeakage(output, [this.lastActorRecall.world, this.lastActorRecall.narrator, ...this.lastActorRecall.actors]);
-    if (this.multiActorRepository) void this.multiActorRepository.recordKnowledgeLeakageAudit(audit).catch(error => logger.warn('角色知识泄漏审计持久化失败。', error));
+    if (this.multiActorRepository) {
+      await this.multiActorRepository.recordKnowledgeLeakageAudit(audit)
+        .catch(error => logger.warn('角色知识泄漏审计持久化失败。', error));
+    }
     return audit;
   }
 
@@ -1138,10 +1630,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         && this.hostContext === context
         && this.multiActorRepository === repository
         && this.actorRegistry === registry;
-      const staleScopeError = (): Error & { code: string } => Object.assign(
-        new Error('生成前记忆准备所属聊天已变化，已丢弃旧结果。'),
-        { code: 'MEMORY_STALE_GENERATION_SCOPE' },
-      );
+      const staleScopeError = (): Error => createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', {
+        stage: 'memory.generation.prepare.scope',
+      });
       const chatKey = input.chatKey?.trim() || this.getChatKey();
       const sources = await context.collectSources(chatKey);
       if (!isCurrent()) throw staleScopeError();
@@ -1160,7 +1651,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.lastPreparedGeneration = prepared;
       this.lastSceneState = prepared.sceneState;
       this.lastSceneCast = prepared.sceneCast;
-      this.lastGenerationCastPlan = prepared.castPlan;
       this.lastActorRecall = prepared.recalled;
       response = prepared.recalled;
       built = prepared.prompt;
@@ -1189,7 +1679,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         this.lastExposureIds.set(packet.traceId, exposure.id);
         return exposure;
       });
-      await exposureRepository.upsertDerived('recall-exposures', exposures.map(exposure => ({ ...exposure })));
+      // Recall exposures are rebuildable diagnostics. Their persistence must
+      // not suppress an otherwise valid prompt contribution.
+      await exposureRepository.upsertDerived('recall-exposures', exposures.map(exposure => ({ ...exposure })))
+        .catch(error => logger.warn('RecallExposure 派生记录写入失败，继续使用已生成的记忆 Prompt。', error));
     }
     return built;
   }
@@ -1457,46 +1950,19 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     try {
       const persistedAudits = await this.multiActorRepository.listChangeAudits();
       const selectedAudit = persistedAudits.find(record => String(record.id ?? '') === auditId);
-      const selectedMetadata = selectedAudit?.metadata && typeof selectedAudit.metadata === 'object' && !Array.isArray(selectedAudit.metadata)
-        ? selectedAudit.metadata as Record<string, unknown>
-        : {};
-      if (String(selectedMetadata.attachmentKind ?? '') === 'capture-repair-v0') {
-        throw Object.assign(new Error('定向修复子 ChangeSet 不能单独回滚；请回滚其原始 Capture 批次。'), {
-          code: 'CAPTURE_REPAIR_CHILD_ROLLBACK_FORBIDDEN',
-        });
-      }
-      const rollbackAuditIds = new Set<string>([auditId]);
-      let discovered = true;
-      while (discovered) {
-        discovered = false;
-        for (const record of persistedAudits) {
-          const metadata = record.metadata && typeof record.metadata === 'object'
-            ? record.metadata as Record<string, unknown>
-            : undefined;
-          const parentId = String(metadata?.parentChangeSetId ?? '');
-          const recordId = String(record.id ?? '');
-          if (recordId && parentId && rollbackAuditIds.has(parentId) && !rollbackAuditIds.has(recordId)) {
-            rollbackAuditIds.add(recordId);
-            discovered = true;
-          }
-        }
-      }
-      const affectedTraceIds = new Set(persistedAudits
-        .filter(record => rollbackAuditIds.has(String(record.id ?? '')))
-        .flatMap(record => Array.isArray(record.entries) ? record.entries : [])
+      const affectedTraceIds = new Set((Array.isArray(selectedAudit?.entries) ? selectedAudit.entries : [])
         .filter(entry => entry && typeof entry === 'object'
           && String((entry as Record<string, unknown>).collection ?? '') === 'memory-traces')
         .map(entry => String((entry as Record<string, unknown>).recordId ?? ''))
         .filter(Boolean));
       const invalidatedDreamJobs = (await this.multiActorRepository.listDerived('dream-jobs'))
-        .filter(job => rollbackAuditIds.has(String(job.sourceChangeSetId ?? ''))
-          || rollbackAuditIds.has(String(job.parentChangeSetId ?? ''))
+        .filter(job => String(job.sourceChangeSetId ?? '') === auditId
           || (Array.isArray(job.traceIds) && job.traceIds.some(traceId => affectedTraceIds.has(String(traceId)))))
         .map(job => ({ id: String(job.id ?? ''), ownerId: String(job.ownerId ?? '') }))
         .filter(job => job.id && job.ownerId);
       const affectedFactIds = await this.multiActorRepository.rollbackChangeSet(auditId);
       await this.reloadActorDirectoryState(this.multiActorRepository);
-      const rebuilt = await this.rebuildCaptureDerivationsAfterRollback(this.multiActorRepository);
+      const rebuilt = await this.rebuildCaptureProjections(this.multiActorRepository);
       for (const job of invalidatedDreamJobs) this.dreamCoordinator.forgetJob(job.id);
       this.clearAutomaticDreamTimers();
       for (const job of await this.multiActorRepository.listDerived('dream-jobs')) {
@@ -1505,7 +1971,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.recallIndex.replace([...rebuilt.facts]);
       this.lastSceneCast = null;
       this.lastSceneState = null;
-      this.lastGenerationCastPlan = null;
       this.lastPreparedGeneration = null;
       this.lastIncludedTraceIds = [];
       this.lastActorRecall = null;
@@ -1713,6 +2178,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   async bindCurrentChat(): Promise<void> {
+    const finish = startMemoryPerformanceSpan('application.chat-bind');
     const chatKey = this.getChatKey();
     const workspaceId = this.hostContext?.getWorkspaceId() ?? '';
     const scopeKey = workspaceId && chatKey ? JSON.stringify([workspaceId, chatKey]) : '';
@@ -1731,12 +2197,16 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     if (this.multiActorRepository && actorScopeChanged && workspaceId) {
       try {
         this.actorCorrectionChangeSets.clear();
-        // WorkspacePort open/defineCollection is idempotent. Re-open on a chat
+        // Workspace open with its complete schema is idempotent. Re-open on a chat
         // or group switch so the new v0 collections are ready before Capture.
         await this.multiActorRepository.open();
         if (!isCurrent()) return;
         await this.reloadActorDirectoryState(this.multiActorRepository);
         if (!isCurrent()) return;
+        void this.reconcileHistoricalCaptureRepairs(this.multiActorRepository).catch((error) => logger.warn(
+          '历史 Capture 修复将在打开初始化页面时继续。',
+          readSSHelperFailure(error, { reasonCode: 'MEMORY_CHAT_READ_FAILED', stage: 'memory.repair.reconcile.background' }),
+        ));
       } catch (error) {
         if (!isCurrent()) return;
         this.recallIndex.replace([]);
@@ -1764,6 +2234,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.lastRecallLogId = null;
       this.clearRuntimeError();
       if (isCurrent()) this.emitOverviewChanged();
+      finish();
       return;
     }
     if (!this.sqliteAvailable) {
@@ -1778,35 +2249,46 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         await this.loadSettings();
         if (!isCurrent()) return;
       } catch (error) {
+        finish('error');
         if (!isCurrent()) return;
         this.recallIndex.replace([]);
         this.vectorIndex.stop();
-        this.setRuntimeError(error, 'SQLITE_SERVICE_UNAVAILABLE', 'chat-bind');
+        this.setRuntimeError(error, 'WORKSPACE_DATABASE_UNAVAILABLE', 'chat-bind');
         this.emitOverviewChanged();
         return;
       }
     }
     try {
-      const bootstrap = chatKey ? await this.repository.bootstrap(chatKey) : null;
-      if (!isCurrent()) return;
-      const actorFacts = this.multiActorRepository && chatKey
-        ? await this.multiActorRepository.listFacts()
-        : [];
+      const [actorFacts, traces] = this.multiActorRepository && chatKey
+        ? await Promise.all([
+            this.multiActorRepository.listFacts(),
+            this.multiActorRepository.listTraces(),
+          ])
+        : [[], []];
       if (this.multiActorRepository && chatKey) {
-        const traces = await this.multiActorRepository.listTraces();
         this.actorExposureTracker = new RecallExposureTracker(traces);
-        const persistedDreamJobs = await this.multiActorRepository.listDerived('dream-jobs');
-        this.dreamCoordinator.hydrateJobs(persistedDreamJobs.filter(job => typeof job.id === 'string' && typeof job.ownerId === 'string' && typeof job.workspaceId === 'string' && typeof job.chatKey === 'string' && typeof job.status === 'string' && typeof job.phase === 'string' && Array.isArray(job.traceIds)) as unknown as import('../domain').DreamJob[]);
-        for (const job of persistedDreamJobs.filter(job => (job.status === 'queued' || job.status === 'running') && typeof job.id === 'string' && typeof job.ownerId === 'string')) this.scheduleAutomaticDream(String(job.id), chatKey, String(job.ownerId));
-        const persistedDreamAudits = await this.multiActorRepository.listDerived('dream-audits');
-        this.dreamCoordinator.hydrateAudits(persistedDreamAudits.filter(audit => typeof audit.id === 'string' && typeof audit.jobId === 'string' && typeof audit.ownerId === 'string') as unknown as import('../application/dream').DreamAudit[]);
+        const dreamRepository = this.multiActorRepository;
+        void Promise.all([
+          dreamRepository.listDerived('dream-jobs'),
+          dreamRepository.listDerived('dream-audits'),
+        ]).then(([persistedDreamJobs, persistedDreamAudits]) => {
+          if (!isCurrent() || this.multiActorRepository !== dreamRepository) return;
+          this.dreamCoordinator.hydrateJobs(persistedDreamJobs.filter(job => typeof job.id === 'string' && typeof job.ownerId === 'string' && typeof job.workspaceId === 'string' && typeof job.chatKey === 'string' && typeof job.status === 'string' && typeof job.phase === 'string' && Array.isArray(job.traceIds)) as unknown as import('../domain').DreamJob[]);
+          for (const job of persistedDreamJobs.filter(job => (job.status === 'queued' || job.status === 'running') && typeof job.id === 'string' && typeof job.ownerId === 'string')) this.scheduleAutomaticDream(String(job.id), chatKey, String(job.ownerId));
+          this.dreamCoordinator.hydrateAudits(persistedDreamAudits.filter(audit => typeof audit.id === 'string' && typeof audit.jobId === 'string' && typeof audit.ownerId === 'string') as unknown as import('../application/dream').DreamAudit[]);
+          traceMemoryStartup('application:dream-state-ready');
+          this.emitOverviewChanged();
+        }).catch((error) => logger.warn(
+          'Dream 状态将在打开页面时重新加载。',
+          readSSHelperFailure(error, { reasonCode: 'MEMORY_CHAT_READ_FAILED', stage: 'memory.dream.hydrate.background' }),
+        ));
       }
-      const factsById = new Map<string, import('../domain').MemoryFact>();
-      for (const fact of [...(bootstrap?.facts ?? []), ...actorFacts]) factsById.set(fact.id, fact);
-      this.recallIndex.replace([...factsById.values()]);
+      this.recallIndex.replace(actorFacts);
+      traceMemoryStartup('application:recall-index-ready');
       this.boundChatKey = chatKey;
       this.clearRuntimeError();
     } catch (error) {
+      finish('error');
       if (!isCurrent()) return;
       this.recallIndex.replace([]);
       // A character/group workspace error is not automatically a global
@@ -1826,6 +2308,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       void this.ensureSummaryProgress(chatKey).then(() => this.emitSettingsChanged()).catch(() => undefined);
     }
     if (isCurrent()) this.emitOverviewChanged();
+    finish();
   }
 
   getSettings(): MemoryUiSettings {
@@ -1862,6 +2345,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         ? settings.preExtractReferenceMode
         : 'auto',
       preExtractReferenceMaxChars: clampPreExtractReferenceMaxChars(settings.preExtractReferenceMaxChars),
+      structuredRepairEnabled: settings.structuredRepairEnabled === true,
+      structuredRepairBeforeFloors: Math.min(10, Math.max(0, Math.trunc(settings.structuredRepairBeforeFloors))),
+      structuredRepairAfterFloors: Math.min(10, Math.max(0, Math.trunc(settings.structuredRepairAfterFloors))),
+      structuredRepairMaxItems: Math.min(10, Math.max(1, Math.trunc(settings.structuredRepairMaxItems))),
       graphEnabled: settings.graphEnabled === true,
       graphLlmRelationEnabled: settings.graphLlmRelationEnabled === true,
       graphMaxHops: clampGraphMaxHops(settings.graphMaxHops),
@@ -1960,6 +2447,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.emitOverviewChanged();
   }
 
+  isCaptureBusy(): boolean {
+    return this.capturePromise !== null || this.actorCapturePromise !== null;
+  }
+
   async initialize(selectedKinds?: string[], options?: MemoryInitializationOptions): Promise<void> {
     await this.flushCapture('initialize', undefined, selectedKinds, options);
   }
@@ -1970,27 +2461,21 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     await this.initialize(selectedKinds, options);
   }
 
-  /**
-   * Read capture progress from the active v0 repository.  The generic
-   * MemoryRepository job facade is intentionally retained only for the
-   * isolated legacy test double; a bound production workspace always takes
-   * this branch and never reads the retired batch pipeline.
-   */
+  /** Read capture progress from the single bound capture store. */
   private async listCaptureJobs(chatKey: string): Promise<MemoryJob[]> {
-    if (this.multiActorRepository) {
-      return (await this.multiActorRepository.listCaptureJobs())
-        .filter(record => String(record.chatKey ?? '') === chatKey)
-        .filter(record => record.type === 'initialize' || record.type === 'incremental')
-        .filter(record => record.checkpoint && typeof record.checkpoint === 'object')
-        .map(record => record as unknown as MemoryJob);
-    }
-    return this.repository.listJobs(chatKey);
+    const repository = this.multiActorRepository;
+    if (!repository) throw new Error('Memory capture store is not bound.');
+    return (await repository.listCaptureJobs())
+      .filter(record => String(record.chatKey ?? '') === chatKey)
+      .filter(record => record.type === 'initialize' || record.type === 'incremental')
+      .filter(record => record.checkpoint && typeof record.checkpoint === 'object')
+      .map(record => record as unknown as MemoryJob);
   }
 
   async retry(): Promise<void> {
     this.clearRuntimeError();
     const paused = (await this.listCaptureJobs(this.requireChatKey()))
-      .filter((job) => job.status === 'paused')
+      .filter((job) => job.status === 'paused' || job.status === 'needs_repair')
       .sort((left, right) => right.updatedAt - left.updatedAt)[0];
     await this.flushCapture(paused?.type ?? 'incremental', paused);
   }
@@ -2005,7 +2490,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ? currentChatSizeBytes / storage.workspaceSizeBytes
       : 0;
     const degraded = (message = this.error, recallRoutes?: MemoryRecallRouteDiagnostics): MemoryUiOverview => {
-      const diagnostic = this.errorDiagnostic ?? describeMemoryError(message, 'SQLITE_SERVICE_UNAVAILABLE', 'health');
+      const diagnostic = this.errorDiagnostic ?? describeMemoryError(message, 'WORKSPACE_DATABASE_UNAVAILABLE', 'health');
       const currentChat = this.getCurrentChatInfo();
       return ({
       status: 'error',
@@ -2017,10 +2502,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       currentChatUsageRatio,
       lastOrganizedAt: this.lastOrganizedAt,
       pendingJobs: 0,
-      llmAvailable: readMemoryLlmApi() !== null,
+      llmAvailable: readMemoryLlmClient() !== null,
       ...(recallRoutes ? { embedding: recallRoutes.embedding, rerank: recallRoutes.rerank } : {}),
-      errorCode: diagnostic.code,
-      error: diagnostic.reason,
+      failure: readSSHelperFailure(diagnostic)!,
       errorDiagnostic: diagnostic,
     });
     };
@@ -2028,19 +2512,24 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       traceMemoryStartup('application:overview-degraded');
       return degraded(this.error, recallRoutes);
     }
-    let facts: MemoryFact[] = [];
+    let factCount = 0;
     let jobs: MemoryJob[] = [];
     let actorJobs: Array<Record<string, unknown>> = [];
     if (chatKey) {
       try {
-        const [loadedFacts, loadedJobs, loadedActorJobs] = await Promise.all([
-          this.multiActorRepository ? this.multiActorRepository.listFacts() : this.repository.listFacts(chatKey),
+        const [factPage, loadedJobs, loadedActorJobs] = await Promise.all([
+          this.multiActorRepository
+            ? this.multiActorRepository.page<MemoryFact>('facts', { limit: 1, includeTotal: true }, {
+                workspaceId: this.multiActorRepository.boundWorkspaceId,
+                chatKey,
+              })
+            : this.repository.pageFacts(chatKey, { limit: 1, includeTotal: true }),
           this.listCaptureJobs(chatKey),
           this.multiActorRepository
             ? this.multiActorRepository.listDerived('dream-jobs')
             : Promise.resolve([] as Array<Record<string, unknown>>),
         ]);
-        facts = loadedFacts;
+        factCount = factPage.total ?? factPage.items.length;
         jobs = loadedJobs;
         actorJobs = loadedActorJobs;
         traceMemoryStartup('application:overview-records-ready');
@@ -2057,7 +2546,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     ].filter(Number.isFinite).reduce<number | null>((latest, updatedAt) => latest === null ? updatedAt : Math.max(latest, updatedAt), null);
     const llmRoute = this.currentLlmRouteDiagnostic();
     traceMemoryStartup('application:overview-route-cached');
-    const errorCode = this.errorDiagnostic?.code;
+    const failure = this.errorDiagnostic ? readSSHelperFailure(this.errorDiagnostic) : undefined;
     const currentChat = this.getCurrentChatInfo();
     const bound = Boolean(chatKey && this.boundChatKey === chatKey);
     const overview: MemoryUiOverview = {
@@ -2065,18 +2554,17 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       bound,
       ...(chatKey ? { chatKey } : {}),
       ...(currentChat.name ? { chatName: currentChat.name } : {}),
-      factCount: facts.length,
+      factCount,
       currentChatSizeBytes,
       currentChatUsageRatio,
       lastOrganizedAt: this.lastOrganizedAt ?? latestCompletedAt,
       pendingJobs: jobs.filter((job) => job.status === 'queued' || job.status === 'running' || job.status === 'paused').length
         + actorJobs.filter(job => ['queued', 'running', 'paused'].includes(String(job.status ?? ''))).length,
-      llmAvailable: readMemoryLlmApi() !== null,
+      llmAvailable: readMemoryLlmClient() !== null,
       ...(llmRoute.resourceId ? { llmResource: llmRoute.resourceId } : {}),
       ...(llmRoute.model ? { llmModel: llmRoute.model } : {}),
       ...(recallRoutes ? { embedding: recallRoutes.embedding, rerank: recallRoutes.rerank } : {}),
-      ...(errorCode ? { errorCode } : {}),
-      ...(this.error ? { error: this.error } : {}),
+      ...(failure ? { failure } : {}),
       ...(this.errorDiagnostic ? { errorDiagnostic: this.errorDiagnostic } : {}),
     };
     traceMemoryStartup('application:overview-ready');
@@ -2086,26 +2574,23 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   async getInitializationSources(options: MemoryInitializationOptions = {}): Promise<MemoryInitializationSourceOption[]> {
     const chatKey = this.getChatKey();
     if (!chatKey) return [];
+    const sourceFilterOptions = { includeHiddenMessageFloors: options.includeHiddenMessageFloors !== false };
     const [groups, initialization] = await Promise.all([
       this.collectSources(chatKey).then((sources) => {
         const rawGroups = summarizeSourceGroups(sources);
-        const defaultGroups = summarizeSourceGroups(filterSourceBlocks(sources));
-        const currentGroups = summarizeSourceGroups(filterSourceBlocks(sources, options));
-        const invisibleGroups = summarizeSourceGroups(filterSourceBlocks(sources, { includeInvisibleHistory: true }));
+        const defaultGroups = summarizeSourceGroups(filterSourceBlocks(sources, { includeHiddenMessageFloors: true }));
+        const currentGroups = summarizeSourceGroups(filterSourceBlocks(sources, sourceFilterOptions));
         const defaultById = new Map(defaultGroups.map((group) => [group.id, group]));
         const currentById = new Map(currentGroups.map((group) => [group.id, group]));
-        const invisibleById = new Map(invisibleGroups.map((group) => [group.id, group]));
         return rawGroups.map((group) => {
           const current = currentById.get(group.id);
           const safe = defaultById.get(group.id);
-          const invisible = invisibleById.get(group.id);
           return {
             ...group,
             count: current?.count ?? 0,
             rawCount: group.count,
             defaultCount: safe?.count ?? 0,
             excludedCount: Math.max(0, group.count - (current?.count ?? 0)),
-            invisibleCount: Math.max(0, (invisible?.count ?? 0) - (safe?.count ?? 0)),
           };
         });
       }),
@@ -2121,7 +2606,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       rawCount: group.rawCount,
       defaultCount: group.defaultCount,
       excludedCount: group.excludedCount,
-      ...(group.invisibleCount === undefined ? {} : { invisibleCount: group.invisibleCount }),
       selected: group.count > 0 && selectedKinds.has(group.id),
     }));
   }
@@ -2145,8 +2629,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         updatedAt: job.updatedAt,
         totalBatches: job.checkpoint.totalBatches ?? job.checkpoint.batchIndex,
         selectedSourceKinds: [...(job.checkpoint.selectedSourceGroupIds ?? [])],
-        ...(job.checkpoint.includeInvisibleHistory === undefined ? {} : { includeInvisibleHistory: job.checkpoint.includeInvisibleHistory }),
-        ...(job.error ? { error: job.error } : {}),
+        ...(job.checkpoint.includeHiddenMessageFloors === undefined ? {} : {
+          includeHiddenMessageFloors: job.checkpoint.includeHiddenMessageFloors,
+        }),
+        ...(job.failure ? { failure: job.failure } : {}),
       })),
     };
   }
@@ -2154,11 +2640,17 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   async getInitializationEstimate(selectedKinds?: string[], options: MemoryInitializationOptions = {}): Promise<MemoryInitializationEstimate> {
     const chatKey = this.getChatKey();
     if (!chatKey) return estimateSummaryInitialization(0, []);
-    const sources = selectSourceGroups(filterSourceBlocks(await this.collectSources(chatKey), options), selectedKinds);
+    const includeHiddenMessageFloors = options.includeHiddenMessageFloors !== false;
+    const sources = selectSourceGroups(filterSourceBlocks(
+      await this.collectSources(chatKey),
+      { includeHiddenMessageFloors },
+    ), selectedKinds);
     const messageCount = sources.filter((source) => source.kind === 'message').length;
-    return estimateSummaryInitialization(messageCount, buildSummaryBatches(sources, summaryStrategyFromSettings(this.settings), {
-      includeSystemMessages: options.includeInvisibleHistory === true,
-    }));
+    return estimateSummaryInitialization(messageCount, buildSummaryBatches(
+      sources,
+      summaryStrategyFromSettings(this.settings),
+      { includeHiddenMessageFloors },
+    ));
   }
 
   async getCaptureProgress(): Promise<MemoryCaptureProgress> {
@@ -2166,6 +2658,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       return {
         ...this.activeCaptureProgress,
         elapsedMs: this.activeCaptureProgress.status === 'running'
+          || this.activeCaptureProgress.status === 'repairing'
           ? Math.max(0, Date.now() - this.captureStartedAt)
           : this.activeCaptureProgress.elapsedMs,
       };
@@ -2182,31 +2675,30 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       totalBatches: latest.checkpoint.totalBatches ?? latest.checkpoint.batchIndex,
       processedCount: latest.checkpoint.processedCount,
       elapsedMs: Math.max(0, latest.updatedAt - latest.createdAt),
-      ...(latest.error ? { error: latest.error } : {}),
+      ...(latest.failure ? { failure: latest.failure } : {}),
       ...(latest.checkpoint.phase ? { phase: latest.checkpoint.phase } : {}),
       ...(latest.outcome ? { outcome: latest.outcome } : {}),
+      ...(latest.checkpoint.pendingRepairCount !== undefined
+        ? { pendingRepairCount: latest.checkpoint.pendingRepairCount }
+        : {}),
+      ...(latest.checkpoint.retryableRepairCount !== undefined ? { retryableRepairCount: latest.checkpoint.retryableRepairCount } : {}),
+      ...(latest.checkpoint.exhaustedRepairCount !== undefined ? { exhaustedRepairCount: latest.checkpoint.exhaustedRepairCount } : {}),
+      ...(latest.checkpoint.reviewRequiredCount !== undefined ? { reviewRequiredCount: latest.checkpoint.reviewRequiredCount } : {}),
+      ...(latest.checkpoint.unresolvedRejectionCount !== undefined ? { unresolvedRejectionCount: latest.checkpoint.unresolvedRejectionCount } : {}),
+      ...(latest.checkpoint.repairedCount !== undefined ? { repairedCount: latest.checkpoint.repairedCount } : {}),
+      ...(latest.checkpoint.degradedCount !== undefined
+        ? { degradedCount: latest.checkpoint.degradedCount }
+        : {}),
+      ...(latest.checkpoint.ignoredCount !== undefined ? { ignoredCount: latest.checkpoint.ignoredCount } : {}),
       ...(latest.outcome === 'partial' ? { rejectedCount: Number((latest as MemoryJob & { rejectionCount?: number }).rejectionCount ?? 0) } : {}),
     };
   }
 
   async listAuditRecords(): Promise<Array<Record<string, unknown>>> {
     const chatKey = this.requireChatKey();
-    const batchAudits = this.multiActorRepository
-      ? []
-      : (await this.repository.listJobBatchAudits(chatKey)).map((audit) => ({
-        ...audit,
-        status: audit.rolledBackAt ? '已回滚' : '已完成',
-        rejected: audit.rejections,
-      }));
     const actorAudits = this.multiActorRepository
       ? (await this.multiActorRepository.listChangeAudits())
         .filter(record => String(record.kind ?? '') === 'capture-change-set-v0')
-        .filter(record => {
-          const metadata = record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
-            ? record.metadata as Record<string, unknown>
-            : {};
-          return String(metadata.attachmentKind ?? '') !== 'capture-repair-v0';
-        })
         .map(record => {
         const metadata = record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
           ? record.metadata as Record<string, unknown>
@@ -2227,14 +2719,14 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       })
       : [];
     const auditTimestamp = (record: Record<string, unknown>): number => Number(record.createdAt ?? record.updatedAt ?? 0);
-    return [...batchAudits, ...actorAudits].sort((left, right) => auditTimestamp(right) - auditTimestamp(left));
+    return actorAudits.sort((left, right) => auditTimestamp(right) - auditTimestamp(left));
   }
 
   private async readCaptureRejections(
     auditId: string,
   ): Promise<{ audit: import('../infrastructure').ChangeAudit; rejections: AutomaticIngestRejection[] }> {
     const repository = this.multiActorRepository;
-    if (!repository) throw new Error('当前存储不支持 Capture 定向修复。');
+    if (!repository) throw new Error('当前存储不支持 Capture 失败项处理。');
     const audit = await repository.getChangeAudit(auditId);
     if (!audit || audit.kind !== 'capture-change-set-v0' || audit.chatKey !== this.requireChatKey()) throw new Error('找不到当前聊天的 Capture 审计记录。');
     const metadata = audit.metadata && typeof audit.metadata === 'object' && !Array.isArray(audit.metadata)
@@ -2244,22 +2736,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ? metadata.rejections.filter((item): item is AutomaticIngestRejection => Boolean(item && typeof item === 'object'))
       : [];
     return { audit, rejections: structuredClone(rejections) };
-  }
-
-  async getCaptureRepairEstimate(auditId: string, rejectionIds: readonly string[]): Promise<{
-    requestCount: number;
-    groupCounts: Partial<Record<'actor' | 'location' | 'episode' | 'claim', number>>;
-  }> {
-    const selected = new Set(rejectionIds.map(String));
-    const { rejections } = await this.readCaptureRejections(auditId);
-    const groupCounts: Partial<Record<'actor' | 'location' | 'episode' | 'claim', number>> = {};
-    for (const rejection of rejections) {
-      if (!rejection.id || !selected.has(rejection.id) || (rejection.status ?? 'unresolved') !== 'unresolved') continue;
-      if (!['actor', 'location', 'episode', 'claim'].includes(String(rejection.recordType))) continue;
-      const recordType = rejection.recordType as 'actor' | 'location' | 'episode' | 'claim';
-      groupCounts[recordType] = (groupCounts[recordType] ?? 0) + 1;
-    }
-    return { requestCount: Object.keys(groupCounts).length, groupCounts };
   }
 
   async ignoreCaptureRejections(auditId: string, rejectionIds: readonly string[]): Promise<void> {
@@ -2278,121 +2754,49 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.emitOverviewChanged();
   }
 
-  async repairCaptureRejections(auditId: string, rejectionIds: readonly string[]): Promise<void> {
-    const repository = this.multiActorRepository;
-    const context = this.hostContext;
-    if (!repository || !context) throw new Error('当前存储不支持 Capture 定向修复。');
-    const selected = new Set(rejectionIds.map(String));
-    const { audit, rejections } = await this.readCaptureRejections(auditId);
-    const sources = await context.collectSources(this.requireChatKey());
-    const sourceById = new Map(sources.map(source => [source.id, source]));
-    const captureVersion = this.captureVersion;
-    const chatKey = this.requireChatKey();
-    const results: import('./actors').MultiActorCaptureResult[] = [];
-    const repairAttempts = new Map<string, number>();
-    let updated = [...rejections];
-    const order = ['actor', 'location', 'episode', 'claim'] as const;
-    try {
-      for (const recordType of order) {
-        const group = updated.filter(rejection => rejection.recordType === recordType
-          && Boolean(rejection.id && selected.has(rejection.id))
-          && (rejection.status ?? 'unresolved') === 'unresolved');
-        if (group.length === 0) continue;
-        const groupIds = new Set(group.map(item => item.id!));
-        const groupSourceRefs = [...new Set(group.flatMap(item => item.sourceRefs ?? []))];
-        const groupSources = groupSourceRefs.map(ref => sourceById.get(ref)).filter((source): source is SourceBlock => Boolean(source));
-        if (groupSources.length === 0) throw new Error('失败项的原始来源已不存在，无法定向修复。');
-        const repairRequest: CaptureRepairRequest = {
-          recordType,
-          items: group.map(rejection => ({
-            rejectionId: rejection.id!,
-            recordType,
-            localId: String(rejection.candidateSnapshot?.localId ?? rejection.id),
-            code: rejection.code,
-            fieldPath: rejection.fieldPath ?? '',
-            message: rejection.message,
-            candidateSnapshot: structuredClone(rejection.candidateSnapshot ?? {}),
-          })),
-        };
-        const attempt = Math.max(0, ...group.map(item => item.repairAttempts ?? 0)) + 1;
-        for (const rejection of group) repairAttempts.set(rejection.id!, attempt);
-        const result = await this.executeActorCapture(groupSources, {
-          captureJobId: String((audit.metadata as Record<string, unknown> | undefined)?.captureJobId ?? ''),
-          writableSourceRefs: groupSourceRefs,
-          repairRequest,
-          idempotencyKey: `capture-repair:${auditId}:${recordType}:${[...groupIds].sort().join(',')}:attempt:${attempt}`,
-          parentChangeSetId: auditId,
-          graphLlmRelationEnabled: this.getEffectiveSettings().graphEnabled && this.getEffectiveSettings().graphLlmRelationEnabled,
-        });
-        results.push(result);
-        const accepted = new Set(result.acceptedLocalIds[recordType]);
-        if (group.every((rejection) => !accepted.has(String(rejection.candidateSnapshot?.localId ?? rejection.id)))) {
-          throw Object.assign(new Error(`${recordType} 定向修复没有产生任何通过校验的记录。`), {
-            code: 'CAPTURE_REPAIR_NOT_APPLIED',
-          });
-        }
-        updated = updated.map((rejection) => {
-          if (!rejection.id || !groupIds.has(rejection.id)) return rejection;
-          const localId = String(rejection.candidateSnapshot?.localId ?? rejection.id);
-          return accepted.has(localId)
-            ? { ...rejection, status: 'repaired' as const, repairAttempts: attempt, repairedAt: Date.now(), lastAttemptAt: Date.now() }
-            : { ...rejection, status: 'unresolved' as const, repairAttempts: attempt, lastAttemptAt: Date.now() };
-        });
-      }
-      if (results.length === 0) throw new Error('没有可修复的待处理项。');
-      // The repair is one logical action even when it needs several record-type
-      // requests. Defer the parent audit update until every child commit and
-      // all derived projections are durable.
-      await this.finalizeActorCaptureResults(results, sources, captureVersion, chatKey);
-      await repository.updateCaptureAuditRejections(auditId, updated);
-      await this.bindCurrentChat();
-    } catch (error) {
-      const rollbackFailures: unknown[] = [];
-      const affectedFactIds = new Set<string>();
-      for (const result of [...results].reverse()) {
-        if (!result.changeAudit?.id) continue;
-        try {
-          for (const factId of await repository.rollbackChangeSet(result.changeAudit.id)) affectedFactIds.add(factId);
-        } catch (rollbackError) {
-          rollbackFailures.push(rollbackError);
-        }
-      }
-      // Capture mutates the in-memory actor/location directories before commit.
-      // If a later repair group fails, rolling back the child ChangeSets is not
-      // enough; reload the persisted snapshot so rejected repair identities do
-      // not remain resolvable until the next plugin restart.
-      await this.reloadActorDirectoryState(repository).catch(() => undefined);
-      const now = Date.now();
-      const unresolved = rejections.map((rejection) => {
-        if (!rejection.id || !selected.has(rejection.id) || (rejection.status ?? 'unresolved') !== 'unresolved') return rejection;
-        const { repairedAt: _repairedAt, ignoredAt: _ignoredAt, ...withoutResolution } = rejection;
-        return {
-          ...withoutResolution,
-          status: 'unresolved' as const,
-          repairAttempts: repairAttempts.get(rejection.id) ?? rejection.repairAttempts ?? 0,
-          lastAttemptAt: now,
-        };
-      });
-      await repository.updateCaptureAuditRejections(auditId, unresolved).catch(() => undefined);
-      await this.bindCurrentChat().catch(() => undefined);
-      if (affectedFactIds.size > 0) {
-        await this.vectorIndex.rebuildFacts(chatKey, [...affectedFactIds])
-          .catch(() => this.vectorIndex.scheduleSync(chatKey));
-      }
-      this.scheduleGraph(chatKey);
-      this.emitOverviewChanged();
-      if (rollbackFailures.length > 0) {
-        throw Object.assign(new Error(`定向修复失败，且有 ${rollbackFailures.length} 个子 ChangeSet 回滚失败，必须人工检查审计记录。`), {
-          code: 'MEMORY_CAPTURE_ROLLBACK_FAILED',
-          cause: rollbackFailures[0],
-        });
-      }
-      throw error;
-    }
-  }
-
   async getMainChatUsage(): Promise<MainChatUsage[]> {
     return this.repository.listMainChatUsage(this.requireChatKey());
+  }
+
+  captureGenerationCompletionScope(): GenerationCompletionScope {
+    const workspaceId = this.hostContext?.getWorkspaceId().trim() ?? '';
+    const chatKey = this.getChatKey().trim();
+    if (!workspaceId || !chatKey) {
+      throw createSSHelperError('MEMORY_CAPTURE_NOT_BOUND', {
+        stage: 'memory.generation-completion.scope',
+      });
+    }
+    const preparedGeneration = this.lastPreparedGeneration === null
+      ? null
+      : structuredClone(this.lastPreparedGeneration);
+    return Object.freeze({
+      workspaceId,
+      chatKey,
+      preparedGeneration,
+      recallLogId: this.lastRecallLogId,
+    });
+  }
+
+  createGenerationCompletionCommit(
+    scope: GenerationCompletionScope,
+    usage: MainChatUsage,
+    message?: ChatMessageSnapshot,
+  ): GenerationCompletionCommit {
+    if (usage.chatKey !== scope.chatKey) {
+      throw createSSHelperError('INVALID_PAYLOAD', {
+        stage: 'memory.generation-completion.create',
+      });
+    }
+    return Object.freeze({
+      ...scope,
+      usage: structuredClone(usage),
+      ...(message === undefined ? {} : { message: structuredClone(message) }),
+    });
+  }
+
+  isGenerationCompletionScopeCurrent(scope: GenerationCompletionScope): boolean {
+    return scope.workspaceId === (this.hostContext?.getWorkspaceId() ?? '')
+      && scope.chatKey === this.getChatKey();
   }
 
   async recordMainChatUsage(usage: MainChatUsage): Promise<void> {
@@ -2403,25 +2807,84 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     });
   }
 
-  async rollbackBatch(jobId: string, batchIndex: number): Promise<void> {
-    const chatKey = this.requireChatKey();
-    let affectedFactIds: string[];
-    try {
-      affectedFactIds = await this.repository.rollbackJobBatch(jobId, batchIndex, chatKey);
-    } catch (error) {
-      await this.bindCurrentChat();
-      throw error;
+  async recordCompletedGeneration(commit: GenerationCompletionCommit): Promise<GenerationRecallDetail | undefined> {
+    const { workspaceId, chatKey, preparedGeneration: prepared, message } = commit;
+    const usage: MainChatUsage = {
+      ...commit.usage,
+      ...(commit.recallLogId ? { recallLogId: commit.recallLogId } : {}),
+    };
+    if (!prepared
+      || message?.role !== 'assistant'
+      || prepared.castPlan.chatKey !== chatKey
+      || prepared.castPlan.workspaceId !== workspaceId) {
+      await this.repository.addMainChatUsageForScope({ workspaceId, chatKey }, usage);
+      return undefined;
     }
-    try {
-      if (affectedFactIds.length > 0) {
-        await this.vectorIndex.rebuildFacts(chatKey, affectedFactIds);
-        await this.repository.completeRollbackIndexRepair(jobId, batchIndex);
-      }
-    } catch {
-      await this.bindCurrentChat();
-      throw Object.assign(new Error('回滚已提交，向量索引修复等待重试。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
-    }
-    await this.bindCurrentChat();
+    const baseDetail = createGenerationRecallDetail(prepared, message, usage.capturedAt);
+    const snapshot = await this.repository.prepareGenerationPromptSnapshot(
+      { workspaceId, chatKey },
+      baseDetail.id,
+      prepared.prompt.prompt,
+      commit.finalPromptSnapshot,
+      usage.capturedAt,
+    );
+    const detail: GenerationRecallDetail = { ...baseDetail, promptSnapshot: snapshot.metadata };
+    await this.repository.commitMainChatGenerationForScope({ workspaceId, chatKey }, {
+      ...usage,
+      id: `main-usage:${detail.id}`,
+      messageId: detail.messageId,
+      generationRecallDetailId: detail.id,
+    }, detail, snapshot);
+    this.emitGenerationRecallDetailsChanged('updated');
+    this.emitOverviewChanged();
+    return detail;
+  }
+
+  async listGenerationRecallDetails(chatKey = this.requireChatKey()): Promise<GenerationRecallDetail[]> {
+    const currentChatKey = this.requireChatKey();
+    if (chatKey.trim() !== currentChatKey) return [];
+    return this.repository.listGenerationRecallDetails(currentChatKey);
+  }
+
+  async findGenerationRecallDetails(
+    workspaceId: string,
+    chatKey: string,
+    targets: readonly GenerationRecallLookupTarget[],
+    signal?: AbortSignal,
+  ): Promise<GenerationRecallDetail[]> {
+    return this.repository.findGenerationRecallDetailsForTargets(
+      workspaceId,
+      chatKey,
+      targets,
+      signal,
+    );
+  }
+
+  async loadGenerationPromptSnapshot(
+    workspaceId: string,
+    chatKey: string,
+    snapshotId: string,
+    signal?: AbortSignal,
+  ) {
+    return this.repository.loadGenerationPromptSnapshot(workspaceId, chatKey, snapshotId, signal);
+  }
+
+  async applyGenerationRecallMessageDeletion(messageIndex: number, deletedCount: number): Promise<number> {
+    const changed = await this.repository.applyGenerationRecallMessageDeletion(this.requireChatKey(), messageIndex, deletedCount);
+    if (changed > 0) { this.emitGenerationRecallDetailsChanged('updated'); this.emitOverviewChanged(); }
+    return changed;
+  }
+
+  async applyGenerationRecallMessageEdit(message: import('@ss-helper/sdk').ChatMessageSnapshot): Promise<number> {
+    const changed = await this.repository.applyGenerationRecallMessageEdit(this.requireChatKey(), message);
+    if (changed > 0) { this.emitGenerationRecallDetailsChanged('updated'); this.emitOverviewChanged(); }
+    return changed;
+  }
+
+  async applyGenerationRecallSwipeDeletion(messageIndex: number, deletedVariantId: string): Promise<number> {
+    const changed = await this.repository.applyGenerationRecallSwipeDeletion(this.requireChatKey(), messageIndex, deletedVariantId);
+    if (changed > 0) { this.emitGenerationRecallDetailsChanged('updated'); this.emitOverviewChanged(); }
+    return changed;
   }
 
   async cancelCapture(): Promise<void> {
@@ -2454,9 +2917,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.multiActorRepository
         ? (query.trim() ? this.facts.search(query) : this.facts.list({}))
         : (query.trim() ? this.repository.searchFacts(chatKey, query) : this.repository.listFacts(chatKey)),
-      this.multiActorRepository
-        ? Promise.resolve([] as import('../domain').MemoryJobBatchAudit[])
-        : this.repository.listJobBatchAudits(chatKey),
+      Promise.resolve([] as import('../domain').MemoryJobBatchAudit[]),
       this.multiActorRepository
         ? this.multiActorRepository.listChangeAudits().then(records => records.filter(record => String(record.kind ?? '') === 'capture-change-set-v0'))
         : Promise.resolve([] as Array<Record<string, unknown>>),
@@ -2497,6 +2958,175 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return result;
   }
 
+  async listFactsPage(request: MemoryPageRequest): Promise<MemoryPage<MemoryUiFact>> {
+    const chatKey = this.requireChatKey();
+    const signal = request.signal;
+    const query = request.query?.trim().toLocaleLowerCase() ?? '';
+    const pageRequest: MemoryPageRequest = {
+      ...request,
+      filter: { ...(request.filter ?? {}) },
+    };
+    let page: MemoryPage<MemoryFact>;
+    if (!this.multiActorRepository) {
+      page = await this.repository.pageFacts(chatKey, pageRequest);
+    } else if (!query) {
+      page = await this.multiActorRepository.page<MemoryFact>('facts', pageRequest, {
+        workspaceId: this.multiActorRepository.boundWorkspaceId,
+        chatKey,
+      });
+    } else {
+      const items: MemoryFact[] = [];
+      let cursor = request.cursor;
+      let nextCursor: string | null = cursor ?? null;
+      const seen = new Set<string>();
+      do {
+        if (signal?.aborted) throw signal.reason;
+        const rawPage = await this.multiActorRepository.page<MemoryFact>('facts', {
+          ...pageRequest,
+          ...(cursor === undefined ? {} : { cursor }),
+          limit: Math.max(1, request.limit - items.length),
+          includeTotal: false,
+        }, {
+          workspaceId: this.multiActorRepository.boundWorkspaceId,
+          chatKey,
+        });
+        for (const fact of rawPage.items) {
+          if ([fact.content, fact.canonicalKey, ...fact.entityKeys].some(value => value.toLocaleLowerCase().includes(query))) items.push(fact);
+        }
+        nextCursor = rawPage.nextCursor;
+        if (items.length >= request.limit || nextCursor === null) break;
+        if (seen.has(nextCursor)) throw createSSHelperError('INTERNAL_ERROR', { stage: 'memory.ui.facts-page.search-pagination' });
+        seen.add(nextCursor);
+        cursor = nextCursor;
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+      } while (cursor);
+      page = { items, nextCursor };
+    }
+
+    if (signal?.aborted) throw signal.reason;
+    const factIds = page.items.map(fact => fact.id);
+    let evidence: MemoryEvidence[] = [];
+    if (factIds.length > 0) {
+      if (this.multiActorRepository) {
+        let cursor: string | undefined;
+        do {
+          const evidencePage = await this.multiActorRepository.page<MemoryEvidence>('evidence', {
+            limit: 500,
+            signal,
+            ...(cursor === undefined ? {} : { cursor }),
+            where: [{ field: 'factId', op: 'in', value: factIds }],
+          }, {
+            workspaceId: this.multiActorRepository.boundWorkspaceId,
+            chatKey,
+          });
+          evidence.push(...evidencePage.items);
+          cursor = evidencePage.nextCursor ?? undefined;
+        } while (cursor);
+      } else evidence = await this.repository.listEvidenceForFacts(chatKey, factIds, signal);
+    }
+    const evidenceByFact = new Map<string, MemoryEvidence[]>();
+    for (const item of evidence) {
+      const bucket = evidenceByFact.get(item.factId) ?? [];
+      bucket.push(item);
+      evidenceByFact.set(item.factId, bucket);
+    }
+    return {
+      items: page.items.map(fact => asUiFact(
+        fact,
+        (evidenceByFact.get(fact.id) ?? []).map(item => ({ sourceRef: item.sourceRef, excerpt: item.excerpt })),
+        [],
+      )),
+      nextCursor: page.nextCursor,
+      ...(page.total === undefined ? {} : { total: page.total }),
+    };
+  }
+
+  async getLibraryStats(): Promise<{
+    total: number;
+    active: number;
+    pending: number;
+    evidenceCoverage: number;
+    kindCounts: Readonly<Record<string, number>>;
+    statusCounts: Readonly<Record<string, number>>;
+  }> {
+    const chatKey = this.requireChatKey();
+    const scope = this.multiActorRepository
+      ? { workspaceId: this.multiActorRepository.boundWorkspaceId, chatKey }
+      : undefined;
+    const count = async (request: MemoryPageRequest): Promise<number> => {
+      const page = this.multiActorRepository
+        ? await this.multiActorRepository.page<MemoryFact>('facts', { ...request, limit: 1, includeTotal: true }, scope)
+        : await this.repository.pageFacts(chatKey, { ...request, limit: 1, includeTotal: true });
+      return page.total ?? page.items.length;
+    };
+    const kinds = ['identity', 'relationship', 'location', 'world_rule', 'state', 'goal', 'commitment', 'preference', 'capability', 'event', 'other'];
+    const statuses = ['active', 'pending', 'superseded', 'invalid'];
+    const [total, evidenceBacked, kindValues, statusValues] = await Promise.all([
+      count({ limit: 1 }),
+      count({ limit: 1, where: [{ field: 'freshestEvidenceAt', op: 'gt', value: 0 }] }),
+      Promise.all(kinds.map(kind => count({ limit: 1, filter: { kind } }))),
+      Promise.all(statuses.map(status => count({ limit: 1, filter: { status } }))),
+    ]);
+    const kindCounts = Object.fromEntries(kinds.map((kind, index) => [kind, kindValues[index] ?? 0]));
+    const statusCounts = Object.fromEntries(statuses.map((status, index) => [status, statusValues[index] ?? 0]));
+    return {
+      total,
+      active: statusCounts.active ?? 0,
+      pending: statusCounts.pending ?? 0,
+      evidenceCoverage: total === 0 ? 0 : Math.round((evidenceBacked / total) * 100),
+      kindCounts,
+      statusCounts,
+    };
+  }
+
+  async loadMemoryPage<T>(resource: MemoryPageResource, request: MemoryPageRequest): Promise<MemoryPage<T>> {
+    if (resource === 'facts') return this.listFactsPage(request) as Promise<MemoryPage<T>>;
+    const chatKey = this.requireChatKey();
+    const workspaceId = this.multiActorRepository?.boundWorkspaceId;
+    const workspaceOnly = resource === 'actors' || resource === 'actor-aliases' || resource === 'profiles' || resource === 'profile-claims';
+    const scope: Record<string, string> = resource === 'usage'
+      ? { chatKey }
+      : {
+          ...(workspaceId ? { workspaceId } : {}),
+          ...(workspaceOnly ? {} : { chatKey }),
+          ...(resource === 'actor-candidates' ? { status: 'pending' } : {}),
+        };
+    const load = (pageRequest: MemoryPageRequest): Promise<MemoryPage<T>> => {
+      if (this.multiActorRepository && resource !== 'usage') {
+        return this.multiActorRepository.page<T>(resource, pageRequest, scope);
+      }
+      return this.repository.pageCollection<T>(resource, pageRequest, scope);
+    };
+    const needle = request.query?.trim().toLocaleLowerCase() ?? '';
+    if (!needle) return load(request);
+
+    const items: T[] = [];
+    let cursor = request.cursor;
+    let nextCursor: string | null = cursor ?? null;
+    const seen = new Set<string>();
+    do {
+      if (request.signal?.aborted) throw request.signal.reason;
+      const page = await load({
+        ...request,
+        ...(cursor === undefined ? {} : { cursor }),
+        query: '',
+        limit: Math.max(1, request.limit - items.length),
+        includeTotal: false,
+      });
+      for (const item of page.items) {
+        const haystack = JSON.stringify(item).toLocaleLowerCase();
+        if (haystack.includes(needle)) items.push(item);
+      }
+      nextCursor = page.nextCursor;
+      if (items.length >= request.limit || nextCursor === null) break;
+      if (seen.has(nextCursor)) throw createSSHelperError('INTERNAL_ERROR', { stage: `memory.ui.${resource}.search-pagination` });
+      seen.add(nextCursor);
+      cursor = nextCursor;
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    } while (cursor);
+    return { items, nextCursor };
+  }
+
   onSettingsChanged(listener: (settings: MemoryUiSettings) => void): () => void {
     this.settingsListeners.add(listener);
     return () => this.settingsListeners.delete(listener);
@@ -2505,6 +3135,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   onOverviewChanged(listener: () => void): () => void {
     this.overviewListeners.add(listener);
     return () => this.overviewListeners.delete(listener);
+  }
+
+  onGenerationRecallDetailsChanged(listener: (kind: 'updated' | 'cleared') => void): () => void {
+    this.generationRecallDetailListeners.add(listener);
+    return () => this.generationRecallDetailListeners.delete(listener);
   }
 
   async updateFact(id: string, content: string): Promise<void> {
@@ -2583,10 +3218,12 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     });
   }
 
-  async getSqliteStatus(): Promise<MemorySqliteStatus> {
+  async getSqliteStatus(options: { readonly detailed?: boolean } = {}): Promise<MemorySqliteStatus> {
     try {
       traceMemoryStartup('application:sqlite-status-begin');
-      const health = await this.repository.refreshHealth(this.getChatKey());
+      const health = options.detailed === true
+        ? await this.repository.refreshHealth(this.getChatKey())
+        : await this.repository.readHealth();
       traceMemoryStartup('application:sqlite-status-health-ready');
       // Raw SQLite health is not sufficient for the v0 Memory runtime. The
       // actor repository also performs the retired-collection guard; never
@@ -2606,9 +3243,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       const eligibleFacts = Number(sqliteCoverage?.eligibleFacts ?? sqliteCoverage?.totalFacts ?? health.tableCounts.facts ?? 0);
       const coverageRatio = Number(sqliteCoverage?.ratio ?? sqliteCoverage?.coverage
         ?? (eligibleFacts === 0 ? 1 : indexedFacts / eligibleFacts));
-      const lastError = typeof health.lastError === 'string'
-        ? health.lastError
-        : health.lastError?.message;
       return {
         connected: health.connected,
         serverVersion: health.serverVersion,
@@ -2625,12 +3259,12 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         tableCounts: { ...health.tableCounts },
         tableBytes: { ...health.tableBytes },
         vectorCoverage: { indexedFacts, eligibleFacts, ratio: coverageRatio },
-        ...(lastError ? { lastError } : {}),
+        ...(health.failure ? { failure: health.failure } : {}),
       };
     } catch (error) {
       this.sqliteAvailable = false;
       this.vectorIndex.stop();
-      this.setRuntimeError(error, 'SQLITE_SERVICE_UNAVAILABLE', 'health');
+      this.setRuntimeError(error, 'WORKSPACE_DATABASE_UNAVAILABLE', 'health');
       const previous = this.repository.getHealthSnapshot();
       return {
         connected: false,
@@ -2648,12 +3282,15 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         tableCounts: previous?.tableCounts ?? {},
         tableBytes: previous?.tableBytes ?? {},
         vectorCoverage: { indexedFacts: 0, eligibleFacts: 0, ratio: 0 },
-        lastError: this.errorDiagnostic?.reason ?? 'SQLite 工作区服务未连接。',
+        failure: readSSHelperFailure(error, {
+          reasonCode: 'WORKSPACE_DATABASE_UNAVAILABLE',
+          stage: 'memory.health',
+        })!,
       };
     }
   }
 
-  private setRuntimeError(error: unknown, fallbackCode: string, stage: Parameters<typeof describeMemoryError>[2]): void {
+  private setRuntimeError(error: unknown, fallbackCode: SSHelperReasonCode, stage: Parameters<typeof describeMemoryError>[2]): void {
     const diagnostic = describeMemoryError(error, fallbackCode, stage);
     this.status = 'error';
     this.errorDiagnostic = diagnostic;
@@ -2667,7 +3304,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   exportSqliteBackup(): Promise<Blob> {
-    if (!this.sqliteAvailable) throw new Error('Memory workspace 不可用，无法导出备份。');
+    if (!this.sqliteAvailable) throw createSSHelperError('WORKSPACE_UNAVAILABLE', { stage: 'memory.archive.export' });
     return this.repository.exportBackup();
   }
 
@@ -2676,9 +3313,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     // archive would silently reintroduce retired facts, slots and ownership
     // semantics, so the old archive route is fail-closed rather than treated
     // as a migration helper.
-    const error = new Error('Memory v0 不支持旧归档导入；请删除旧数据库并从当前来源重新 Capture。') as Error & { code?: string };
-    error.code = 'MEMORY_ARCHIVE_IMPORT_DISABLED';
-    throw error;
+    throw createSSHelperError('MEMORY_ARCHIVE_IMPORT_DISABLED', { stage: 'memory.archive.import' });
   }
 
   async checkSqliteIntegrity(): Promise<{ ok: boolean; message: string }> {
@@ -2688,8 +3323,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   async clearCurrentChatData(): Promise<void> {
     const chatKey = this.requireChatKey();
-    await this.repository.clearCurrentChatData(chatKey);
-    await this.multiActorRepository?.clearCurrentChatData();
+    if (this.multiActorRepository) await this.multiActorRepository.clearCurrentChatData();
+    else await this.repository.clearCurrentChatData(chatKey);
     this.actorRegistry?.hydratePending([]);
     this.actorRegistry?.clearAudits();
     this.actorCorrectionChangeSets.clear();
@@ -2706,7 +3341,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.lastRecallLogId = null;
     this.lastSceneCast = null;
     this.lastSceneState = null;
-    this.lastGenerationCastPlan = null;
     this.lastPreparedGeneration = null;
     this.lastIncludedTraceIds = [];
     this.lastActorRecall = null;
@@ -2718,6 +3352,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.cancelRequested = false;
     this.clearRuntimeError();
     this.scheduleGraph(chatKey);
+    this.emitGenerationRecallDetailsChanged('cleared');
     this.emitOverviewChanged();
   }
 
@@ -2733,7 +3368,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.lastRecallLogId = null;
     this.lastSceneCast = null;
     this.lastSceneState = null;
-    this.lastGenerationCastPlan = null;
     this.lastPreparedGeneration = null;
     this.lastIncludedTraceIds = [];
     this.lastActorRecall = null;
@@ -2742,11 +3376,12 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     if (this.hostContext && this.multiActorRepository) {
       this.bindStorageScope(this.hostContext.getWorkspaceId(), this.getChatKey());
     }
+    this.emitGenerationRecallDetailsChanged('cleared');
     await this.bindCurrentChat();
   }
 
   private async loadSettings(): Promise<void> {
-    const [enabled, autoOrganize, summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode, preExtractReferenceEnabled, preExtractReferenceItems, preExtractReferenceMode, preExtractReferenceMaxChars, graphEnabled, graphLlmRelationEnabled, graphMaxHops, graphMaxEdges, chatOverrides, summaryProgressByChat] = await Promise.all([
+    const [enabled, autoOrganize, summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode, preExtractReferenceEnabled, preExtractReferenceItems, preExtractReferenceMode, preExtractReferenceMaxChars, structuredRepairEnabled, structuredRepairBeforeFloors, structuredRepairAfterFloors, structuredRepairMaxItems, graphEnabled, graphLlmRelationEnabled, graphMaxHops, graphMaxEdges, chatOverrides, summaryProgressByChat] = await Promise.all([
       this.repository.getSetting<boolean>('enabled'),
       this.repository.getSetting<boolean>('autoOrganize'),
       this.repository.getSetting<MemoryGlobalSettings['summaryBatchMode']>('summaryBatchMode'),
@@ -2763,6 +3398,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.repository.getSetting<number>('preExtractReferenceItems'),
       this.repository.getSetting<MemoryUiSettings['preExtractReferenceMode']>('preExtractReferenceMode'),
       this.repository.getSetting<number>('preExtractReferenceMaxChars'),
+      this.repository.getSetting<boolean>('structuredRepairEnabled'),
+      this.repository.getSetting<number>('structuredRepairBeforeFloors'),
+      this.repository.getSetting<number>('structuredRepairAfterFloors'),
+      this.repository.getSetting<number>('structuredRepairMaxItems'),
       this.repository.getSetting<boolean>('graphEnabled'),
       this.repository.getSetting<boolean>('graphLlmRelationEnabled'),
       this.repository.getSetting<number>('graphMaxHops'),
@@ -2803,6 +3442,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         ? preExtractReferenceMode
         : 'auto',
       preExtractReferenceMaxChars: clampPreExtractReferenceMaxChars(preExtractReferenceMaxChars ?? DEFAULT_SETTINGS.preExtractReferenceMaxChars),
+      structuredRepairEnabled: structuredRepairEnabled ?? DEFAULT_SETTINGS.structuredRepairEnabled,
+      structuredRepairBeforeFloors: Math.min(10, Math.max(0, Math.trunc(structuredRepairBeforeFloors ?? DEFAULT_SETTINGS.structuredRepairBeforeFloors))),
+      structuredRepairAfterFloors: Math.min(10, Math.max(0, Math.trunc(structuredRepairAfterFloors ?? DEFAULT_SETTINGS.structuredRepairAfterFloors))),
+      structuredRepairMaxItems: Math.min(10, Math.max(1, Math.trunc(structuredRepairMaxItems ?? DEFAULT_SETTINGS.structuredRepairMaxItems))),
       graphEnabled: graphEnabled ?? DEFAULT_SETTINGS.graphEnabled,
       graphLlmRelationEnabled: graphLlmRelationEnabled ?? DEFAULT_SETTINGS.graphLlmRelationEnabled,
       graphMaxHops: clampGraphMaxHops(graphMaxHops ?? DEFAULT_SETTINGS.graphMaxHops),
@@ -2903,7 +3546,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return this.capturePromise;
   }
 
-  /** Production multi-owner Capture uses the same summary window and batching settings as the compatibility path. */
+  /** Production multi-owner Capture uses the configured summary window and batching settings. */
   private async runMultiActorCaptureWorkflow(
     mode: 'initialize' | 'incremental',
     resumeJob?: MemoryJob,
@@ -2918,6 +3561,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const captureVersion = this.captureVersion;
     const captureSettings = this.getEffectiveSettings();
     const strategy = summaryStrategyFromSettings(captureSettings);
+    const includeHiddenMessageFloors = mode === 'initialize'
+      && (resumeJob?.checkpoint.includeHiddenMessageFloors ?? options.includeHiddenMessageFloors ?? true);
     const [baselineFacts, referenceScope] = captureSettings.preExtractReferenceEnabled
       ? await Promise.all([
         actorRepository.listFacts(),
@@ -2932,10 +3577,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         captureSettings.graphEnabled ? new MemoryGraphRecallIndex(deriveMemoryGraphProjection(baselineFacts)) : undefined,
       )
       : null;
-    const includeInvisibleHistory = mode === 'initialize'
-      && (resumeJob?.checkpoint.includeInvisibleHistory ?? options.includeInvisibleHistory === true);
     const allSources = selectSourceGroups(
-      await context.collectSources(chatKey).then(sources => filterSourceBlocks(sources, { includeInvisibleHistory })),
+      await context.collectSources(chatKey).then(sources => filterSourceBlocks(sources, { includeHiddenMessageFloors })),
       mode === 'incremental' ? undefined : (resumeJob?.checkpoint.selectedSourceGroupIds ?? selectedSourceGroups),
     );
     this.assertCaptureCurrent(captureVersion, chatKey);
@@ -2951,7 +3594,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const sources = automaticWindow?.sources ?? (mode === 'incremental' ? [] : allSources);
     if (sources.length === 0) return;
     const summaryOptions = {
-      includeSystemMessages: includeInvisibleHistory,
+      includeHiddenMessageFloors,
       ...(automaticWindow ? { writableSourceRefs: automaticWindow.writableSourceRefs } : {}),
     };
     const messageSources = visibleConversationMessages(sources, summaryOptions);
@@ -2966,17 +3609,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         : undefined;
     const allPlans = buildSummaryBatchPlans(sources, strategy, summaryOptions);
     const requestedResumeBatchIndex = Math.min(allPlans.length, Math.max(0, resumeJob?.checkpoint.batchIndex ?? 0));
-    // A job can fail after its last canonical batch but before job-final
-    // derivations/status are durable. Re-run the last batch on retry so a fresh
-    // ChangeSet can own the final projections.
-    const retryLastCompletedBatch = Boolean(resumeJob && allPlans.length > 0 && requestedResumeBatchIndex === allPlans.length);
-    const resumeBatchIndex = retryLastCompletedBatch ? allPlans.length - 1 : requestedResumeBatchIndex;
-    const resumedProcessedCount = Math.max(
-      0,
-      (resumeJob?.checkpoint.processedCount ?? 0) - (retryLastCompletedBatch ? allPlans.at(-1)?.messageCount ?? 0 : 0),
-    );
+    const resumeBatchIndex = requestedResumeBatchIndex;
+    const resumedProcessedCount = Math.max(0, resumeJob?.checkpoint.processedCount ?? 0);
     const plans = allPlans.slice(resumeBatchIndex);
-    if (plans.length === 0) return;
     const selectedGroups = resumeJob?.checkpoint.selectedSourceGroupIds
       ?? selectedSourceGroups
       ?? summarizeSourceGroups(allSources).map(group => group.id);
@@ -2985,13 +3620,16 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const createdAt = resumeJob?.createdAt ?? Date.now();
     const baseCheckpoint: MemoryJob['checkpoint'] = {
       batchIndex: resumeBatchIndex,
+      lastScannedBatch: resumeJob?.checkpoint.lastScannedBatch ?? resumeBatchIndex,
+      completedBatchCount: resumeJob?.checkpoint.completedBatchCount ?? resumeBatchIndex,
+      pendingRepairCount: resumeJob?.checkpoint.pendingRepairCount ?? 0,
       totalBatches,
       processedCount: resumedProcessedCount,
       ...(resumeJob?.checkpoint.lastSourceRef === undefined ? {} : { lastSourceRef: resumeJob.checkpoint.lastSourceRef }),
       ...(resumeJob?.checkpoint.overlapSourceRefs === undefined ? {} : { overlapSourceRefs: resumeJob.checkpoint.overlapSourceRefs }),
       ...(resumeJob?.checkpoint.metadataSourceRefs === undefined ? {} : { metadataSourceRefs: resumeJob.checkpoint.metadataSourceRefs }),
       selectedSourceGroupIds: selectedGroups,
-      ...(mode === 'initialize' ? { includeInvisibleHistory } : {}),
+      includeHiddenMessageFloors,
       ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
       phase: 'capture',
     };
@@ -2999,6 +3637,107 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ...job,
       workspaceId: actorRepository.boundWorkspaceId,
     });
+    if (plans.length === 0) {
+      if (resumeJob) {
+        if (resumeJob.status === 'needs_repair' || (resumeJob.checkpoint.pendingRepairCount ?? 0) > 0) {
+          this.status = 'working';
+          this.captureStartedAt = Date.now();
+          const repair = await this.runDeferredCaptureRepairs(
+            actorRepository,
+            jobId,
+            allSources,
+            captureSettings,
+            captureVersion,
+            chatKey,
+            includeHiddenMessageFloors,
+          );
+          const finalQueue = await actorRepository.listCaptureRepairQueue(jobId);
+          const reconciledJob = (await actorRepository.listCaptureJobs())
+            .find(job => String(job.id ?? '') === jobId) as unknown as MemoryJob | undefined;
+          const repairBaseJob = reconciledJob ?? resumeJob;
+          const queueByRejectionId = new Map(finalQueue.flatMap(record =>
+            (record.rejectionIds?.length ? record.rejectionIds : record.rejectionId ? [record.rejectionId] : [])
+              .map(rejectionId => [rejectionId, record] as const)));
+          const rejections = (repairBaseJob.rejections ?? []).map(rejection => {
+            const queueRecord = rejection.id ? queueByRejectionId.get(rejection.id) : undefined;
+            if (!queueRecord || queueRecord.status !== 'resolved') return rejection;
+            return {
+              ...rejection,
+              status: 'repaired' as const,
+              repairAttempts: queueRecord.attemptCount,
+              repairedAt: queueRecord.resolvedAt ?? Date.now(),
+            };
+          });
+          const unresolvedCount = rejections.filter(rejection => (rejection.status ?? 'unresolved') === 'unresolved').length;
+          const repairCounts = this.captureRepairQueueCounts(finalQueue);
+          const retryableRepairCount = repairCounts.retryable;
+          const exhaustedRepairCount = repairCounts.exhausted;
+          const reviewRequiredCount = exhaustedRepairCount + repairCounts.dependencyReview + rejections.filter(rejection =>
+            (rejection.status ?? 'unresolved') === 'unresolved'
+            && (!rejection.id || !repairCounts.linkedRejectionIds.has(rejection.id))).length;
+          const repairedCount = rejections.filter(rejection => rejection.status === 'repaired').length;
+          const ignoredCount = rejections.filter(rejection => rejection.status === 'ignored').length;
+          const nextStatus = retryableRepairCount > 0
+            ? 'needs_repair' as const
+            : unresolvedCount > 0 ? 'needs_review' as const : 'completed' as const;
+          const nextCheckpoint = {
+            ...baseCheckpoint,
+            phase: 'repair' as const,
+            pendingRepairCount: retryableRepairCount,
+            retryableRepairCount,
+            exhaustedRepairCount,
+            reviewRequiredCount,
+            unresolvedRejectionCount: unresolvedCount,
+            repairedCount,
+            degradedCount: repair.degraded,
+            ignoredCount,
+          };
+          const repairJobWithoutFailure = { ...repairBaseJob };
+          delete repairJobWithoutFailure.failure;
+          await persistJob({
+            ...repairJobWithoutFailure,
+            status: nextStatus,
+            outcome: unresolvedCount > 0 ? 'partial' : 'complete',
+            rejectionCount: unresolvedCount,
+            rejections,
+            checkpoint: nextCheckpoint,
+            updatedAt: Date.now(),
+          });
+          this.activeCaptureProgress = {
+            status: nextStatus,
+            jobId,
+            batchIndex: totalBatches,
+            totalBatches,
+            processedCount: nextCheckpoint.processedCount,
+            elapsedMs: Date.now() - this.captureStartedAt,
+            phase: 'repair',
+            outcome: unresolvedCount > 0 ? 'partial' : 'complete',
+            rejectedCount: unresolvedCount,
+            pendingRepairCount: retryableRepairCount,
+            retryableRepairCount,
+            exhaustedRepairCount,
+            reviewRequiredCount,
+            unresolvedRejectionCount: unresolvedCount,
+            repairedCount,
+            degradedCount: repair.degraded,
+            ignoredCount,
+          };
+          this.status = 'ready';
+          return;
+        }
+        await this.rebuildCaptureProjections(actorRepository).catch((error) => {
+          logger.warn('Capture 已全部提交，派生投影将在后续重建。', error);
+        });
+        const { failure: _previousFailure, ...completedJob } = resumeJob;
+        await persistJob({
+          ...completedJob,
+          status: 'completed',
+          checkpoint: baseCheckpoint,
+          updatedAt: Date.now(),
+        });
+      }
+      return;
+    }
     this.status = 'working';
     this.cancelRequested = false;
     this.captureStartedAt = Date.now();
@@ -3038,7 +3777,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       }
       return [...byId.values()];
     };
-    let finalizationStarted = false;
     try {
       for (let index = 0; index < plans.length; index += 1) {
         const plan = plans[index]!;
@@ -3051,6 +3789,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           elapsedMs: Date.now() - this.captureStartedAt,
           phase: 'capture',
         };
+        this.emitOverviewChanged();
         const existingMemoryContext = referenceRetriever ? await referenceRetriever.load({
           chatKey,
           sources: plan.sources,
@@ -3063,13 +3802,38 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           graphMaxEdges: captureSettings.graphMaxEdges,
         }) : [];
         this.assertCaptureCurrent(captureVersion, chatKey);
+        const writableRefs = new Set(plan.writableSourceRefs);
+        const nextMetadataRefs = new Set(processedMetadataRefs);
+        plan.sources
+          .filter((source) => source.kind !== 'message' && writableRefs.has(source.id))
+          .forEach((source) => nextMetadataRefs.add(source.id));
+        const nextCheckpoint: MemoryJob['checkpoint'] = {
+          ...baseCheckpoint,
+          batchIndex: resumeBatchIndex + index + 1,
+          lastScannedBatch: resumeBatchIndex + index + 1,
+          completedBatchCount: (baseCheckpoint.completedBatchCount ?? resumeBatchIndex) + index + 1,
+          processedCount: processedCount + plan.messageCount,
+          lastSourceRef: plan.sources.at(-1)?.id,
+          overlapSourceRefs: plan.sources.filter((source) => !writableRefs.has(source.id)).map((source) => source.id),
+          metadataSourceRefs: [...nextMetadataRefs],
+        };
         const result = await this.executeActorCapture(plan.sources, {
-          includeInvisibleHistory,
           captureJobId: jobId,
+          captureJob: {
+            id: jobId,
+            chatKey,
+            type: mode,
+            status: 'running',
+            checkpoint: nextCheckpoint,
+            ...(aggregatedRejections.length > 0 ? { rejections: aggregatedRejections } : {}),
+            createdAt,
+            updatedAt: Date.now(),
+          },
           writableSourceRefs: plan.writableSourceRefs,
           existingMemoryContext,
           graphLlmRelationEnabled: captureSettings.graphEnabled && captureSettings.graphLlmRelationEnabled,
           idempotencyKey: `capture:${jobId}:batch:${resumeBatchIndex + index + 1}`,
+          includeHiddenMessageFloors,
         });
         captureResults.push(result);
         aggregatedRejections = replaceRejectionsForSources(
@@ -3077,72 +3841,148 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           plan.writableSourceRefs,
           result.rejections ?? [],
         );
-        processedCount += plan.messageCount;
-        const writableRefs = new Set(plan.writableSourceRefs);
-        plan.sources
-          .filter((source) => source.kind !== 'message' && writableRefs.has(source.id))
-          .forEach((source) => processedMetadataRefs.add(source.id));
-        checkpoint = {
-          ...baseCheckpoint,
-          batchIndex: resumeBatchIndex + index + 1,
+        processedCount = nextCheckpoint.processedCount;
+        for (const ref of nextMetadataRefs) processedMetadataRefs.add(ref);
+        checkpoint = nextCheckpoint;
+        this.activeCaptureProgress = {
+          status: 'running',
+          jobId,
+          batchIndex: checkpoint.batchIndex,
+          totalBatches,
           processedCount,
-          lastSourceRef: plan.sources.at(-1)?.id,
-          overlapSourceRefs: plan.sources.filter((source) => !writableRefs.has(source.id)).map((source) => source.id),
-          metadataSourceRefs: [...processedMetadataRefs],
+          elapsedMs: Date.now() - this.captureStartedAt,
+          phase: 'capture',
         };
-        const currentRejections = aggregatedRejections;
-        const currentUnresolvedCount = currentRejections
-          .filter(item => (item.status ?? 'unresolved') === 'unresolved').length;
+        this.emitOverviewChanged();
+      }
+      let finalRejections = aggregatedRejections;
+      const initiallyRepairable = finalRejections.filter(rejection =>
+        (rejection.status ?? 'unresolved') === 'unresolved'
+        && ['schema_validation_failed', 'entity_ref_unsupported', 'invalid_reference', 'excerpt_mismatch', 'dependency_invalid'].includes(rejection.code)).length;
+      if (initiallyRepairable > 0) {
+        checkpoint = {
+          ...checkpoint,
+          phase: 'repair',
+          pendingRepairCount: initiallyRepairable,
+        };
+        this.activeCaptureProgress = {
+          status: captureSettings.structuredRepairEnabled ? 'repairing' : 'needs_repair',
+          jobId,
+          batchIndex: 0,
+          totalBatches: initiallyRepairable,
+          processedCount: 0,
+          elapsedMs: Date.now() - this.captureStartedAt,
+          phase: 'repair',
+          outcome: 'partial',
+          rejectedCount: initiallyRepairable,
+          pendingRepairCount: initiallyRepairable,
+        };
+        this.emitOverviewChanged();
         await persistJob({
           id: jobId,
           chatKey,
           type: mode,
-          status: 'running',
-          outcome: currentUnresolvedCount > 0 ? 'partial' : 'complete',
-          rejectionCount: currentUnresolvedCount,
-          ...(currentRejections.length > 0 ? { rejections: currentRejections } : {}),
+          status: captureSettings.structuredRepairEnabled ? 'repairing' : 'needs_repair',
+          outcome: 'partial',
+          rejectionCount: finalRejections.filter(rejection => (rejection.status ?? 'unresolved') === 'unresolved').length,
+          rejections: finalRejections,
           checkpoint,
           createdAt,
           updatedAt: Date.now(),
         });
+        const repair = await this.runDeferredCaptureRepairs(
+          actorRepository,
+          jobId,
+          allSources,
+          captureSettings,
+          captureVersion,
+          chatKey,
+          includeHiddenMessageFloors,
+        );
+        captureResults.push(...repair.results);
+        const repairQueue = await actorRepository.listCaptureRepairQueue(jobId);
+        const queueByRejectionId = new Map(repairQueue.flatMap(record =>
+          (record.rejectionIds?.length ? record.rejectionIds : record.rejectionId ? [record.rejectionId] : [])
+            .map(rejectionId => [rejectionId, record] as const)));
+        finalRejections = finalRejections.map(rejection => {
+          const queueRecord = rejection.id ? queueByRejectionId.get(rejection.id) : undefined;
+          return queueRecord?.status === 'resolved'
+            ? {
+              ...rejection,
+              status: 'repaired' as const,
+              repairAttempts: queueRecord.attemptCount,
+              repairedAt: queueRecord.resolvedAt ?? Date.now(),
+            }
+            : rejection;
+        });
+        const repairCounts = this.captureRepairQueueCounts(repairQueue);
+        const retryableRepairCount = repairCounts.retryable;
+        const exhaustedRepairCount = repairCounts.exhausted;
+        checkpoint = {
+          ...checkpoint,
+          pendingRepairCount: retryableRepairCount,
+          retryableRepairCount,
+          exhaustedRepairCount,
+          reviewRequiredCount: exhaustedRepairCount + repairCounts.dependencyReview + finalRejections.filter(rejection =>
+            (rejection.status ?? 'unresolved') === 'unresolved'
+            && (!rejection.id || !repairCounts.linkedRejectionIds.has(rejection.id))).length,
+          unresolvedRejectionCount: finalRejections.filter(rejection => (rejection.status ?? 'unresolved') === 'unresolved').length,
+          repairedCount: finalRejections.filter(rejection => rejection.status === 'repaired').length,
+          degradedCount: repair.degraded,
+          ignoredCount: finalRejections.filter(rejection => rejection.status === 'ignored').length,
+        };
       }
-      const finalRejections = aggregatedRejections;
       const acceptedFacts = captureResults.flatMap(result => result.facts);
       const acceptedFactIds = new Set([...baselineFacts.map(fact => fact.id), ...acceptedFacts.map(fact => fact.id)]);
       const orphanTraceCount = captureResults
         .flatMap(result => result.traces)
         .filter(trace => !acceptedFactIds.has(trace.factId))
         .length;
-      // `claim` is the v1 record type. Count legacy `fact` rows as well so a
-      // paused job created before the Claim migration cannot be resumed into a
-      // false completed state after upgrade.
-      const unresolvedClaimRejections = finalRejections.filter(rejection => ['claim', 'fact'].includes(String(rejection.recordType))
-        && (rejection.status ?? 'unresolved') === 'unresolved').length;
-      if (orphanTraceCount > 0 || (mode === 'initialize' && acceptedFacts.length === 0 && unresolvedClaimRejections > 0)) {
-        finalizationStarted = true;
-        throw Object.assign(new Error(
-          orphanTraceCount > 0
-            ? `初始化完整性检查失败：发现 ${orphanTraceCount} 条角色记忆痕迹缺少对应事实，已回滚本次 Capture。`
-            : `初始化没有生成任何可召回事实，且有 ${unresolvedClaimRejections} 条 Claim 仍被拒绝，已回滚本次 Capture。`,
-        ), {
-          code: 'MEMORY_CAPTURE_INTEGRITY_FAILED',
-          orphanTraceCount,
-          unresolvedClaimRejections,
+      if (orphanTraceCount > 0) {
+        throw createSSHelperError('MEMORY_CAPTURE_INTEGRITY_FAILED', {
+          stage: 'memory.capture.integrity',
         });
       }
-      finalizationStarted = true;
-      await this.finalizeActorCaptureResults(captureResults, sources, captureVersion, chatKey, false);
+      try {
+        await this.finalizeActorCaptureResults(captureResults, sources, captureVersion, chatKey, false);
+      } catch (error) {
+        // Base facts, evidence, traces, the root ChangeSet and the batch
+        // checkpoint were already committed atomically. Rebuildable
+        // projections must never turn that successful commit into a paused
+        // capture job.
+        this.assertCaptureCurrent(captureVersion, chatKey);
+        logger.warn('Capture 基础事实已提交，派生投影将在后续重建。', error);
+      }
       this.assertCaptureCurrent(captureVersion, chatKey);
       const outcome = finalRejections.some(rejection => (rejection.status ?? 'unresolved') === 'unresolved')
         ? 'partial' as const
         : 'complete' as const;
       const unresolvedCount = finalRejections
         .filter(rejection => (rejection.status ?? 'unresolved') === 'unresolved').length;
+      checkpoint = {
+        ...checkpoint,
+        degradedCount: captureResults.filter(result => result.resolutionMode === 'degraded').length,
+      };
+      const retryableRepairCount = checkpoint.retryableRepairCount ?? checkpoint.pendingRepairCount ?? 0;
+      const nextStatus = retryableRepairCount > 0
+        ? 'needs_repair' as const
+        : unresolvedCount > 0 ? 'needs_review' as const : 'completed' as const;
+      if (unresolvedCount > 0) {
+        checkpoint = {
+          ...checkpoint,
+          phase: 'repair',
+          // This counter represents records that are still present in the
+          // repair queue, not the number that entered the phase. Resolved
+          // records must therefore reduce it instead of being restored by
+          // the original repairable count.
+          pendingRepairCount: checkpoint.pendingRepairCount ?? initiallyRepairable,
+        };
+      }
       await persistJob({
         id: jobId,
         chatKey,
         type: mode,
-        status: 'completed',
+        status: nextStatus,
         outcome,
         rejectionCount: unresolvedCount,
         rejections: finalRejections,
@@ -3161,34 +4001,52 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.status = 'ready';
       this.clearRuntimeError();
       this.activeCaptureProgress = {
-        status: 'completed',
+        status: nextStatus,
         jobId,
         batchIndex: totalBatches,
         totalBatches,
         processedCount,
         elapsedMs: Date.now() - this.captureStartedAt,
-        phase: 'capture',
+        phase: unresolvedCount > 0 ? 'repair' : 'capture',
         outcome,
         rejectedCount: finalRejections.filter(item => (item.status ?? 'unresolved') === 'unresolved').length,
+        pendingRepairCount: checkpoint.pendingRepairCount ?? 0,
+        retryableRepairCount: checkpoint.retryableRepairCount ?? 0,
+        exhaustedRepairCount: checkpoint.exhaustedRepairCount ?? 0,
+        reviewRequiredCount: checkpoint.reviewRequiredCount ?? 0,
+        unresolvedRejectionCount: checkpoint.unresolvedRejectionCount ?? unresolvedCount,
+        repairedCount: checkpoint.repairedCount ?? 0,
+        degradedCount: checkpoint.degradedCount ?? 0,
+        ignoredCount: checkpoint.ignoredCount ?? 0,
       };
     } catch (error) {
-      const errorCode = error && typeof error === 'object' ? String((error as { code?: unknown }).code ?? '') : '';
+      const failure = readSSHelperFailure(error, {
+        reasonCode: 'INTERNAL_ERROR',
+        stage: 'memory.capture',
+      })!;
       if (this.stopped || captureVersion !== this.captureVersion || this.getChatKey() !== chatKey) {
-        if (errorCode === 'MEMORY_CAPTURE_ROLLBACK_FAILED') {
+        if (failure.reasonCode === 'MEMORY_CAPTURE_ROLLBACK_FAILED') {
           checkpoint = baseCheckpoint;
-          const message = error instanceof Error ? error.message : String(error);
           this.setRuntimeError(error, 'MEMORY_CAPTURE_ROLLBACK_FAILED', 'operation');
           if (!this.stopped && this.getChatKey() === chatKey) {
-            await persistJob({ id: jobId, chatKey, type: mode, status: 'failed', checkpoint, error: message, createdAt, updatedAt: Date.now() });
+            await persistJob({
+              id: jobId,
+              chatKey,
+              type: mode,
+              status: 'failed',
+              checkpoint,
+              failure,
+              createdAt,
+              updatedAt: Date.now(),
+            });
           }
           this.activeCaptureProgress = {
             status: 'failed', jobId, batchIndex: checkpoint.batchIndex, totalBatches,
             processedCount: checkpoint.processedCount, elapsedMs: Date.now() - this.captureStartedAt,
-            error: message, phase: 'capture',
+            failure, phase: 'capture',
           };
           throw error;
         }
-        if (finalizationStarted) checkpoint = baseCheckpoint;
         if (!this.stopped) await persistJob({ id: jobId, chatKey, type: mode, status: 'paused', checkpoint, createdAt, updatedAt: Date.now() });
         this.status = this.getEffectiveSettings().enabled ? 'ready' : 'disabled';
         this.activeCaptureProgress = {
@@ -3202,19 +4060,22 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         };
         return;
       }
-      let effectiveError = error;
-      if (finalizationStarted) {
-        try {
-          await this.rollbackActorCaptureResults(captureResults, actorRepository);
-        } catch (rollbackError) {
-          effectiveError = rollbackError;
-        }
-        checkpoint = baseCheckpoint;
-      }
-      const message = effectiveError instanceof Error ? effectiveError.message : String(effectiveError);
-      this.setRuntimeError(effectiveError, 'MEMORY_CAPTURE_FAILED', 'operation');
-      const pauseForRetry = isRetryableCaptureError(effectiveError);
-      await persistJob({ id: jobId, chatKey, type: mode, status: pauseForRetry ? 'paused' : 'failed', checkpoint, error: message, createdAt, updatedAt: Date.now() });
+      this.setRuntimeError(error, 'INTERNAL_ERROR', 'operation');
+      const pauseForRetry = isRetryableCaptureError(error);
+      const contextualFailure: SSHelperFailureContext = {
+        ...failure,
+        batchIndex: checkpoint.batchIndex,
+      };
+      await persistJob({
+        id: jobId,
+        chatKey,
+        type: mode,
+        status: pauseForRetry ? 'paused' : 'failed',
+        checkpoint,
+        failure: contextualFailure,
+        createdAt,
+        updatedAt: Date.now(),
+      });
       this.activeCaptureProgress = {
         status: pauseForRetry ? 'paused' : 'failed',
         jobId,
@@ -3222,7 +4083,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         totalBatches,
         processedCount: checkpoint.processedCount,
         elapsedMs: Date.now() - this.captureStartedAt,
-        error: message,
+        failure: contextualFailure,
         phase: 'capture',
       };
       throw error;
@@ -3239,7 +4100,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const settings = this.getEffectiveSettings();
     if (!settings.enabled) return;
     if (!this.actorCapture || !this.multiActorRepository) {
-      throw Object.assign(new Error('Claim Capture 尚未绑定人物、地点或工作区。'), { code: 'MEMORY_CAPTURE_NOT_BOUND' });
+      throw createSSHelperError('MEMORY_CAPTURE_NOT_BOUND', { stage: 'memory.capture.bind' });
     }
     await this.runMultiActorCaptureWorkflow(mode, resumeJob, selectedSourceGroups, options);
   }
@@ -3272,6 +4133,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     });
   }
 
+  private emitGenerationRecallDetailsChanged(kind: 'updated' | 'cleared'): void {
+    if (this.stopped) return;
+    this.generationRecallDetailListeners.forEach((listener) => {
+      try { listener(kind); } catch { /* a stale chat action listener must not affect application state */ }
+    });
+  }
+
   private scheduleGraph(chatKey: string): void {
     if (!chatKey) return;
     const effective = this.getEffectiveSettings();
@@ -3301,7 +4169,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   private assertCaptureCurrent(version: number, chatKey: string): void {
     if (this.stopped || version !== this.captureVersion || this.getChatKey() !== chatKey) {
-      throw new CaptureCancelledError();
+      throw createSSHelperError('CANCELLED', { stage: 'memory.capture.cancel' });
     }
   }
 

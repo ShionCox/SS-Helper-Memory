@@ -225,7 +225,7 @@ export class ActiveCastResolver {
       // Scene casts are chat-scoped records. Including the chat key prevents
       // equal floor/epoch values in two chats from overwriting one another in
       // the shared workspace collection.
-      id: `scene-cast:${this.registry.workspaceId}:${encodeURIComponent(chatKey)}:${currentFloor}:${encodeURIComponent(options.sceneEpoch ?? 'default')}`,
+      id: `scene-cast:${encodeURIComponent(this.registry.workspaceId)}:${encodeURIComponent(chatKey)}:${currentFloor}:${encodeURIComponent(options.sceneEpoch ?? 'default')}`,
       workspaceId: this.registry.workspaceId,
       chatKey,
       floor: currentFloor,

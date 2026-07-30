@@ -178,10 +178,6 @@ export function buildMemoryPromptResult(
   })
 }
 
-/** Builds the exact injection text while preserving the legacy string API. */
-export function buildMemoryPrompt(result: RecallResult, options: MemoryPromptOptions = {}): string {
-  return buildMemoryPromptResult(result, options).prompt
-}
 
 export const memoryPromptLimits = Object.freeze({
   defaultMaxChars: DEFAULT_PROMPT_MAX_CHARS,
@@ -193,6 +189,7 @@ export interface ActorMemoryPromptOptions {
   readonly currentViewpointOwnerId?: string
   readonly rules?: readonly string[]
   readonly castPlan?: GenerationCastPlan
+  readonly answerMode?: 'roleplay' | 'direct'
 }
 
 export interface ActorMemoryPromptResult {
@@ -243,7 +240,7 @@ export function buildActorMemoryPromptResult(response: ActorRecallResponse, opti
   ].filter(Boolean))
   const actors = [...response.actors].sort((left, right) => Number(currentActorIds.has(right.ownerId)) - Number(currentActorIds.has(left.ownerId)) || left.ownerId.localeCompare(right.ownerId))
   const partitions = [response.world, response.narrator, ...actors]
-  if (partitions.every(partition => partition.packets.length === 0) && !options.castPlan) {
+  if (partitions.every(partition => partition.packets.length === 0) && (!options.castPlan || options.answerMode === 'direct')) {
     return Object.freeze({ prompt: '', includedTraceIds: Object.freeze([]), omittedTraceIds: Object.freeze([]), diagnostics: Object.freeze({ maxChars, usedChars: 0, partitionBudgets: Object.freeze({}), includedCount: 0, omittedCount: 0, mode: response.request.mode ?? 'multi_actor' }) })
   }
   const actorCount = actors.length
@@ -258,7 +255,7 @@ export function buildActorMemoryPromptResult(response: ActorRecallResponse, opti
   const lines = [`<memory_context mode="${mode}" scene="${sceneLabel}">`]
   const castPlan = options.castPlan ?? response.request.castPlan
   const ownerNameById = new Map(partitions.map(partition => [partition.ownerId, partition.ownerName]))
-  if (castPlan) {
+  if (castPlan && options.answerMode !== 'direct') {
     const castLine = (label: string, ownerIds: readonly string[]): string => `${label}：${ownerIds.map(ownerId => xmlEscape(ownerNameById.get(ownerId) ?? ownerId)).join('、') || '无'}`
     lines.push(
       '<generation_cast>',

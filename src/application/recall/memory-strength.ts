@@ -31,9 +31,7 @@ export function effectiveMemoryStrength(trace: ActorMemoryTrace, now = Date.now(
   const elapsed = Math.max(0, now - (trace.lastRehearsedAt ?? trace.updatedAt));
   const decay = Math.exp(-elapsed / halfLife);
   const rehearsal = 1 + Math.max(0, trace.rehearsalCount) * resolved.rehearsalGain;
-  // Domain salience is 0–1. Accept legacy-looking 0–100 fixtures defensively
-  // without changing the persisted v0 contract.
-  const salience = trace.emotionalSalience > 1 ? trace.emotionalSalience / 100 : trace.emotionalSalience;
+  const salience = trace.emotionalSalience;
   const emotion = 1 + clamp(salience, 0, 1) * resolved.emotionalGain;
   const cue = clamp(resolved.cueMatch ?? 1, 0, 1);
   const interference = Math.max(0, resolved.interference);
@@ -51,10 +49,6 @@ export function deterministicSeed(ownerId: string, factId: string, traceRevision
   return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
-function seedNumber(seed: string): number {
-  return Number.parseInt(seed.slice(0, 8), 16) / 0xffffffff;
-}
-
 function gist(content: string): string {
   const normalized = content.replace(/\s+/gu, ' ').trim();
   if (!normalized) return '一段相关记忆';
@@ -66,11 +60,15 @@ function gist(content: string): string {
   return sentence.length > max ? `${sentence.slice(0, Math.max(2, max - 1))}…` : `${sentence.slice(0, Math.max(2, sentence.length - 1))}…`;
 }
 
-type RecallFact = Pick<MemoryFact, 'id' | 'content'>;
+type RecallFact = Pick<MemoryFact, 'id' | 'content'> & Partial<Pick<MemoryFact, 'subjectKey' | 'predicateKey'>>;
 
-function detailUnits(trace: ActorMemoryTrace, fact: RecallFact): MemoryDetailUnit[] {
-  return [{ id: `detail:${trace.id}:gist`, traceId: trace.id, text: gist(fact.content), sensitivity: 'gist', minStrength: MEMORY_STRENGTH_LEVELS.fragment, sourceFactId: fact.id },
-    { id: `detail:${trace.id}:exact`, traceId: trace.id, text: fact.content, sensitivity: 'exact', minStrength: MEMORY_STRENGTH_LEVELS.exact, sourceFactId: fact.id }];
+function fragment(fact: RecallFact, strength: number): string {
+  const subject = fact.subjectKey?.trim() || '这件事';
+  if (strength < MEMORY_STRENGTH_LEVELS.fragment) return `对「${subject}」有一段模糊印象。`;
+  const predicate = fact.predicateKey?.trim() || '';
+  return predicate
+    ? `隐约记得「${subject}」与「${predicate}」有关，细节不清。`
+    : `对「${subject}」有一段模糊印象。`;
 }
 
 /**
@@ -88,12 +86,11 @@ export function buildMemoryRecallPacketAtStrength(
   const strength = clamp(effectiveStrengthValue);
   if (strength <= 0 || strength < MEMORY_STRENGTH_LEVELS.forgotten) return null;
   const seed = deterministicSeed(trace.ownerId, trace.factId, trace.traceRevision, sceneEpoch);
-  const available = detailUnits(trace, fact).filter(detail => strength >= detail.minStrength);
   const useExact = strength >= MEMORY_STRENGTH_LEVELS.exact;
-  const packetDetails = useExact ? available : available.filter(detail => detail.sensitivity !== 'exact');
-  const omittedDetailCount = detailUnits(trace, fact).length - packetDetails.length;
+  const packetDetails: MemoryDetailUnit[] = [];
+  const omittedDetailCount = useExact ? 0 : 1;
   const clarity = strength >= MEMORY_STRENGTH_LEVELS.clear ? trace.clarity : strength >= MEMORY_STRENGTH_LEVELS.gist ? Math.min(trace.clarity, 65) : Math.min(trace.clarity, 35);
-  const packetGist = strength >= MEMORY_STRENGTH_LEVELS.gist ? gist(fact.content) : (seedNumber(seed) > 0.15 ? '关于某件事的模糊记忆' : '一段不清晰的相关记忆');
+  const packetGist = useExact ? fact.content : strength >= MEMORY_STRENGTH_LEVELS.gist ? gist(fact.content) : fragment(fact, strength);
   return { traceId: trace.id, factId: fact.id, ownerId: trace.ownerId, gist: packetGist, details: packetDetails, effectiveStrength: strength, clarity, deterministicSeed: seed, omittedDetailCount };
 }
 

@@ -5,6 +5,7 @@
  * container.  The records below describe the in-world subjects that live in
  * that container and the evidence that explains what each subject knows.
  */
+import type { SSHelperFailureContext } from '@ss-helper/sdk';
 
 export const MEMORY_MODEL_VERSION = 0 as const;
 
@@ -179,8 +180,8 @@ export interface MemoryObservation {
 export interface ActorMemoryTrace {
   readonly id: string;
   readonly workspaceId: string;
-  /** Chat provenance is persisted by the repository; traces may be shared by a workspace. */
-  readonly chatKey?: string;
+  /** Exact chat provenance. A trace never floats across chats in the same workspace. */
+  readonly chatKey: string;
   readonly ownerId: string;
   readonly factId: string;
   readonly sourceObservationIds: readonly string[];
@@ -189,13 +190,14 @@ export interface ActorMemoryTrace {
   readonly strength: number;
   readonly clarity: number;
   readonly beliefConfidence: number;
+  /** Emotional salience normalized to the closed interval [0, 1]. */
   readonly emotionalSalience: number;
   readonly rehearsalCount: number;
   readonly traceRevision: number;
-  /** Source timeline floor used by profile lookback; optional for older v0 rows. */
+  /** Source timeline floor used by profile lookback; metadata-only facts may not map to a chat floor. */
   readonly floor?: number;
   /** Earliest point at which this owner could have learned the fact. */
-  readonly learnedAt?: number;
+  readonly learnedAt: number;
   readonly lastRehearsedAt?: number;
   readonly createdAt: number;
   readonly updatedAt: number;
@@ -253,11 +255,14 @@ export interface ActorRecallRequest {
   readonly maxItems?: number;
   readonly now?: number;
   readonly sceneEpoch?: string;
-  /** Generation-time cast planning is optional for legacy diagnostic calls. */
+  /** Direct diagnostic recall may omit a plan; the coordinator derives a deterministic one. */
   readonly castPlan?: import('./generation-cast').GenerationCastPlan;
   readonly intentPlan?: import('./recall-plan').GenerationRecallIntentPlan;
   /** Controlled coverage expansion may raise, but never lower, this level. */
   readonly minimumRetrievalLevel?: 1 | 2 | 3 | 4;
+  /** True only for the verifier's single controlled fallback pass. */
+  readonly coverageExpansion?: boolean;
+  readonly excludedFactIds?: readonly string[];
 }
 
 export interface ActorMemoryPartition {
@@ -267,13 +272,46 @@ export interface ActorMemoryPartition {
   readonly packets: readonly MemoryRecallPacket[];
 }
 
+export interface ActorRecallCandidateAudit {
+  readonly factId: string;
+  /** Owners whose allowed public traces support this single, de-duplicated retrieval. */
+  readonly applicableOwnerIds?: readonly string[];
+  readonly factKind?: string;
+  readonly traceIds: readonly string[];
+  readonly sourceFloors: readonly number[];
+  readonly summary: string;
+  readonly score: number;
+  readonly selected: boolean;
+  readonly reasonCodes: readonly string[];
+  readonly omittedReason?: string;
+  readonly lexicalScore?: number;
+  readonly vectorScore?: number;
+  readonly graphScore?: number;
+  readonly lexicalRank?: number;
+  readonly vectorRank?: number;
+  readonly graphRank?: number;
+  readonly fusionScore?: number;
+  readonly rerankScore?: number;
+}
+
+export interface ActorRecallCandidatePartition {
+  readonly ownerId: string;
+  readonly ownerName: string;
+  readonly role: ActorMemoryPartition['role'];
+  readonly candidates: readonly ActorRecallCandidateAudit[];
+}
+
 export interface ActorRecallResponse {
-  readonly request: ActorRecallRequest;
+  readonly request: ActorRecallRequest & { readonly castPlan: import('./generation-cast').GenerationCastPlan };
   readonly world: ActorMemoryPartition;
   readonly narrator: ActorMemoryPartition;
   readonly actors: readonly ActorMemoryPartition[];
+  /** Complete owner-isolated candidate pool retained for generation audit. */
+  readonly candidatePartitions?: readonly ActorRecallCandidatePartition[];
   readonly diagnostics: {
     readonly candidateCount: number;
+    readonly uniqueCandidateCount?: number;
+    readonly duplicateCandidateCount?: number;
     readonly selectedCount: number;
     readonly partitions: number;
     readonly mode: ActorRecallMode;
@@ -323,7 +361,7 @@ export interface DreamJob {
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly appliedAt?: number;
-  readonly error?: string;
+  readonly failure?: SSHelperFailureContext;
 }
 
 export interface DreamNarrative {

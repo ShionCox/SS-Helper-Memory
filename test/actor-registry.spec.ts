@@ -31,7 +31,10 @@ describe('ActorRegistry correction and pending state', () => {
     expect(() => registry.discover({
       displayName: '临时人物', sourceRef: 'message:invalid-id', sourceType: 'message', confidence: 0.5,
       excerpt: '临时人物走进房间。', confirmed: false, preferredOwnerId: 'owner:world',
-    })).toThrow('preferredOwnerId 格式非法');
+    })).toThrowError(expect.objectContaining({
+      code: 'INVALID_PAYLOAD',
+      details: expect.objectContaining({ reasonCode: 'INVALID_PAYLOAD', stage: 'memory.actor.discover' }),
+    }));
 
     const first = registry.discover({
       displayName: '临时甲', sourceRef: 'message:first', sourceType: 'message', confidence: 0.5,
@@ -41,7 +44,10 @@ describe('ActorRegistry correction and pending state', () => {
     expect(() => registry.discover({
       displayName: '临时乙', sourceRef: 'message:second', sourceType: 'message', confidence: 0.5,
       excerpt: '临时乙走进房间。', confirmed: false, preferredOwnerId: 'provisional:scene:test:abc',
-    })).toThrow('已被其他人物占用');
+    })).toThrowError(expect.objectContaining({
+      code: 'CONFLICT',
+      details: expect.objectContaining({ reasonCode: 'WORKSPACE_CONFLICT', stage: 'memory.actor.discover' }),
+    }));
     expect(registry.getOwner('provisional:scene:test:abc')?.canonicalName).toBe('临时甲');
   });
 

@@ -719,7 +719,6 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
       if (!line) continue;
       const active = edge.id === selectedEdge;
       const connected = eventRelatedEdgeIds.has(edge.id) || Boolean(selectedNode && edgeConnectedToNode(edge, selectedNode));
-      const insideSelectedCluster = !selectedCluster || (edge.source.clusterId === selectedCluster && edge.target.clusterId === selectedCluster);
       const material = line.material;
       material.color.set(active || connected ? '#ffffff' : selectedEdge || selectedEvent ? '#35404d' : '#8893a2');
       material.opacity = active || connected ? .98 : selectedEdge || selectedEvent ? .2 : selectedNode ? .2 : .7;

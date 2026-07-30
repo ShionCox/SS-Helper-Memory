@@ -3,9 +3,10 @@ import type { PluginSession } from '@ss-helper/sdk';
 import { registerMemoryContributions, type MemoryHostCapability } from '../src/ss-helper/plugin';
 import { MEMORY_WORKBENCH_POPUP } from '../src/ss-helper/settings';
 
-function createSession(includeMenu = true) {
+function createSession() {
   const popupRegistrations: any[] = [];
   const menuRegistrations: any[] = [];
+  const messageActionRegistrations: any[] = [];
   const cleanups: Array<ReturnType<typeof vi.fn>> = [];
   const cleanup = () => {
     const fn = vi.fn();
@@ -14,28 +15,32 @@ function createSession(includeMenu = true) {
   };
   const openPopup = vi.fn();
   const session = {
-    services: { expose: vi.fn(() => cleanup()) },
-    events: { publish: vi.fn() },
+    bus: { handle: vi.fn(() => cleanup()), publish: vi.fn() },
     ui: { openPopup, showToast: vi.fn() },
+    host: { chat: { navigate: vi.fn() } },
     registerChatIndicator: vi.fn(() => cleanup()),
+    registerChatMessageAction: vi.fn((registration) => {
+      messageActionRegistrations.push(registration);
+      return cleanup();
+    }),
     registerSettings: vi.fn(() => cleanup()),
     registerPopup: vi.fn((registration) => {
       popupRegistrations.push(registration);
       return cleanup();
     }),
-    ...(includeMenu ? {
-      registerExtensionMenuItem: vi.fn((registration) => {
-        menuRegistrations.push(registration);
-        return cleanup();
-      }),
-    } : {}),
+    registerExtensionMenuItem: vi.fn((registration) => {
+      menuRegistrations.push(registration);
+      return cleanup();
+    }),
   } as unknown as PluginSession<MemoryHostCapability>;
-  return { session, popupRegistrations, menuRegistrations, cleanups, openPopup };
+  return { session, popupRegistrations, menuRegistrations, messageActionRegistrations, cleanups, openPopup };
 }
 
 const controller = {
   isChatEnabled: () => true,
   onSettingsChanged: () => () => undefined,
+  onOverviewChanged: () => () => undefined,
+  findGenerationRecallDetails: async () => [],
 } as any;
 
 const statusSource = {
@@ -58,6 +63,9 @@ describe('Memory extension menu contribution', () => {
     );
     expect(fixture.popupRegistrations.some((registration) => registration.token === MEMORY_WORKBENCH_POPUP)).toBe(true);
     expect(fixture.menuRegistrations).toHaveLength(1);
+    expect(fixture.messageActionRegistrations).toEqual([
+      expect.objectContaining({ id: 'generation-recall-detail', icon: 'brain' }),
+    ]);
     expect(fixture.menuRegistrations[0]).toMatchObject({
       id: 'memory-workbench',
       label: '记忆工作台',
@@ -69,17 +77,5 @@ describe('Memory extension menu contribution', () => {
 
     contribution.dispose();
     expect(fixture.cleanups.every((dispose) => dispose.mock.calls.length === 1)).toBe(true);
-  });
-
-  it('keeps older Core sessions usable when menu registration is unavailable', () => {
-    const fixture = createSession(false);
-    expect(() => registerMemoryContributions(
-      fixture.session,
-      controller,
-      () => undefined,
-      statusSource,
-      recovery,
-    ).dispose()).not.toThrow();
-    expect(fixture.menuRegistrations).toHaveLength(0);
   });
 });

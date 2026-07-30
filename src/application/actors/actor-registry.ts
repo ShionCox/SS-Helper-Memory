@@ -13,6 +13,7 @@ import {
   type MemoryTraits,
   type MemoryOwner,
 } from '../../domain';
+import { createSSHelperError } from '@ss-helper/sdk';
 
 export interface ActorDiscoveryInput {
   readonly displayName: string;
@@ -299,11 +300,19 @@ export class ActorRegistry {
     // accompanying display name also failed the entity boundary.
     if (preferredOwnerId) {
       if (!/^provisional:[A-Za-z0-9_.!~*'()%:-]+$/u.test(preferredOwnerId)) {
-        throw Object.assign(new Error('临时人物 preferredOwnerId 格式非法。'), { code: 'ACTOR_PREFERRED_ID_INVALID' });
+        throw createSSHelperError('INVALID_PAYLOAD', {
+          stage: 'memory.actor.discover',
+          path: '$.preferredOwnerId',
+          keyword: 'pattern',
+          expected: 'provisional:<safe-id>',
+        });
       }
       const occupied = this.ownersById.get(preferredOwnerId);
       if (occupied && preliminaryNormalized && normalizeActorName(ownerName(occupied)) !== preliminaryNormalized) {
-        throw Object.assign(new Error('临时人物 preferredOwnerId 已被其他人物占用。'), { code: 'ACTOR_PREFERRED_ID_CONFLICT' });
+        throw createSSHelperError('WORKSPACE_CONFLICT', {
+          stage: 'memory.actor.discover',
+          collection: 'actor-owners',
+        });
       }
     }
 

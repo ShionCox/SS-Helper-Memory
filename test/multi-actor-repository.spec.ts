@@ -1,19 +1,25 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { WorkspacePort, WorkspaceRecord } from '@ss-helper/sdk';
+import { createSSHelperError, type WorkspacePort, type WorkspaceQueryOptions, type WorkspaceRecord, type WorkspaceSession } from '@ss-helper/sdk';
 import { MultiActorMemoryRepository, type CaptureCommit } from '../src/infrastructure/multi-actor-memory-repository';
 
-type RecordRequest = { collection?: string; recordId?: string; value?: unknown };
+type RecordRequest = { workspaceId?: string; collection?: string; recordId?: string; value?: unknown };
 type QueryRequest = { collection?: string; filter?: Record<string, unknown> };
 type TransactionRequest = { operations: readonly { action: 'delete' | 'upsert'; collection: string; recordId: string; value?: unknown }[] };
+type LegacyRecord = WorkspaceRecord & { readonly recordId: string; readonly version: number };
+type TestWorkspacePort = WorkspacePort & {
+  defineCollection(request: { name: string; indexes?: readonly string[] }): Promise<void>;
+  get(request: RecordRequest): Promise<LegacyRecord | null>;
+  upsert(request: RecordRequest): Promise<LegacyRecord>;
+  delete(request: RecordRequest): Promise<boolean>;
+  query(request: QueryRequest): Promise<{ records: LegacyRecord[]; nextCursor: string | null }>;
+  transaction(request: TransactionRequest): Promise<{ operationCount: number; replayed: boolean; results: unknown[] }>;
+};
 
-function port(): WorkspacePort {
+function port(): TestWorkspacePort {
   const collections = new Map<string, Map<string, { value: unknown; version: number; updatedAt: number }>>();
   const declaredIndexes = new Map<string, Set<string>>();
   const key = (collection: string, id: string) => `${collection}:${id}`;
-  return {
-    health: async () => ({ ready: true, database: 'memory', schemaVersion: 0 }),
-    integrity: async () => ({ ok: true, messages: [] }),
-    open: async (request: { workspaceId: string }) => ({ ownerPluginId: 'test', workspaceId: request.workspaceId, created: false }),
+  const legacy = {
     list: async () => ({ workspaces: [], nextCursor: null }),
     removeWorkspace: async () => false,
     clearOwned: async () => 0,
@@ -41,7 +47,10 @@ function port(): WorkspacePort {
         }
       }
       const bucket = collections.get(collection) ?? new Map();
-      const records: WorkspaceRecord[] = [...bucket.entries()].map(([compound, value]) => ({ recordId: compound.slice(collection.length + 1), ...value } as WorkspaceRecord)).filter(record => Object.entries(request.filter ?? {}).every(([field, expected]) => (record.value as Record<string, unknown>)[field] === expected));
+      const records: LegacyRecord[] = [...bucket.entries()].map(([compound, value]) => {
+        const recordId = compound.slice(collection.length + 1);
+        return { id: recordId, recordId, value: value.value as never, revision: value.version, version: value.version, updatedAt: value.updatedAt };
+      }).filter(record => Object.entries(request.filter ?? {}).every(([field, expected]) => (record.value as Record<string, unknown>)[field] === expected));
       return { records, nextCursor: null };
     },
     transaction: async (request: TransactionRequest) => {
@@ -60,7 +69,67 @@ function port(): WorkspacePort {
     vectorUpsert: async () => undefined, vectorSearch: async () => [], vectorDelete: async () => false, vectorList: async () => ({ vectors: [], nextCursor: null }), vectorClear: async () => 0,
     repair: async () => ({ repaired: true, backupId: 'test' }),
     grant: async () => undefined, revoke: async () => undefined, export: async () => new Blob(), import: async () => undefined, exportAll: async () => ({ archive: {}, sha256: '' }), importAll: async () => undefined,
-  } as unknown as WorkspacePort;
+  };
+  const workspace = {
+    admin: {
+      health: async () => ({ ready: true, status: 'ready' as const, database: 'memory', schemaVersion: 0 }),
+      integrity: async () => ({ ok: true, messages: [] }),
+      reset: async () => 0,
+      backup: async () => ({ archive: {} as never, sha256: '' }),
+    },
+    open: async (request: Parameters<WorkspacePort['open']>[0]) => {
+      for (const declaration of request.schema.collections) await workspace.defineCollection(declaration);
+      return {
+        id: request.id,
+        get: async (collection: string, id: string) => {
+          const record = await workspace.get({ collection, recordId: id });
+          return record ? { id, value: record.value as never, revision: record.version, updatedAt: record.updatedAt } : null;
+        },
+        query: async (collection: string, options: WorkspaceQueryOptions = {}) => {
+          const page = await workspace.query({ collection, filter: options.filter as Record<string, unknown> });
+          return { records: page.records.map((record) => ({ id: record.recordId, value: record.value, revision: record.version, updatedAt: record.updatedAt })), nextCursor: page.nextCursor };
+        },
+        commit: async (request: Parameters<WorkspaceSession['commit']>[0]) => {
+          if (request.idempotencyKey.length > 128 || !/^[\w.:-]+$/u.test(request.idempotencyKey)) {
+            throw Object.assign(new Error('idempotencyKey is invalid'), { code: 'INVALID_PAYLOAD' });
+          }
+          await workspace.transaction({
+            operations: request.operations.map((operation) => operation.action === 'put'
+              ? { action: 'upsert' as const, collection: operation.collection, recordId: operation.id, value: operation.value }
+              : { action: 'delete' as const, collection: operation.collection, recordId: operation.id }),
+          });
+          const results = await Promise.all(request.operations.map(async (operation) => {
+            if (operation.action === 'delete') {
+              return {
+                collection: operation.collection,
+                id: operation.id,
+                action: operation.action,
+                revision: (operation.expectedRevision ?? 0) + 1,
+                removed: true,
+              };
+            }
+            const stored = await workspace.get({ collection: operation.collection, recordId: operation.id });
+            return {
+              collection: operation.collection,
+              id: operation.id,
+              action: operation.action,
+              revision: stored?.version ?? 1,
+            };
+          }));
+          return { requestId: request.idempotencyKey, replayed: false, results };
+        },
+        vectors: {
+          upsert: async () => undefined,
+          search: async () => [],
+          delete: async () => false,
+          list: async () => ({ vectors: [], nextCursor: null }),
+          clear: async () => 0,
+        },
+      };
+    },
+    ...legacy,
+  } as unknown as TestWorkspacePort;
+  return workspace;
 }
 
 function commit(traceStrength: number, rehearsalCount: number): CaptureCommit {
@@ -68,7 +137,7 @@ function commit(traceStrength: number, rehearsalCount: number): CaptureCommit {
   return {
     envelope: { workspaceId: 'w', chatKey: 'chat', sourceRefs: ['source:s'], actorCandidates: [], locationCandidates: [], episodes: [], claimLocalIds: ['claim:f'], capturedAt: 1 },
     owners: [], aliases: [], locations: [], locationAliases: [], episodes: [], observations: [], facts: [fact], evidence: [{ id: 'evidence:f', workspaceId: 'w', chatKey: 'chat', factId: fact.id, sourceRef: 'source:s', excerpt: 'A知道铜钥匙位置', occurredAt: 1, createdAt: 1 }],
-    traces: [{ id: 'trace:owner:actor:a:fact:f', workspaceId: 'w', chatKey: 'chat', ownerId: 'owner:actor:a', factId: fact.id, sourceObservationIds: ['o1'], knowledgeMode: 'experienced', privacy: 'public', strength: traceStrength, clarity: 80, beliefConfidence: 0.8, emotionalSalience: 0.2, rehearsalCount, traceRevision: 1, createdAt: 1, updatedAt: 1 }],
+    traces: [{ id: 'trace:owner:actor:a:fact:f', workspaceId: 'w', chatKey: 'chat', ownerId: 'owner:actor:a', factId: fact.id, sourceObservationIds: ['o1'], knowledgeMode: 'experienced', privacy: 'public', strength: traceStrength, clarity: 80, beliefConfidence: 0.8, emotionalSalience: 0.2, rehearsalCount, traceRevision: 1, learnedAt: 1, createdAt: 1, updatedAt: 1 }],
   };
 }
 
@@ -94,7 +163,8 @@ function currentStableKey(value: string): string {
 
 describe('multi-actor repository transaction semantics', () => {
   it('persists and clears the additive scene, cast, coverage and usage records', async () => {
-    const repository = new MultiActorMemoryRepository(port());
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
     repository.bind('w', 'chat');
     await repository.open();
     const state = {
@@ -132,6 +202,8 @@ describe('multi-actor repository transaction semantics', () => {
       id: 'usage:1', workspaceId: 'w', chatKey: 'chat', planId: plan.id, ownerId: 'owner:actor:a',
       traceId: 'trace:1', factId: 'fact:1', usage: 'explicit', confidence: 1, createdAt: 3,
     }]);
+    await workspace.upsert({ workspaceId: 'w', collection: 'generation-prompt-snapshots', recordId: 'snapshot:1', value: { id: 'snapshot:1', workspaceId: 'w', chatKey: 'chat' } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'generation-prompt-snapshot-chunks', recordId: 'snapshot:1:chunk:0', value: { id: 'snapshot:1:chunk:0', workspaceId: 'w', chatKey: 'chat', snapshotId: 'snapshot:1', index: 0 } });
 
     expect(await repository.getSceneState()).toMatchObject({ sceneId: 'scene:1', presentOwnerIds: ['owner:actor:a'] });
     expect(await repository.listSceneTransitions()).toMatchObject([{ reason: 'explicit_entry' }]);
@@ -144,27 +216,8 @@ describe('multi-actor repository transaction semantics', () => {
     expect(await repository.getSceneState()).toBeUndefined();
     expect(await repository.listGenerationCastPlans()).toEqual([]);
     expect(await repository.listMemoryUsageLogs()).toEqual([]);
-  });
-
-  it('keeps existing Capture available when an additive cast collection cannot be created', async () => {
-    const workspace = port();
-    const defineCollection = workspace.defineCollection.bind(workspace);
-    workspace.defineCollection = async (request) => {
-      if (request.name === 'scene-states') throw Object.assign(new Error('unsupported collection'), { code: 'COLLECTION_UNAVAILABLE' });
-      return defineCollection(request);
-    };
-    const repository = new MultiActorMemoryRepository(workspace);
-    repository.bind('w', 'chat');
-    await expect(repository.open()).resolves.toBeUndefined();
-    await expect(repository.commitCapture(commit(40, 0))).resolves.toMatchObject({ kind: 'capture-change-set-v0' });
-    await expect(repository.saveSceneState({
-      id: 'scene-state:w:chat', workspaceId: 'w', chatKey: 'chat', sceneId: 'scene:1', sceneEpoch: 1,
-      locationKeys: [], viewpointOwnerId: 'owner:narrator', presentOwnerIds: [], nearbyOwnerIds: [], exitedOwnerIds: [],
-      recentSpeakerOwnerIds: [], mentionedOwnerIds: [], startedAtFloor: 1, updatedAtFloor: 1,
-      confidence: 0.5, revision: 1, sourceRefs: [], createdAt: 1, updatedAt: 1,
-    })).resolves.toBeUndefined();
-    expect(await repository.getSceneState()).toBeUndefined();
-    expect(await repository.listFacts()).toHaveLength(1);
+    expect((await workspace.query({ collection: 'generation-prompt-snapshots', filter: { chatKey: 'chat' } })).records).toEqual([]);
+    expect((await workspace.query({ collection: 'generation-prompt-snapshot-chunks', filter: { chatKey: 'chat' } })).records).toEqual([]);
   });
 
   it('ignores a damaged persisted SceneState so callers can rebuild from SceneCast and recent floors', async () => {
@@ -180,20 +233,9 @@ describe('multi-actor repository transaction semantics', () => {
     expect(await repository.listSceneStates()).toEqual([]);
   });
 
-  it('fails closed when a retired collection contains rows without workspace metadata', async () => {
-    const workspace = port();
-    const originalQuery = workspace.query.bind(workspace);
-    workspace.query = async (request) => {
-      if (request.collection === 'fact-slots') return { records: [{ recordId: 'legacy-slot', value: { chatKey: 'chat', slotKey: 'A::知道', factId: 'fact:f' }, version: 1, updatedAt: 1 }], nextCursor: null };
-      return originalQuery(request);
-    };
-    const repository = new MultiActorMemoryRepository(workspace);
-    repository.bind('w', 'chat');
-    await expect(repository.open()).rejects.toMatchObject({ code: 'MEMORY_RETIRED_STORAGE_DETECTED' });
-  });
-
   it('merges trace history and rolls back derived records with the same ChangeSet', async () => {
-    const repository = new MultiActorMemoryRepository(port()); repository.bind('w', 'chat'); await repository.open();
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace); repository.bind('w', 'chat'); await repository.open();
     await repository.commitCapture({ ...commit(40, 3), idempotencyKey: 'capture:trace:first' });
     const audit = await repository.commitCapture({ ...commit(30, 0), idempotencyKey: 'capture:trace:second' });
     const trace = (await repository.listTraces())[0]!;
@@ -203,7 +245,451 @@ describe('multi-actor repository transaction semantics', () => {
     await repository.upsertDerivedForChangeSet(audit.id, [{ collection: 'memory-details', records: [{ id: 'detail:new', workspaceId: 'w', chatKey: 'chat', sourceChangeSetId: audit.id }] }]);
     await repository.rollbackChangeSet(audit.id);
     expect((await repository.listTraces())[0]!.rehearsalCount).toBe(3);
-    expect((await repository.workspace.get({ workspaceId: 'w', collection: 'memory-details', recordId: 'detail:new' }))).toBeNull();
+    expect((await workspace.get({ workspaceId: 'w', collection: 'memory-details', recordId: 'detail:new' }))).toBeNull();
+  });
+
+  it('commits repair descriptors with the batch checkpoint and closes them when ignored', async () => {
+    const repository = new MultiActorMemoryRepository(port());
+    repository.bind('w', 'chat');
+    await repository.open();
+    const rejection = {
+      id: 'rejection:schema:1',
+      index: 2,
+      code: 'schema_validation_failed' as const,
+      message: 'expected property to be present',
+      recordType: 'claim' as const,
+      fieldPath: '$.claims[2].objectRef',
+      sourceRefs: ['source:s'],
+      requestId: 'request:capture:1',
+      status: 'unresolved' as const,
+      repairAttempts: 0,
+    };
+    const base = commit(40, 0);
+    const audit = await repository.commitCapture({
+      ...base,
+      captureJobId: 'capture-job:repair',
+      captureJob: {
+        id: 'capture-job:repair',
+        workspaceId: 'w',
+        chatKey: 'chat',
+        status: 'running',
+        checkpoint: {
+          batchIndex: 1,
+          lastScannedBatch: 1,
+          completedBatchCount: 1,
+          pendingRepairCount: 0,
+          processedCount: 1,
+          phase: 'capture',
+        },
+      },
+      outcome: 'partial',
+      rejections: [rejection],
+      idempotencyKey: 'capture:repair:atomic',
+    });
+
+    const queue = await repository.listCaptureRepairQueue('capture-job:repair');
+    expect(queue).toEqual([
+      expect.objectContaining({
+        jobId: 'capture-job:repair',
+        batchIndex: 0,
+        collection: 'claims',
+        itemIndex: 2,
+        originalRequestId: 'request:capture:1',
+        rejectionId: rejection.id,
+        status: 'queued',
+        attemptCount: 0,
+      }),
+    ]);
+    expect((await repository.listCaptureJobs())[0]).toMatchObject({
+      outcome: 'partial',
+      rejectionCount: 1,
+      checkpoint: { pendingRepairCount: 1 },
+    });
+    expect(audit.entries.some(entry => entry.collection === 'capture-repair-queue')).toBe(true);
+
+    await repository.updateCaptureAuditRejections(audit.id, [{
+      ...rejection,
+      status: 'ignored',
+      ignoredAt: 2,
+    }]);
+    expect((await repository.listCaptureRepairQueue('capture-job:repair'))[0]).toMatchObject({ status: 'ignored' });
+    expect((await repository.listCaptureJobs())[0]).toMatchObject({
+      status: 'completed',
+      outcome: 'complete',
+      rejectionCount: 0,
+      checkpoint: { phase: 'repair', pendingRepairCount: 0 },
+    });
+  });
+
+  it('keeps all 130 unresolved items visible from a 146-rejection historical distribution', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    const rejections = Array.from({ length: 146 }, (_, index) => ({
+      id: `historical:${index}`,
+      index,
+      code: index < 55 ? 'dependency_invalid' as const
+        : index < 108 ? 'excerpt_mismatch' as const
+          : 'invalid_reference' as const,
+      message: 'safe issue',
+      recordType: 'claim' as const,
+      fieldPath: index < 55 ? 'episodeLocalId' : index < 108 ? 'evidenceExcerpt' : 'subjectRef',
+      sourceRefs: ['source:s'],
+      requestId: 'request:historical',
+      status: index < 13 ? 'repaired' as const : index < 16 ? 'ignored' as const : 'unresolved' as const,
+      repairAttempts: index < 13 ? 1 : 0,
+    }));
+    const base = commit(41, 0);
+    await repository.commitCapture({
+      ...base,
+      captureJobId: 'capture-job:historical',
+      captureJob: {
+        id: 'capture-job:historical',
+        workspaceId: 'w',
+        chatKey: 'chat',
+        status: 'running',
+        checkpoint: { batchIndex: 1, processedCount: 1, phase: 'capture' },
+      },
+      outcome: 'partial',
+      rejections,
+      idempotencyKey: 'capture:historical',
+    });
+    expect(await repository.listCaptureRepairQueue('capture-job:historical')).toHaveLength(130);
+    expect((await repository.listCaptureJobs())[0]).toMatchObject({
+      rejectionCount: 130,
+      checkpoint: {
+        pendingRepairCount: 130,
+        retryableRepairCount: 130,
+        unresolvedRejectionCount: 130,
+        repairedCount: 13,
+        ignoredCount: 3,
+      },
+    });
+  });
+
+  it('reconciliation writes legacy resolved queue state back to its Change Audit and job', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    const rejection = {
+      id: 'legacy:resolved',
+      index: 0,
+      code: 'invalid_reference' as const,
+      message: 'safe issue',
+      recordType: 'claim' as const,
+      fieldPath: 'subjectRef',
+      sourceRefs: ['source:s'],
+      requestId: 'request:legacy',
+      status: 'unresolved' as const,
+      repairAttempts: 0,
+    };
+    const audit = await repository.commitCapture({
+      ...commit(42, 0),
+      captureJobId: 'capture-job:legacy-resolved',
+      captureJob: {
+        id: 'capture-job:legacy-resolved',
+        workspaceId: 'w',
+        chatKey: 'chat',
+        status: 'running',
+        checkpoint: { batchIndex: 1, processedCount: 1, phase: 'capture' },
+      },
+      outcome: 'partial',
+      rejections: [rejection],
+      idempotencyKey: 'capture:legacy-resolved',
+    });
+    const [repair] = await repository.listCaptureRepairQueue('capture-job:legacy-resolved');
+    await repository.updateCaptureRepairRecord({
+      ...repair!,
+      status: 'resolved',
+      attemptCount: 1,
+      resolutionMode: 'repaired',
+      resolvedAt: 20,
+      updatedAt: 20,
+    });
+
+    await repository.reconcileCaptureRepairQueue('capture-job:legacy-resolved');
+
+    const repairedAudit = await repository.getChangeAudit(audit.id);
+    expect((repairedAudit?.metadata as { rejections: Array<{ status: string; repairAttempts: number }> }).rejections[0])
+      .toMatchObject({ status: 'repaired', repairAttempts: 1 });
+    expect((await repository.listCaptureJobs())[0]).toMatchObject({
+      status: 'completed',
+      rejectionCount: 0,
+      checkpoint: { pendingRepairCount: 0, repairedCount: 1 },
+    });
+  });
+
+  it('reconciliation restores historical repairAttempts when rebuilding a missing queue row', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    await repository.commitCapture({
+      ...commit(43, 0),
+      captureJobId: 'capture-job:legacy-attempt',
+      captureJob: {
+        id: 'capture-job:legacy-attempt',
+        workspaceId: 'w',
+        chatKey: 'chat',
+        status: 'running',
+        checkpoint: { batchIndex: 1, processedCount: 1, phase: 'capture' },
+      },
+      outcome: 'partial',
+      rejections: [{
+        id: 'legacy:attempt',
+        index: 0,
+        code: 'invalid_reference',
+        message: 'safe issue',
+        recordType: 'claim',
+        fieldPath: 'subjectRef',
+        sourceRefs: ['source:s'],
+        requestId: 'request:legacy-attempt',
+        status: 'unresolved',
+        repairAttempts: 1,
+      }],
+      idempotencyKey: 'capture:legacy-attempt',
+    });
+    const [created] = await repository.listCaptureRepairQueue('capture-job:legacy-attempt');
+    await workspace.delete({ collection: 'capture-repair-queue', recordId: created!.id });
+
+    const [rebuilt] = await repository.reconcileCaptureRepairQueue('capture-job:legacy-attempt');
+    expect(rebuilt).toMatchObject({ attemptCount: 1, maxAttempts: 2, status: 'queued' });
+  });
+
+  it('reconciliation coalesces one-based rejection diagnostics with the zero-based queue batch', async () => {
+    const repository = new MultiActorMemoryRepository(port());
+    repository.bind('w', 'chat');
+    await repository.open();
+    const jobId = 'capture-job:batch-normalization';
+    await repository.commitCapture({
+      ...commit(44, 0),
+      captureJobId: jobId,
+      captureJob: {
+        id: jobId,
+        workspaceId: 'w',
+        chatKey: 'chat',
+        status: 'running',
+        checkpoint: { batchIndex: 1, lastScannedBatch: 1, processedCount: 1, phase: 'capture' },
+      },
+      outcome: 'partial',
+      rejections: [{
+        id: 'rejection:batch-normalization',
+        index: 0,
+        batchIndex: 1,
+        code: 'invalid_reference',
+        message: 'safe issue',
+        recordType: 'claim',
+        fieldPath: 'subjectRef',
+        sourceRefs: ['source:s'],
+        requestId: 'request:batch-normalization',
+        status: 'unresolved',
+      }],
+      idempotencyKey: 'capture:batch-normalization',
+    });
+
+    expect(await repository.listCaptureRepairQueue(jobId)).toEqual([
+      expect.objectContaining({ batchIndex: 0 }),
+    ]);
+    const reconciled = await repository.reconcileCaptureRepairQueue(jobId);
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0]).toMatchObject({
+      batchIndex: 0,
+      rejectionIds: ['rejection:batch-normalization'],
+    });
+  });
+
+  it('does not turn repair-attempt audits into new work and removes their legacy queue rows', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    const jobId = 'capture-job:repair-audit';
+    const originalRejection = {
+      id: 'rejection:original',
+      index: 0,
+      code: 'invalid_reference' as const,
+      message: 'safe issue',
+      recordType: 'claim' as const,
+      fieldPath: 'subjectRef',
+      sourceRefs: ['source:s'],
+      requestId: 'request:original',
+      status: 'unresolved' as const,
+      repairAttempts: 0,
+    };
+    const originalAudit = await repository.commitCapture({
+      ...commit(44, 0),
+      captureJobId: jobId,
+      captureJob: {
+        id: jobId,
+        workspaceId: 'w',
+        chatKey: 'chat',
+        status: 'running',
+        checkpoint: { batchIndex: 1, processedCount: 1, phase: 'capture' },
+      },
+      outcome: 'partial',
+      rejections: [originalRejection],
+      idempotencyKey: 'capture:repair-audit:original',
+    });
+    const repairRejection = {
+      ...originalRejection,
+      id: 'rejection:repair-attempt',
+      // A provider may replay the parent request id. Cleanup must distinguish
+      // records by rejection lineage rather than deleting this whole key.
+      requestId: 'request:original',
+    };
+    await repository.commitCapture({
+      ...commit(45, 0),
+      captureJobId: jobId,
+      outcome: 'partial',
+      rejections: [repairRejection],
+      // Simulates an audit written before capturePhase was persisted. The
+      // stable repair transaction namespace remains available for recovery.
+      idempotencyKey: `capture:${jobId}:repair:queue-record:1`,
+    });
+    await workspace.upsert({
+      workspaceId: 'w',
+      collection: 'capture-repair-queue',
+      recordId: 'legacy-derived-repair-row',
+      value: {
+        id: 'legacy-derived-repair-row',
+        workspaceId: 'w',
+        chatKey: 'chat',
+        jobId,
+        batchIndex: 0,
+        collection: 'claims',
+        itemIndex: 0,
+        issues: [{ path: 'subjectRef', keyword: 'validation', expected: 'supported ref' }],
+        sourceRefs: ['source:s'],
+        fallbackSourceRefs: ['source:s'],
+        originalRequestId: 'request:original',
+        rejectionIds: ['rejection:repair-attempt'],
+        status: 'queued',
+        attemptCount: 0,
+        maxAttempts: 2,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    });
+
+    const queue = await repository.reconcileCaptureRepairQueue(jobId);
+
+    expect(queue).toHaveLength(1);
+    expect(queue[0]).toMatchObject({
+      originalRequestId: 'request:original',
+      rejectionIds: ['rejection:original'],
+    });
+    expect(await workspace.get({
+      workspaceId: 'w',
+      collection: 'capture-repair-queue',
+      recordId: 'legacy-derived-repair-row',
+    })).toBeNull();
+    await repository.updateCaptureAuditRejections(originalAudit.id, [{
+      ...originalRejection,
+      status: 'repaired',
+      repairedAt: 2,
+      repairAttempts: 1,
+    }]);
+    expect((await repository.listCaptureJobs())[0]).toMatchObject({
+      status: 'completed',
+      rejectionCount: 0,
+      checkpoint: { unresolvedRejectionCount: 0 },
+    });
+  });
+
+  it('serializes concurrent writes to the same repair queue record', async () => {
+    const repository = new MultiActorMemoryRepository(port());
+    repository.bind('w', 'chat');
+    await repository.open();
+    const record = {
+      id: 'repair:serialized',
+      workspaceId: 'w',
+      chatKey: 'chat',
+      jobId: 'job:serialized',
+      batchIndex: 0,
+      collection: 'claims' as const,
+      itemIndex: 0,
+      issues: [{ path: '$.claims[0]', keyword: 'schema', expected: 'valid claim' }],
+      sourceRefs: ['source:s'],
+      fallbackSourceRefs: [],
+      status: 'queued' as const,
+      attemptCount: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    await repository.updateCaptureRepairRecord(record);
+
+    await expect(Promise.all([
+      repository.updateCaptureRepairRecord({ ...record, status: 'running', updatedAt: 2 }),
+      repository.updateCaptureRepairRecord({ ...record, status: 'queued', updatedAt: 3 }),
+    ])).resolves.toEqual([undefined, undefined]);
+  });
+
+  it('rejects repair queue updates outside the bound workspace through the canonical error center', async () => {
+    const repository = new MultiActorMemoryRepository(port());
+    repository.bind('w', 'chat');
+    await repository.open();
+
+    await expect(repository.updateCaptureRepairRecord({
+      id: 'repair:foreign',
+      workspaceId: 'foreign-workspace',
+      chatKey: 'chat',
+      jobId: 'job:repair',
+      batchIndex: 0,
+      collection: 'claims',
+      itemIndex: 0,
+      issues: [{ path: '$.claims[0]', keyword: 'schema', expected: 'valid claim' }],
+      sourceRefs: ['source:s'],
+      fallbackSourceRefs: [],
+      status: 'queued',
+      attemptCount: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    })).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+      details: {
+        reasonCode: 'WORKSPACE_ACCESS_DENIED',
+        stage: 'memory.repair.queue.ownership',
+        collection: 'capture-repair-queue',
+      },
+    });
+  });
+
+  it('folds duplicate record mutations and rebuilds once after an optimistic conflict', async () => {
+    const workspace = port();
+    const transaction = workspace.transaction.bind(workspace);
+    let transactionCalls = 0;
+    const transactionSpy = vi.spyOn(workspace, 'transaction').mockImplementation(async request => {
+      transactionCalls += 1;
+      if (transactionCalls === 1) {
+        throw createSSHelperError('WORKSPACE_CONFLICT', { stage: 'test.workspace.commit' });
+      }
+      return transaction(request);
+    });
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    const base = commit(40, 0);
+    const duplicateFact = {
+      ...base.facts[0]!,
+      content: 'A最终知道铜钥匙位置',
+      updatedAt: 2,
+    };
+
+    const audit = await repository.commitCapture({
+      ...base,
+      idempotencyKey: 'capture:conflict:once',
+      facts: [base.facts[0]!, duplicateFact],
+    });
+
+    expect(transactionSpy).toHaveBeenCalledTimes(2);
+    for (const [request] of transactionSpy.mock.calls) {
+      const keys = request.operations.map(operation => `${operation.collection}\0${operation.recordId}`);
+      expect(new Set(keys).size).toBe(keys.length);
+    }
+    expect(audit.entries.filter(entry => entry.collection === 'facts' && entry.recordId === 'fact:f')).toHaveLength(1);
+    expect((await repository.listFacts())[0]?.content).toBe('A最终知道铜钥匙位置');
   });
 
   it('refuses to roll back an older Capture after a newer independent Capture changed the same record', async () => {
@@ -218,8 +704,12 @@ describe('multi-actor repository transaction semantics', () => {
     });
 
     await expect(repository.rollbackChangeSet(older.id)).rejects.toMatchObject({
-      code: 'CHANGESET_ROLLBACK_CONFLICT',
-      collection: 'memory-traces',
+      code: 'CONFLICT',
+      details: {
+        reasonCode: 'WORKSPACE_CONFLICT',
+        stage: 'memory.repository.rollback.preflight',
+        collection: 'memory-traces',
+      },
     });
     expect((await repository.listTraces())[0]).toMatchObject({ strength: 90, sourceObservationIds: ['o1', 'o2'] });
     expect((await repository.getChangeAudit(older.id))?.rolledBackAt).toBeUndefined();
@@ -229,7 +719,7 @@ describe('multi-actor repository transaction semantics', () => {
     expect(await repository.listFacts()).toEqual([]);
   });
 
-  it('chunks large derived projections into linked child ChangeSets and cascades parent rollback', async () => {
+  it('writes large derived projections as rebuildable chunks without child ChangeSets', async () => {
     const workspace = port();
     const repository = new MultiActorMemoryRepository(workspace); repository.bind('w', 'chat'); await repository.open();
     const parent = await repository.commitCapture(commit(40, 0));
@@ -245,15 +735,9 @@ describe('multi-actor repository transaction semantics', () => {
 
     await repository.upsertDerivedForChangeSet(parent.id, [{ collection: 'memory-details', records: details }]);
 
-    const children = (await repository.listChangeAudits()).filter((audit) => {
-      const metadata = audit.metadata && typeof audit.metadata === 'object'
-        ? audit.metadata as Record<string, unknown>
-        : undefined;
-      return metadata?.parentChangeSetId === parent.id;
-    });
-    expect(children).toHaveLength(3);
+    expect(await repository.listChangeAudits()).toHaveLength(1);
     expect((await repository.getChangeAudit(parent.id))?.entries).toHaveLength(parent.entries.length);
-    expect(Math.max(...transaction.mock.calls.map(([request]) => request.operations.length))).toBeLessThanOrEqual(129);
+    expect(Math.max(...transaction.mock.calls.map(([request]) => request.operations.length))).toBeLessThanOrEqual(128);
     expect(await workspace.get({ workspaceId: 'w', collection: 'memory-details', recordId: 'detail:0' })).not.toBeNull();
     expect(await workspace.get({ workspaceId: 'w', collection: 'memory-details', recordId: 'detail:299' })).not.toBeNull();
 
@@ -261,103 +745,7 @@ describe('multi-actor repository transaction semantics', () => {
 
     expect(await workspace.get({ workspaceId: 'w', collection: 'memory-details', recordId: 'detail:0' })).toBeNull();
     expect(await workspace.get({ workspaceId: 'w', collection: 'memory-details', recordId: 'detail:299' })).toBeNull();
-    const rolledChildren = (await repository.listChangeAudits()).filter((audit) => children.some(child => child.id === audit.id));
-    expect(rolledChildren.every(audit => Boolean(audit.rolledBackAt))).toBe(true);
-  });
-
-  it('cascades targeted repair Capture children and returns every affected fact id', async () => {
-    const workspace = port();
-    const repository = new MultiActorMemoryRepository(workspace);
-    repository.bind('w', 'chat');
-    await repository.open();
-    const parent = await repository.commitCapture({ ...commit(40, 0), idempotencyKey: 'capture:parent' });
-    const repairFact = {
-      ...commit(50, 0).facts[0]!,
-      id: 'fact:repair',
-      canonicalKey: 'A::修复事实',
-      predicateKey: '修复事实',
-      content: 'A通过定向修复补充了铜钥匙信息',
-      evidenceIds: ['evidence:repair'],
-    };
-    const repair = await repository.commitCapture({
-      ...commit(50, 0),
-      idempotencyKey: 'capture:repair',
-      parentChangeSetId: parent.id,
-      facts: [repairFact],
-      evidence: [{
-        id: 'evidence:repair', workspaceId: 'w', chatKey: 'chat', factId: repairFact.id,
-        sourceRef: 'source:s', excerpt: 'A通过定向修复补充了铜钥匙信息', occurredAt: 2, createdAt: 2,
-      }],
-      traces: [{
-        ...commit(50, 0).traces[0]!, id: 'trace:owner:actor:a:fact:repair', factId: repairFact.id,
-      }],
-    });
-
-    expect(repair.metadata).toMatchObject({ parentChangeSetId: parent.id, attachmentKind: 'capture-repair-v0' });
-    expect((await repository.listFacts()).map(fact => fact.id).sort()).toEqual(['fact:f', 'fact:repair']);
-
-    const affected = await repository.rollbackChangeSet(parent.id);
-
-    expect(affected.sort()).toEqual(['fact:f', 'fact:repair']);
-    expect(await repository.listFacts()).toEqual([]);
-    expect((await repository.getChangeAudit(parent.id))?.rolledBackAt).toBeTypeOf('number');
-    expect((await repository.getChangeAudit(repair.id))?.rolledBackAt).toBeTypeOf('number');
-    await expect(repository.rollbackChangeSet(parent.id)).resolves.toEqual([]);
-  });
-
-  it('preflights the whole rollback tree so a parent conflict does not partially undo repair children', async () => {
-    const workspace = port();
-    const repository = new MultiActorMemoryRepository(workspace);
-    repository.bind('w', 'chat');
-    await repository.open();
-    const parent = await repository.commitCapture({ ...commit(40, 0), idempotencyKey: 'capture:tree-parent' });
-    const repairFact = {
-      ...commit(50, 0).facts[0]!, id: 'fact:tree-repair', canonicalKey: 'A::修复::树', predicateKey: '修复',
-      content: 'A补充了修复事实', evidenceIds: ['evidence:tree-repair'],
-    };
-    const repair = await repository.commitCapture({
-      ...commit(50, 0), idempotencyKey: 'capture:tree-repair', parentChangeSetId: parent.id,
-      facts: [repairFact],
-      evidence: [{ id: 'evidence:tree-repair', workspaceId: 'w', chatKey: 'chat', factId: repairFact.id, sourceRef: 'source:s', excerpt: repairFact.content, occurredAt: 2, createdAt: 2 }],
-      traces: [{ ...commit(50, 0).traces[0]!, id: 'trace:owner:actor:a:fact:tree-repair', factId: repairFact.id }],
-    });
-    // A later independent Capture changes a record owned by the parent but not
-    // by the repair child, creating a parent-only rollback conflict.
-    await repository.commitCapture({
-      ...commit(90, 0), idempotencyKey: 'capture:tree-newer',
-      traces: [{ ...commit(90, 0).traces[0]!, sourceObservationIds: ['o1', 'o-later'], updatedAt: 3 }],
-    });
-
-    await expect(repository.rollbackChangeSet(parent.id)).rejects.toMatchObject({ code: 'CHANGESET_ROLLBACK_CONFLICT' });
-
-    expect((await repository.listFacts()).map(fact => fact.id)).toContain('fact:tree-repair');
-    expect((await repository.getChangeAudit(repair.id))?.rolledBackAt).toBeUndefined();
-    expect((await repository.getChangeAudit(parent.id))?.rolledBackAt).toBeUndefined();
-  });
-
-  it('rejects a missing, foreign or already-rolled-back repair parent', async () => {
-    const workspace = port();
-    const repository = new MultiActorMemoryRepository(workspace);
-    repository.bind('w', 'chat');
-    await repository.open();
-
-    await expect(repository.commitCapture({
-      ...commit(40, 0), idempotencyKey: 'capture:missing-parent', parentChangeSetId: 'change-audit:missing',
-    })).rejects.toMatchObject({ code: 'CAPTURE_REPAIR_PARENT_INVALID' });
-
-    await workspace.upsert({
-      workspaceId: 'w', collection: 'change-audits', recordId: 'change-audit:foreign',
-      value: { id: 'change-audit:foreign', workspaceId: 'w', chatKey: 'other', kind: 'capture-change-set-v0', createdAt: 1, entries: [] },
-    });
-    await expect(repository.commitCapture({
-      ...commit(40, 0), idempotencyKey: 'capture:foreign-parent', parentChangeSetId: 'change-audit:foreign',
-    })).rejects.toMatchObject({ code: 'CAPTURE_REPAIR_PARENT_INVALID' });
-
-    const parent = await repository.commitCapture({ ...commit(40, 0), idempotencyKey: 'capture:rolled-parent' });
-    await repository.rollbackChangeSet(parent.id);
-    await expect(repository.commitCapture({
-      ...commit(40, 0), idempotencyKey: 'capture:after-rollback', parentChangeSetId: parent.id,
-    })).rejects.toMatchObject({ code: 'CAPTURE_REPAIR_PARENT_INVALID' });
+    expect((await repository.listChangeAudits()).filter(audit => audit.id !== parent.id)).toEqual([]);
   });
 
   it('uses a fresh deterministic idempotency key when replaying a rolled-back Capture batch', async () => {
@@ -395,11 +783,14 @@ describe('multi-actor repository transaction semantics', () => {
       canonicalKey: 'A::不同内容',
     };
     await expect(repository.commitCapture({ ...original, facts: [changedFact] }))
-      .rejects.toMatchObject({ code: 'CAPTURE_IDEMPOTENCY_MISMATCH' });
+      .rejects.toMatchObject({
+        code: 'CONFLICT',
+        details: { reasonCode: 'WORKSPACE_CONFLICT', stage: 'memory.repository.capture.idempotency' },
+      });
     expect((await repository.listFacts()).map(fact => fact.content)).toEqual(['A知道铜钥匙位置']);
   });
 
-  it('requires newest-first rollback for batches in the same Capture job', async () => {
+  it('rolls back exactly one root batch without cascading to another batch in the same job', async () => {
     const repository = new MultiActorMemoryRepository(port());
     repository.bind('w', 'chat');
     await repository.open();
@@ -419,12 +810,9 @@ describe('multi-actor repository transaction semantics', () => {
       traces: [],
     });
 
-    await expect(repository.rollbackChangeSet(first.id)).rejects.toMatchObject({
-      code: 'CHANGESET_ROLLBACK_ORDER_REQUIRED',
-      newerAuditId: second.id,
-    });
-    await expect(repository.rollbackChangeSet(second.id)).resolves.toEqual([]);
     await expect(repository.rollbackChangeSet(first.id)).resolves.toEqual(['fact:f']);
+    expect((await repository.getChangeAudit(first.id))?.rolledBackAt).toBeTypeOf('number');
+    expect((await repository.getChangeAudit(second.id))?.rolledBackAt).toBeUndefined();
   });
 
   it('invalidates detached derived caches and Dreams by affected fact/trace dependency', async () => {
@@ -463,6 +851,98 @@ describe('multi-actor repository transaction semantics', () => {
     for (const row of rows) {
       expect(await workspace.get({ workspaceId: 'w', collection: row.collection, recordId: row.id })).toBeNull();
     }
+  });
+
+  it('writes each rebuildable derived record once without an optimistic revision guard', async () => {
+    const workspace = port();
+    const originalOpen = workspace.open.bind(workspace);
+    let commitCalls = 0;
+    const committedOperationKeys: string[][] = [];
+    workspace.open = (async (request: Parameters<WorkspacePort['open']>[0]) => {
+      const session = await originalOpen(request);
+      return {
+        ...session,
+        commit: async (commitRequest: Parameters<WorkspaceSession['commit']>[0]) => {
+          commitCalls += 1;
+          committedOperationKeys.push(commitRequest.operations.map(operation => `${operation.collection}\0${operation.id}`));
+          expect(commitRequest.operations.every(operation => operation.expectedRevision === undefined)).toBe(true);
+          return session.commit(commitRequest);
+        },
+      };
+    }) as WorkspacePort['open'];
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+
+    await repository.upsertDerived('memory-details', [{
+      id: 'detail:race',
+      workspaceId: 'w',
+      chatKey: 'chat',
+      ownerId: 'owner:actor:a',
+      traceId: 'trace:a',
+    }, {
+      id: 'detail:race',
+      workspaceId: 'w',
+      chatKey: 'chat',
+      ownerId: 'owner:actor:a',
+      traceId: 'trace:final',
+    }]);
+
+    expect(commitCalls).toBe(1);
+    for (const keys of committedOperationKeys) expect(new Set(keys).size).toBe(keys.length);
+    await expect(workspace.get({
+      workspaceId: 'w',
+      collection: 'memory-details',
+      recordId: 'detail:race',
+    })).resolves.toMatchObject({ recordId: 'detail:race', value: { traceId: 'trace:final' } });
+  });
+
+  it('serializes concurrent derived projection writes in one repository session', async () => {
+    const workspace = port();
+    const originalOpen = workspace.open.bind(workspace);
+    let activeCommits = 0;
+    let maxActiveCommits = 0;
+    workspace.open = (async (request: Parameters<WorkspacePort['open']>[0]) => {
+      const session = await originalOpen(request);
+      return {
+        ...session,
+        commit: async (commitRequest: Parameters<WorkspaceSession['commit']>[0]) => {
+          activeCommits += 1;
+          maxActiveCommits = Math.max(maxActiveCommits, activeCommits);
+          await new Promise(resolve => setTimeout(resolve, 5));
+          try {
+            return await session.commit(commitRequest);
+          } finally {
+            activeCommits -= 1;
+          }
+        },
+      };
+    }) as WorkspacePort['open'];
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+
+    await Promise.all([
+      repository.upsertDerived('memory-details', [{
+        id: 'detail:serialized',
+        workspaceId: 'w',
+        chatKey: 'chat',
+        traceId: 'trace:first',
+      }]),
+      repository.upsertDerived('memory-details', [{
+        id: 'detail:serialized',
+        workspaceId: 'w',
+        chatKey: 'chat',
+        traceId: 'trace:second',
+      }]),
+    ]);
+
+    expect(maxActiveCommits).toBe(1);
+    await expect(workspace.get({
+      workspaceId: 'w',
+      collection: 'memory-details',
+      recordId: 'detail:serialized',
+    })).resolves.toMatchObject({ value: { traceId: 'trace:second' } });
   });
 
   it('returns the persisted audit without executing a duplicate active idempotency request again', async () => {
@@ -513,7 +993,11 @@ describe('multi-actor repository transaction semantics', () => {
     });
 
     await expect(repository.commitCapture(input)).rejects.toMatchObject({
-      code: 'CAPTURE_IDEMPOTENCY_UNVERIFIABLE',
+      code: 'INTERNAL',
+      details: {
+        reasonCode: 'MEMORY_CAPTURE_INTEGRITY_FAILED',
+        stage: 'memory.repository.capture.idempotency',
+      },
     });
   });
 
@@ -712,7 +1196,7 @@ describe('multi-actor repository transaction semantics', () => {
     const headId = `fact-head:${encodeURIComponent('chat')}:${encodeURIComponent(fact.slotKey!)}`;
     expect(await workspace.get({ workspaceId: 'w', collection: 'fact-heads', recordId: headId })).toMatchObject({ value: { factId: fact.id } });
     const traceId = `trace:owner:actor:a:${fact.id}`;
-    await workspace.upsert({ workspaceId: 'w', collection: 'memory-traces', recordId: traceId, value: { id: traceId, workspaceId: 'w', chatKey: 'chat', ownerId: 'owner:actor:a', factId: fact.id, sourceObservationIds: [], knowledgeMode: 'asserted', privacy: 'public', strength: 80, clarity: 80, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, createdAt: 1, updatedAt: 1 } });
+    await workspace.upsert({ workspaceId: 'w', collection: 'memory-traces', recordId: traceId, value: { id: traceId, workspaceId: 'w', chatKey: 'chat', ownerId: 'owner:actor:a', factId: fact.id, sourceObservationIds: [], knowledgeMode: 'asserted', privacy: 'public', strength: 80, clarity: 80, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: 1, updatedAt: 1 } });
     await workspace.upsert({ workspaceId: 'w', collection: 'profile-claims', recordId: 'profile:test', value: { id: 'profile:test', workspaceId: 'w', ownerId: 'owner:actor:a', claim: fact.content, level: 3, supportingTraceIds: [traceId], confidence: 1, status: 'active', createdAt: 1, updatedAt: 1 } });
     const updated = await repository.upsertManualFact({ ...fact, id: fact.id, content: 'A知道新的铜钥匙位置' });
     expect(updated.revision).toBe(2);
@@ -775,7 +1259,7 @@ describe('multi-actor repository transaction semantics', () => {
     expect(await workspace.get({ workspaceId: 'w', collection: 'fact-heads', recordId: headId })).toBeNull();
   });
 
-  it('legacy traces without chatKey are visible only when their fact belongs to the current chat', async () => {
+  it('rejects traces from the retired schema instead of inferring their chat', async () => {
     const workspace = port();
     const repository = new MultiActorMemoryRepository(workspace);
     repository.bind('w', 'chat-a');
@@ -789,7 +1273,10 @@ describe('multi-actor repository transaction semantics', () => {
     await workspace.upsert({ workspaceId: 'w', collection: 'memory-traces', recordId: 'trace:a', value: { ...legacyTrace, id: 'trace:a', factId: factA.id } as never });
     await workspace.upsert({ workspaceId: 'w', collection: 'memory-traces', recordId: 'trace:b', value: { ...legacyTrace, id: 'trace:b', factId: factB.id } as never });
 
-    expect((await repository.listTraces()).map(item => item.id)).toEqual(['trace:a']);
+    await expect(repository.listTraces()).rejects.toMatchObject({
+      code: 'INVALID_PAYLOAD',
+      details: { reasonCode: 'SCHEMA_VALIDATION_FAILED', stage: 'memory.repository.trace.read' },
+    });
   });
 
   it('rejects foreign-chat audits and derived records at the repository boundary', async () => {
@@ -801,7 +1288,10 @@ describe('multi-actor repository transaction semantics', () => {
     await workspace.upsert({ workspaceId: 'w', collection: 'change-audits', recordId: foreignAudit.id, value: foreignAudit });
 
     await expect(repository.getChangeAudit(foreignAudit.id)).resolves.toBeUndefined();
-    await expect(repository.rollbackChangeSet(foreignAudit.id)).rejects.toThrow('当前聊天');
+    await expect(repository.rollbackChangeSet(foreignAudit.id)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+      details: { reasonCode: 'WORKSPACE_NOT_FOUND', stage: 'memory.repository.rollback.lookup' },
+    });
     await expect(repository.upsertDerivedForChangeSet(foreignAudit.id, [{
       collection: 'memory-details', records: [{ id: 'detail:foreign', workspaceId: 'w', chatKey: 'chat-a' }],
     }])).rejects.toThrow('当前聊天');
@@ -879,7 +1369,7 @@ describe('multi-actor repository transaction semantics', () => {
     expect(await workspace.get({ workspaceId: 'w', collection: 'facts', recordId: factId })).toMatchObject({ value: { subjectEntityId: fromOwnerId } });
   });
 
-  it('stops on a repeated pagination cursor and batches large destructive clears', async () => {
+  it('stops on a repeated pagination cursor and clears one chat in one atomic change-set', async () => {
     const stalledWorkspace = port();
     const originalQuery = stalledWorkspace.query.bind(stalledWorkspace);
     stalledWorkspace.query = async (request) => request.collection === 'facts'
@@ -888,7 +1378,14 @@ describe('multi-actor repository transaction semantics', () => {
     const stalledRepository = new MultiActorMemoryRepository(stalledWorkspace);
     stalledRepository.bind('w', 'chat');
     await stalledRepository.open();
-    await expect(stalledRepository.listFacts()).rejects.toMatchObject({ code: 'WORKSPACE_PAGINATION_STALLED' });
+    await expect(stalledRepository.listFacts()).rejects.toMatchObject({
+      code: 'CONFLICT',
+      details: {
+        reasonCode: 'WORKSPACE_CONFLICT',
+        stage: 'memory.persistence.pagination',
+        collection: 'facts',
+      },
+    });
 
     const workspace = port();
     const transaction = vi.fn(workspace.transaction.bind(workspace));
@@ -901,7 +1398,7 @@ describe('multi-actor repository transaction semantics', () => {
     }
     transaction.mockClear();
     await repository.clearCurrentChatData();
-    expect(transaction).toHaveBeenCalledTimes(2);
-    expect(transaction.mock.calls.every(call => call[0].operations.length <= 500)).toBe(true);
+    expect(transaction).toHaveBeenCalledTimes(1);
+    expect(transaction.mock.calls[0]?.[0].operations).toHaveLength(501);
   });
 });

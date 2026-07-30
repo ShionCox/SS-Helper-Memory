@@ -1,15 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  configureMemoryLlmApi,
+  configureMemoryLlmClient,
+  MEMORY_CAPTURE_REPAIR_TASK,
   MEMORY_CAPTURE_MAX_TOKENS,
   MEMORY_LLM_ROUTE_DIAGNOSTIC_TIMEOUT_MS,
-  MemoryLlmTaskError,
   normalizeStructuredCapture,
   readMemoryLlmRouteDiagnostic,
   StructuredMemoryCaptureExtractor,
-  type MemoryLlmApi,
+  type MemoryLlmClient,
 } from '../src/application/ingest/llm-extractor';
 import type { SourceBlock } from '../src/application/ingest/types';
+import { buildSupportedEvidenceDirectory } from '../src/application/ingest/supported-evidence-directory';
 
 const source: SourceBlock = {
   id: 'message:1', chatKey: 'chat', kind: 'message', role: 'assistant',
@@ -20,13 +21,13 @@ const emptyCapture = { actorCandidates: [], locationCandidates: [], episodes: []
 
 describe('StructuredMemoryCaptureExtractor', () => {
   it('uses the Claim task budget and returns safe audit metadata', async () => {
-    const runTask = vi.fn(async (_input: Parameters<MemoryLlmApi['runTask']>[0]) => ({
+    const runTask = vi.fn(async (_input: Parameters<MemoryLlmClient['runTask']>[0]) => ({
       ok: true as const,
       data: emptyCapture,
       meta: { requestId: 'req', resourceId: 'resource', model: 'model', latencyMs: 42 },
       usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
     }));
-    const result = await new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmApi)).extract({
+    const result = await new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmClient)).extract({
       chatKey: source.chatKey,
       sources: [source],
     });
@@ -39,38 +40,149 @@ describe('StructuredMemoryCaptureExtractor', () => {
     expect(result.audit?.usage).toMatchObject({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
   });
 
-  it('automatically retries one structural failure without a browser prompt', async () => {
-    const runTask = vi.fn(async (_input: Parameters<MemoryLlmApi['runTask']>[0]): Promise<any> => ({ ok: true as const, data: emptyCapture }))
-      .mockResolvedValueOnce({ ok: false as const, error: 'Schema 校验失败', reasonCode: 'schema_validation_failed', retryable: true })
-      .mockResolvedValueOnce({ ok: true as const, data: emptyCapture });
-    const result = await new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmApi)).extract({
+  it('delegates bounded Schema repair to one LLM bus call and records its diagnostics', async () => {
+    const runTask = vi.fn(async (_input: Parameters<MemoryLlmClient['runTask']>[0]): Promise<any> => ({
+      ok: true as const,
+      data: emptyCapture,
+      meta: { requestId: 'root-request', attemptCount: 2, repairCount: 1, transport: 'json_schema' },
+    }));
+    const result = await new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmClient)).extract({
       chatKey: source.chatKey,
       sources: [source],
     });
-    expect(runTask).toHaveBeenCalledTimes(2);
-    expect(runTask.mock.calls[1]?.[0].input.messages[0]?.content).toContain('上一轮输出未通过结构校验');
-    expect(result.diagnostics?.automaticRepairCalls).toBe(1);
+    expect(runTask).toHaveBeenCalledTimes(1);
+    expect(result.diagnostics?.schemaRepairCalls).toBe(1);
+    expect(result.audit?.requestId).toBe('root-request');
+  });
+
+  it('turns itemized LLM rejections into safe repair descriptors without a second extractor call', async () => {
+    const runTask = vi.fn(async (_input: Parameters<MemoryLlmClient['runTask']>[0]): Promise<any> => ({
+      ok: true as const,
+      data: emptyCapture,
+      meta: {
+        requestId: 'capture-partial',
+        resourceId: 'resource-1',
+        model: 'model-1',
+        validationOutcome: 'partial',
+        attemptCount: 1,
+        repairCount: 0,
+        itemRejections: [{
+          collection: 'claims',
+          itemIndex: 2,
+          issues: [{ path: '$.claims[2].objectRef', keyword: 'required', expected: 'property to be present' }],
+          sourceRefs: ['message:1'],
+        }],
+      },
+    }));
+    const result = await new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmClient)).extract({
+      chatKey: source.chatKey,
+      sources: [source],
+      writableSourceRefs: [source.id],
+    });
+
+    expect(runTask).toHaveBeenCalledTimes(1);
+    expect(result.rejections).toEqual([expect.objectContaining({
+      code: 'schema_validation_failed',
+      recordType: 'claim',
+      index: 2,
+      fieldPath: '$.claims[2].objectRef',
+      issues: [{ path: '$.claims[2].objectRef', keyword: 'required', expected: 'property to be present' }],
+      sourceRefs: ['message:1'],
+      requestId: 'capture-partial',
+      resourceId: 'resource-1',
+      model: 'model-1',
+      status: 'unresolved',
+      repairAttempts: 0,
+    })]);
+    expect(JSON.stringify(result.rejections)).not.toContain('rawValue');
+  });
+
+  it('uses a dedicated one-shot repair task with safe issues, source floors and the original route', async () => {
+    const runTask = vi.fn(async (input: Parameters<MemoryLlmClient['runTask']>[0]): Promise<any> => {
+      const evidenceSpanId = (input.schema as any).properties.items.items.properties.evidenceSpanId.enum[0];
+      return {
+        ok: true as const,
+        data: {
+        items: [{
+          localId: 'actor-violet',
+          displayName: '紫罗',
+          aliases: [],
+          evidenceSpanId,
+          confidence: 0.98,
+        }],
+        },
+        meta: {
+        requestId: 'repair-request',
+        parentRequestId: 'capture-request',
+        resourceId: 'resource-1',
+        model: 'model-1',
+        validationOutcome: 'complete',
+        itemRejections: [],
+        attemptCount: 1,
+        repairCount: 0,
+        },
+      };
+    });
+    const result = await new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmClient)).extract({
+      chatKey: source.chatKey,
+      sources: [source],
+      writableSourceRefs: [source.id],
+      repair: {
+        collection: 'actorCandidates',
+        issues: [{ path: '$.actorCandidates[0].displayName', keyword: 'required', expected: 'property to be present' }],
+        parentRequestId: 'capture-request',
+        resourceId: 'resource-1',
+        model: 'model-1',
+        maxItems: 1,
+      },
+    });
+
+    expect(runTask).toHaveBeenCalledTimes(1);
+    const request = runTask.mock.calls[0]![0];
+    const messages = (request.input as { messages: Array<{ role: string; content: string }> }).messages;
+    expect(request).toMatchObject({
+      taskKey: MEMORY_CAPTURE_REPAIR_TASK,
+      parentRequestId: 'capture-request',
+      route: { resourceId: 'resource-1', model: 'model-1' },
+      budget: { maxTokens: 2_048, maxLatencyMs: 180_000 },
+      schema: {
+        required: ['items'],
+        properties: { items: { minItems: 1, maxItems: 1 } },
+      },
+    });
+    expect((request.schema as any).properties.items.items.properties).not.toHaveProperty('sourceRef');
+    expect(messages[0]?.content).toContain('$.actorCandidates[0].displayName');
+    expect(messages[1]?.content).toContain('紫罗能够净化空气');
+    expect(messages.map(message => message.content).join('\n')).not.toContain('"rawFailure":');
+    expect(result.actorCandidates).toEqual([expect.objectContaining({ localId: 'actor-violet', displayName: '紫罗' })]);
+    expect(result.audit?.requestId).toBe('repair-request');
   });
 
   it('does not retry non-structural authentication failures and preserves the reason', async () => {
     const runTask = vi.fn(async () => ({
       ok: false as const,
-      error: 'authentication failed',
-      reasonCode: 'credential_missing',
+      failure: {
+        reasonCode: 'AUTH_FAILED' as const,
+        stage: 'llm.provider.authenticate',
+        requestId: 'auth-request',
+      },
       meta: { resourceId: 'resource', model: 'model' },
     }));
-    await expect(new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmApi)).extract({
+    await expect(new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmClient)).extract({
       chatKey: source.chatKey,
       sources: [source],
     })).rejects.toMatchObject({
-      name: 'MemoryLlmTaskError',
-      details: { reasonCode: 'credential_missing', resourceId: 'resource', model: 'model' },
-    } satisfies Partial<MemoryLlmTaskError>);
+      code: 'FORBIDDEN',
+      details: {
+        reasonCode: 'AUTH_FAILED',
+        requestId: 'auth-request',
+      },
+    });
     expect(runTask).toHaveBeenCalledTimes(1);
   });
 
   it('reports route diagnostics with a bounded timeout', async () => {
-    configureMemoryLlmApi({
+    configureMemoryLlmClient({
       runTask: async <T>() => ({ ok: true as const, data: emptyCapture as T }),
       inspect: { previewRoute: async () => new Promise(() => undefined) },
     });
@@ -78,25 +190,84 @@ describe('StructuredMemoryCaptureExtractor', () => {
     const result = await readMemoryLlmRouteDiagnostic();
     expect(Date.now() - started).toBeLessThan(MEMORY_LLM_ROUTE_DIAGNOSTIC_TIMEOUT_MS + 1_000);
     expect(result).toMatchObject({ available: false });
-    configureMemoryLlmApi(null);
+    configureMemoryLlmClient(null);
   }, MEMORY_LLM_ROUTE_DIAGNOSTIC_TIMEOUT_MS + 2_000);
 
-  it('does not replace hallucinated evidence with a merely similar source paragraph', () => {
+  it('turns an evidence span outside the closed set into an item rejection', () => {
     const row: SourceBlock = {
       ...source,
       content: '白夕小时与白夕叶在门口交谈，但没有发生冲突。',
     };
+    const directory = buildSupportedEvidenceDirectory([row]);
     const result = normalizeStructuredCapture({
       actorCandidates: [], locationCandidates: [], episodes: [], claims: [{
-        localId: 'hallucinated', sourceRef: row.id, episodeLocalId: '', kind: 'event',
+        localId: 'hallucinated', episodeLocalId: '', kind: 'event',
         subjectRef: '', subjectText: '白夕小时', predicateKey: '杀死', objectText: '白夕叶',
-        content: '白夕小时杀死白夕叶。', evidenceExcerpt: '白夕小时杀死白夕叶',
+        content: '白夕小时杀死白夕叶。', evidenceSpanId: 'outside-closed-set',
         knowledge: { mode: 'asserted', privacy: 'public', ownerRefs: [], speakerRef: '', viewpointRef: '', observerRefs: [], presentRefs: [], mentionedRefs: [] },
         confidence: 0.9, stableAnchor: false,
       }],
-    }, [row]);
+    }, [row], directory, { requestId: 'capture-evidence', resourceId: 'resource', model: 'model' });
+    expect(result.claims).toEqual([]);
+    expect(result.rejections).toEqual([expect.objectContaining({
+      code: 'schema_validation_failed',
+      recordType: 'claim',
+      index: 0,
+      fieldPath: '$.claims[0].evidenceSpanId',
+      issues: [{ path: '$.claims[0].evidenceSpanId', keyword: 'enum', expected: 'supported evidence span' }],
+      sourceRefs: [row.id],
+      requestId: 'capture-evidence',
+      resourceId: 'resource',
+      model: 'model',
+      status: 'unresolved',
+      repairAttempts: 0,
+    })]);
+  });
 
-    expect(result.claims[0]?.evidenceExcerpt).toBe('白夕小时杀死白夕叶');
-    expect(row.content).not.toContain(result.claims[0]!.evidenceExcerpt);
+  it('derives the source deterministically from the selected evidence span', () => {
+    const second: SourceBlock = {
+      ...source,
+      id: 'message:2',
+      content: '白夕叶留在门口。',
+    };
+    const directory = buildSupportedEvidenceDirectory([source, second]);
+    const secondSpanId = directory.spans.find(span => span.sourceRef === second.id)!.evidenceSpanId;
+    const result = normalizeStructuredCapture({
+      actorCandidates: [{
+        localId: 'actor-leaf',
+        displayName: '白夕叶',
+        aliases: [],
+        evidenceSpanId: secondSpanId,
+        confidence: 0.95,
+      }],
+      locationCandidates: [],
+      episodes: [],
+      claims: [],
+    }, [source, second], directory, { requestId: 'capture-cross-source' });
+    expect(result.actorCandidates).toEqual([expect.objectContaining({
+      sourceRef: second.id,
+      evidenceExcerpt: second.content,
+    })]);
+    expect(result.rejections).toBeUndefined();
+  });
+
+  it('preserves the request id when a root envelope cannot be mapped', async () => {
+    const runTask = vi.fn(async (): Promise<any> => ({
+      ok: true as const,
+      data: null,
+      meta: { requestId: 'capture-root-invalid', resourceId: 'resource-1', model: 'model-1' },
+    }));
+    await expect(new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmClient)).extract({
+      chatKey: source.chatKey,
+      sources: [source],
+    })).rejects.toMatchObject({
+      details: expect.objectContaining({
+        reasonCode: 'SCHEMA_VALIDATION_FAILED',
+        stage: 'memory.capture.map',
+        requestId: 'capture-root-invalid',
+        resourceId: 'resource-1',
+        model: 'model-1',
+      }),
+    });
   });
 });

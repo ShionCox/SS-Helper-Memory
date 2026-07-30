@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { LLM_STRUCTURED_TASK_V0 } from '@ss-helper/sdk';
 import {
   buildStructuredCaptureSchema,
+  buildStructuredRepairSchema,
   StructuredMemoryCaptureExtractor,
-  type MemoryLlmApi,
+  type MemoryLlmClient,
 } from '../src/application/ingest/llm-extractor';
+import { buildSupportedReferenceDirectory } from '../src/application/actors/supported-reference-directory';
 import type { MemoryExtractionInput, SourceBlock } from '../src/application/ingest/types';
 
 const source: SourceBlock = {
@@ -17,6 +20,41 @@ const source: SourceBlock = {
 };
 
 describe('Claim capture schema', () => {
+  it('builds a source-supported closed set and applies it to every repair reference field', () => {
+    const repairSource: SourceBlock = {
+      ...source,
+      content: '琴乃进入加油站并报告燃油情况。',
+      actorRefs: ['owner:kotono'],
+      locationRefs: ['location:station:internal'],
+    };
+    const directory = buildSupportedReferenceDirectory(
+      [repairSource],
+      [
+        { referenceId: 'A01', ownerId: 'owner:kotono', canonicalName: '白夕琴乃', aliases: ['琴乃'], status: 'confirmed' },
+        { referenceId: 'A02', ownerId: 'owner:absent', canonicalName: '未登场人物', aliases: [], status: 'confirmed' },
+      ],
+      [
+        { referenceId: 'L01', locationId: 'location:station:internal', canonicalName: '加油站', aliases: [], status: 'confirmed' },
+        { referenceId: 'L02', locationId: 'location:absent', canonicalName: '仓库', aliases: [], status: 'confirmed' },
+      ],
+    );
+    expect(directory.allowedActorRefs.map(item => item.referenceId)).toEqual(['A01']);
+    expect(directory.allowedLocationRefs.map(item => item.referenceId)).toEqual(['L01']);
+    expect(directory.allowedEpisodeRefs).toEqual([]);
+    expect(directory.candidateSetHash).toMatch(/^[a-f0-9]{32}$/u);
+
+    const episodeSchema = buildStructuredRepairSchema([source.id], 'episodes', 1, directory) as any;
+    const episode = episodeSchema.properties.items.items.properties;
+    expect(episode.participantRefs.items.enum).toEqual(['A01', 'player', 'world', 'narrator']);
+    expect(episode.locationRef.enum).toEqual(['', 'L01']);
+
+    const claimSchema = buildStructuredRepairSchema([source.id], 'claims', 1, directory) as any;
+    const claim = claimSchema.properties.items.items.properties;
+    expect(claim.subjectRef.enum).toEqual(['', 'A01', 'player', 'world', 'narrator', 'L01']);
+    expect(claim.episodeLocalId.enum).toEqual(['']);
+    expect(claim.knowledge.properties.ownerRefs.items.enum).not.toContain('A02');
+  });
+
   it('uses a small fixed shape and never asks the model for machine time or derived records', () => {
     const schema = buildStructuredCaptureSchema([source.id]) as Record<string, any>;
     expect(schema).toMatchObject({
@@ -34,14 +72,25 @@ describe('Claim capture schema', () => {
     expect(claimProperties).not.toHaveProperty('validUntil');
     expect(schema.properties).not.toHaveProperty('observations');
     expect(schema.properties).not.toHaveProperty('facts');
-    expect(claimProperties.sourceRef.enum).toEqual([source.id]);
+    expect(schema.properties.actorCandidates.items.properties).not.toHaveProperty('sourceRef');
+    expect(schema.properties.locationCandidates.items.properties).not.toHaveProperty('sourceRef');
+    expect(claimProperties).not.toHaveProperty('sourceRef');
+  });
+
+  it('passes the SDK public-data boundary even when schema nodes are shared', () => {
+    expect(LLM_STRUCTURED_TASK_V0.validateRequest!({
+      task: 'memory_capture',
+      input: { messages: [{ role: 'user', content: source.content }] },
+      outputSchema: buildStructuredCaptureSchema([source.id]) as Record<string, never>,
+    })).toBe(true);
   });
 
   it('serializes stable actor/location directories and preserves a valid Claim', async () => {
     let userPayload: Record<string, any> | undefined;
-    const llm: MemoryLlmApi = {
-      async runTask<T>(input: Parameters<MemoryLlmApi['runTask']>[0]) {
+    const llm: MemoryLlmClient = {
+      async runTask<T>(input: Parameters<MemoryLlmClient['runTask']>[0]) {
         userPayload = JSON.parse(input.input.messages.find((message: { role: string }) => message.role === 'user')?.content ?? '{}');
+        const evidenceSpanId = (input.schema as any).properties.claims.items.properties.evidenceSpanId.enum[0];
         return {
           ok: true as const,
           data: {
@@ -59,7 +108,6 @@ describe('Claim capture schema', () => {
             }],
             claims: [{
               localId: 'claim-1',
-              sourceRef: source.id,
               episodeLocalId: 'episode-1',
               kind: 'state',
               subjectRef: 'location:station',
@@ -67,7 +115,7 @@ describe('Claim capture schema', () => {
               predicateKey: '燃油储量',
               objectText: '总容量的百分之四十五',
               content: '加油站地下储油库燃油约占总容量的百分之四十五。',
-              evidenceExcerpt: '地下储油库燃油约占总容量的百分之四十五',
+              evidenceSpanId,
               knowledge: {
                 mode: 'experienced', privacy: 'limited', ownerRefs: ['actor:kotono'],
                 speakerRef: 'actor:kotono', viewpointRef: 'actor:kotono', observerRefs: ['actor:kotono'],
@@ -93,7 +141,8 @@ describe('Claim capture schema', () => {
     expect(userPayload?.knownLocations).toEqual([{ ref: 'location:station', canonicalName: '加油站', aliases: ['目标加油站'], status: 'confirmed' }]);
     expect(JSON.stringify(userPayload)).not.toContain('owner:internal');
     expect(JSON.stringify(userPayload)).not.toContain('location:internal');
-    expect(result.claims[0]).toMatchObject({ kind: 'state', confidence: 0.98, subjectRef: 'location:station' });
+    expect(result.claims[0]).toMatchObject({ kind: 'state', confidence: 0.98, subjectRef: 'location:station', sourceRef: source.id });
+    expect(result.claims[0]?.evidenceExcerpt).toBe(source.content);
     expect(result.episodes[0]).toMatchObject({ storyTimeText: '灾变第三十八日清晨' });
   });
 
@@ -101,8 +150,8 @@ describe('Claim capture schema', () => {
     const overlap: SourceBlock = { ...source, id: 'message:old', content: '上一批只读上下文。' };
     let schema: Record<string, any> | undefined;
     let payload: Record<string, any> | undefined;
-    const llm: MemoryLlmApi = {
-      async runTask<T>(input: Parameters<MemoryLlmApi['runTask']>[0]) {
+    const llm: MemoryLlmClient = {
+      async runTask<T>(input: Parameters<MemoryLlmClient['runTask']>[0]) {
         schema = input.schema as Record<string, any>;
         payload = JSON.parse(input.input.messages[1]?.content ?? '{}');
         return { ok: true as const, data: { actorCandidates: [], locationCandidates: [], episodes: [], claims: [] } as T };
@@ -115,11 +164,11 @@ describe('Claim capture schema', () => {
     });
     expect(payload).toMatchObject({ allowedSourceRefs: [source.id], contextOnlySourceRefs: [overlap.id] });
     expect(schema?.properties.episodes.items.properties.sourceRefs.items.enum).toEqual([source.id]);
-    expect(schema?.properties.claims.items.properties.sourceRef.enum).toEqual([source.id]);
+    expect(schema?.properties.claims.items.properties).not.toHaveProperty('sourceRef');
   });
 
-  it('normalizes deterministic provider mistakes without inventing evidence', async () => {
-    const llm: MemoryLlmApi = {
+  it('does not normalize deterministic provider mistakes or invent evidence', async () => {
+    const llm: MemoryLlmClient = {
       async runTask<T>() {
         return {
           ok: true as const,
@@ -128,10 +177,10 @@ describe('Claim capture schema', () => {
             locationCandidates: [],
             episodes: [],
             claims: [{
-              localId: 'claim-1', sourceRef: source.id, episodeLocalId: '', kind: 'action',
+              localId: 'claim-1', episodeLocalId: '', kind: 'action',
               subjectRef: '', subjectKey: '白夕琴乃', predicateKey: '报告', objectKey: '燃油储量',
               content: '白夕琴乃报告地下储油库燃油约占百分之四十五。',
-              evidenceExcerpt: '燃油约占总容量百分之四十五',
+              evidenceSpanId: 'outside-closed-set',
               knowledge: {
                 mode: 'experienced', privacy: 'limited', ownerRefs: [], speakerRef: '',
                 viewportRef: '', observerRefs: [], presentRefs: [], mentionedRefs: [],
@@ -142,13 +191,15 @@ describe('Claim capture schema', () => {
         };
       },
     };
-    const result = await new StructuredMemoryCaptureExtractor(() => llm).extract({ chatKey: source.chatKey, sources: [source] });
-    expect(result.claims[0]).toMatchObject({ kind: 'event', subjectText: '白夕琴乃', objectText: '燃油储量', confidence: 0.9 });
-    // The extractor may normalize shape/enums, but it must not silently bind a
-    // semantically different quote. The Capture validator will reject/repair
-    // this non-contiguous evidence explicitly.
-    expect(result.claims[0]!.evidenceExcerpt).toBe('燃油约占总容量百分之四十五');
-    expect(source.content).not.toContain(result.claims[0]!.evidenceExcerpt);
-    expect(result.diagnostics?.deterministicRepairs).toBeGreaterThan(0);
+    const result = await new StructuredMemoryCaptureExtractor(() => llm).extract({
+      chatKey: source.chatKey,
+      sources: [source],
+    });
+    expect(result.claims).toEqual([]);
+    expect(result.rejections).toEqual([expect.objectContaining({
+      code: 'schema_validation_failed',
+      fieldPath: '$.claims[0].evidenceSpanId',
+      status: 'unresolved',
+    })]);
   });
 });

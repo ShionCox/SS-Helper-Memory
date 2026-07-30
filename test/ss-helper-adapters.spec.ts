@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MEMORY_GRAPH_V0, MEMORY_RECALL_V0, MEMORY_UPDATED_V0, type PluginSession } from '@ss-helper/sdk';
+import { MEMORY_GRAPH_V0, MEMORY_RECALL_V0, MEMORY_UPDATED_V0, type PluginSession, type SettingsField } from '@ss-helper/sdk';
 import { createMemorySettingsAdapter, MEMORY_DEFAULT_SETTINGS, MEMORY_SETTINGS_SCHEMA } from '../src/ss-helper/settings';
 import { registerMemoryServices } from '../src/ss-helper/services';
+
+const graphStatus = () => ({
+  chatKey: '', enabled: false, phase: 'disabled' as const, nodeCount: 0, edgeCount: 0, updatedAt: 0,
+});
 
 const liveStatusSource = {
   loadStatus: () => ({ workspaceStatus: { value: '已就绪', tone: 'success' as const } }),
@@ -11,6 +15,10 @@ const liveStatusSource = {
   },
   assess: async () => ({ warnings: [] }),
 };
+
+function flattenSettingsFields(fields: readonly SettingsField[]): SettingsField[] {
+  return fields.flatMap((field) => field.kind === 'section' ? flattenSettingsFields(field.children) : [field]);
+}
 
 describe('SS-Helper Memory typed adapters', () => {
   it('uses the Core settings schema/adapter without a second settings root', async () => {
@@ -23,12 +31,15 @@ describe('SS-Helper Memory typed adapters', () => {
       resetSettings: async () => { settings = { ...MEMORY_DEFAULT_SETTINGS }; listeners.forEach((listener) => listener(settings)); },
       getCurrentChatInfo: () => ({ available: true, name: 'Chat A', key: 'chat-a', mode: settings.chatMode, effectiveEnabled: settings.enabled }),
       getSummaryProgressInfo: () => ({ available: true, initialized: false }),
+      getGraphStatus: graphStatus,
       onSettingsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     }, liveStatusSource);
     expect(MEMORY_SETTINGS_SCHEMA.id).toBe('ss-helper.memory');
-    expect(await adapter.load()).toMatchObject({
+    const loaded = await adapter.load();
+    expect(loaded).toMatchObject({
       enabled: true,
       maxRecallItems: 12,
+      maxPlannerCallsPerTurn: '1',
       preExtractReferenceEnabled: true,
       preExtractReferenceItems: 8,
       preExtractReferenceMode: 'auto',
@@ -38,6 +49,19 @@ describe('SS-Helper Memory typed adapters', () => {
       graphMaxHops: 1,
       graphMaxEdges: 12,
     });
+    const writableFields = flattenSettingsFields(MEMORY_SETTINGS_SCHEMA.fields)
+      .filter((field) => field.kind !== 'action' && field.kind !== 'status');
+    expect(Object.keys(loaded).sort()).toEqual(writableFields.map((field) => field.id).sort());
+    for (const field of writableFields) {
+      const value = loaded[field.id];
+      if (field.kind === 'toggle' || field.kind === 'checkbox') expect(typeof value, field.id).toBe('boolean');
+      else if (field.kind === 'select' || field.kind === 'radio') expect(field.options.some((option) => option.value === value), field.id).toBe(true);
+      else if (field.kind === 'range') {
+        expect(typeof value, field.id).toBe('number');
+        expect(Number(value), field.id).toBeGreaterThanOrEqual(field.min);
+        expect(Number(value), field.id).toBeLessThanOrEqual(field.max);
+      }
+    }
     await adapter.save({ enabled: false, maxRecallItems: 6 });
     expect(settings).toMatchObject({ enabled: false, maxRecallItems: 6, promptMaxChars: 8_000 });
     await adapter.save({ ...settings, preExtractReferenceItems: 99, preExtractReferenceMode: 'vector', preExtractReferenceMaxChars: 4_099 });
@@ -83,6 +107,7 @@ describe('SS-Helper Memory typed adapters', () => {
       resetSettings: async () => { settings = { ...MEMORY_DEFAULT_SETTINGS }; listeners.forEach((listener) => listener(settings)); },
       getCurrentChatInfo: () => ({ available: false, name: '', key: '', mode: 'inherit', effectiveEnabled: false }),
       getSummaryProgressInfo: () => ({ available: false, initialized: false }),
+      getGraphStatus: graphStatus,
       onSettingsChanged: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     }, liveStatusSource);
     expect(await adapter.loadFieldState?.()).toMatchObject({
@@ -109,6 +134,7 @@ describe('SS-Helper Memory typed adapters', () => {
       resetSettings: async () => {},
       getCurrentChatInfo: () => ({ available: true, name: 'Chat A', key: 'chat-a', mode: settings.chatMode, effectiveEnabled: true }),
       getSummaryProgressInfo: () => ({ available: true, initialized: true, completedFloor: 60, nextWindow: '下一窗口：第 61–65 层', waitingFloors: 1 }),
+      getGraphStatus: graphStatus,
       onSettingsChanged: () => () => {},
     };
     const adapter = createMemorySettingsAdapter(controller, liveStatusSource);
@@ -133,6 +159,7 @@ describe('SS-Helper Memory typed adapters', () => {
       resetSettings: async () => {},
       getCurrentChatInfo: () => chat,
       getSummaryProgressInfo: () => ({ available: chat.available, initialized: false }),
+      getGraphStatus: graphStatus,
       onSettingsChanged: (listener) => { const callback = () => listener({ ...MEMORY_DEFAULT_SETTINGS }); listeners.add(callback); return () => listeners.delete(callback); },
     }, liveStatusSource);
     const snapshots: Array<Record<string, { value: string; description?: string }>> = [];
@@ -159,6 +186,7 @@ describe('SS-Helper Memory typed adapters', () => {
       resetSettings: async () => {},
       getCurrentChatInfo: () => ({ available: true, name: 'Alice', key: 'chat-a', mode: settings.chatMode, effectiveEnabled: settings.enabled }),
       getSummaryProgressInfo: () => ({ available: true, initialized: false }),
+      getGraphStatus: graphStatus,
       onSettingsChanged: () => () => {},
     };
     const adapter = createMemorySettingsAdapter(controller, { loadStatus: () => ({}), subscribeStatus: () => () => {}, assess }, toast);
@@ -175,9 +203,12 @@ describe('SS-Helper Memory typed adapters', () => {
 
     saveSettings.mockRejectedValueOnce(new Error('workspace transaction failed'));
     toast.mockClear();
-    await expect(adapter.save({ ...settings, maxRecallItems: 14 })).rejects.toThrow('workspace transaction failed');
+    await expect(adapter.save({ ...settings, maxRecallItems: 14 })).rejects.toMatchObject({
+      code: 'INTERNAL',
+      details: { reasonCode: 'INTERNAL_ERROR', stage: 'memory.settings.save' },
+    });
     expect(toast).toHaveBeenCalledTimes(1);
-    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ level: 'error', code: 'MEMORY_SETTINGS_SAVE_FAILED', durationMs: 0 }));
+    expect(toast).toHaveBeenCalledWith(expect.objectContaining({ level: 'error', code: 'INTERNAL_ERROR', durationMs: 0 }));
   });
 
   it('validates globally enabled resource modes even when no chat is selected', async () => {
@@ -193,6 +224,7 @@ describe('SS-Helper Memory typed adapters', () => {
       resetSettings: async () => undefined,
       getCurrentChatInfo: () => ({ available: false, name: '', key: '', mode: 'inherit', effectiveEnabled: false }),
       getSummaryProgressInfo: () => ({ available: false, initialized: false }),
+      getGraphStatus: graphStatus,
       onSettingsChanged: () => () => undefined,
     }, { loadStatus: () => ({}), subscribeStatus: () => () => undefined, assess });
 
@@ -209,8 +241,7 @@ describe('SS-Helper Memory typed adapters', () => {
     const publish = vi.fn();
     const dispose = vi.fn();
     const session = {
-      services: { expose: vi.fn((token, next) => { handlers.set(token, next); return dispose; }) },
-      events: { publish },
+      bus: { handle: vi.fn((token, next) => { handlers.set(token, next); return dispose; }), publish },
     } as unknown as PluginSession;
     const registration = registerMemoryServices(session, {
       getChatKey: () => 'chat-a',

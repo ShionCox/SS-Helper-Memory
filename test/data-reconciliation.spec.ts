@@ -27,6 +27,7 @@ describe('canonical reconciliation', () => {
   it('deduplicates equivalent content under the same canonical key', () => {
     expect(
       decideFactReconciliation(existing, {
+        kind: existing.kind,
         canonicalKey: existing.canonicalKey,
         content: ' 艾琳当前停留在南港，正在等待前往北塔的船只恢复通行。 ',
         confidence: 0.92,
@@ -38,6 +39,7 @@ describe('canonical reconciliation', () => {
   it('supersedes only when conflicting evidence is newer and confident', () => {
     expect(
       decideFactReconciliation(existing, {
+        kind: existing.kind,
         canonicalKey: existing.canonicalKey,
         content: '艾琳已经离开南港并抵达北塔，当前正在塔内查阅旧星图。',
         confidence: 0.9,
@@ -47,6 +49,7 @@ describe('canonical reconciliation', () => {
 
     expect(
       decideFactReconciliation(existing, {
+        kind: existing.kind,
         canonicalKey: existing.canonicalKey,
         content: '艾琳已经离开南港并抵达北塔，当前正在塔内查阅旧星图。',
         confidence: 0.7,
@@ -56,6 +59,7 @@ describe('canonical reconciliation', () => {
 
     expect(
       decideFactReconciliation(existing, {
+        kind: existing.kind,
         canonicalKey: existing.canonicalKey,
         content: '艾琳已经离开南港并抵达北塔，当前正在塔内查阅旧星图。',
         confidence: 0.96,

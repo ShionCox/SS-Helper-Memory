@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryVectorIndexService } from '../src/application/recall/vector-index-service';
 import type { MemoryFact, MemoryFactVector } from '../src/domain';
-import type { MemoryLlmApi } from '../src/application/ingest/llm-extractor';
+import type { MemoryLlmClient } from '../src/application/ingest/llm-extractor';
 
 function memoryFact(id: string): MemoryFact {
   return {
@@ -71,7 +71,7 @@ describe('事实向量索引服务', () => {
   it('回滚后只重建受影响事实的向量', async () => {
     const repository = new FakeVectorRepository(3);
     const embed = vi.fn(async ({ texts }: { texts: string[] }) => ({ ok: true as const, vectors: texts.map(() => [1, 0]), model: 'BAAI/bge-m3' }));
-    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
     service.start();
 
     await service.rebuildFacts('chat-a', ['fact-1']);
@@ -84,14 +84,14 @@ describe('事实向量索引服务', () => {
   it('拒绝同批非法维度且不写入半批数据', async () => {
     const repository = new FakeVectorRepository();
     const embed = vi.fn(async () => ({ ok: true as const, vectors: [[1, 0], [1, 0, 0]], model: 'BAAI/bge-m3' }));
-    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
     service.start();
 
     await service.rebuild('chat-a');
     const status = await service.getStatus('chat-a');
 
     expect(repository.upsertFactVector).not.toHaveBeenCalled();
-    expect(status.lastError).toContain('维度不一致');
+    expect(status.lastError).toBe('INTERNAL_ERROR · 程序内部错误');
   });
 
   it('服务端返回备用 embedding 路由时，后续批次使用实际路由而不重复回填', async () => {
@@ -105,7 +105,7 @@ describe('事实向量索引服务', () => {
         meta: { resourceId: 'fallback-resource', model: 'fallback-embedding-model' },
       };
     });
-    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
     service.start();
 
     await service.rebuild('chat-a');
@@ -119,10 +119,26 @@ describe('事实向量索引服务', () => {
     expect(status.coverage).toMatchObject({ ready: 2, missing: 0, stale: 0 });
   });
 
+  it('通过插件总线时每批最多传输 8 条向量', async () => {
+    const repository = new FakeVectorRepository(17);
+    const embed = vi.fn(async ({ texts }: { texts: string[] }) => ({
+      ok: true as const,
+      vectors: texts.map(() => [1, 0]),
+      model: 'BAAI/bge-m3',
+    }));
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
+    service.start();
+
+    await service.rebuild('chat-a');
+
+    expect(embed.mock.calls.map(([input]) => input.texts.length)).toEqual([8, 8, 1]);
+    expect(repository.upsertFactVector).toHaveBeenCalledTimes(17);
+  });
+
   it('publishes rebuilding and ready states without allowing a listener to break indexing', async () => {
     const repository = new FakeVectorRepository(1);
     const embed = vi.fn(async ({ texts }: { texts: string[] }) => ({ ok: true as const, vectors: texts.map(() => [1, 0]), model: 'BAAI/bge-m3' }));
-    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
     const states: boolean[] = [];
     service.onStatusChanged((_chatKey, status) => states.push(status.rebuilding));
     service.onStatusChanged(() => { throw new Error('UI listener failure'); });
@@ -142,7 +158,7 @@ describe('事实向量索引服务', () => {
       await new Promise<void>((resolve) => releases.push(resolve));
       return { ok: true as const, vectors: texts.map(() => [1, 0]), model: 'BAAI/bge-m3' };
     });
-    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
     service.start();
 
     service.scheduleSync('chat-a');
@@ -176,7 +192,7 @@ describe('事实向量索引服务', () => {
       model: 'fallback-model',
       meta: { resourceId: 'fallback-resource', model: 'fallback-model' },
     }));
-    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
     service.start();
 
     const first = await service.search('chat-a', '备用路由查询');
@@ -195,7 +211,7 @@ describe('事实向量索引服务', () => {
       dimensions: 2, vector: new Float32Array([1, 0]).buffer, createdAt: 1, updatedAt: 1,
     });
     const embed = vi.fn(async () => ({ ok: true as const, vectors: [[1, 0]], model: 'BAAI/bge-m3' }));
-    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
     service.start();
 
     const first = await service.search('chat-a', '同一个查询');
@@ -211,7 +227,7 @@ describe('事实向量索引服务', () => {
     vi.useFakeTimers();
     const repository = new FakeVectorRepository(0);
     const embed = vi.fn(() => new Promise<never>(() => undefined));
-    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
     service.start();
 
     const pending = service.search('chat-a', '超时查询');
@@ -224,7 +240,7 @@ describe('事实向量索引服务', () => {
     const repository = new FakeVectorRepository(1);
     let release: ((value: { ok: true; vectors: number[][]; model: string }) => void) | undefined;
     const embed = vi.fn(() => new Promise<{ ok: true; vectors: number[][]; model: string }>((resolve) => { release = resolve; }));
-    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
     service.start();
 
     const rebuilding = service.rebuild('chat-a');
@@ -240,7 +256,7 @@ describe('事实向量索引服务', () => {
     const repository = new FakeVectorRepository(1);
     let release: ((value: { ok: true; vectors: number[][]; model: string }) => void) | undefined;
     const embed = vi.fn(() => new Promise<{ ok: true; vectors: number[][]; model: string }>((resolve) => { release = resolve; }));
-    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmApi), routes);
+    const service = new MemoryVectorIndexService(repository as never, () => ({ embed } as unknown as MemoryLlmClient), routes);
     service.start();
 
     const rebuilding = service.rebuildFacts('chat-a', ['fact-0']);
@@ -248,7 +264,10 @@ describe('事实向量索引服务', () => {
     service.stop();
     release?.({ ok: true, vectors: [[1, 0]], model: 'BAAI/bge-m3' });
 
-    await expect(rebuilding).rejects.toMatchObject({ code: 'VECTOR_INDEX_REPAIR_PENDING' });
+    await expect(rebuilding).rejects.toMatchObject({
+      code: 'INTERNAL',
+      details: { reasonCode: 'INTERNAL_ERROR', stage: 'memory.vector.rebuild' },
+    });
     expect(repository.upsertFactVector).not.toHaveBeenCalled();
   });
 });

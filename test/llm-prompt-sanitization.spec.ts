@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { StructuredMemoryCaptureExtractor, type MemoryLlmApi } from '../src/application/ingest/llm-extractor';
+import { StructuredMemoryCaptureExtractor, type MemoryLlmClient } from '../src/application/ingest/llm-extractor';
 import type { SourceBlock } from '../src/application/ingest/types';
 
 describe('memory Capture prompt sanitization', () => {
   it('never exposes persistence owner/location IDs to the model', async () => {
-    const runTask = vi.fn(async (_input: Parameters<MemoryLlmApi['runTask']>[0]) => ({
+    const runTask = vi.fn(async (_input: Parameters<MemoryLlmClient['runTask']>[0]) => ({
       ok: true as const,
       data: { actorCandidates: [], locationCandidates: [], episodes: [], claims: [] },
       meta: { resourceId: 'generation', model: 'test', latencyMs: 1 },

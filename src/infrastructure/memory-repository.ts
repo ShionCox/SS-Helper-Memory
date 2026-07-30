@@ -1,25 +1,30 @@
-import type { IngestCommit, IngestCommitter } from '../application/ingest/types';
 import type {
+  ChatMessageSnapshot,
   PlainData,
+  FinalPromptSnapshot,
+  SSHelperFailureContext,
   WorkspacePort,
-  WorkspaceRecord,
-  WorkspaceTransactionOperation,
-  WorkspaceVectorInfo,
 } from '@ss-helper/sdk';
-import { SDK_PACKAGE_VERSION } from '@ss-helper/sdk';
+import {
+  SDK_PACKAGE_VERSION,
+  createSSHelperError,
+  readSSHelperFailure,
+} from '@ss-helper/sdk';
 import {
   ACTIVE_CONFIDENCE_THRESHOLD,
   MAX_FACT_CONTENT_LENGTH,
   MIN_FACT_CONTENT_LENGTH,
   createCanonicalKey,
   createFactSlotKey,
-  decideFactReconciliation,
   normalizeFactContent,
-  validateAutomaticProposal,
-  type AutomaticFactProposal,
-  AutomaticIngestResult,
   FactListOptions,
   MainChatUsage,
+  GenerationRecallDetail,
+  GenerationRecallLookupTarget,
+  GenerationPromptSnapshotChunk,
+  GenerationPromptSnapshotManifest,
+  GenerationPromptSnapshotMetadata,
+  GenerationPromptSnapshotPayload,
   ManualFactInput,
   MemoryEvidence,
   MemoryFact,
@@ -29,53 +34,35 @@ import {
   MemoryGraphEdge,
   MemoryGraphNode,
   MemoryGraphProjection,
-  MemoryJob,
-  MemoryJobBatchAudit,
   MemoryRecallLog,
   MemorySettingRecord,
   UpsertMemoryFactVectorInput,
   deriveMemoryGraphProjection,
   graphNodeId,
   isGraphBackedFact,
+  stableMemoryRecordKey,
 } from '../domain';
 import { float32ArrayToArrayBuffer, sha256Content } from './vector/vector-utils';
-import { traceMemoryStartup } from '../host/runtime-feedback';
+import { startMemoryPerformanceSpan, traceMemoryStartup } from '../host/runtime-feedback';
+import {
+  memoryStoreFor,
+  type MemoryStore,
+  type StoreOperation,
+  type StoreRecord as WorkspaceRecord,
+  type StoreVectorInfo as WorkspaceVectorInfo,
+} from './memory-store';
+import { MEMORY_WORKSPACE_COLLECTIONS } from './memory-workspace-schema';
+import type { MemoryPage, MemoryPageRequest } from '../ui/memory-page';
 
 const DEFAULT_SEARCH_LIMIT = 50;
 const MAX_SEARCH_LIMIT = 500;
 const QUERY_PAGE_SIZE = 1_000;
 const TRANSACTION_BATCH_SIZE = 500;
+const LOOKUP_CHUNK_SIZE = 100;
+const PROMPT_SNAPSHOT_CHUNK_BYTES = 256 * 1024;
+const PROMPT_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
 const SETTINGS_WORKSPACE_ID = 'settings:global';
-const COLLECTIONS = Object.freeze({
-  actors: ['workspaceId', 'kind', 'canonicalName', 'status', 'updatedAt'],
-  'actor-aliases': ['workspaceId', 'ownerId', 'normalizedValue', 'status', 'updatedAt'],
-  'actor-candidates': ['workspaceId', 'chatKey', 'status', 'confidence', 'updatedAt'],
-  locations: ['workspaceId', 'canonicalName', 'status', 'updatedAt'],
-  'location-aliases': ['workspaceId', 'locationId', 'normalizedValue', 'status', 'updatedAt'],
-  'location-candidates': ['workspaceId', 'chatKey', 'status', 'confidence', 'updatedAt'],
-  episodes: ['workspaceId', 'chatKey', 'floorStart', 'occurredAt', 'createdAt'],
-  observations: ['workspaceId', 'episodeId', 'sourceRef', 'speakerOwnerId', 'occurredAt'],
-  facts: ['workspaceId', 'chatKey', 'status', 'kind', 'updatedAt'],
-  evidence: ['workspaceId', 'chatKey', 'factId', 'occurredAt'],
-  'fact-heads': ['workspaceId', 'chatKey', 'slotKey', 'factId'],
-  'memory-traces': ['workspaceId', 'chatKey', 'ownerId', 'factId', 'updatedAt'],
-  'scene-casts': ['workspaceId', 'chatKey', 'floor', 'createdAt'],
-  'capture-jobs': ['workspaceId', 'chatKey', 'status', 'updatedAt'],
-  'change-audits': ['workspaceId', 'chatKey', 'createdAt'],
-  'memory-details': ['workspaceId', 'chatKey', 'ownerId', 'traceId'],
-  'memory-links': ['workspaceId', 'chatKey', 'ownerId', 'updatedAt'],
-  profiles: ['workspaceId', 'ownerId', 'updatedAt'],
-  'profile-claims': ['workspaceId', 'ownerId', 'level', 'updatedAt'],
-  'relationship-claims': ['workspaceId', 'fromOwnerId', 'toOwnerId', 'updatedAt'],
-  'recall-exposures': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
-  'dream-jobs': ['workspaceId', 'chatKey', 'ownerId', 'status', 'updatedAt'],
-  'dream-audits': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
-  'dream-narratives': ['workspaceId', 'chatKey', 'ownerId', 'createdAt'],
-  usage: ['chatKey', 'capturedAt'],
-  'recall-logs': ['chatKey', 'createdAt'],
-  'graph-nodes': ['workspaceId', 'chatKey', 'entityKey', 'updatedAt'],
-  'graph-edges': ['workspaceId', 'chatKey', 'fromNodeId', 'toNodeId', 'backingFactId', 'updatedAt'],
-} as const);
+const COLLECTIONS = MEMORY_WORKSPACE_COLLECTIONS;
 
 export interface MemoryWorkspaceHealth {
   connected: boolean;
@@ -92,24 +79,14 @@ export interface MemoryWorkspaceHealth {
   tableCounts: Record<string, number>;
   tableBytes: Record<string, number | null>;
   vectorCoverage?: { indexedFacts?: number; eligibleFacts?: number; ratio?: number; ready?: number; totalFacts?: number; coverage?: number };
-  lastError?: string | { message?: string };
+  failure?: SSHelperFailureContext;
 }
-
-export interface MemoryWorkspaceBootstrap<TFact> extends MemoryWorkspaceHealth { facts: TFact[]; }
 
 function asPlain(value: unknown): PlainData { return structuredClone(value) as PlainData; }
-function workspaceErrorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== 'object') return undefined;
-  const detailsCode = 'details' in error ? (error as { details?: { reasonCode?: unknown } }).details?.reasonCode : undefined;
-  if (detailsCode) return String(detailsCode);
-  const causeCode = 'cause' in error ? workspaceErrorCode((error as { cause?: unknown }).cause) : undefined;
-  if (causeCode) return causeCode;
-  return 'code' in error ? String((error as { code?: unknown }).code) : undefined;
-}
-
-function paginationStalledError(scope: string): Error & { code: string } {
-  return Object.assign(new Error(`Memory ${scope} 分页游标未推进，已停止读取以避免界面持续等待。`), {
-    code: 'WORKSPACE_PAGINATION_STALLED',
+function paginationStalledError(scope: string): Error {
+  return createSSHelperError('WORKSPACE_CONFLICT', {
+    stage: 'memory.persistence.pagination',
+    collection: scope,
   });
 }
 
@@ -131,7 +108,7 @@ interface FactSlotValue {
 
 function normalizedChatKey(chatKey: string): string {
   const value = chatKey.trim();
-  if (!value) throw new Error('当前聊天缺少稳定 ID，Memory 操作已停止。');
+  if (!value) throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.repository.chat-key' });
   return value;
 }
 
@@ -179,6 +156,38 @@ function textBytes(value: string | undefined): number {
   return value ? textEncoder.encode(value).byteLength : 0;
 }
 
+function splitUtf8(value: string, maximumBytes = PROMPT_SNAPSHOT_CHUNK_BYTES): string[] {
+  const chunks: string[] = [];
+  let current = '';
+  let bytes = 0;
+  for (const character of value) {
+    const size = textEncoder.encode(character).byteLength;
+    if (bytes > 0 && bytes + size > maximumBytes) {
+      chunks.push(current);
+      current = '';
+      bytes = 0;
+    }
+    current += character;
+    bytes += size;
+  }
+  if (current || value.length === 0) chunks.push(current);
+  return chunks;
+}
+
+function containsExactText(value: unknown, expected: string): boolean {
+  if (!expected) return true;
+  if (typeof value === 'string') return value.includes(expected);
+  if (Array.isArray(value)) return value.some(item => containsExactText(item, expected));
+  if (value && typeof value === 'object') return Object.values(value as Record<string, unknown>).some(item => containsExactText(item, expected));
+  return false;
+}
+
+export interface PreparedGenerationPromptSnapshot {
+  readonly manifest: GenerationPromptSnapshotManifest;
+  readonly chunks: readonly GenerationPromptSnapshotChunk[];
+  readonly metadata: GenerationPromptSnapshotMetadata;
+}
+
 function plainBytes(value: PlainData | undefined): number {
   return value === undefined ? 0 : textBytes(JSON.stringify(value));
 }
@@ -193,52 +202,6 @@ function vectorPayloadBytes(vector: WorkspaceVectorInfo): number {
     + plainBytes(vector.metadata)
     + Math.max(0, vector.dimensions) * Float32Array.BYTES_PER_ELEMENT;
 }
-
-function undoEntryBelongsToChat(entry: UndoLogEntry, chatKey: string): boolean {
-  const values = [entry.before, entry.after].filter((value): value is PlainData => value !== undefined);
-  return values.length > 0 && values.every((value) => dataChatKey(value) === chatKey);
-}
-
-interface UndoLogEntry {
-  collection: 'facts' | 'evidence' | 'fact-heads';
-  recordId: string;
-  before?: PlainData;
-  after?: PlainData;
-  beforeRevision: number;
-  afterRevision?: number;
-}
-
-interface UndoLogV0 {
-  id: string;
-  kind: 'undo-log-v0';
-  chatKey: string;
-  jobId: string;
-  batchIndex: number;
-  transactionId: string;
-  committedSequence: number;
-  entries: readonly UndoLogEntry[];
-  result?: AutomaticIngestResult;
-  createdAt: number;
-  rolledBackAt?: number;
-  rolledBackBy?: string;
-}
-
-interface RollbackMarkerV0 {
-  id: string;
-  kind: 'rollback-v0';
-  chatKey: string;
-  jobId: string;
-  batchIndex: number;
-  status: 'index-repair-pending' | 'completed';
-  affectedLogIds: string[];
-  affectedFactIds: string[];
-  createdAt: number;
-  completedAt?: number;
-}
-
-let lastCommittedSequence = 0;
-function nextCommittedSequence(): number { lastCommittedSequence = Math.max(lastCommittedSequence + 1, Date.now() * 1_000); return lastCommittedSequence; }
-function undoRecordKey(entry: UndoLogEntry): string { return `${entry.collection}\0${entry.recordId}`; }
 
 function samePlainData(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
@@ -257,52 +220,109 @@ function evidenceId(factId: string, sourceRef: string, excerpt: string): string 
   return `evidence:${factId}:${stableHash(`${sourceRef}\n${excerpt}`)}`;
 }
 
-function rows<T>(value: T[] | { items?: T[] } | undefined | null): T[] {
-  if (Array.isArray(value)) return value;
-  return Array.isArray(value?.items) ? value.items : [];
-}
 
 /** Memory 的唯一仓储。领域逻辑留在 Memory，持久化只使用 SDK 通用 WorkspacePort。 */
-export class MemoryRepository implements IngestCommitter {
+export class MemoryRepository {
   private healthSnapshot: MemoryWorkspaceHealth | null = null;
   private workspaceId = '';
   private sourceChatKey = '';
 
-  constructor(readonly workspace: WorkspacePort) {}
+  private readonly store: MemoryStore;
+
+  constructor(readonly workspace: WorkspacePort) {
+    this.store = memoryStoreFor(workspace);
+  }
 
   bind(workspaceId: string, sourceChatKey: string): void {
-    this.workspaceId = workspaceId.trim();
-    this.sourceChatKey = sourceChatKey.trim();
+    const nextWorkspaceId = workspaceId.trim();
+    const nextChatKey = sourceChatKey.trim();
+    const workspaceChanged = this.workspaceId !== nextWorkspaceId;
+    const chatChanged = this.sourceChatKey !== nextChatKey;
+    this.workspaceId = nextWorkspaceId;
+    this.sourceChatKey = nextChatKey;
+    if (workspaceChanged) {
+      this.healthSnapshot = null;
+    } else if (chatChanged && this.healthSnapshot) {
+      // Workspace totals remain valid, but this value is scoped to the old
+      // chat. Never present it as the newly bound chat's usage.
+      this.healthSnapshot = {
+        ...this.healthSnapshot,
+        currentChatSizeBytes: 0,
+      };
+    }
   }
 
   private requireChatKey(chatKey = this.sourceChatKey): string {
     const value = normalizedChatKey(chatKey);
     if (this.sourceChatKey && value !== this.sourceChatKey) {
-      throw Object.assign(new Error('当前聊天已切换，旧聊天操作已安全取消。'), { code: 'MEMORY_CHAT_CHANGED' });
+      throw createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', {
+        stage: 'memory.repository.chat-scope',
+      });
     }
     return value;
   }
 
   private requireWorkspaceId(): string {
-    if (!this.workspaceId) throw new Error('当前角色或群组缺少稳定 ID，Memory workspace 未启用。');
+    if (!this.workspaceId) {
+      throw createSSHelperError('MEMORY_CAPTURE_NOT_BOUND', {
+        stage: 'memory.repository.workspace-binding',
+      });
+    }
     return this.workspaceId;
   }
 
   private async ensureCollections(workspaceId: string): Promise<void> {
-    await this.workspace.open({ workspaceId, create: true, metadata: { kind: workspaceId.startsWith('group:') ? 'group' : workspaceId === SETTINGS_WORKSPACE_ID ? 'settings' : 'host_card' } });
-    if (workspaceId === SETTINGS_WORKSPACE_ID) {
-      await this.workspace.defineCollection({ workspaceId, name: 'settings', indexes: ['key'] });
-      return;
-    }
-    for (const [name, indexes] of Object.entries(COLLECTIONS)) await this.workspace.defineCollection({ workspaceId, name, indexes });
+    await this.store.bind(
+      workspaceId,
+      workspaceId === SETTINGS_WORKSPACE_ID
+        ? [{ name: 'settings', indexes: ['key'] }]
+        : Object.entries(COLLECTIONS).map(([name, indexes]) => ({ name, indexes })),
+      { kind: workspaceId.startsWith('group:') ? 'group' : workspaceId === SETTINGS_WORKSPACE_ID ? 'settings' : 'host_card' },
+    );
+  }
+
+  private async ensureGenerationRecallDetailsCollection(workspaceId: string): Promise<void> {
+    await this.store.bind(
+      workspaceId,
+      [{
+        name: 'generation-recall-details',
+        indexes: [...COLLECTIONS['generation-recall-details']],
+      }],
+      { kind: workspaceId.startsWith('group:') ? 'group' : 'host_card' },
+    );
   }
 
   async open(): Promise<void> {
-    const health = await this.workspace.health();
-    if (!health.ready) throw new Error(health.error || 'SS-Helper workspace 数据库未连接。');
-    await this.ensureCollections(SETTINGS_WORKSPACE_ID);
-    if (this.workspaceId) await this.ensureCollections(this.workspaceId);
-    this.healthSnapshot = await this.refreshHealth();
+    const finish = startMemoryPerformanceSpan('repository.open');
+    const health = await this.store.health();
+    if (!health.ready) {
+      finish('error');
+      throw createSSHelperError('WORKSPACE_DATABASE_UNAVAILABLE', {
+        stage: 'memory.repository.open.health',
+      });
+    }
+    try {
+      await this.ensureCollections(SETTINGS_WORKSPACE_ID);
+    } catch (cause) {
+      finish('error');
+      const failure = readSSHelperFailure(cause, {
+        reasonCode: 'MEMORY_CHAT_BIND_FAILED',
+        stage: 'memory.repository.open.settings',
+      })!;
+      throw createSSHelperError(failure.reasonCode, failure);
+    }
+    try {
+      if (this.workspaceId) await this.ensureCollections(this.workspaceId);
+    } catch (cause) {
+      finish('error');
+      const failure = readSSHelperFailure(cause, {
+        reasonCode: 'MEMORY_CHAT_BIND_FAILED',
+        stage: 'memory.repository.open.chat',
+      })!;
+      throw createSSHelperError(failure.reasonCode, failure);
+    }
+    this.healthSnapshot = this.toHealthSnapshot(health);
+    finish();
   }
 
   close(): void {
@@ -313,9 +333,51 @@ export class MemoryRepository implements IngestCommitter {
     return this.healthSnapshot ? structuredClone(this.healthSnapshot) : null;
   }
 
+  async readHealth(): Promise<MemoryWorkspaceHealth> {
+    const finish = startMemoryPerformanceSpan('repository.health.basic');
+    const health = await this.store.health();
+    const previous = this.healthSnapshot;
+    this.healthSnapshot = this.toHealthSnapshot(health, previous ? {
+      workspaceSizeBytes: previous.workspaceSizeBytes,
+      currentChatSizeBytes: previous.currentChatSizeBytes,
+      tableCounts: previous.tableCounts,
+      tableBytes: previous.tableBytes,
+    } : {});
+    finish(health.ready ? 'success' : 'error');
+    return structuredClone(this.healthSnapshot);
+  }
+
+  private toHealthSnapshot(
+    health: Awaited<ReturnType<MemoryStore['health']>>,
+    sizes: {
+      readonly workspaceSizeBytes?: number;
+      readonly currentChatSizeBytes?: number;
+      readonly tableCounts?: Record<string, number>;
+      readonly tableBytes?: Record<string, number | null>;
+    } = {},
+  ): MemoryWorkspaceHealth {
+    return {
+      connected: health.ready,
+      serverVersion: SDK_PACKAGE_VERSION,
+      nodeVersion: health.nodeVersion ?? 'N/A',
+      protocolVersion: 0,
+      sqliteVersion: health.sqliteVersion ?? 'N/A',
+      schemaVersion: health.schemaVersion,
+      databasePath: `data/_ss-helper-v0/${health.database}`,
+      databaseSizeBytes: health.databaseSizeBytes ?? 0,
+      workspaceSizeBytes: sizes.workspaceSizeBytes ?? 0,
+      currentChatSizeBytes: sizes.currentChatSizeBytes ?? 0,
+      walMode: health.walMode ?? 'N/A',
+      tableCounts: sizes.tableCounts ?? {},
+      tableBytes: sizes.tableBytes ?? {},
+      ...(health.failure ? { failure: structuredClone(health.failure) } : {}),
+    };
+  }
+
   async refreshHealth(_chatKey?: string): Promise<MemoryWorkspaceHealth> {
+    const finish = startMemoryPerformanceSpan('repository.health.detailed');
     traceMemoryStartup('repository:health-begin');
-    const health = await this.workspace.health();
+    const health = await this.store.health();
     traceMemoryStartup(`repository:health-${health.ready ? 'ready' : 'degraded'}`);
     const tableCounts: Record<string, number> = {};
     const tableBytes: Record<string, number | null> = {};
@@ -350,46 +412,19 @@ export class MemoryRepository implements IngestCommitter {
         .reduce((total, vector) => total + vectorPayloadBytes(vector), 0);
     }
     traceMemoryStartup('repository:health-snapshot');
-    this.healthSnapshot = {
-      connected: health.ready,
-      serverVersion: SDK_PACKAGE_VERSION,
-      nodeVersion: health.nodeVersion ?? 'N/A',
-      protocolVersion: 0,
-      sqliteVersion: health.sqliteVersion ?? 'N/A',
-      schemaVersion: health.schemaVersion,
-      databasePath: `data/_ss-helper-v0/${health.database}`,
-      databaseSizeBytes: health.databaseSizeBytes ?? 0,
+    this.healthSnapshot = this.toHealthSnapshot(health, {
       workspaceSizeBytes,
       currentChatSizeBytes,
-      walMode: health.walMode ?? 'N/A',
       tableCounts,
       tableBytes,
-      ...(health.error ? { lastError: health.error } : {}),
-    };
+    });
+    finish(health.ready ? 'success' : 'error');
     return structuredClone(this.healthSnapshot);
   }
 
-  async bootstrap(chatKey: string): Promise<MemoryWorkspaceBootstrap<MemoryFact>> {
-    const health = await this.refreshHealth(chatKey);
-    if (!health.connected) {
-      throw Object.assign(new Error(health.lastError ? String(health.lastError) : 'SQLite 工作区服务未连接。'), {
-        code: 'SQLITE_SERVICE_UNAVAILABLE',
-      });
-    }
-    await this.ensureChatIsolation();
-    return { ...health, facts: await this.listAllFacts(chatKey) };
-  }
-
-  private ensureChatIsolation(): Promise<void> {
-    // Chat ownership is encoded directly on every v0 fact/evidence/head row;
-    // there is no repair or migration pass at startup.
-    this.requireWorkspaceId();
-    return Promise.resolve();
-  }
-
-  private async transactInBatches(workspaceId: string, operations: readonly WorkspaceTransactionOperation[]): Promise<void> {
+  private async transactInBatches(workspaceId: string, operations: readonly StoreOperation[]): Promise<void> {
     for (let offset = 0; offset < operations.length; offset += TRANSACTION_BATCH_SIZE) {
-      await this.workspace.transaction({ workspaceId, operations: operations.slice(offset, offset + TRANSACTION_BATCH_SIZE) });
+      await this.store.apply({ workspaceId, operations: operations.slice(offset, offset + TRANSACTION_BATCH_SIZE) });
     }
   }
 
@@ -397,7 +432,7 @@ export class MemoryRepository implements IngestCommitter {
     const records: WorkspaceRecord[] = []; let cursor: string | undefined;
     const seenCursors = new Set<string>();
     do {
-      const page = await this.workspace.query({ workspaceId, collection, filter, ...(orderBy ? { orderBy } : {}), ...(cursor ? { cursor } : {}), limit: QUERY_PAGE_SIZE });
+      const page = await this.store.scan({ workspaceId, collection, filter, ...(orderBy ? { orderBy } : {}), ...(cursor ? { cursor } : {}), limit: QUERY_PAGE_SIZE });
       records.push(...page.records);
       const nextCursor = page.nextCursor ?? undefined;
       if (nextCursor !== undefined && seenCursors.has(nextCursor)) throw paginationStalledError(`记录集合 ${collection}`);
@@ -419,7 +454,7 @@ export class MemoryRepository implements IngestCommitter {
     const vectors = []; let cursor: string | undefined;
     const seenCursors = new Set<string>();
     do {
-      const page = await this.workspace.vectorList({
+      const page = await this.store.vectors.list({
         workspaceId: this.requireWorkspaceId(),
         collection: 'facts',
         ...(chatKey ? { metadata: { chatKey: this.requireChatKey(chatKey) } } : {}),
@@ -495,7 +530,7 @@ export class MemoryRepository implements IngestCommitter {
       const edgeById = new Map(currentEdges.map((record) => [record.recordId, record]));
       const desiredNodes = projection.nodes.filter((node) => node.chatKey === chatKey);
       const desiredEdges = projection.edges.filter((edge) => edge.chatKey === chatKey);
-      const upserts: WorkspaceTransactionOperation[] = [];
+      const upserts: StoreOperation[] = [];
       for (const node of desiredNodes) {
         const current = nodeById.get(node.id);
         if (current && samePlainData(current.value, node)) continue;
@@ -514,7 +549,7 @@ export class MemoryRepository implements IngestCommitter {
       }
       const desiredNodeIds = new Set(desiredNodes.map((node) => node.id));
       const desiredEdgeIds = new Set(desiredEdges.map((edge) => edge.id));
-      const deletes: WorkspaceTransactionOperation[] = [
+      const deletes: StoreOperation[] = [
         ...currentEdges
           .filter((record) => !desiredEdgeIds.has(record.recordId))
           .map((record) => ({ action: 'delete' as const, collection: 'graph-edges', recordId: record.recordId, expectedVersion: record.version })),
@@ -527,7 +562,7 @@ export class MemoryRepository implements IngestCommitter {
       // edges; the next deterministic pass removes the redundant entries.
       await this.transactInBatches(workspaceId, [...upserts, ...deletes]);
     } catch (error) {
-      if (workspaceErrorCode(error) === 'WORKSPACE_CONFLICT' && retryAttempt < 1) {
+      if (readSSHelperFailure(error)?.reasonCode === 'WORKSPACE_CONFLICT' && retryAttempt < 1) {
         return this.reconcileGraphProjection(chatKey, projection, retryAttempt + 1);
       }
       throw error;
@@ -545,7 +580,7 @@ export class MemoryRepository implements IngestCommitter {
   }
 
   async getFact(chatKey: string, id: string): Promise<MemoryFact | undefined> {
-    const result = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: id });
+    const result = await this.store.read({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: id });
     const fact = result?.value as MemoryFact | undefined;
     return factBelongsToChat(fact, chatKey) ? fact : undefined;
   }
@@ -554,21 +589,21 @@ export class MemoryRepository implements IngestCommitter {
     chatKey = this.requireChatKey(chatKey);
     const content = normalizeFactContent(input.content);
     if (Array.from(content).length < MIN_FACT_CONTENT_LENGTH || Array.from(content).length > MAX_FACT_CONTENT_LENGTH) {
-      throw new Error(`手动记忆正文必须为 ${MIN_FACT_CONTENT_LENGTH}–${MAX_FACT_CONTENT_LENGTH} 字。`);
+      throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.repository.manual-fact.content' });
     }
     const confidence = input.confidence ?? 1;
     if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
-      throw new Error('手动记忆置信度必须位于 0 到 1 之间。');
+      throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.repository.manual-fact.confidence' });
     }
     const id = input.id ?? createId('fact');
-    const previousRecord = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: id });
+    const previousRecord = await this.store.read({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: id });
     const previous = previousRecord?.value as MemoryFact | undefined;
     if (previous && !factBelongsToChat(previous, chatKey)) {
-      throw Object.assign(new Error('当前聊天不存在该记忆，跨聊天编辑已阻止。'), { code: 'MEMORY_FACT_NOT_FOUND' });
+      throw createSSHelperError('WORKSPACE_NOT_FOUND', { stage: 'memory.repository.manual-fact.lookup' });
     }
     const slotKey = createFactSlotKey(input.subjectKey, input.predicateKey);
     if (previous && previous.slotKey !== slotKey && (previous.supersedesId || previous.supersededById)) {
-      throw new Error('已形成历史链的记忆不能修改主体或谓词；请新增记忆或先删除历史链。');
+      throw createSSHelperError('WORKSPACE_CONFLICT', { stage: 'memory.repository.manual-fact.history' });
     }
     const slotFacts = (await this.listFacts(chatKey))
       .filter(item => item.slotKey === slotKey && (item.status === 'active' || item.status === 'pending'))
@@ -637,25 +672,25 @@ export class MemoryRepository implements IngestCommitter {
     }] : [];
     const workspaceId = this.requireWorkspaceId();
     const slotRecordId = factSlotRecordId(chatKey, slotKey);
-    const slotRecord = await this.workspace.get({ workspaceId, collection: 'fact-heads', recordId: slotRecordId });
+    const slotRecord = await this.store.read({ workspaceId, collection: 'fact-heads', recordId: slotRecordId });
     const currentSlot = slotRecord?.value;
     if (slotRecord && (!isFactSlotValue(currentSlot)
       || currentSlot.chatKey !== chatKey
       || currentSlot.slotKey !== slotKey
       || currentSlot.factId !== expectedSlotFactId)) {
-      throw Object.assign(new Error('记忆槽位已变化，请刷新后重试。'), { code: 'WORKSPACE_CONFLICT' });
+      throw createSSHelperError('WORKSPACE_CONFLICT', { stage: 'memory.repository.manual-fact.slot' });
     }
-    const operations: WorkspaceTransactionOperation[] = [
+    const operations: StoreOperation[] = [
       { action: 'upsert', collection: 'facts', recordId: fact.id, value: asPlain(fact), expectedVersion: previousRecord?.version ?? 0 },
       { action: 'upsert', collection: 'evidence', recordId: evidence.id, value: asPlain(evidence) },
     ];
     for (const related of relatedFacts) {
-      const record = await this.workspace.get({ workspaceId, collection: 'facts', recordId: related.id });
+      const record = await this.store.read({ workspaceId, collection: 'facts', recordId: related.id });
       operations.push({ action: 'upsert', collection: 'facts', recordId: related.id, value: asPlain(related), expectedVersion: record?.version ?? 0 });
     }
     if (status === 'active' || status === 'pending') operations.push({ action: 'upsert', collection: 'fact-heads', recordId: slotRecordId, value: asPlain(slotValue(chatKey, slotKey, fact.id)), expectedVersion: slotRecord?.version ?? 0 });
     this.requireChatKey(chatKey);
-    await this.workspace.transaction({ workspaceId, operations });
+    await this.store.apply({ workspaceId, operations });
     return fact;
   }
 
@@ -666,13 +701,15 @@ export class MemoryRepository implements IngestCommitter {
   async removeFact(chatKey: string, id: string): Promise<boolean> {
     chatKey = this.requireChatKey(chatKey);
     const workspaceId = this.requireWorkspaceId();
-    const targetRecord = await this.workspace.get({ workspaceId, collection: 'facts', recordId: id });
+    const targetRecord = await this.store.read({ workspaceId, collection: 'facts', recordId: id });
     const target = targetRecord?.value as MemoryFact | undefined;
     if (!target || !targetRecord || !factBelongsToChat(target, chatKey)) return false;
     const relatedIds = [target.supersedesId, target.supersededById].filter((value): value is string => Boolean(value));
-    const relatedRecords = await Promise.all(relatedIds.map((recordId) => this.workspace.get({ workspaceId, collection: 'facts', recordId })));
-    if (relatedRecords.some(item => !item || !factBelongsToChat(item.value as unknown as MemoryFact, chatKey))) throw new Error('记忆历史链已变化或包含其他聊天，请刷新后重试。');
-    const operations: WorkspaceTransactionOperation[] = [{ action: 'delete', collection: 'facts', recordId: id, expectedVersion: targetRecord.version }];
+    const relatedRecords = await Promise.all(relatedIds.map((recordId) => this.store.read({ workspaceId, collection: 'facts', recordId })));
+    if (relatedRecords.some(item => !item || !factBelongsToChat(item.value as unknown as MemoryFact, chatKey))) {
+      throw createSSHelperError('WORKSPACE_CONFLICT', { stage: 'memory.repository.remove-fact.history' });
+    }
+    const operations: StoreOperation[] = [{ action: 'delete', collection: 'facts', recordId: id, expectedVersion: targetRecord.version }];
     for (const record of relatedRecords) {
       const value = structuredClone(record!.value as unknown as MemoryFact);
       if (value.supersededById === id) { delete value.supersededById; value.status = 'active'; }
@@ -684,7 +721,7 @@ export class MemoryRepository implements IngestCommitter {
     for (const record of evidence) operations.push({ action: 'delete', collection: 'evidence', recordId: record.recordId, expectedVersion: record.version });
     if (target.slotKey) {
       const slotRecordId = factSlotRecordId(chatKey, target.slotKey);
-      const slot = await this.workspace.get({ workspaceId, collection: 'fact-heads', recordId: slotRecordId });
+      const slot = await this.store.read({ workspaceId, collection: 'fact-heads', recordId: slotRecordId });
       if (slot) {
         const replacement = selectedSlotFact(relatedRecords.map((record) => record!.value as unknown as MemoryFact));
         operations.push(replacement
@@ -693,8 +730,8 @@ export class MemoryRepository implements IngestCommitter {
       }
     }
     this.requireChatKey(chatKey);
-    await this.workspace.transaction({ workspaceId, operations });
-    await this.workspace.vectorDelete({ workspaceId, collection: 'facts', recordId: id }).catch(() => false);
+    await this.store.apply({ workspaceId, operations });
+    await this.store.vectors.delete({ workspaceId, collection: 'facts', recordId: id }).catch(() => false);
     return true;
   }
 
@@ -706,458 +743,532 @@ export class MemoryRepository implements IngestCommitter {
     return this.listAllRows<MemoryEvidence>('evidence', { chatKey: this.requireChatKey(chatKey), factId });
   }
 
-  async commitIngest(input: IngestCommit, retryAttempt = 0): Promise<AutomaticIngestResult> {
-    const chatKey = this.requireChatKey(input.chatKey);
-    const startedAt = Date.now();
-    const batchIndex = input.checkpoint.batchIndex ?? 1;
-    const undoLogId = `undo-v0:${input.jobId}:${batchIndex}`;
-    const existingUndo = await this.workspace.get({ workspaceId: this.requireWorkspaceId(), collection: 'change-audits', recordId: undoLogId });
-    if (existingUndo) {
-      const log = existingUndo.value as unknown as UndoLogV0;
-      if (log.kind !== 'undo-log-v0' || log.chatKey !== chatKey || !log.result) {
-        throw Object.assign(new Error('整理批次幂等标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
-      }
-      return structuredClone(log.result);
-    }
-    const sourceRows = input.sources.map(source => ({
-      id: source.id,
-      chatKey: source.chatKey,
-      type: source.kind,
-      content: source.content,
-      occurredAt: source.createdAt,
-      ...(source.floor === undefined ? {} : { floor: source.floor }),
-    }));
-    if (sourceRows.some(source => source.chatKey !== chatKey)) {
-      throw new Error('整理批次包含其他聊天的来源，事务已取消。');
-    }
-    const rejected = structuredClone(input.rejections ?? []);
-    const proposals = input.facts.map((proposal, index) => {
-      const automatic: AutomaticFactProposal = {
-        kind: proposal.kind,
-        subjectKey: proposal.subjectKey,
-        predicateKey: proposal.predicateKey,
-        ...(proposal.objectKey === undefined ? {} : { objectKey: proposal.objectKey }),
-        content: proposal.content,
-        entityKeys: proposal.entityKeys,
-        confidence: proposal.confidence,
-        evidence: [{ sourceRef: proposal.sourceRef, excerpt: proposal.evidenceExcerpt }],
-        ...(proposal.validFrom === undefined ? {} : { validFrom: proposal.validFrom }),
-        ...(proposal.validTo === undefined ? {} : { validUntil: proposal.validTo }),
-        ...(proposal.stable === undefined ? {} : { stableAnchor: proposal.stable }),
-        ...(proposal.scope === undefined ? {} : { scope: proposal.scope }),
-      };
-      const validation = validateAutomaticProposal(automatic, sourceRows);
-      if (!validation.ok) {
-        rejected.push({ index, code: validation.code, message: validation.message });
-        return null;
-      }
-      return validation.value;
-    }).filter(value => value !== null);
-    if (rejected.length > (input.rejections?.length ?? 0)) {
-      throw new Error(`记忆批次包含无效事实，事务已取消：${rejected.at(-1)?.message ?? ''}`);
-    }
+  async addMainChatUsage(usage: MainChatUsage): Promise<void> {
+    await this.addMainChatUsageForScope({
+      workspaceId: this.requireWorkspaceId(),
+      chatKey: this.requireChatKey(usage.chatKey),
+    }, usage);
+  }
 
-    const beforeFactRecords = await this.listAllRecordRows('facts', { chatKey });
-    const beforeFacts = beforeFactRecords.map((record) => record.value as unknown as MemoryFact);
-    const beforeRecordById = new Map(beforeFactRecords.map((record) => [record.recordId, record]));
-    const touchedSlots = new Set(proposals.map(proposal => proposal.slotKey));
-    const baseSlotFactIds = Object.fromEntries([...touchedSlots].map(slotKey => [
-      slotKey,
-      beforeFacts
-        .filter(fact => fact.slotKey === slotKey && (fact.status === 'active' || fact.status === 'pending'))
-        .sort((left, right) => {
-          if (left.status !== right.status) return left.status === 'active' ? -1 : 1;
-          return right.freshestEvidenceAt - left.freshestEvidenceAt
-            || right.updatedAt - left.updatedAt
-            || left.id.localeCompare(right.id);
-        })[0]?.id ?? null,
-    ]));
-    const workingFacts = new Map(beforeFacts.map(fact => [fact.id, structuredClone(fact)]));
-    const changedFacts = new Map<string, MemoryFact>();
-    const changedEvidence: MemoryEvidence[] = [];
-    const result: AutomaticIngestResult = {
-      facts: [], accepted: 0, duplicated: 0, pending: 0, superseded: 0, rejected,
+  async pageCollection<T>(
+    collection: keyof typeof COLLECTIONS,
+    request: MemoryPageRequest,
+    scope: Readonly<Record<string, PlainData>> = {},
+  ): Promise<MemoryPage<T>> {
+    if (request.signal?.aborted) throw request.signal.reason;
+    const page = await this.store.scan({
+      workspaceId: this.requireWorkspaceId(),
+      collection,
+      filter: { ...scope, ...request.filter },
+      ...(request.where === undefined ? {} : { where: request.where }),
+      ...(request.orderBy === undefined ? {} : { orderBy: request.orderBy }),
+      ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
+      limit: Math.max(1, Math.min(500, Math.trunc(request.limit))),
+      includeTotal: request.includeTotal === true,
+    });
+    if (request.signal?.aborted) throw request.signal.reason;
+    return {
+      items: page.records.map(record => record.value as unknown as T),
+      nextCursor: page.nextCursor,
+      ...(page.total === undefined ? {} : { total: page.total }),
     };
-    const sourceById = new Map(sourceRows.map(source => [source.id, source]));
+  }
 
-    for (const proposal of proposals) {
-      const candidates = [...workingFacts.values()].filter(fact => fact.slotKey === proposal.slotKey
-        && (fact.status === 'active' || fact.status === 'pending'));
-      const duplicate = candidates.find(fact => decideFactReconciliation(fact, proposal) === 'duplicate');
-      const existing = duplicate ?? candidates.sort((left, right) => {
-        if (left.status !== right.status) return left.status === 'active' ? -1 : 1;
-        return right.freshestEvidenceAt - left.freshestEvidenceAt;
-      })[0];
-      const hasNovelSource = existing
-        ? proposal.sourceRefs.some(sourceRef => !existing.sourceRefs.includes(sourceRef))
-        : true;
-      const decision = decideFactReconciliation(existing, existing && !hasNovelSource
-        ? { ...proposal, freshestEvidenceAt: existing.freshestEvidenceAt }
-        : proposal);
-      const now = Date.now();
-
-      if (decision === 'duplicate' && existing) {
-        const evidence = proposal.evidence.map(item => {
-          const source = sourceById.get(item.sourceRef)!;
-          return {
-            id: evidenceId(existing.id, source.id, item.excerpt), factId: existing.id,
-            chatKey, sourceRef: source.id, sourceType: source.type,
-            excerpt: item.excerpt, ...(source.floor === undefined ? {} : { floor: source.floor }),
-            occurredAt: source.occurredAt, createdAt: now,
-          } satisfies MemoryEvidence;
-        });
-        const merged: MemoryFact = {
-          ...existing,
-          confidence: Math.max(existing.confidence, proposal.confidence),
-          status: existing.status === 'pending' && proposal.status === 'active' ? 'active' : existing.status,
-          sourceRefs: [...new Set([...existing.sourceRefs, ...proposal.sourceRefs])],
-          evidenceIds: [...new Set([...existing.evidenceIds, ...evidence.map(item => item.id)])],
-          freshestEvidenceAt: Math.max(existing.freshestEvidenceAt, proposal.freshestEvidenceAt),
-          revision: existing.revision + 1,
-          updatedAt: now,
-        };
-        workingFacts.set(merged.id, merged);
-        changedFacts.set(merged.id, merged);
-        changedEvidence.push(...evidence);
-        result.facts.push(merged);
-        result.duplicated += 1;
-        continue;
-      }
-
-      const id = createId('fact');
-      const effectiveStatus = decision === 'pending' ? 'pending' : proposal.status;
-      const evidence = proposal.evidence.map(item => {
-        const source = sourceById.get(item.sourceRef)!;
-        return {
-          id: evidenceId(id, source.id, item.excerpt), factId: id,
-          chatKey, sourceRef: source.id, sourceType: source.type,
-          excerpt: item.excerpt, ...(source.floor === undefined ? {} : { floor: source.floor }),
-          occurredAt: source.occurredAt, createdAt: now,
-        } satisfies MemoryEvidence;
+  async pageFacts(chatKey: string, request: MemoryPageRequest): Promise<MemoryPage<MemoryFact>> {
+    chatKey = this.requireChatKey(chatKey);
+    const needle = request.query?.trim().toLocaleLowerCase() ?? '';
+    const limit = Math.max(1, Math.min(500, Math.trunc(request.limit)));
+    const baseFilter = { chatKey, ...request.filter };
+    if (!needle) {
+      if (request.signal?.aborted) throw request.signal.reason;
+      const page = await this.store.scan({
+        workspaceId: this.requireWorkspaceId(),
+        collection: 'facts',
+        filter: baseFilter,
+        ...(request.where === undefined ? {} : { where: request.where }),
+        ...(request.orderBy === undefined ? {} : { orderBy: request.orderBy }),
+        ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
+        limit,
+        includeTotal: request.includeTotal === true,
       });
-      const fact: MemoryFact = {
-        id, chatKey, kind: proposal.kind, subjectKey: proposal.subjectKey,
-        predicateKey: proposal.predicateKey,
-        ...(proposal.objectKey === undefined ? {} : { objectKey: proposal.objectKey }),
-        canonicalKey: proposal.canonicalKey, slotKey: proposal.slotKey, content: proposal.content,
-        entityKeys: proposal.entityKeys, confidence: proposal.confidence, status: effectiveStatus,
-        sourceRefs: proposal.sourceRefs, evidenceIds: evidence.map(item => item.id),
-        freshestEvidenceAt: proposal.freshestEvidenceAt,
-        ...(proposal.validFrom === undefined ? {} : { validFrom: proposal.validFrom }),
-        ...(proposal.validUntil === undefined ? {} : { validUntil: proposal.validUntil }),
-        ...(proposal.stableAnchor === undefined ? {} : { stableAnchor: proposal.stableAnchor }),
-        ...(proposal.scope === undefined ? {} : { scope: structuredClone(proposal.scope) }),
-        origin: 'automatic', revision: 1,
-        ...(decision === 'supersede' && existing ? { supersedesId: existing.id } : {}),
-        createdAt: now, updatedAt: now,
+      if (request.signal?.aborted) throw request.signal.reason;
+      return {
+        items: page.records.map(record => record.value as unknown as MemoryFact),
+        nextCursor: page.nextCursor,
+        ...(page.total === undefined ? {} : { total: page.total }),
       };
-      if (decision === 'supersede' && existing) {
-        const replaced: MemoryFact = {
-          ...existing, status: 'superseded', supersededById: id,
-          revision: existing.revision + 1, updatedAt: now,
-        };
-        workingFacts.set(replaced.id, replaced);
-        changedFacts.set(replaced.id, replaced);
-        result.superseded += 1;
-      }
-      workingFacts.set(fact.id, fact);
-      changedFacts.set(fact.id, fact);
-      changedEvidence.push(...evidence);
-      result.facts.push(fact);
-      result.accepted += 1;
-      if (effectiveStatus === 'pending') result.pending += 1;
     }
 
-    const now = input.checkpoint.completedAt;
-    const job: MemoryJob = {
-      id: input.jobId, chatKey, type: input.jobType ?? 'incremental',
-      status: input.jobStatus ?? 'completed',
-      checkpoint: {
-        batchIndex,
-        ...(input.checkpoint.totalBatches === undefined ? {} : { totalBatches: input.checkpoint.totalBatches }),
-        processedCount: input.checkpoint.processedCount ?? input.checkpoint.sourceIds.length,
-        ...(input.checkpoint.sourceIds.at(-1) ? { lastSourceRef: input.checkpoint.sourceIds.at(-1) } : {}),
-        overlapSourceRefs: input.checkpoint.overlapSourceRefs ?? input.checkpoint.sourceIds.slice(-2),
-        ...(input.checkpoint.metadataSourceRefs === undefined ? {} : { metadataSourceRefs: input.checkpoint.metadataSourceRefs }),
-        ...(input.checkpoint.selectedSourceGroupIds === undefined ? {} : { selectedSourceGroupIds: input.checkpoint.selectedSourceGroupIds }),
-        ...(input.checkpoint.summaryStartFloor === undefined ? {} : { summaryStartFloor: input.checkpoint.summaryStartFloor }),
-        ...(input.checkpoint.summaryEndFloor === undefined ? {} : { summaryEndFloor: input.checkpoint.summaryEndFloor }),
-        ...(input.checkpoint.summaryEndMessageId === undefined ? {} : { summaryEndMessageId: input.checkpoint.summaryEndMessageId }),
-      },
-      createdAt: now,
-      updatedAt: now,
-    };
-    const audit: MemoryJobBatchAudit = {
-      id: `batch-audit:${job.id}:${batchIndex}`, chatKey, jobId: job.id, batchIndex,
-      sourceRefs: sourceRows.map(source => source.id), accepted: result.accepted,
-      rejected: result.rejected.length, duplicated: result.duplicated, pending: result.pending,
-      superseded: result.superseded, rejections: result.rejected,
-      startedAt, completedAt: Date.now(), usage: input.audit?.usage ?? null,
-      ...(input.audit?.requestId ? { requestId: input.audit.requestId } : {}),
-      ...(input.audit?.resourceId ? { resourceId: input.audit.resourceId } : {}),
-      ...(input.audit?.model ? { model: input.audit.model } : {}),
-      ...(input.audit?.latencyMs === undefined ? {} : { latencyMs: input.audit.latencyMs }),
-    };
-    try {
-      const workspaceId = this.requireWorkspaceId();
-      const operations: WorkspaceTransactionOperation[] = [];
-      const undoEntries: UndoLogEntry[] = [];
-      for (const fact of changedFacts.values()) {
-        const beforeRecord = beforeRecordById.get(fact.id);
-        const beforeRevision = beforeRecord?.revision ?? beforeRecord?.version ?? 0;
-        operations.push({ action: 'upsert', collection: 'facts', recordId: fact.id, value: asPlain(fact), expectedRevision: beforeRevision });
-        const before = beforeRecord?.value;
-        undoEntries.push({ collection: 'facts', recordId: fact.id, ...(before === undefined ? {} : { before: asPlain(before) }), after: asPlain(fact), beforeRevision, afterRevision: beforeRevision + 1 });
-      }
-      for (const evidence of changedEvidence) {
-        const before = await this.workspace.get({ workspaceId, collection: 'evidence', recordId: evidence.id });
-        const beforeRevision = before?.revision ?? before?.version ?? 0;
-        operations.push({ action: 'upsert', collection: 'evidence', recordId: evidence.id, value: asPlain(evidence), expectedRevision: beforeRevision });
-        undoEntries.push({ collection: 'evidence', recordId: evidence.id, ...(before == null ? {} : { before: asPlain(before.value) }), after: asPlain(evidence), beforeRevision, afterRevision: beforeRevision + 1 });
-      }
-      for (const slotKey of touchedSlots) {
-        const slotRecordId = factSlotRecordId(chatKey, slotKey);
-        const slotRecord = await this.workspace.get({ workspaceId, collection: 'fact-heads', recordId: slotRecordId });
-        const currentSlot = slotRecord?.value;
-        if (slotRecord && (!isFactSlotValue(currentSlot)
-          || currentSlot.chatKey !== chatKey
-          || currentSlot.slotKey !== slotKey
-          || currentSlot.factId !== baseSlotFactIds[slotKey])) throw Object.assign(new Error('记忆槽位已变化。'), { code: 'WORKSPACE_CONFLICT' });
-        const selected = selectedSlotFact([...workingFacts.values()].filter((fact) => fact.slotKey === slotKey));
-        if (selected) {
-          const after = asPlain(slotValue(chatKey, slotKey, selected.id));
-          const beforeRevision = slotRecord?.revision ?? slotRecord?.version ?? 0;
-          operations.push({ action: 'upsert', collection: 'fact-heads', recordId: slotRecordId, value: after, expectedRevision: beforeRevision });
-          undoEntries.push({ collection: 'fact-heads', recordId: slotRecordId, ...(slotRecord == null ? {} : { before: asPlain(slotRecord.value) }), after, beforeRevision, afterRevision: beforeRevision + 1 });
-        } else {
-          const beforeRevision = slotRecord?.revision ?? slotRecord?.version ?? 0;
-          if (slotRecord) {
-            operations.push({ action: 'delete', collection: 'fact-heads', recordId: slotRecordId, expectedRevision: beforeRevision });
-            undoEntries.push({ collection: 'fact-heads', recordId: slotRecordId, before: asPlain(slotRecord.value), beforeRevision });
-          }
+    const matches: MemoryFact[] = [];
+    let cursor = request.cursor;
+    let nextCursor: string | null = cursor ?? null;
+    const seen = new Set<string>();
+    do {
+      if (request.signal?.aborted) throw request.signal.reason;
+      const page = await this.store.scan({
+        workspaceId: this.requireWorkspaceId(),
+        collection: 'facts',
+        filter: baseFilter,
+        ...(request.where === undefined ? {} : { where: request.where }),
+        ...(request.orderBy === undefined ? {} : { orderBy: request.orderBy }),
+        ...(cursor === undefined ? {} : { cursor }),
+        limit: Math.max(1, limit - matches.length),
+      });
+      for (const record of page.records) {
+        const fact = record.value as unknown as MemoryFact;
+        if ([fact.content, fact.canonicalKey, ...fact.entityKeys].some(value => value.toLocaleLowerCase().includes(needle))) {
+          matches.push(fact);
+          if (matches.length >= limit) break;
         }
       }
-      const jobRecord = await this.workspace.get({ workspaceId, collection: 'capture-jobs', recordId: job.id });
-      operations.push({ action: 'upsert', collection: 'capture-jobs', recordId: job.id, value: asPlain(job), expectedVersion: jobRecord?.version ?? 0 });
-      operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
-      const undoLog: UndoLogV0 = { id: undoLogId, kind: 'undo-log-v0', chatKey, jobId: job.id, batchIndex, transactionId: input.audit?.requestId ?? undoLogId, committedSequence: nextCommittedSequence(), entries: undoEntries, result: structuredClone(result), createdAt: startedAt };
-      operations.push({ action: 'upsert', collection: 'change-audits', recordId: undoLog.id, value: asPlain(undoLog) });
-      this.requireChatKey(chatKey);
-      await this.workspace.transaction({ workspaceId, idempotencyKey: undoLogId, operations });
-      return result;
-    } catch (error) {
-      if (workspaceErrorCode(error) === 'WORKSPACE_CONFLICT' && retryAttempt < 1) return this.commitIngest(input, retryAttempt + 1);
-      throw error;
+      nextCursor = page.nextCursor;
+      if (matches.length >= limit || nextCursor === null) break;
+      if (seen.has(nextCursor)) throw paginationStalledError('事实搜索');
+      seen.add(nextCursor);
+      cursor = nextCursor;
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    } while (cursor);
+    return { items: matches, nextCursor };
+  }
+
+  async listEvidenceForFacts(chatKey: string, factIds: readonly string[], signal?: AbortSignal): Promise<MemoryEvidence[]> {
+    chatKey = this.requireChatKey(chatKey);
+    const ids = [...new Set(factIds.filter(Boolean))];
+    if (ids.length === 0) return [];
+    const evidence: MemoryEvidence[] = [];
+    let cursor: string | undefined;
+    do {
+      if (signal?.aborted) throw signal.reason;
+      const page = await this.store.scan({
+        workspaceId: this.requireWorkspaceId(),
+        collection: 'evidence',
+        filter: { chatKey },
+        where: [{ field: 'factId', op: 'in', value: ids }],
+        ...(cursor === undefined ? {} : { cursor }),
+        limit: QUERY_PAGE_SIZE,
+      });
+      evidence.push(...page.records.map(record => record.value as unknown as MemoryEvidence));
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return evidence;
+  }
+
+  async addMainChatUsageForScope(
+    scope: { readonly workspaceId: string; readonly chatKey: string },
+    usage: MainChatUsage,
+  ): Promise<void> {
+    const workspaceId = scope.workspaceId.trim();
+    const chatKey = normalizedChatKey(scope.chatKey);
+    if (!workspaceId || usage.chatKey !== chatKey) {
+      throw createSSHelperError('INVALID_PAYLOAD', {
+        stage: 'memory.repository.usage.scope',
+      });
+    }
+    const result = await this.store.apply({
+      workspaceId,
+      idempotencyKey: `main-usage:${usage.id}`,
+      operations: [{
+        action: 'upsert',
+        collection: 'usage',
+        recordId: usage.id,
+        value: asPlain(usage),
+      }],
+    });
+  }
+
+  async commitMainChatGeneration(usage: MainChatUsage, detail: GenerationRecallDetail, snapshot?: PreparedGenerationPromptSnapshot): Promise<void> {
+    await this.commitMainChatGenerationForScope({
+      workspaceId: this.requireWorkspaceId(),
+      chatKey: this.requireChatKey(usage.chatKey),
+    }, usage, detail, snapshot);
+  }
+
+  async prepareGenerationPromptSnapshot(
+    scope: { readonly workspaceId: string; readonly chatKey: string },
+    detailId: string,
+    memoryInjection: string,
+    prompt: FinalPromptSnapshot | undefined,
+    createdAt: number,
+  ): Promise<PreparedGenerationPromptSnapshot> {
+    const workspaceId = scope.workspaceId.trim();
+    const chatKey = normalizedChatKey(scope.chatKey);
+    const snapshotId = `${detailId}:prompt-snapshot`;
+    const serialized = prompt === undefined ? '' : JSON.stringify(prompt);
+    const byteLength = textBytes(serialized);
+    const sha256 = await sha256Content(serialized);
+    const kind = prompt?.kind ?? 'unknown';
+    const messageCount = prompt?.kind === 'chat' ? prompt.messages.length : undefined;
+    const verifiedIncludesMemory = prompt?.kind === 'chat'
+      ? containsExactText(prompt.messages, memoryInjection)
+      : prompt?.kind === 'text' ? prompt.prompt.includes(memoryInjection) : false;
+    const captureStatus = prompt === undefined ? 'unavailable' as const
+      : byteLength > PROMPT_SNAPSHOT_MAX_BYTES ? 'too_large' as const : 'available' as const;
+    const texts = captureStatus === 'available' ? splitUtf8(serialized) : [];
+    const metadata: GenerationPromptSnapshotMetadata = {
+      snapshotId, kind, ...(messageCount === undefined ? {} : { messageCount }), byteLength, sha256,
+      chunkCount: texts.length, captureStatus, verifiedIncludesMemory,
+    };
+    const manifest: GenerationPromptSnapshotManifest = {
+      id: snapshotId, workspaceId, chatKey, detailId, memoryInjection, createdAt, ...metadata,
+    };
+    const chunks = texts.map((content, index): GenerationPromptSnapshotChunk => ({
+      id: `${snapshotId}:chunk:${index}`, workspaceId, chatKey, snapshotId, index, content,
+    }));
+    return { manifest, chunks, metadata };
+  }
+
+  async commitMainChatGenerationForScope(
+    scope: { readonly workspaceId: string; readonly chatKey: string },
+    usage: MainChatUsage,
+    detail: GenerationRecallDetail,
+    snapshot?: PreparedGenerationPromptSnapshot,
+  ): Promise<void> {
+    const workspaceId = scope.workspaceId.trim();
+    const chatKey = normalizedChatKey(scope.chatKey);
+    if (!workspaceId) {
+      throw createSSHelperError('INVALID_PAYLOAD', {
+        stage: 'memory.repository.generation-recall.scope',
+      });
+    }
+    if (detail.chatKey !== chatKey || detail.workspaceId !== workspaceId
+      || usage.chatKey !== chatKey || usage.generationRecallDetailId !== detail.id) {
+      throw createSSHelperError('INVALID_PAYLOAD', {
+        stage: 'memory.repository.generation-recall.commit',
+      });
+    }
+    if (snapshot !== undefined && (snapshot.manifest.workspaceId !== workspaceId
+      || snapshot.manifest.chatKey !== chatKey || snapshot.manifest.detailId !== detail.id
+      || detail.promptSnapshot?.snapshotId !== snapshot.manifest.snapshotId)) {
+      throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.repository.generation-prompt-snapshot.scope' });
+    }
+    const [existingUsage, existingDetail, existingManifest] = await Promise.all([
+      this.store.read({ workspaceId, collection: 'usage', recordId: usage.id }),
+      this.store.read({ workspaceId, collection: 'generation-recall-details', recordId: detail.id }),
+      snapshot === undefined ? Promise.resolve(null) : this.store.read({ workspaceId, collection: 'generation-prompt-snapshots', recordId: snapshot.manifest.id }),
+    ]);
+    if (existingUsage !== null && existingDetail !== null && (snapshot === undefined || existingManifest !== null)) return;
+    if (existingUsage !== null || existingDetail !== null || existingManifest !== null) {
+      throw createSSHelperError('WORKSPACE_CONFLICT', {
+        stage: 'memory.repository.generation-recall.partial-record',
+      });
+    }
+    const operations: StoreOperation[] = [
+      {
+        action: 'upsert', collection: 'usage', recordId: usage.id, value: asPlain(usage), expectedVersion: 0,
+      },
+      {
+        action: 'upsert', collection: 'generation-recall-details', recordId: detail.id, value: asPlain(detail), expectedVersion: 0,
+      },
+    ];
+    if (snapshot !== undefined) {
+      operations.push({ action: 'upsert', collection: 'generation-prompt-snapshots', recordId: snapshot.manifest.id, value: asPlain(snapshot.manifest), expectedVersion: 0 });
+      operations.push(...snapshot.chunks.map(chunk => ({ action: 'upsert' as const, collection: 'generation-prompt-snapshot-chunks', recordId: chunk.id, value: asPlain(chunk), expectedVersion: 0 })));
+    }
+    const result = await this.store.apply({
+      workspaceId,
+      idempotencyKey: `generation-recall:${detail.id}`,
+      operations,
+    });
+    const expected: Array<{ collection: string; recordId: string }> = [
+      { collection: 'usage', recordId: usage.id },
+      { collection: 'generation-recall-details', recordId: detail.id },
+      ...(snapshot === undefined ? [] : [
+        { collection: 'generation-prompt-snapshots', recordId: snapshot.manifest.id },
+        ...snapshot.chunks.map(chunk => ({ collection: 'generation-prompt-snapshot-chunks', recordId: chunk.id })),
+      ]),
+    ];
+    if (result.results.length !== expected.length || expected.some((item, index) => {
+      const committed = result.results[index];
+      return committed?.action !== 'upsert'
+        || committed.collection !== item.collection
+        || committed.recordId !== item.recordId
+        || !Number.isInteger(committed.revision)
+        || committed.revision < 1;
+    })) {
+      throw createSSHelperError('INVALID_PAYLOAD', {
+        stage: 'memory.repository.generation-recall.result',
+      });
     }
   }
 
-  async commit(input: IngestCommit): Promise<void> {
-    await this.commitIngest(input);
-  }
-
-  async putJob(job: MemoryJob): Promise<void> {
-    this.requireChatKey(job.chatKey);
-    const workspaceId = this.requireWorkspaceId(); const current = await this.workspace.get({ workspaceId, collection: 'capture-jobs', recordId: job.id });
-    await this.workspace.upsert({ workspaceId, collection: 'capture-jobs', recordId: job.id, value: asPlain(job), expectedVersion: current?.version ?? 0 });
-  }
-
-  async listJobs(chatKey: string): Promise<MemoryJob[]> {
-    return (await this.listAllRows<MemoryJob>('capture-jobs', { chatKey: this.requireChatKey(chatKey) }))
-      .filter((job) => (job.type === 'initialize' || job.type === 'incremental')
-        && Boolean(job.checkpoint && typeof job.checkpoint === 'object'));
-  }
-
-  async addJobBatchAudit(audit: MemoryJobBatchAudit): Promise<void> {
-    this.requireChatKey(audit.chatKey);
-    await this.workspace.upsert({ workspaceId: this.requireWorkspaceId(), collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
-  }
-
-  async listJobBatchAudits(chatKey: string, jobId?: string): Promise<MemoryJobBatchAudit[]> {
-    // `change-audits` is shared by the v0 batch facade and the multi-actor
-    // repository. Only the explicit batch-audit id shape belongs to this API;
-    // otherwise actor Capture/Dream/security audits would be rendered twice as
-    // legacy batch rows by the workbench.
-    return (await this.listAllRows<MemoryJobBatchAudit>('change-audits', { chatKey: this.requireChatKey(chatKey), ...(jobId ? { jobId } : {}) }))
-      .filter((audit) => String((audit as { kind?: unknown }).kind ?? '') !== 'undo-log-v0')
-      .filter((audit) => String((audit as { id?: unknown }).id ?? '').startsWith('batch-audit:'));
-  }
-
-  async addMainChatUsage(usage: MainChatUsage): Promise<void> {
-    this.requireChatKey(usage.chatKey);
-    await this.workspace.upsert({ workspaceId: this.requireWorkspaceId(), collection: 'usage', recordId: usage.id, value: asPlain(usage) });
+  async loadGenerationPromptSnapshot(workspaceId: string, chatKey: string, snapshotId: string, signal?: AbortSignal): Promise<GenerationPromptSnapshotPayload | undefined> {
+    workspaceId = workspaceId.trim(); chatKey = normalizedChatKey(chatKey); snapshotId = snapshotId.trim();
+    if (!workspaceId || !snapshotId) throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.repository.generation-prompt-snapshot.read' });
+    if (signal?.aborted) throw signal.reason;
+    if (!this.store.hasSession(workspaceId)) await this.ensureCollections(workspaceId);
+    const record = await this.store.read({ workspaceId, collection: 'generation-prompt-snapshots', recordId: snapshotId });
+    if (record === null) return undefined;
+    const manifest = record.value as unknown as GenerationPromptSnapshotManifest;
+    if (manifest.workspaceId !== workspaceId || manifest.chatKey !== chatKey || manifest.snapshotId !== snapshotId) {
+      throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.repository.generation-prompt-snapshot.manifest' });
+    }
+    if (manifest.captureStatus !== 'available') return { manifest };
+    const rows = await this.listAllRecordRows('generation-prompt-snapshot-chunks', { chatKey, snapshotId }, undefined, workspaceId);
+    const chunks = rows.map(row => row.value as unknown as GenerationPromptSnapshotChunk).sort((left, right) => left.index - right.index);
+    if (signal?.aborted) throw signal.reason;
+    if (chunks.length !== manifest.chunkCount || chunks.some((chunk, index) => chunk.index !== index || chunk.snapshotId !== snapshotId)) {
+      throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.repository.generation-prompt-snapshot.chunks' });
+    }
+    const serialized = chunks.map(chunk => chunk.content).join('');
+    if (textBytes(serialized) !== manifest.byteLength || await sha256Content(serialized) !== manifest.sha256) {
+      throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.repository.generation-prompt-snapshot.integrity' });
+    }
+    let request: GenerationPromptSnapshotPayload['request'];
+    try { request = JSON.parse(serialized) as GenerationPromptSnapshotPayload['request']; }
+    catch { throw createSSHelperError('INVALID_JSON', { stage: 'memory.repository.generation-prompt-snapshot.parse' }); }
+    if (request?.kind !== manifest.kind) throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.repository.generation-prompt-snapshot.kind' });
+    return { manifest, request };
   }
 
   async listMainChatUsage(chatKey: string): Promise<MainChatUsage[]> {
     return this.listAllRows<MainChatUsage>('usage', { chatKey: this.requireChatKey(chatKey) });
   }
 
-  async rollbackJobBatch(jobId: string, batchIndex: number, expectedChatKey?: string): Promise<string[]> {
-    const workspaceId = this.requireWorkspaceId();
-    expectedChatKey = expectedChatKey ? this.requireChatKey(expectedChatKey) : undefined;
-    const markerId = `rollback-v0:${jobId}:${batchIndex}`;
-    const existingMarker = await this.workspace.get({ workspaceId, collection: 'change-audits', recordId: markerId });
-    if (existingMarker) {
-      const marker = existingMarker.value as unknown as RollbackMarkerV0;
-      if (marker.kind !== 'rollback-v0') throw Object.assign(new Error('回滚标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
-      if (marker.status === 'completed') return [];
-      await this.deleteRollbackVectors(workspaceId, marker);
-      return [...marker.affectedFactIds];
+  async listGenerationRecallDetails(chatKey: string): Promise<GenerationRecallDetail[]> {
+    return this.listAllRows<GenerationRecallDetail>('generation-recall-details', {
+      chatKey: this.requireChatKey(chatKey),
+    });
+  }
+
+  async findGenerationRecallDetailsForTargets(
+    workspaceId: string,
+    chatKey: string,
+    targets: readonly GenerationRecallLookupTarget[],
+    signal?: AbortSignal,
+  ): Promise<GenerationRecallDetail[]> {
+    workspaceId = workspaceId.trim();
+    chatKey = normalizedChatKey(chatKey);
+    if (!workspaceId || !chatKey) {
+      throw createSSHelperError('INVALID_PAYLOAD', {
+        stage: 'memory.repository.generation-recall.lookup-scope',
+      });
     }
-    const allRows = await this.listAllRecordRows('change-audits');
-    const logRows = allRows.filter((row) => (row.value as { kind?: unknown }).kind === 'undo-log-v0');
-    const allLogs = logRows.map((row) => ({ row, log: row.value as unknown as UndoLogV0 })).filter(({ log }) => !log.rolledBackBy).sort((left, right) => left.log.committedSequence - right.log.committedSequence);
-    const target = allLogs.find(({ log }) => log.jobId === jobId && log.batchIndex === batchIndex);
-    if (!target) throw new Error('该整理批次没有可执行的 UndoLogV0；旧快照仅可查看，不能执行回滚。');
-    if (expectedChatKey && target.log.chatKey !== expectedChatKey) throw new Error('整理批次不属于当前聊天。');
-    const included = new Map<string, { row: WorkspaceRecord; log: UndoLogV0 }>();
-    for (const item of allLogs) if (item.log.chatKey === target.log.chatKey && item.log.jobId === jobId && item.log.batchIndex >= batchIndex) included.set(item.log.id, item);
-    const affectedKeys = new Set([...included.values()].flatMap(({ log }) => log.entries.map(undoRecordKey)));
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const item of allLogs) {
-        if (included.has(item.log.id) || item.log.chatKey !== target.log.chatKey || item.log.committedSequence <= target.log.committedSequence) continue;
-        if (item.log.entries.some((entry) => affectedKeys.has(undoRecordKey(entry)))) { included.set(item.log.id, item); item.log.entries.forEach((entry) => affectedKeys.add(undoRecordKey(entry))); changed = true; }
+    if (targets.length === 0) return [];
+    if (!this.store.hasSession(workspaceId)) await this.ensureGenerationRecallDetailsCollection(workspaceId);
+    if (signal?.aborted) throw signal.reason;
+    const found = new Map<string, GenerationRecallDetail>();
+    const scanValues = async (field: 'messageId' | 'messageIndex', values: readonly (string | number)[]): Promise<void> => {
+      for (let offset = 0; offset < values.length; offset += LOOKUP_CHUNK_SIZE) {
+        const chunk = values.slice(offset, offset + LOOKUP_CHUNK_SIZE);
+        let cursor: string | undefined;
+        do {
+          if (signal?.aborted) throw signal.reason;
+          const page = await this.store.scan({
+            workspaceId,
+            collection: 'generation-recall-details',
+            filter: { chatKey },
+            where: [{ field, op: 'in', value: chunk }],
+            orderBy: { field: 'createdAt', direction: 'desc' },
+            ...(cursor === undefined ? {} : { cursor }),
+            limit: QUERY_PAGE_SIZE,
+          });
+          for (const record of page.records) {
+            const detail = record.value as unknown as GenerationRecallDetail;
+            if (detail.previewState !== 'invalidated') found.set(detail.id, detail);
+          }
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
       }
-    }
-    if ([...included.values()].some(({ log }) => log.entries.some((entry) => !undoEntryBelongsToChat(entry, target.log.chatKey)))) {
-      throw Object.assign(new Error('回滚记录缺少当前聊天归属，已安全取消。'), { code: 'WORKSPACE_CONFLICT' });
-    }
-    const chains = new Map<string, UndoLogEntry[]>();
-    for (const { log } of [...included.values()].sort((a, b) => a.log.committedSequence - b.log.committedSequence)) for (const entry of log.entries) { const key = undoRecordKey(entry); const chain = chains.get(key) ?? []; chain.push(entry); chains.set(key, chain); }
-    const operations: WorkspaceTransactionOperation[] = [];
-    const affectedFactIds = new Set<string>();
-    for (const chain of chains.values()) {
-      for (let index = 1; index < chain.length; index += 1) if (!samePlainData(chain[index - 1].after, chain[index].before)) throw Object.assign(new Error('UndoLogV0 修订链不连续，回滚已取消。'), { code: 'WORKSPACE_CONFLICT' });
-      const first = chain[0]; const last = chain.at(-1)!; const current = await this.workspace.get({ workspaceId, collection: last.collection, recordId: last.recordId });
-      const revision = current?.revision ?? current?.version ?? 0;
-      if (last.after === undefined ? current !== null : current === null || !samePlainData(current.value, last.after) || (last.afterRevision !== undefined && revision !== last.afterRevision)) throw Object.assign(new Error('记忆记录已被其他任务修改，回滚已安全取消。'), { code: 'WORKSPACE_CONFLICT' });
-      if (last.collection === 'facts') affectedFactIds.add(last.recordId);
-      if (first.before === undefined) { if (current) operations.push({ action: 'delete', collection: last.collection, recordId: last.recordId, expectedRevision: revision }); }
-      else operations.push({ action: 'upsert', collection: last.collection, recordId: last.recordId, value: first.before, expectedRevision: revision });
-    }
-    const rollbackAt = Date.now();
-    for (const { row, log } of included.values()) operations.push({ action: 'upsert', collection: 'change-audits', recordId: row.recordId, value: asPlain({ ...log, rolledBackAt: rollbackAt, rolledBackBy: markerId }), expectedRevision: row.revision ?? row.version });
-    const affectedJobs = new Map<string, number>();
-    for (const { log } of included.values()) affectedJobs.set(log.jobId, Math.min(affectedJobs.get(log.jobId) ?? log.batchIndex, log.batchIndex));
-    for (const [affectedJobId, firstBatch] of affectedJobs) {
-      const jobRecord = await this.workspace.get({ workspaceId, collection: 'capture-jobs', recordId: affectedJobId });
-      if (jobRecord) { const value = jobRecord.value as unknown as MemoryJob; operations.push({ action: 'upsert', collection: 'capture-jobs', recordId: affectedJobId, value: asPlain({ ...value, status: 'paused', checkpoint: { ...value.checkpoint, batchIndex: Math.max(0, firstBatch - 1) }, updatedAt: rollbackAt }), expectedRevision: jobRecord.revision ?? jobRecord.version }); }
-    }
-    for (const { log } of included.values()) {
-      const auditRecord = allRows.find((row) => row.recordId === `batch-audit:${log.jobId}:${log.batchIndex}`);
-      if (auditRecord) operations.push({ action: 'upsert', collection: 'change-audits', recordId: auditRecord.recordId, value: asPlain({ ...(auditRecord.value as object), rolledBackAt: rollbackAt, rollbackId: markerId }), expectedRevision: auditRecord.revision ?? auditRecord.version });
-    }
-    const marker: RollbackMarkerV0 = { id: markerId, kind: 'rollback-v0', chatKey: target.log.chatKey, jobId, batchIndex, status: 'index-repair-pending', affectedLogIds: [...included.keys()], affectedFactIds: [...affectedFactIds], createdAt: rollbackAt };
-    operations.push({ action: 'upsert', collection: 'change-audits', recordId: markerId, value: asPlain(marker), expectedRevision: 0 });
-    const result = await this.workspace.transaction({ workspaceId, idempotencyKey: markerId, operations });
-    void result;
-    await this.deleteRollbackVectors(workspaceId, marker);
-    return [...marker.affectedFactIds];
+    };
+
+    const messageIndexes = [...new Set(targets.map(target => target.messageIndex))];
+    const messageIds = [...new Set(targets.flatMap(target => target.messageIds).filter(Boolean))];
+    await Promise.all([
+      scanValues('messageIndex', messageIndexes),
+      scanValues('messageId', messageIds),
+    ]);
+    if (signal?.aborted) throw signal.reason;
+    return [...found.values()].sort((left, right) =>
+      right.createdAt - left.createdAt || left.id.localeCompare(right.id));
   }
 
-  private async deleteRollbackVectors(workspaceId: string, marker: RollbackMarkerV0): Promise<void> {
-    const failed: string[] = [];
-    for (const recordId of marker.affectedFactIds) try {
-      const factRecord = await this.workspace.get({ workspaceId, collection: 'facts', recordId });
-      const fact = factRecord?.value as unknown as MemoryFact | undefined;
-      if (fact && !factBelongsToChat(fact, marker.chatKey)) throw new Error('向量记录属于其他聊天。');
-      await this.workspace.vectorDelete({ workspaceId, collection: 'facts', recordId });
-    } catch { failed.push(recordId); }
-    if (failed.length) throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
+  async applyGenerationRecallMessageDeletion(chatKey: string, messageIndex: number, deletedCount: number, invalidatedAt = Date.now()): Promise<number> {
+    chatKey = this.requireChatKey(chatKey);
+    if (!Number.isSafeInteger(messageIndex) || messageIndex < 0 || !Number.isSafeInteger(deletedCount) || deletedCount <= 0) return 0;
+    const records = await this.listAllRecordRows('generation-recall-details', { chatKey });
+    const endIndex = messageIndex + deletedCount;
+    const changed = records.filter((record) => {
+      const value = record.value as unknown as GenerationRecallDetail;
+      return value.messageIndex >= messageIndex;
+    }).map((record) => {
+      const value = record.value as unknown as GenerationRecallDetail;
+      if (value.messageIndex < endIndex) return {
+        record,
+        value: this.invalidatedGenerationRecallDetail(value, 'message_deleted', invalidatedAt),
+        purgeSnapshot: value.previewState !== 'invalidated',
+      };
+      const nextIndex = value.messageIndex - deletedCount;
+      return {
+        record,
+        value: {
+          ...value,
+          messageIndex: nextIndex,
+          ...(value.messageIdIsSynthetic === true ? { messageId: String(nextIndex) } : {}),
+        },
+        purgeSnapshot: false,
+      };
+    });
+    return this.writeGenerationRecallChanges(chatKey, changed);
   }
 
-  async completeRollbackIndexRepair(jobId: string, batchIndex: number): Promise<void> {
-    const workspaceId = this.requireWorkspaceId();
-    const markerId = `rollback-v0:${jobId}:${batchIndex}`;
-    const markerRecord = await this.workspace.get({ workspaceId, collection: 'change-audits', recordId: markerId });
-    if (!markerRecord) throw Object.assign(new Error('回滚修复标识不存在。'), { code: 'WORKSPACE_CONFLICT' });
-    const marker = markerRecord.value as unknown as RollbackMarkerV0;
-    if (marker.kind !== 'rollback-v0') throw Object.assign(new Error('回滚标识冲突。'), { code: 'WORKSPACE_CONFLICT' });
-    if (marker.status === 'completed') return;
-    this.requireChatKey(marker.chatKey);
-    const requiredVectorIds = new Set<string>();
-    for (const recordId of marker.affectedFactIds) {
-      const factRecord = await this.workspace.get({ workspaceId, collection: 'facts', recordId });
-      const fact = factRecord?.value as unknown as MemoryFact | undefined;
-      if (fact && factBelongsToChat(fact, marker.chatKey) && (fact.status === 'active' || fact.status === 'pending')) requiredVectorIds.add(recordId);
-    }
-    const vectorIds = new Set((await this.listAllVectors(marker.chatKey)).map((item) => item.recordId));
-    if ([...requiredVectorIds].some((recordId) => !vectorIds.has(recordId))) {
-      throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
-    }
-    const completed: RollbackMarkerV0 = { ...marker, status: 'completed', completedAt: Date.now() };
-    await this.workspace.upsert({ workspaceId, collection: 'change-audits', recordId: marker.id, value: asPlain(completed), expectedRevision: markerRecord.revision ?? markerRecord.version });
+  async applyGenerationRecallMessageEdit(chatKey: string, edited: ChatMessageSnapshot, invalidatedAt = Date.now()): Promise<number> {
+    chatKey = this.requireChatKey(chatKey);
+    const records = await this.listAllRecordRows('generation-recall-details', { chatKey });
+    const variantId = edited.variantId ?? '';
+    const fingerprint = stableMemoryRecordKey(edited.text);
+    const changed = records.filter((record) => {
+      const value = record.value as unknown as GenerationRecallDetail;
+      return value.previewState !== 'invalidated' && value.messageIndex === edited.index
+        && (value.variantId ?? '') === variantId && value.outputFingerprint !== fingerprint;
+    }).map((record) => ({
+      record,
+      value: this.invalidatedGenerationRecallDetail(record.value as unknown as GenerationRecallDetail, 'message_edited', invalidatedAt),
+      purgeSnapshot: true,
+    }));
+    return this.writeGenerationRecallChanges(chatKey, changed);
+  }
+
+  async applyGenerationRecallSwipeDeletion(chatKey: string, messageIndex: number, deletedVariantId: string, invalidatedAt = Date.now()): Promise<number> {
+    chatKey = this.requireChatKey(chatKey);
+    if (!Number.isSafeInteger(messageIndex) || messageIndex < 0) return 0;
+    const deletedVariant = /^\d+$/u.test(deletedVariantId) ? Number(deletedVariantId) : undefined;
+    const records = await this.listAllRecordRows('generation-recall-details', { chatKey });
+    const changed = records.filter((record) => {
+      const value = record.value as unknown as GenerationRecallDetail;
+      if (value.messageIndex !== messageIndex) return false;
+      const variant = value.variantId ?? '';
+      return variant === deletedVariantId || (deletedVariant !== undefined && /^\d+$/u.test(variant) && Number(variant) > deletedVariant);
+    }).map((record) => {
+      const value = record.value as unknown as GenerationRecallDetail;
+      if ((value.variantId ?? '') === deletedVariantId) return {
+        record,
+        value: this.invalidatedGenerationRecallDetail(value, 'swipe_deleted', invalidatedAt),
+        purgeSnapshot: value.previewState !== 'invalidated',
+      };
+      return { record, value: { ...value, variantId: String(Number(value.variantId) - 1) }, purgeSnapshot: false };
+    });
+    return this.writeGenerationRecallChanges(chatKey, changed);
+  }
+
+  private invalidatedGenerationRecallDetail(
+    value: GenerationRecallDetail,
+    reason: NonNullable<GenerationRecallDetail['invalidationReason']>,
+    invalidatedAt: number,
+  ): GenerationRecallDetail {
+    const { promptSnapshot: _snapshot, ...safe } = value;
+    return { ...safe, previewState: 'invalidated', invalidatedAt, invalidationReason: reason };
+  }
+
+  private async writeGenerationRecallChanges(
+    chatKey: string,
+    changed: readonly { record: WorkspaceRecord; value: GenerationRecallDetail; purgeSnapshot: boolean }[],
+  ): Promise<number> {
+    if (changed.length === 0) return 0;
+    const snapshotRecords = await Promise.all(changed.filter(change => change.purgeSnapshot).map(async ({ record }) => {
+      const value = record.value as unknown as GenerationRecallDetail;
+      const snapshotId = value.promptSnapshot?.snapshotId;
+      if (!snapshotId) return [] as Array<{ collection: string; record: WorkspaceRecord }>;
+      const manifest = await this.store.read({ workspaceId: this.requireWorkspaceId(), collection: 'generation-prompt-snapshots', recordId: snapshotId });
+      const chunks = await this.listAllRecordRows('generation-prompt-snapshot-chunks', { chatKey, snapshotId });
+      return [
+        ...(manifest === null ? [] : [{ collection: 'generation-prompt-snapshots', record: manifest }]),
+        ...chunks.map(chunk => ({ collection: 'generation-prompt-snapshot-chunks', record: chunk })),
+      ];
+    }));
+    await this.store.apply({
+      workspaceId: this.requireWorkspaceId(),
+      operations: [
+        ...changed.map(({ record, value }) => ({
+          action: 'upsert' as const,
+          collection: 'generation-recall-details',
+          recordId: record.recordId,
+          value: asPlain(value),
+          expectedVersion: record.version,
+        })),
+        ...snapshotRecords.flat().map(({ collection, record }) => ({
+          action: 'delete' as const,
+          collection,
+          recordId: record.recordId,
+          expectedVersion: record.version,
+        })),
+      ],
+    });
+    return changed.length;
   }
 
   async getSetting<T>(key: string): Promise<T | undefined> {
-    const result = await this.workspace.get({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
+    const result = await this.store.read({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
     const value = result?.value as unknown as MemorySettingRecord | undefined;
     return value?.value as T | undefined;
   }
 
   async setSetting(key: string, value: unknown): Promise<void> {
-    await this.ensureCollections(SETTINGS_WORKSPACE_ID); const current = await this.workspace.get({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
+    await this.ensureCollections(SETTINGS_WORKSPACE_ID); const current = await this.store.read({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
     const setting: MemorySettingRecord = { id: key, namespace: 'stx_memory', key, value, updatedAt: Date.now() };
-    await this.workspace.upsert({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key, value: asPlain(setting), expectedVersion: current?.version ?? 0 });
+    await this.store.write({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key, value: asPlain(setting), expectedVersion: current?.version ?? 0 });
   }
 
   async setSettings(values: Record<string, unknown>): Promise<void> {
-    await this.ensureCollections(SETTINGS_WORKSPACE_ID); const operations: WorkspaceTransactionOperation[] = [];
+    await this.ensureCollections(SETTINGS_WORKSPACE_ID); const operations: StoreOperation[] = [];
     for (const [key, value] of Object.entries(values)) {
-      const current = await this.workspace.get({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
+      const current = await this.store.read({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
       operations.push({ action: 'upsert', collection: 'settings', recordId: key, value: asPlain({ id: key, namespace: 'stx_memory', key, value, updatedAt: Date.now() }), expectedVersion: current?.version ?? 0 });
     }
-    await this.workspace.transaction({ workspaceId: SETTINGS_WORKSPACE_ID, operations });
+    await this.store.apply({ workspaceId: SETTINGS_WORKSPACE_ID, operations });
   }
 
   async addRecallLog(log: MemoryRecallLog): Promise<void> {
     this.requireChatKey(log.chatKey);
     const { injectedPrompt: _sensitivePrompt, ...safeLog } = log;
-    await this.workspace.upsert({ workspaceId: this.requireWorkspaceId(), collection: 'recall-logs', recordId: log.id, value: asPlain(safeLog) });
+    await this.store.write({ workspaceId: this.requireWorkspaceId(), collection: 'recall-logs', recordId: log.id, value: asPlain(safeLog) });
   }
 
   async getLastRecall(chatKey: string): Promise<MemoryRecallLog | undefined> {
     chatKey = this.requireChatKey(chatKey);
-    const page = await this.workspace.query({ workspaceId: this.requireWorkspaceId(), collection: 'recall-logs', filter: { chatKey }, orderBy: { field: 'createdAt', direction: 'desc' }, limit: 1 });
+    const page = await this.store.scan({ workspaceId: this.requireWorkspaceId(), collection: 'recall-logs', filter: { chatKey }, orderBy: { field: 'createdAt', direction: 'desc' }, limit: 1 });
     return page.records[0]?.value as unknown as MemoryRecallLog | undefined;
   }
 
   async clearCurrentChatData(chatKey: string): Promise<void> {
     chatKey = this.requireChatKey(chatKey);
     const workspaceId = this.requireWorkspaceId();
-    const [evidenceRecords, jobRecords, auditRecords, usageRecords, logRecords, factRecords, slotRecords, graphNodeRecords, graphEdgeRecords] = await Promise.all([
+    const [evidenceRecords, jobRecords, auditRecords, usageRecords, logRecords, recallDetailRecords, promptSnapshotRecords, promptChunkRecords, factRecords, slotRecords, graphNodeRecords, graphEdgeRecords] = await Promise.all([
       this.listAllRecordRows('evidence', { chatKey }), this.listAllRecordRows('capture-jobs', { chatKey }), this.listAllRecordRows('change-audits', { chatKey }),
-      this.listAllRecordRows('usage', { chatKey }), this.listAllRecordRows('recall-logs', { chatKey }), this.listAllRecordRows('facts', { chatKey }),
+      this.listAllRecordRows('usage', { chatKey }), this.listAllRecordRows('recall-logs', { chatKey }),
+      this.listAllRecordRows('generation-recall-details', { chatKey }),
+      this.listAllRecordRows('generation-prompt-snapshots', { chatKey }), this.listAllRecordRows('generation-prompt-snapshot-chunks', { chatKey }),
+      this.listAllRecordRows('facts', { chatKey }),
       this.listAllRecordRows('fact-heads', { chatKey }),
       this.listAllRecordRows('graph-nodes', { chatKey }), this.listAllRecordRows('graph-edges', { chatKey }),
     ]);
     const collections = [
       ['evidence', evidenceRecords], ['capture-jobs', jobRecords], ['change-audits', auditRecords],
-      ['usage', usageRecords], ['recall-logs', logRecords], ['facts', factRecords], ['fact-heads', slotRecords],
+      ['usage', usageRecords], ['recall-logs', logRecords], ['generation-recall-details', recallDetailRecords],
+      ['generation-prompt-snapshots', promptSnapshotRecords], ['generation-prompt-snapshot-chunks', promptChunkRecords],
+      ['facts', factRecords], ['fact-heads', slotRecords],
       ['graph-edges', graphEdgeRecords], ['graph-nodes', graphNodeRecords],
     ] as const;
-    const operations: WorkspaceTransactionOperation[] = collections.flatMap(([collection, records]) => records.map((record) => ({
+    const operations: StoreOperation[] = collections.flatMap(([collection, records]) => records.map((record) => ({
       action: 'delete' as const, collection, recordId: record.recordId, expectedVersion: record.version,
     })));
     this.requireChatKey(chatKey);
     await this.transactInBatches(workspaceId, operations);
-    await this.workspace.vectorClear({ workspaceId, collection: 'facts', metadata: { chatKey } });
+    await this.store.vectors.clear({ workspaceId, collection: 'facts', metadata: { chatKey } });
   }
 
   async getChatKeys(): Promise<string[]> {
-    const values = await Promise.all(['facts', 'evidence', 'capture-jobs', 'change-audits', 'usage', 'recall-logs', 'graph-nodes', 'graph-edges'].map((collection) => this.listAllRecordRows(collection)));
+    const values = await Promise.all(['facts', 'evidence', 'capture-jobs', 'change-audits', 'usage', 'recall-logs', 'generation-recall-details', 'generation-prompt-snapshots', 'generation-prompt-snapshot-chunks', 'graph-nodes', 'graph-edges'].map((collection) => this.listAllRecordRows(collection)));
     return [...new Set(values.flat().map((record) => (record.value as unknown as { chatKey?: string }).chatKey).filter((value): value is string => Boolean(value)))].sort();
   }
 
   async upsertFactVector(input: UpsertMemoryFactVectorInput): Promise<MemoryFactVector> {
     const chatKey = this.requireChatKey(input.chatKey);
     const fact = await this.getFact(chatKey, input.factId);
-    if (!fact) throw Object.assign(new Error('当前聊天不存在该记忆，向量写入已阻止。'), { code: 'MEMORY_FACT_NOT_FOUND' });
+    if (!fact) throw createSSHelperError('WORKSPACE_NOT_FOUND', { stage: 'memory.repository.vector.fact' });
     const now = input.updatedAt ?? Date.now();
     const contentHash = await sha256Content(input.content);
     const vector = float32ArrayToArrayBuffer(input.vector);
-    await this.workspace.vectorUpsert({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: input.factId, model: input.model, vector: Array.from(input.vector), metadata: { chatKey, contentHash, resourceId: input.resourceId, dimensions: input.vector.length, updatedAt: now } });
+    await this.store.vectors.upsert({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: input.factId, model: input.model, vector: Array.from(input.vector), metadata: { chatKey, contentHash, resourceId: input.resourceId, dimensions: input.vector.length, updatedAt: now } });
     return {
       factId: input.factId,
       chatKey,
@@ -1173,11 +1284,11 @@ export class MemoryRepository implements IngestCommitter {
 
   async deleteFactVector(chatKey: string, factId: string): Promise<boolean> {
     if (!await this.getFact(chatKey, factId)) return false;
-    return this.workspace.vectorDelete({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: factId });
+    return this.store.vectors.delete({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: factId });
   }
 
   async clearFactVectors(chatKey: string): Promise<number> {
-    return this.workspace.vectorClear({ workspaceId: this.requireWorkspaceId(), collection: 'facts', metadata: { chatKey: this.requireChatKey(chatKey) } });
+    return this.store.vectors.clear({ workspaceId: this.requireWorkspaceId(), collection: 'facts', metadata: { chatKey: this.requireChatKey(chatKey) } });
   }
 
   async getFactVectorCoverage(chatKey: string, target: MemoryFactVectorTarget): Promise<MemoryFactVectorCoverage> {
@@ -1206,29 +1317,30 @@ export class MemoryRepository implements IngestCommitter {
     model?: string;
   }): Promise<Array<{ factId: string; score: number }>> {
     const metadata = { chatKey: this.requireChatKey(input.chatKey), ...(input.resourceId ? { resourceId: input.resourceId } : {}) };
-    return this.workspace.vectorSearch({ workspaceId: this.requireWorkspaceId(), collection: 'facts', vector: Array.from(input.vector), ...(input.limit === undefined ? {} : { limit: input.limit }), ...(input.model ? { model: input.model } : {}), metadata }).then((hits) => hits.map((hit) => ({ factId: hit.recordId, score: hit.score })));
+    return this.store.vectors.search({ workspaceId: this.requireWorkspaceId(), collection: 'facts', vector: Array.from(input.vector), ...(input.limit === undefined ? {} : { limit: input.limit }), ...(input.model ? { model: input.model } : {}), metadata }).then((hits) => hits.map((hit) => ({ factId: hit.recordId, score: hit.score })));
   }
 
   async clearAllMemory(): Promise<number> {
-    const removed = await this.workspace.clearOwned({ preserveWorkspaceIds: [SETTINGS_WORKSPACE_ID], idempotencyKey: `memory-clear:${crypto.randomUUID()}` });
+    const removed = await this.store.reset([SETTINGS_WORKSPACE_ID]);
     if (this.workspaceId) await this.ensureCollections(this.workspaceId);
     return removed;
   }
 
   async exportBackup(): Promise<Blob> {
-    const backup = await this.workspace.exportAll();
-    return new Blob([JSON.stringify({ format: 'ss-helper-memory', version: 0, ...backup })], { type: 'application/vnd.ss-helper.workspace+json' });
+    throw createSSHelperError('MEMORY_ARCHIVE_EXPORT_DISABLED', {
+      stage: 'memory.repository.archive.export',
+    });
   }
 
   async importBackup(file: File): Promise<void> {
     void file;
-    const error = new Error('v0 不接受旧 Memory 归档；请删除旧数据并从当前聊天重新捕获。') as Error & { code?: string };
-    error.code = 'MEMORY_ARCHIVE_IMPORT_DISABLED';
-    throw error;
+    throw createSSHelperError('MEMORY_ARCHIVE_IMPORT_DISABLED', {
+      stage: 'memory.repository.archive.import',
+    });
   }
 
   async checkIntegrity(): Promise<{ ok: boolean; message: string }> {
-    const sqlite = await this.workspace.integrity(); if (!sqlite.ok) return { ok: false, message: sqlite.messages.join('；') };
+    const sqlite = await this.store.integrity(); if (!sqlite.ok) return { ok: false, message: sqlite.messages.join('；') };
     const [facts, evidence, slots, vectors, graphNodes, graphEdges] = await Promise.all([
       this.listAllRecordRows('facts'), this.listAllRows<MemoryEvidence>('evidence'), this.listAllRecordRows('fact-heads'), this.listAllVectors(),
       this.listAllRows<MemoryGraphNode>('graph-nodes'), this.listAllRows<MemoryGraphEdge>('graph-edges'),
@@ -1293,8 +1405,4 @@ export class MemoryRepository implements IngestCommitter {
     return { ok: problems.length === 0, message: problems.length ? problems.join('；') : 'SQLite 与 Memory workspace 完整性检查通过。' };
   }
 
-}
-
-function uniqueStrings(values: readonly string[]): string[] {
-  return [...new Set(values.map((value) => String(value ?? '').trim()).filter(Boolean))];
 }

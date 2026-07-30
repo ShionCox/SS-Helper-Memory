@@ -36,6 +36,7 @@ export interface SummaryInitializationEstimate {
 
 export interface SummaryBatchOptions {
   includeSystemMessages?: boolean;
+  includeHiddenMessageFloors?: boolean;
   /** 可选的任务级写入白名单；未列入的来源仍可作为只读上下文。 */
   writableSourceRefs?: readonly string[];
 }
@@ -50,7 +51,7 @@ export const DEFAULT_SUMMARY_STRATEGY: Readonly<SummaryStrategy> = Object.freeze
   batchMode: 'floors',
   batchFloors: 5,
   batchChars: 12_000,
-  triggerIntervalFloors: 5,
+  triggerIntervalFloors: 1,
   overlapFloors: 2,
 });
 
@@ -80,8 +81,9 @@ export function visibleConversationMessages(blocks: readonly SourceBlock[], opti
 /** 单条超长消息拆分后仍共用同一个 floor；这里把它们重新视作一个聊天楼层。 */
 export function conversationFloorGroups(blocks: readonly SourceBlock[], options: SummaryBatchOptions = {}): SourceBlock[][] {
   const includeSystemMessages = options.includeSystemMessages === true;
+  const includeHiddenMessageFloors = options.includeHiddenMessageFloors === true;
   const messages = blocks
-    .filter((source) => source.kind === 'message' && !source.hidden && (
+    .filter((source) => source.kind === 'message' && (!(source.hidden || source.visibility === 'hidden') || includeHiddenMessageFloors) && (
       ((source.role === 'user' || source.role === 'assistant') && source.messageType !== 'system' && source.messageType !== 'tool' && source.messageType !== 'reasoning')
       || (includeSystemMessages && (source.role === 'system' || source.messageType === 'system') && source.messageType !== 'tool' && source.messageType !== 'reasoning')
     ))

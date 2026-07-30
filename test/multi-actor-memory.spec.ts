@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { ActorRegistry, ActiveCastResolver, KnowledgeProjector, MultiActorCaptureService } from '../src/application/actors';
+import { ActorRegistry, ActiveCastResolver, KnowledgeProjector } from '../src/application/actors';
 import { buildActorMemoryPromptResult } from '../src/application/prompt';
 import { ActorRecallService } from '../src/application/recall';
-import { RecallExposureTracker, buildMemoryRecallPacket, deterministicSeed } from '../src/application/recall';
+import { RecallExposureTracker, buildMemoryRecallPacket, buildMemoryRecallPacketAtStrength, deterministicSeed } from '../src/application/recall';
 import { auditKnowledgeLeakage, effectiveMemoryStrength } from '../src/application/recall';
 import { ProfileCoordinator } from '../src/application/profile';
 import { DreamCoordinator } from '../src/application/dream';
@@ -28,6 +28,15 @@ describe('卡内多角色认知模型', () => {
     expect(cast.mentionedOwnerIds).toEqual(expect.arrayContaining([a.owner.id, b.owner.id]));
     expect(cast.presentOwnerIds).toContain(a.owner.id);
     expect(cast.presentOwnerIds).not.toContain(b.owner.id);
+  });
+
+  it('含中文的工作区和聊天键仍生成 Workspace 可接受的 SceneCast record id', () => {
+    const registry = new ActorRegistry('character:小時.png');
+    const cast = new ActiveCastResolver(registry).resolve([
+      source('m-unicode', '小時站在实验室里。', 1, { chatKey: '小時 - 复测' }),
+    ]).scene;
+    expect(cast.id).toMatch(/^[A-Za-z0-9_.!~*'()%:-]+$/u);
+    expect(cast.id).not.toContain('小時');
   });
 
   it('助手首人称消息使用宿主作者作为说话者线索，但不把通用 assistant 建成人物', () => {
@@ -103,7 +112,7 @@ describe('卡内多角色认知模型', () => {
   it('卡片/世界书明确绑定主体时只播种该主体的画像', () => {
     const registry = new ActorRegistry('character:c1');
     const a = registry.discover({ displayName: 'A', sourceRef: 'card:1', sourceType: 'host_card', confidence: 0.95 });
-    const seededFact = { ...fact('f-seed', 'A的核心身份是守门人'), kind: 'identity' as const, entityKeys: [a.owner.id], scope: { hostCardKeys: ['card:1'] } };
+    const seededFact = { ...fact('f-seed', 'A的核心身份是守门人'), kind: 'identity' as const, subjectEntityId: a.owner.id, entityKeys: [a.owner.id], scope: { hostCardKeys: ['card:1'] } };
     const episode = { id: 'e-seed', workspaceId: 'character:c1', chatKey: 'chat', floorStart: 1, floorEnd: 1, sourceRefs: ['card:1'], participantIds: [a.owner.id], presentOwnerIds: [], mentionedOwnerIds: [a.owner.id], occurredAt: 1, createdAt: 1 };
     const observation: MemoryObservation = { id: 'o-seed', workspaceId: 'character:c1', episodeId: episode.id, sourceRef: 'card:1', speakerOwnerId: 'owner:world', viewpointOwnerId: 'owner:narrator', observerOwnerIds: [], channel: 'worldbook', privacy: 'public', knowledgeMode: 'asserted', excerpt: 'A的核心身份是守门人', mentionedOwnerIds: [a.owner.id], presentOwnerIds: [], factLocalIds: [seededFact.id], occurredAt: 1, createdAt: 1 };
     const projected = new KnowledgeProjector().project({ workspaceId: 'character:c1', facts: [seededFact], episodes: [episode], observations: [observation], owners: registry.listOwners() });
@@ -143,8 +152,8 @@ describe('卡内多角色认知模型', () => {
     const b = 'owner:actor:b';
     const facts = new Map([['fa', fact('fa', 'A的秘密是蓝色钥匙')], ['fb', fact('fb', 'B听见了公开消息')]]);
     const traces: ActorMemoryTrace[] = [
-      { id: 'ta', workspaceId: 'w', ownerId: a, factId: 'fa', sourceObservationIds: ['oa'], knowledgeMode: 'experienced', privacy: 'private', strength: 90, clarity: 90, beliefConfidence: 1, emotionalSalience: 20, rehearsalCount: 0, traceRevision: 1, createdAt: Date.now(), updatedAt: Date.now() },
-      { id: 'tb', workspaceId: 'w', ownerId: b, factId: 'fb', sourceObservationIds: ['ob'], knowledgeMode: 'heard', privacy: 'public', strength: 60, clarity: 60, beliefConfidence: 0.8, emotionalSalience: 10, rehearsalCount: 0, traceRevision: 1, createdAt: Date.now(), updatedAt: Date.now() },
+      { id: 'ta', workspaceId: 'w', chatKey: 'chat', ownerId: a, factId: 'fa', sourceObservationIds: ['oa'], knowledgeMode: 'experienced', privacy: 'private', strength: 90, clarity: 90, beliefConfidence: 1, emotionalSalience: 20, rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: Date.now(), updatedAt: Date.now() },
+      { id: 'tb', workspaceId: 'w', chatKey: 'chat', ownerId: b, factId: 'fb', sourceObservationIds: ['ob'], knowledgeMode: 'heard', privacy: 'public', strength: 60, clarity: 60, beliefConfidence: 0.8, emotionalSalience: 10, rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: Date.now(), updatedAt: Date.now() },
     ];
     const response = await new ActorRecallService({
       recallObjective: () => ({ chatKey: 'chat', query: '钥匙', maxItems: 12, createdAt: 1, items: [...facts.values()].map(item => ({ fact: item, score: 1, reason: { lexical: true, entity: false, context: false, stableAnchor: false } })), candidates: [], diagnostics: { candidateCount: 2, eligibleCount: 2, selectedCount: 2, llmCalls: 0 } }),
@@ -161,7 +170,7 @@ describe('卡内多角色认知模型', () => {
   it('多主体 Prompt 分区预算不超过全局上限，并尊重显式当前视角', () => {
     const a = 'owner:actor:a';
     const b = 'owner:actor:b';
-    const traceA: ActorMemoryTrace = { id: 'budget-trace-a', workspaceId: 'w', ownerId: a, factId: 'budget-fact-a', sourceObservationIds: ['oa'], knowledgeMode: 'experienced', privacy: 'public', strength: 90, clarity: 90, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, createdAt: 1, updatedAt: 1 };
+    const traceA: ActorMemoryTrace = { id: 'budget-trace-a', workspaceId: 'w', chatKey: 'chat', ownerId: a, factId: 'budget-fact-a', sourceObservationIds: ['oa'], knowledgeMode: 'experienced', privacy: 'public', strength: 90, clarity: 90, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: 1, updatedAt: 1 };
     const traceB: ActorMemoryTrace = { ...traceA, id: 'budget-trace-b', ownerId: b, factId: 'budget-fact-b', sourceObservationIds: ['ob'] };
     const packetA = buildMemoryRecallPacket(traceA, fact('budget-fact-a', 'A记得北门附近有一条安全通道'), 1, 'budget-scene')!;
     const packetB = buildMemoryRecallPacket(traceB, fact('budget-fact-b', 'B记得南侧仓库仍保存着维修工具'), 1, 'budget-scene')!;
@@ -169,6 +178,13 @@ describe('卡内多角色认知模型', () => {
       request: {
         workspaceId: 'w', chatKey: 'chat', query: '路线和工具', mode: 'multi_actor' as const,
         scene: { id: 'budget-scene', workspaceId: 'w', chatKey: 'chat', floor: 1, members: [], viewpointOwnerId: a, speakerOwnerIds: [], presentOwnerIds: [a, b], mentionedOwnerIds: [a, b], createdAt: 1 },
+        castPlan: {
+          id: 'budget-plan', workspaceId: 'w', chatKey: 'chat', sceneId: 'budget-scene', basedOnFloor: 1,
+          mode: 'multi_actor' as const, viewpointOwnerId: a, requiredOwnerIds: [a, b], likelyOwnerIds: [],
+          backgroundOwnerIds: [], mentionedOnlyOwnerIds: [], excludedOwnerIds: [],
+          permissionByOwner: { [a]: 'full' as const, [b]: 'full' as const },
+          plannerMode: 'deterministic' as const, confidence: 1, evidence: [], newActorProposals: [], createdAt: 1,
+        },
       },
       world: { ownerId: 'owner:world', ownerName: '世界', role: 'world' as const, packets: [] },
       narrator: { ownerId: 'owner:narrator', ownerName: '旁白', role: 'narrator' as const, packets: [] },
@@ -187,7 +203,7 @@ describe('卡内多角色认知模型', () => {
   });
 
   it('强度衰减与模糊包使用稳定种子，候选曝光不会自动 rehearsal', () => {
-    const trace: ActorMemoryTrace = { id: 't', workspaceId: 'w', ownerId: 'owner:actor:a', factId: 'f', sourceObservationIds: ['o'], knowledgeMode: 'experienced', privacy: 'private', strength: 90, clarity: 90, beliefConfidence: 1, emotionalSalience: 10, rehearsalCount: 0, traceRevision: 1, createdAt: 1, updatedAt: Date.now() };
+    const trace: ActorMemoryTrace = { id: 't', workspaceId: 'w', chatKey: 'chat', ownerId: 'owner:actor:a', factId: 'f', sourceObservationIds: ['o'], knowledgeMode: 'experienced', privacy: 'private', strength: 90, clarity: 90, beliefConfidence: 1, emotionalSalience: 10, rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: 1, updatedAt: Date.now() };
     const memory = fact('f', '这是一条需要保留来源的秘密事实');
     const recallNow = Date.now();
     const first = buildMemoryRecallPacket(trace, memory, recallNow, 'scene-1');
@@ -200,8 +216,27 @@ describe('卡内多角色认知模型', () => {
     expect(tracker.markUsed(exposure.id, 0.9, true).trace?.rehearsalCount).toBe(1);
   });
 
+  it('按强度输出完整事实、摘要、主题片段、主体印象或彻底遗忘', () => {
+    const memory = { ...fact('strength-levels', 'A在第12天于地下室找到三把银色钥匙。'), subjectKey: 'A', predicateKey: '找到钥匙' };
+    const memoryTrace: ActorMemoryTrace = { id: 'strength-trace', workspaceId: 'w', chatKey: 'chat', ownerId: 'owner:actor:a', factId: memory.id, sourceObservationIds: ['o'], knowledgeMode: 'experienced', privacy: 'private', strength: 90, clarity: 100, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: 1, updatedAt: 1 };
+    const exact = buildMemoryRecallPacketAtStrength(memoryTrace, memory, 85)!;
+    const summary = buildMemoryRecallPacketAtStrength(memoryTrace, memory, 45)!;
+    const fragment = buildMemoryRecallPacketAtStrength(memoryTrace, memory, 25)!;
+    const impression = buildMemoryRecallPacketAtStrength(memoryTrace, memory, 1)!;
+
+    expect(exact.gist).toBe(memory.content);
+    expect(exact.details).toEqual([]);
+    expect(summary.gist).not.toBe(memory.content);
+    expect(summary.details).toEqual([]);
+    expect(fragment.gist).toBe('隐约记得「A」与「找到钥匙」有关，细节不清。');
+    expect(fragment.gist).not.toMatch(/12|地下室|三把|银色/u);
+    expect(fragment.details).toEqual([]);
+    expect(impression.gist).toBe('对「A」有一段模糊印象。');
+    expect(buildMemoryRecallPacketAtStrength(memoryTrace, memory, 0)).toBeNull();
+  });
+
   it('按主体记忆特质计算强度，并用显式说话标签审计跨角色泄漏', () => {
-    const trace: ActorMemoryTrace = { id: 'trait-trace', workspaceId: 'w', ownerId: 'owner:actor:a', factId: 'trait-fact', sourceObservationIds: ['o'], knowledgeMode: 'experienced', privacy: 'private', strength: 80, clarity: 100, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, createdAt: 1, updatedAt: 1 };
+    const trace: ActorMemoryTrace = { id: 'trait-trace', workspaceId: 'w', chatKey: 'chat', ownerId: 'owner:actor:a', factId: 'trait-fact', sourceObservationIds: ['o'], knowledgeMode: 'experienced', privacy: 'private', strength: 80, clarity: 100, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: 1, updatedAt: 1 };
     const defaultStrength = effectiveMemoryStrength(trace, 1 + 24 * 60 * 60 * 1000);
     const durableStrength = effectiveMemoryStrength(trace, 1 + 24 * 60 * 60 * 1000, { traits: { halfLifeMs: 365 * 24 * 60 * 60 * 1000, rehearsalGain: 0, emotionalGain: 0, interference: 0 } });
     expect(durableStrength).toBeGreaterThan(defaultStrength);
@@ -221,7 +256,7 @@ describe('卡内多角色认知模型', () => {
     const a = 'owner:actor:a';
     const b = 'owner:actor:b';
     const facts = [fact('fa-pool', 'A知道蓝色钥匙'), fact('fb-pool', 'B知道红色钥匙')];
-    const traces: ActorMemoryTrace[] = [a, b].map((ownerId, index) => ({ id: `trace-pool-${index}`, workspaceId: 'w', ownerId, factId: facts[index]!.id, sourceObservationIds: [`o-pool-${index}`], knowledgeMode: 'experienced', privacy: 'public', strength: 80, clarity: 80, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, createdAt: 1, updatedAt: 1 }));
+    const traces: ActorMemoryTrace[] = [a, b].map((ownerId, index) => ({ id: `trace-pool-${index}`, workspaceId: 'w', chatKey: 'chat', ownerId, factId: facts[index]!.id, sourceObservationIds: [`o-pool-${index}`], knowledgeMode: 'experienced', privacy: 'public', strength: 80, clarity: 80, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: 1, updatedAt: 1 }));
     let objectiveQuery: { maxItems?: number; candidateLimit?: number } | undefined;
     const response = await new ActorRecallService({
       recallObjective: (query) => {
@@ -250,9 +285,9 @@ describe('卡内多角色认知模型', () => {
     const coordinator = new ProfileCoordinator();
     const base = fact('profile-fact', 'A长期信任B');
     const traces: ActorMemoryTrace[] = [1, 2, 3].map((index) => ({
-      id: `profile-trace-${index}`, workspaceId: 'w', ownerId: 'owner:actor:a', factId: base.id, sourceObservationIds: [`observation-${index}`],
+      id: `profile-trace-${index}`, workspaceId: 'w', chatKey: 'chat', ownerId: 'owner:actor:a', factId: base.id, sourceObservationIds: [`observation-${index}`],
       knowledgeMode: 'experienced', privacy: 'public', strength: 80, clarity: 80, beliefConfidence: 0.9, emotionalSalience: 20,
-      rehearsalCount: 0, traceRevision: 1, createdAt: index, updatedAt: index,
+      rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: index, updatedAt: index,
     }));
     const result = coordinator.update('owner:actor:a', traces, [{ ...base, kind: 'relationship', subjectEntityId: 'owner:actor:a', objectEntityId: 'owner:actor:b' }], [], 'w');
     expect(result.claims[0]?.supportingTraceIds).toHaveLength(3);
@@ -271,17 +306,17 @@ describe('卡内多角色认知模型', () => {
     };
     const oldFact = { ...fact('profile-old', oldClaim.claim), kind: 'identity' as const, predicateKey: '身份', canonicalKey: 'profile-old::身份' };
     const oldTrace: ActorMemoryTrace = {
-      id: 'trace-old', workspaceId: 'w', ownerId, factId: oldFact.id,
+      id: 'trace-old', workspaceId: 'w', chatKey: 'chat', ownerId, factId: oldFact.id,
       sourceObservationIds: ['profile-old-observation'], knowledgeMode: 'experienced', privacy: 'public',
       strength: 80, clarity: 80, beliefConfidence: 0.9, emotionalSalience: 0,
-      rehearsalCount: 0, traceRevision: 1, createdAt: 1, updatedAt: 1,
+      rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: 1, updatedAt: 1,
     };
     const newFact = { ...fact('profile-new', 'A长期偏好先观察再行动'), kind: 'preference' as const, predicateKey: '行动偏好', canonicalKey: 'profile-new::行动偏好' };
     const newTraces: ActorMemoryTrace[] = [1, 2, 3].map(index => ({
-      id: `profile-new-trace-${index}`, workspaceId: 'w', ownerId, factId: newFact.id,
+      id: `profile-new-trace-${index}`, workspaceId: 'w', chatKey: 'chat', ownerId, factId: newFact.id,
       sourceObservationIds: [`profile-new-observation-${index}`], knowledgeMode: 'experienced', privacy: 'public',
       strength: 80, clarity: 80, beliefConfidence: 0.9, emotionalSalience: 20,
-      rehearsalCount: 0, traceRevision: 1, createdAt: index, updatedAt: index,
+      rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: index, updatedAt: index,
     }));
     const result = coordinator.update(ownerId, [oldTrace, ...newTraces], [oldFact, newFact], [oldClaim], 'w');
     expect(result.claims.find(item => item.id === oldClaim.id)?.status).toBe('active');

@@ -28,6 +28,27 @@ function source(overrides: Partial<SourceBlock> = {}): SourceBlock {
 }
 
 describe('Claim-based multi actor capture', () => {
+  it('exposes request-local typed refs while keeping persistent IDs out of the model contract', async () => {
+    const row = source();
+    let seenActorRef = '';
+    let seenLocationRef = '';
+    const extractor = { extract: vi.fn(async (input: any): Promise<StructuredCaptureResult> => {
+      seenActorRef = input.knownActorContext[0].referenceId;
+      seenLocationRef = input.knownLocationContext[0].referenceId;
+      return empty();
+    }) };
+    const capture = await service('short-ref-w', extractor).capture({
+      workspaceId: 'short-ref-w',
+      chatKey: 'chat',
+      sources: [row],
+    });
+
+    expect(seenActorRef).toBe('A01');
+    expect(seenLocationRef).toBe('L01');
+    expect(capture.owners[0]?.id).not.toBe(seenActorRef);
+    expect(capture.locations[0]?.id).not.toBe(seenLocationRef);
+  });
+
   it('derives machine time, observation, evidence and trace on the server', async () => {
     const row = source();
     const extractor = { extract: vi.fn(async (input: any): Promise<StructuredCaptureResult> => {
@@ -199,7 +220,7 @@ describe('Claim-based multi actor capture', () => {
     ]));
   });
 
-  it('creates a deterministic source episode when the model omits or mistypes episodeLocalId', async () => {
+  it('safely clears an invalid optional episodeLocalId while preserving an otherwise valid claim', async () => {
     const row = source({ id: 'message:fallback', content: '紫罗能够净化空气。', actorRefs: ['紫罗'], locationRefs: [] });
     const extractor = { extract: async (input: any): Promise<StructuredCaptureResult> => {
       const actor = input.knownActorContext[0].referenceId;
@@ -214,9 +235,14 @@ describe('Claim-based multi actor capture', () => {
       };
     } };
     const capture = await service('fallback-w', extractor).capture({ workspaceId: 'fallback-w', chatKey: 'chat', sources: [row] });
-    expect(capture.episodes).toHaveLength(1);
-    expect(capture.observations[0]?.episodeId).toBe(capture.episodes[0]?.id);
-    expect(capture.rejections.some(item => item.code === 'dependency_invalid')).toBe(false);
+    expect(capture.facts).toHaveLength(1);
+    expect(capture.rejections).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'dependency_invalid', fieldPath: 'episodeLocalId' }),
+    ]));
+    expect(capture.resolutionMode).toBe('degraded');
+    expect(capture.fieldActions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'claims[0].episodeLocalId', action: 'clear' }),
+    ]));
   });
 
   it('recovers an explicit named command deterministically when the model omits it', async () => {
@@ -269,21 +295,10 @@ describe('Claim-based multi actor capture', () => {
     expect(capture.diagnostics?.deterministicRepairs).toBe(0);
   });
 
-  it('runs one targeted automatic repair and retains already-valid Claims', async () => {
+  it('does not retry business-invalid Claims and retains already-valid Claims', async () => {
     const row = source({ content: '紫罗能够净化空气，也能感知五十米内的紫骸。', actorRefs: ['紫罗'], locationRefs: [] });
     const extract = vi.fn(async (input: any): Promise<StructuredCaptureResult> => {
       const actor = input.knownActorContext[0].referenceId;
-      if (input.repairRequest) {
-        return {
-          actorCandidates: [], locationCandidates: [], episodes: [],
-          claims: [{
-            localId: 'bad', sourceRef: row.id, kind: 'capability', subjectRef: actor, predicateKey: '感知范围', objectText: '五十米',
-            content: '紫罗能够感知五十米内的紫骸。', evidenceExcerpt: '能感知五十米内的紫骸',
-            knowledge: { mode: 'experienced', privacy: 'public', ownerRefs: [actor], speakerRef: actor, viewpointRef: actor, observerRefs: [actor], presentRefs: [actor], mentionedRefs: [] },
-            confidence: 0.95, stableAnchor: true,
-          }],
-        };
-      }
       return {
         actorCandidates: [], locationCandidates: [], episodes: [], claims: [
           {
@@ -302,13 +317,18 @@ describe('Claim-based multi actor capture', () => {
       };
     });
     const capture = await service('repair-w', { extract }).capture({ workspaceId: 'repair-w', chatKey: 'chat', sources: [row] });
-    expect(extract).toHaveBeenCalledTimes(2);
-    expect(capture.facts.map(fact => fact.predicateKey).sort()).toEqual(['净化', '感知范围']);
-    expect(capture.rejections).toEqual([]);
-    expect(capture.diagnostics).toMatchObject({ automaticRepairCalls: 1, firstPassRejections: 1, automaticallyRepaired: 1 });
+    expect(extract).toHaveBeenCalledTimes(1);
+    expect(capture.facts.map(fact => fact.predicateKey)).toEqual(['净化']);
+    expect(capture.rejections).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'excerpt_mismatch',
+        status: 'unresolved',
+      }),
+    ]));
+    expect(capture.outcome).toBe('partial');
   });
 
-  it('repairs missing knowledge/privacy/confidence instead of defaulting malformed private memory to public', async () => {
+  it('rejects malformed private memory instead of defaulting it to public or retrying', async () => {
     const row = source({
       id: 'message:private-schema-repair',
       content: '艾达心想：绝不能让其他人知道密钥。',
@@ -322,19 +342,6 @@ describe('Claim-based multi actor capture', () => {
         predicateKey: '知道', objectText: '密钥', content: '艾达独自知道一项密钥。',
         evidenceExcerpt: '绝不能让其他人知道密钥', stableAnchor: false,
       };
-      if (input.repairRequest) {
-        return {
-          ...empty(),
-          claims: [{
-            ...base,
-            knowledge: {
-              mode: 'experienced', privacy: 'private', ownerRefs: [actor], speakerRef: actor,
-              viewpointRef: actor, observerRefs: [actor], presentRefs: [actor], mentionedRefs: [],
-            },
-            confidence: 0.95,
-          }],
-        };
-      }
       return {
         ...empty(),
         claims: [{
@@ -352,15 +359,14 @@ describe('Claim-based multi actor capture', () => {
       workspaceId: 'private-schema-w', chatKey: 'chat', sources: [row],
     });
 
-    expect(extract).toHaveBeenCalledTimes(2);
-    expect(capture.rejections).toEqual([]);
-    expect(capture.observations[0]).toMatchObject({ privacy: 'private', knowledgeMode: 'experienced' });
-    expect(capture.traces).toEqual(expect.arrayContaining([
-      expect.objectContaining({ privacy: 'private', knowledgeMode: 'experienced' }),
-    ]));
+    expect(extract).toHaveBeenCalledTimes(1);
+    expect(capture.facts).toEqual([]);
+    expect(capture.traces).toEqual([]);
+    expect(capture.outcome).toBe('partial');
+    expect(capture.rejections).not.toEqual([]);
   });
 
-  it('repairs one transposed prompt-local location reference when evidence names one specific location', async () => {
+  it('rejects a transposed prompt-local location reference instead of guessing its target', async () => {
     const row = source({
       id: 'message:fuel-ref',
       content: '琴乃报告：“加油站地下储油库液面高度约为总高度的百分之四十五。”',
@@ -391,11 +397,10 @@ describe('Claim-based multi actor capture', () => {
     } };
     const capture = await service('fuel-ref-w', extractor).capture({ workspaceId: 'fuel-ref-w', chatKey: 'chat', sources: [row] });
 
-    expect(capture.rejections).toEqual([]);
-    expect(capture.facts).toEqual(expect.arrayContaining([
-      expect.objectContaining({ subjectKey: '地下储油库', predicateKey: '燃油储量', objectKey: '百分之四十五' }),
+    expect(capture.facts).toEqual([]);
+    expect(capture.rejections).toEqual(expect.arrayContaining([
+      expect.objectContaining({ recordType: 'claim', code: 'invalid_reference', fieldPath: 'subjectRef' }),
     ]));
-    expect(capture.diagnostics?.deterministicRepairs).toBeGreaterThanOrEqual(1);
   });
 
   it('maps the exact violet naming ellipsis rewrite back to source text', async () => {
@@ -519,13 +524,12 @@ describe('Claim-based multi actor capture', () => {
     expect(capture.owners.filter(owner => owner.kind === 'actor').map(owner => owner.canonicalName))
       .not.toContain('电池组');
     expect(capture.pendingCandidates).toEqual([]);
-    expect(capture.facts).toEqual(expect.arrayContaining([
-      expect.objectContaining({ subjectKey: '电池组', predicateKey: '输出功率', objectKey: '两千瓦' }),
-    ]));
+    expect(capture.facts).toEqual([]);
     expect(capture.rejections).toEqual(expect.arrayContaining([
       expect.objectContaining({ recordType: 'actor', status: 'ignored' }),
+      expect.objectContaining({ recordType: 'claim', code: 'invalid_reference', fieldPath: 'subjectRef' }),
     ]));
-    expect(capture.outcome).toBe('complete');
+    expect(capture.outcome).toBe('partial');
   });
 
   it('keeps append-only history and supersedes the previous slot head', async () => {
@@ -637,52 +641,6 @@ describe('Claim-based multi actor capture', () => {
     ]));
   });
 
-  it('restricts a targeted repair to the requested localId and skips unrelated deterministic enrichment', async () => {
-    const row = source({
-      id: 'message:targeted-repair',
-      content: '“叶，继续警戒。”小时下达了指令。紫罗轻声说：“我……想要……名字。”',
-      actorRefs: ['白夕小时', '白夕叶', '紫罗'],
-      locationRefs: [],
-    });
-    const extractor = { extract: async (input: any): Promise<StructuredCaptureResult> => {
-      const violet = input.knownActorContext.find((item: any) => item.canonicalName === '紫罗').referenceId;
-      const leaf = input.knownActorContext.find((item: any) => item.canonicalName === '白夕叶').referenceId;
-      return {
-        ...empty(),
-        claims: [
-          {
-            localId: 'requested', sourceRef: row.id, kind: 'goal', subjectRef: violet,
-            predicateKey: '想要', objectText: '名字', content: '紫罗想要一个名字。', evidenceExcerpt: '我……想要……名字',
-            knowledge: { mode: 'self_reported', privacy: 'public', ownerRefs: [violet], speakerRef: violet, observerRefs: [], presentRefs: [violet], mentionedRefs: [] },
-            confidence: 0.98, stableAnchor: false,
-          },
-          {
-            localId: 'unrequested', sourceRef: row.id, kind: 'goal', subjectRef: leaf,
-            predicateKey: '继续警戒', objectText: '', content: '白夕叶继续警戒。', evidenceExcerpt: '叶，继续警戒',
-            knowledge: { mode: 'asserted', privacy: 'public', ownerRefs: [leaf], observerRefs: [leaf], presentRefs: [leaf], mentionedRefs: [] },
-            confidence: 0.98, stableAnchor: false,
-          },
-        ],
-      };
-    } };
-    const repairRequest = {
-      recordType: 'claim' as const,
-      items: [{
-        rejectionId: 'rejection:requested', recordType: 'claim' as const, localId: 'requested',
-        code: 'excerpt_mismatch', fieldPath: 'evidenceExcerpt', message: '修复证据', candidateSnapshot: {},
-      }],
-    };
-
-    const capture = await service('targeted-repair-w', extractor).capture({
-      workspaceId: 'targeted-repair-w', chatKey: 'chat', sources: [row], repairRequest,
-    });
-    expect(capture.rejections).toEqual([]);
-    expect(capture.acceptedLocalIds.claim).toEqual(['requested']);
-    expect(capture.facts).toHaveLength(1);
-    expect(capture.facts[0]?.subjectKey).toBe('紫罗');
-    expect(capture.facts.some(fact => fact.predicateKey === '下达应对指令')).toBe(false);
-  });
-
   it('keeps private self-reported material on the private-thought channel', async () => {
     const row = source({
       id: 'message:private-self-report',
@@ -764,7 +722,7 @@ describe('Claim-based multi actor capture', () => {
 
   it('prioritizes current-source actors when the confirmed directory exceeds the prompt cap', async () => {
     const registry = new ActorRegistry('large-directory-w');
-    const names = Array.from({ length: 110 }, (_, index) => String.fromCodePoint(0x5000 + index));
+    const names = Array.from({ length: 140 }, (_, index) => String.fromCodePoint(0x5000 + index));
     for (const [index, displayName] of names.entries()) {
       registry.discover({
         displayName,
@@ -774,7 +732,7 @@ describe('Claim-based multi actor capture', () => {
     const currentName = [...names].sort((left, right) => left.localeCompare(right, 'zh-CN')).at(-1)!;
     const row = source({ id: 'message:large-directory', content: `${currentName}进入房间。`, actorRefs: [currentName], locationRefs: [] });
     const extract = vi.fn(async (input: any): Promise<StructuredCaptureResult> => {
-      expect(input.knownActorContext).toHaveLength(96);
+      expect(input.knownActorContext).toHaveLength(128);
       expect(input.knownActorContext.some((item: any) => item.canonicalName === currentName)).toBe(true);
       return empty();
     });
@@ -913,7 +871,95 @@ describe('Claim-based multi actor capture', () => {
 
     expect(capture.facts).toEqual([]);
     expect(capture.rejections).toEqual(expect.arrayContaining([
-      expect.objectContaining({ recordType: 'claim', code: 'invalid_reference', fieldPath: 'knowledge.speakerRef' }),
+      expect.objectContaining({ recordType: 'claim', code: 'entity_ref_unsupported', fieldPath: 'knowledge' }),
     ]));
+  });
+
+  it('safely omits unsupported optional episode refs on the final conservative repair', async () => {
+    const row = source({ id: 'message:repair-episode', content: '琴乃完成了燃油检查。', actorRefs: ['琴乃'], locationRefs: [] });
+    const extractor = { extract: async (input: any): Promise<StructuredCaptureResult> => {
+      expect(input.repair.referenceDirectory.allowedActorRefs.map((item: any) => item.referenceId)).toEqual(['A01']);
+      return {
+        ...empty(),
+        episodes: [{
+          localId: 'repair-episode',
+          sourceRefs: [row.id],
+          participantRefs: ['A99'],
+          presentRefs: ['A99'],
+          mentionedRefs: [],
+          locationRef: 'L99',
+          summary: '琴乃完成了本轮燃油检查。',
+        }],
+      };
+    } };
+    const capture = await service('repair-episode-w', extractor).capture({
+      workspaceId: 'repair-episode-w',
+      chatKey: 'chat',
+      sources: [row],
+      repair: {
+        collection: 'episodes',
+        issues: [{ path: 'episodes[0].locationRef', keyword: 'entityRef', expected: 'source-supported ref' }],
+        attempt: 2,
+        maxAttempts: 2,
+        mode: 'conservative',
+        maxItems: 1,
+      },
+    });
+
+    expect(capture.outcome).toBe('complete');
+    expect(capture.resolutionMode).toBe('degraded');
+    expect(capture.rejections).toEqual([]);
+    expect(capture.episodes[0]).toMatchObject({ participantIds: [], presentOwnerIds: [] });
+    expect(capture.episodes[0]).not.toHaveProperty('locationId');
+    expect(capture.fieldActions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'episodes[0].participantRefs', action: 'filter' }),
+      expect.objectContaining({ path: 'episodes[0].presentRefs', action: 'filter' }),
+      expect.objectContaining({ path: 'episodes[0].locationRef', action: 'clear' }),
+    ]));
+  });
+
+  it('degrades a non-relationship subject ref only when supported subject text remains', async () => {
+    const row = source({ id: 'message:repair-claim', content: '琴乃确认燃油仍然充足。', actorRefs: ['琴乃'], locationRefs: [] });
+    const makeExtractor = (kind: 'state' | 'relationship', subjectText: string) => ({
+      extract: async (): Promise<StructuredCaptureResult> => ({
+        ...empty(),
+        claims: [{
+          localId: `repair-${kind}`,
+          sourceRef: row.id,
+          kind,
+          subjectRef: 'A99',
+          subjectText,
+          predicateKey: kind === 'relationship' ? '信任' : '确认燃油',
+          objectRef: kind === 'relationship' ? 'A98' : undefined,
+          objectText: kind === 'relationship' ? '' : '燃油充足',
+          content: kind === 'relationship' ? '琴乃明确表示信任另一人。' : '琴乃确认燃油仍然充足。',
+          evidenceExcerpt: row.content,
+          knowledge: { mode: 'asserted', privacy: 'public', ownerRefs: [], observerRefs: [], presentRefs: [], mentionedRefs: [] },
+          confidence: 0.98,
+          stableAnchor: false,
+        }],
+      }),
+    });
+    const repair = {
+      collection: 'claims' as const,
+      issues: [{ path: 'claims[0].subjectRef', keyword: 'entityRef', expected: 'source-supported ref' }],
+      attempt: 2,
+      maxAttempts: 2,
+      mode: 'conservative' as const,
+      maxItems: 1,
+    };
+    const degraded = await service('repair-claim-w', makeExtractor('state', '琴乃')).capture({
+      workspaceId: 'repair-claim-w', chatKey: 'chat', sources: [row], repair,
+    });
+    const blocked = await service('repair-relationship-w', makeExtractor('relationship', '琴乃')).capture({
+      workspaceId: 'repair-relationship-w', chatKey: 'chat', sources: [row], repair,
+    });
+
+    expect(degraded.outcome).toBe('complete');
+    expect(degraded.resolutionMode).toBe('degraded');
+    expect(degraded.fieldActions).toContainEqual(expect.objectContaining({ path: 'claims[0].subjectRef', action: 'clear' }));
+    expect(blocked.outcome).toBe('partial');
+    expect(blocked.facts).toEqual([]);
+    expect(blocked.fieldActions).toBeUndefined();
   });
 });

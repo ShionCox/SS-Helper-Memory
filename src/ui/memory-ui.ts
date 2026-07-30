@@ -1,28 +1,33 @@
 import './memory.css';
 import './initialization.css';
 import './actor-memory.css';
+import memoryPluginConfig from '../../plugin.config.json' with { type: 'json' };
 import {
   UI_CONTROL_ATTRIBUTE,
   UI_CONTROL_ICON_ONLY_ATTRIBUTE,
   UI_CONTROL_SIZE_ATTRIBUTE,
   UI_CONTROL_TONE_ATTRIBUTE,
+  describeSSHelperFailure,
+  isSSHelperReasonCode,
   type PopupUiContext,
   type ToastNotification,
   type UiControlKind,
   type UiControlSize,
   type UiControlTone,
   type ChatNavigationTarget,
+  type SSHelperFailureContext,
 } from '@ss-helper/sdk';
 import type { SummaryInitializationEstimate } from '../application/ingest/summary-strategy';
 import { DEFAULT_MEMORY_TRAITS, type CastPlanningSettings, type MemoryGraphPreview, type MemoryGraphStatus } from '../domain';
 import { describeMemoryError, type MemoryErrorDiagnostic } from '../diagnostics/memory-error';
-import { traceMemoryStartup } from '../host/runtime-feedback';
+import { startMemoryPerformanceSpan, traceMemoryStartup } from '../host/runtime-feedback';
 import { mountRelationshipGraphThree, type RelationshipGraphCommand, type RelationshipGraphRenderer } from './relationship-graph-three';
 import { selectGraphView } from './relationship-graph-layout';
 import {
   getSceneEventsHeader,
   normalizeSceneEventsSelection,
   renderSceneEventsPage,
+  renderSceneEventRecordRow,
   renderSelectedSceneGraphDetail,
   sceneGraphOwnerKind,
   sceneGraphOwnerLabel,
@@ -36,12 +41,15 @@ import {
 } from './scene-cast-pixi';
 import { renderInitializationView } from './initialization-view';
 import {
+  renderMemoryLibraryFactRow,
   renderMemoryLibraryView,
   selectMemoryLibraryView,
   type MemoryLibrarySort,
 } from './memory-library-view';
+import type { MemoryPage, MemoryPageRequest, MemoryPageResource } from './memory-page';
 import {
   normalizeActorMemorySelection,
+  renderActorMemoryTraceRow,
   renderActorMemoryPage,
   updateActorMemoryGaugeZone,
   type ActorMemoryGroup,
@@ -68,6 +76,10 @@ export interface MemoryUiSettings extends CastPlanningSettings {
   preExtractReferenceItems: number;
   preExtractReferenceMode: 'auto' | 'lexical' | 'vector' | 'hybrid';
   preExtractReferenceMaxChars: number;
+  structuredRepairEnabled: boolean;
+  structuredRepairBeforeFloors: number;
+  structuredRepairAfterFloors: number;
+  structuredRepairMaxItems: number;
   graphEnabled: boolean;
   graphLlmRelationEnabled: boolean;
   graphMaxHops: 1 | 2;
@@ -123,19 +135,17 @@ export interface MemorySqliteStatus {
   tableCounts: Readonly<Record<string, number>>;
   tableBytes: Readonly<Record<string, number | null>>;
   vectorCoverage: { indexedFacts: number; eligibleFacts: number; ratio: number };
-  lastError?: string;
+  failure?: SSHelperFailureContext;
 }
 
 export interface MemorySqliteIntegrityResult { ok: boolean; message: string }
 export const EXPECTED_SQLITE_SCHEMA_VERSION = 0;
 
-export function formatRollbackConfirmation(jobId: string, batchIndex: number): string {
-  return `回滚任务 ${jobId} 的第 ${batchIndex} 批及其后续批次？这会恢复第 ${batchIndex} 批执行前的事实与替代链，之后批次的整理结果也会一并撤销。`;
-}
-
 export interface MemoryUiFact {
   id: string;
   content: string;
+  subjectKey?: string;
+  predicateKey?: string;
   kind: string;
   status: string;
   confidence: number;
@@ -164,13 +174,13 @@ export interface MemoryUiOverview {
   embedding?: MemoryRecallRouteStatus;
   /** Current reranking-model route status, when the LLM capability probe has completed. */
   rerank?: MemoryRecallRouteStatus;
-  errorCode?: string;
-  error?: string;
+  failure?: SSHelperFailureContext;
   errorDiagnostic?: MemoryErrorDiagnostic;
 }
 
 export interface MemoryInitializationOptions {
-  includeInvisibleHistory?: boolean;
+  /** 默认包含酒馆隐藏的普通聊天楼层；设为 false 时仅处理当前可见楼层。 */
+  includeHiddenMessageFloors?: boolean;
 }
 export interface MemoryInitializationSourceOption {
   kind: string;
@@ -183,21 +193,27 @@ export interface MemoryInitializationSourceOption {
   defaultCount: number;
   /** Raw entries still excluded under the current mode. */
   excludedCount: number;
-  /** Entries that become eligible when the one-time invisible-history option is enabled. */
-  invisibleCount?: number;
   selected: boolean;
 }
 export interface MemoryCaptureProgress {
-  status: 'idle' | 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
+  status: 'idle' | 'queued' | 'running' | 'repairing' | 'needs_repair' | 'needs_review' | 'paused' | 'completed' | 'failed' | 'cancelled';
   jobId?: string;
   batchIndex: number;
   totalBatches: number;
   processedCount: number;
   elapsedMs: number;
-  error?: string;
-  phase?: 'capture';
+  failure?: SSHelperFailureContext;
+  phase?: 'capture' | 'repair';
   outcome?: 'complete' | 'partial';
   rejectedCount?: number;
+  pendingRepairCount?: number;
+  retryableRepairCount?: number;
+  exhaustedRepairCount?: number;
+  reviewRequiredCount?: number;
+  unresolvedRejectionCount?: number;
+  repairedCount?: number;
+  degradedCount?: number;
+  ignoredCount?: number;
 }
 
 export interface MemoryInitializationAttempt {
@@ -206,8 +222,8 @@ export interface MemoryInitializationAttempt {
   updatedAt: number;
   totalBatches: number;
   selectedSourceKinds: string[];
-  includeInvisibleHistory?: boolean;
-  error?: string;
+  includeHiddenMessageFloors?: boolean;
+  failure?: SSHelperFailureContext;
 }
 
 export interface MemoryInitializationState {
@@ -260,12 +276,20 @@ export interface MemoryUiController {
   cancelCapture(): Promise<void>;
   retry(): Promise<void>;
   listFacts(query?: string): Promise<MemoryUiFact[]>;
+  listFactsPage?(request: MemoryPageRequest): Promise<MemoryPage<MemoryUiFact>>;
+  getLibraryStats?(): Promise<{
+    total: number;
+    active: number;
+    pending: number;
+    evidenceCoverage: number;
+    kindCounts: Readonly<Record<string, number>>;
+    statusCounts: Readonly<Record<string, number>>;
+  }>;
+  loadMemoryPage?<T>(resource: MemoryPageResource, request: MemoryPageRequest): Promise<MemoryPage<T>>;
   updateFact(id: string, content: string): Promise<void>;
   removeFact(id: string): Promise<void>;
   getLastRecall(): Promise<unknown>;
   listAuditRecords(): Promise<MemoryAuditRecord[]>;
-  getCaptureRepairEstimate?(auditId: string, rejectionIds: readonly string[]): Promise<{ requestCount: number; groupCounts: Partial<Record<'actor' | 'episode' | 'observation' | 'fact', number>> }>;
-  repairCaptureRejections?(auditId: string, rejectionIds: readonly string[]): Promise<void>;
   ignoreCaptureRejections?(auditId: string, rejectionIds: readonly string[]): Promise<void>;
   getMainChatUsage(): Promise<unknown[]>;
   getRecallStatus(): Promise<MemoryRecallStatus>;
@@ -273,8 +297,7 @@ export interface MemoryUiController {
   getGraphStatus(): MemoryGraphStatus;
   getRelationshipGraph(query?: string, limit?: number): Promise<MemoryGraphPreview>;
   rebuildGraph(): Promise<void>;
-  rollbackBatch(jobId: string, batchIndex: number): Promise<void>;
-  getSqliteStatus(): Promise<MemorySqliteStatus>;
+  getSqliteStatus(options?: { readonly detailed?: boolean }): Promise<MemorySqliteStatus>;
   exportSqliteBackup(): Promise<Blob>;
   importSqliteBackup(file: File): Promise<void>;
   checkSqliteIntegrity(): Promise<MemorySqliteIntegrityResult>;
@@ -351,7 +374,7 @@ function isMachineEntityKey(value: string): boolean {
   return Boolean(key) && !HAN_CHARACTER.test(key) && MACHINE_ENTITY_KEY.test(key);
 }
 
-export function localizeLegacyGraphPreview(graph: MemoryGraphPreview): MemoryGraphPreview {
+export function localizeGraphPreview(graph: MemoryGraphPreview): MemoryGraphPreview {
   return {
     nodes: graph.nodes.map((node) => ({ ...node, label: isMachineEntityKey(node.label) ? '相关对象' : node.label })),
     edges: graph.edges.map((edge) => ({ ...edge, predicate: isNonChinesePredicate(edge.predicate) ? translateFactKind(edge.kind) : edge.predicate })),
@@ -363,17 +386,6 @@ export function formatAuditResource(value: unknown): string {
   if (!resource) return '未记录';
   if (resource === '__builtin_tavern__') return '酒馆内置';
   return resource;
-}
-function auditStringList(value: unknown): string[] {
-  return Array.isArray(value)
-    ? [...new Set(value.map((item) => String(item ?? '').trim()).filter(Boolean))]
-    : [];
-}
-function formatAuditRoute(values: unknown, fallback: string, formatter: (value: string) => string = (value) => value): string {
-  const entries = auditStringList(values);
-  if (entries.length === 0) return fallback;
-  if (entries.length === 1) return formatter(entries[0]!);
-  return `多个（${entries.length}）`;
 }
 export function translateOverviewStatus(value: MemoryUiOverview['status']): string { return OVERVIEW_STATUS_LABELS[value]; }
 export function translateChatBinding(value: boolean | undefined): string { return value === true ? '已绑定' : value === false ? '未绑定' : '待确认'; }
@@ -431,12 +443,9 @@ export function filterAndSortFacts(facts: readonly MemoryUiFact[], options: Fact
 
 export interface SafeLlmErrorDetails { code: string; resource: string; model: string }
 export function readSafeLlmErrorDetails(overview: MemoryUiOverview): SafeLlmErrorDetails {
-  const message = overview.error ?? '';
-  const code = overview.errorCode && /^[A-Z][A-Z0-9_]{2,63}$/u.test(overview.errorCode)
-    ? overview.errorCode
-    : message.match(/(?:HTTP\s*)?\b(4\d\d|5\d\d)\b/i)?.[1] ?? '未知';
-  const resource = overview.llmResource ?? message.match(/(?:resource|资源)\s*[:：=]\s*([^\s,，;；]+)/i)?.[1] ?? 'memory_extract 路由';
-  const model = overview.llmModel ?? message.match(/(?:model|模型)\s*[:：=]\s*([^\s,，;；]+)/i)?.[1] ?? '由 LLMHub 决定';
+  const code = overview.failure?.reasonCode ?? 'INTERNAL_ERROR';
+  const resource = overview.llmResource ?? 'memory_extract 路由';
+  const model = overview.llmModel ?? '由 LLMHub 决定';
   return { code, resource, model };
 }
 
@@ -466,16 +475,11 @@ function downloadSqlite(content: Blob): void {
   anchor.click();
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
-function safeErrorCode(error: unknown, fallback: string): string {
-  if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/u.test(error.code)) return error.code;
-  return fallback;
+function safeErrorCode(error: unknown, _fallback: string): string {
+  return describeSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.ui.action' }).reasonCode;
 }
-function safeInlineError(value: unknown, fallback: string): string {
-  if (typeof value !== 'string') return fallback;
-  const code = value.match(/\b[A-Z][A-Z0-9_]{2,63}\b/u)?.[0];
-  if (code) return code;
-  const status = value.match(/\b([45]\d\d)\b/u)?.[1];
-  return status ? `HTTP ${status}` : fallback;
+function safeInlineError(value: unknown, _fallback: string): string {
+  return isSSHelperReasonCode(value) ? value : 'INTERNAL_ERROR';
 }
 
 export type MemoryWorkbenchPage = 'overview' | 'actors' | 'scenes' | 'library' | 'actor-memory' | 'profiles' | 'dreams' | 'recall' | 'audit' | 'initialize' | 'graph' | 'data';
@@ -501,7 +505,6 @@ interface WorkbenchState {
   loading: boolean;
   pageLoading: boolean;
   busyAction: string;
-  errorCode: string;
   errorDiagnostic?: MemoryErrorDiagnostic;
   pageError?: MemoryErrorDiagnostic;
   actionError?: MemoryErrorDiagnostic;
@@ -560,6 +563,7 @@ interface WorkbenchState {
   dreams: Array<Record<string, unknown>>;
   facts: MemoryUiFact[];
   libraryResults: MemoryUiFact[];
+  libraryStats?: Awaited<ReturnType<NonNullable<MemoryUiController['getLibraryStats']>>>;
   query: string;
   selectedKinds: string[];
   selectedStatuses: string[];
@@ -570,7 +574,7 @@ interface WorkbenchState {
   confirmFactId: string;
   sources: MemoryInitializationSourceOption[];
   selectedSourceKinds: string[];
-  includeInvisibleHistory: boolean;
+  includeHiddenMessageFloors: boolean;
   estimate?: MemoryInitializationEstimate;
   initialization?: MemoryInitializationState;
   progress?: MemoryCaptureProgress;
@@ -611,7 +615,10 @@ function renderLoading(message = '正在读取…'): string { return `<div class
 function renderEmpty(message: string, detail = ''): string { return `<div class="stx-memory-empty"><strong>${escapeHtml(message)}</strong>${detail ? `<p>${escapeHtml(detail)}</p>` : ''}</div>`; }
 function renderErrorDetails(diagnostic: MemoryErrorDiagnostic, action: 'retry-load' | 'retry-page' | 'refresh-health' | 'dismiss-error'): string {
   const actionLabel = action === 'dismiss-error' ? '关闭提示' : action === 'refresh-health' ? '重新检查' : '重试';
-  return `<div class="stx-memory-error-details" role="alert"><span class="stx-memory-error-icon" aria-hidden="true"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><div class="stx-memory-error-copy"><div class="stx-memory-error-title"><strong>${escapeHtml(diagnostic.title)}</strong>${renderStatusChip(diagnostic.code, 'error')}</div><div class="stx-memory-error-guidance"><p><b>原因：</b><span>${escapeHtml(diagnostic.reason)}</span></p><p><b>处理建议：</b><span>${escapeHtml(diagnostic.action)}</span></p></div></div><div class="stx-memory-error-actions"><button ${uiControl('button', diagnostic.retryable && action !== 'dismiss-error' ? 'danger' : 'neutral')} type="button" data-action="${action}">${actionLabel}</button></div></div>`;
+  const request = diagnostic.requestId
+    ? `<p class="stx-memory-error-request"><span>请求 ID</span><code>${escapeHtml(diagnostic.requestId)}</code></p>`
+    : '';
+  return `<div class="stx-memory-error-details" role="alert"><span class="stx-memory-error-icon" aria-hidden="true"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><div class="stx-memory-error-copy"><div class="stx-memory-error-title"><strong>${escapeHtml(diagnostic.title)}</strong>${renderStatusChip(diagnostic.reasonCode, 'error')}</div><div class="stx-memory-error-guidance"><p class="stx-memory-error-summary"><span><b>原因：</b>${escapeHtml(diagnostic.reason)}</span><span><b>处理建议：</b>${escapeHtml(diagnostic.action)}</span></p>${request}</div></div><div class="stx-memory-error-actions"><button ${uiControl('button', diagnostic.retryable && action !== 'dismiss-error' ? 'danger' : 'neutral')} type="button" data-action="${action}">${actionLabel}</button></div></div>`;
 }
 function renderRoute(label: string, route: MemoryRecallRouteStatus): string {
   const tone = route.available ? 'success' : 'error';
@@ -666,8 +673,8 @@ export function renderMemoryWorkbench(
   let sceneRendererToken = 0;
   const requestedGraphPage = initialActionId === 'open-relationship-graph' || initialActionId === 'rebuild-relationship-graph';
   const state: WorkbenchState = {
-    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', errorCode: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
-    selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeInvisibleHistory: false, reinitializeOpen: false, audits: [], usages: [], integrityText: '尚未执行完整性检查。', confirmBatchKey: '', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
+    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
+    selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeHiddenMessageFloors: true, reinitializeOpen: false, audits: [], usages: [], integrityText: '尚未执行完整性检查。', confirmBatchKey: '', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
   };
   const sceneEventsState = (): SceneEventsState => ({
     category: state.sceneCategory,
@@ -737,6 +744,14 @@ export function renderMemoryWorkbench(
   const toast = (level: ToastNotification['level'], title: string, message: string, code: string): void => {
     notify({ level, title, message, code, durationMs: level === 'error' ? 0 : 3200 });
   };
+  const elementFromMarkup = (markup: string): HTMLElement => {
+    const shell = document.createElement('div');
+    shell.innerHTML = markup;
+    return (shell.firstElementChild as HTMLElement | null) ?? shell;
+  };
+  const initializationOptions = (): MemoryInitializationOptions => ({
+    includeHiddenMessageFloors: state.includeHiddenMessageFloors,
+  });
   const isChatUnbound = (overview: MemoryUiOverview | undefined = state.overview): boolean =>
     overview?.bound === false || overview?.status === 'unselected';
   const clearActorState = (): void => {
@@ -793,7 +808,10 @@ export function renderMemoryWorkbench(
     if (disposed) return;
     const focusSelector = pendingFocusSelector;
     pendingFocusSelector = '';
-    const factListScrollTop = root.querySelector<HTMLElement>('.stx-memory-fact-list')?.scrollTop;
+    const getFactListScroller = (): HTMLElement | null => root.querySelector<HTMLElement>(
+      '.stx-memory-library-fact-list > .stx-popup-list',
+    ) ?? root.querySelector<HTMLElement>('.stx-memory-fact-list');
+    const factListScrollTop = getFactListScroller()?.scrollTop;
     const active = document.activeElement as HTMLInputElement | HTMLTextAreaElement | null;
     const activeId = active && root.contains(active) && active.id ? active.id : '';
     const activeValue = active && root.contains(active) && ('value' in active) ? active.value : undefined;
@@ -807,7 +825,7 @@ export function renderMemoryWorkbench(
     render();
     const restoreFactListScroll = (): void => {
       if (disposed || factListScrollTop === undefined) return;
-      const factList = root.querySelector<HTMLElement>('.stx-memory-fact-list');
+      const factList = getFactListScroller();
       if (factList) factList.scrollTop = factListScrollTop;
     };
     restoreFactListScroll();
@@ -861,7 +879,7 @@ export function renderMemoryWorkbench(
     progressTimer = undefined;
     // 初始化的前置步骤（读取来源、创建任务）也可能需要一段时间；即使
     // 后端尚未写入 job，也要持续读取进度，让界面能马上反馈“正在提交 LLM”。
-    if (!disposed && (['initialize', 'reinitialize'].includes(state.busyAction) || (state.progress && ['queued', 'running', 'paused'].includes(state.progress.status)))) {
+    if (!disposed && (['initialize', 'reinitialize'].includes(state.busyAction) || (state.progress && ['queued', 'running', 'repairing', 'paused'].includes(state.progress.status)))) {
       progressTimer = window.setTimeout(() => void updateProgress(), 900);
     }
   };
@@ -886,16 +904,43 @@ export function renderMemoryWorkbench(
       state.selectedFactId = '';
       return true;
     }
-    const [allFacts, queryFacts] = await Promise.all([
-      controller.listFacts(),
-      query ? controller.listFacts(query) : Promise.resolve(undefined),
-    ]);
+    const [allFacts, queryFacts, statistics, retainedSelected] = controller.listFactsPage
+      ? await Promise.all([
+          controller.listFactsPage({ limit: 50, includeTotal: true }),
+          query ? controller.listFactsPage({ limit: 50, query }) : Promise.resolve(undefined),
+          controller.getLibraryStats?.(),
+          state.selectedFactId
+              ? controller.listFactsPage({
+                limit: 1,
+                ...(query ? { query } : {}),
+                where: [{ field: 'recordId', op: 'eq', value: state.selectedFactId }],
+              }).then(page => page.items[0])
+            : Promise.resolve(undefined),
+        ]).then(([allPage, queryPage, stats, selected]) => [allPage.items, queryPage?.items, stats, selected] as const)
+      : await Promise.all([
+          controller.listFacts(),
+          query ? controller.listFacts(query) : Promise.resolve(undefined),
+        ]).then(([facts, results]) => [facts, results, undefined, undefined] as const);
     if (!isCurrent() || state.query.trim() !== query) return false;
-    state.facts = allFacts;
-    state.libraryResults = queryFacts ?? allFacts;
+    state.facts = [...allFacts];
+    state.libraryResults = [...(queryFacts ?? allFacts)];
+    if (retainedSelected && !state.facts.some(fact => fact.id === retainedSelected.id)) state.facts.push(retainedSelected);
+    if (retainedSelected && !state.libraryResults.some(fact => fact.id === retainedSelected.id)) state.libraryResults.push(retainedSelected);
+    state.libraryStats = statistics;
     normalizeLibrarySelection();
     return true;
   };
+  const firstMemoryPage = async <T>(
+    resource: MemoryPageResource,
+    fallback: () => Promise<readonly T[]>,
+    request: Partial<MemoryPageRequest> = {},
+  ): Promise<readonly T[]> => controller.loadMemoryPage
+    ? (await controller.loadMemoryPage<T>(resource, {
+        limit: 50,
+        includeTotal: true,
+        ...request,
+      })).items
+    : fallback();
   const refreshLibrarySearch = async (): Promise<boolean> => {
     const requestId = ++librarySearchRequestId;
     const query = state.query.trim();
@@ -905,18 +950,20 @@ export function renderMemoryWorkbench(
       state.selectedFactId = '';
       return true;
     }
-    const results = query
-      ? await controller.listFacts(query)
-      : state.facts.length ? state.facts : await controller.listFacts();
+    const results = controller.listFactsPage
+      ? (await controller.listFactsPage({ limit: 50, ...(query ? { query } : {}), includeTotal: true })).items
+      : query
+        ? await controller.listFacts(query)
+        : state.facts.length ? state.facts : await controller.listFacts();
     if (disposed || requestId !== librarySearchRequestId || state.page !== 'library' || state.query.trim() !== query) return false;
-    state.libraryResults = results;
+    state.libraryResults = [...results];
     normalizeLibrarySelection();
     return true;
   };
   const loadOverview = async (): Promise<void> => {
     const requestId = ++overviewRequestId;
     const isCurrent = (): boolean => !disposed && requestId === overviewRequestId;
-    state.loading = true; state.errorCode = ''; state.errorDiagnostic = undefined; rerender();
+    state.loading = true; state.errorDiagnostic = undefined; rerender();
     try {
       const overview = await controller.getOverview();
       if (!isCurrent()) return;
@@ -929,14 +976,14 @@ export function renderMemoryWorkbench(
         state.recall = await controller.getRecallStatus().catch(() => undefined);
       }
       if (!isCurrent()) return;
-      state.selectedFactId = state.facts[0]?.id ?? '';
+      normalizeLibrarySelection();
       state.loading = false; state.errorDiagnostic = undefined; rerender();
       void updateProgress();
     } catch (error) {
       if (!isCurrent()) return;
-      const diagnostic = describeMemoryError(error, 'MEMORY_WORKBENCH_LOAD_FAILED', 'workbench-load');
-      state.loading = false; state.errorCode = diagnostic.code; state.errorDiagnostic = diagnostic; rerender();
-      toast('error', diagnostic.title, diagnostic.reason, diagnostic.code);
+      const diagnostic = describeMemoryError(error, 'INTERNAL_ERROR', 'workbench-load');
+      state.loading = false; state.errorDiagnostic = diagnostic; rerender();
+      toast('error', diagnostic.title, diagnostic.reason, diagnostic.reasonCode);
     }
   };
   const refreshLiveSnapshot = async (): Promise<void> => {
@@ -993,8 +1040,8 @@ export function renderMemoryWorkbench(
       librarySearchRequestId += 1;
     }
     const requestId = background ? ++backgroundPageRequestId : ++pageRequestId;
-    const enteringInitialize = !background && page === 'initialize' && state.page !== 'initialize';
-    if (enteringInitialize) state.includeInvisibleHistory = false;
+    const finishLoad = startMemoryPerformanceSpan(`workbench.page.${page}.${background ? 'refresh' : 'load'}`);
+    let loadStatus: 'success' | 'error' | 'aborted' = 'success';
     if (!background) {
       state.page = page;
       state.pageLoading = true;
@@ -1014,9 +1061,9 @@ export function renderMemoryWorkbench(
           clearActorState();
         } else {
           const [actors, aliases, pending, reviews] = await Promise.all([
-            controller.listActors ? controller.listActors() : Promise.resolve([]),
-            controller.listActorAliases ? controller.listActorAliases() : Promise.resolve([]),
-            controller.listPendingActorCandidates ? controller.listPendingActorCandidates() : Promise.resolve([]),
+            firstMemoryPage('actors', () => controller.listActors ? controller.listActors() : Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } }),
+            firstMemoryPage('actor-aliases', () => controller.listActorAliases ? controller.listActorAliases() : Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } }),
+            firstMemoryPage('actor-candidates', () => controller.listPendingActorCandidates ? controller.listPendingActorCandidates() : Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } }),
             controller.listActorCorrectionReviews ? controller.listActorCorrectionReviews() : Promise.resolve([]),
           ]);
           if (!isCurrent()) return;
@@ -1031,11 +1078,11 @@ export function renderMemoryWorkbench(
         }
       } else if (page === 'scenes') {
         const [scenes, episodes, observations, actors, aliases, currentSceneState, transitions, plans, planAudits] = await Promise.all([
-          controller.listSceneCasts ? controller.listSceneCasts() : Promise.resolve([]),
-          controller.listEpisodes ? controller.listEpisodes() : Promise.resolve([]),
-          controller.listObservations ? controller.listObservations() : Promise.resolve([]),
-          controller.listActors ? controller.listActors() : Promise.resolve([]),
-          controller.listActorAliases ? controller.listActorAliases() : Promise.resolve([]),
+          firstMemoryPage('scene-casts', () => controller.listSceneCasts ? controller.listSceneCasts() : Promise.resolve([]), { orderBy: { field: 'floor', direction: 'desc' } }),
+          firstMemoryPage('episodes', () => controller.listEpisodes ? controller.listEpisodes() : Promise.resolve([]), { orderBy: { field: 'occurredAt', direction: 'desc' } }),
+          firstMemoryPage('observations', () => controller.listObservations ? controller.listObservations() : Promise.resolve([]), { orderBy: { field: 'occurredAt', direction: 'desc' } }),
+          firstMemoryPage('actors', () => controller.listActors ? controller.listActors() : Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } }),
+          firstMemoryPage('actor-aliases', () => controller.listActorAliases ? controller.listActorAliases() : Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } }),
           controller.getCurrentSceneState ? controller.getCurrentSceneState() : Promise.resolve(null),
           controller.listSceneTransitions ? controller.listSceneTransitions() : Promise.resolve([]),
           controller.listGenerationCastPlans ? controller.listGenerationCastPlans() : Promise.resolve([]),
@@ -1068,33 +1115,34 @@ export function renderMemoryWorkbench(
           return;
         }
         const [actors, aliases, traces, observations, facts] = await Promise.all([
-          controller.listActors ? controller.listActors() : Promise.resolve([]),
-          controller.listActorAliases ? controller.listActorAliases() : Promise.resolve([]),
-          controller.listActorTraces ? controller.listActorTraces() : Promise.resolve([]),
-          controller.listObservations ? controller.listObservations() : Promise.resolve([]),
-          state.overview?.bound === false ? Promise.resolve([]) : controller.listFacts(),
+          firstMemoryPage('actors', () => controller.listActors ? controller.listActors() : Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } }),
+          firstMemoryPage('actor-aliases', () => controller.listActorAliases ? controller.listActorAliases() : Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } }),
+          firstMemoryPage('memory-traces', () => controller.listActorTraces ? controller.listActorTraces() : Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } }),
+          firstMemoryPage('observations', () => controller.listObservations ? controller.listObservations() : Promise.resolve([]), { orderBy: { field: 'occurredAt', direction: 'desc' } }),
+          state.overview?.bound === false ? Promise.resolve([]) : controller.listFactsPage ? controller.listFactsPage({ limit: 50 }).then(page => page.items) : controller.listFacts(),
         ]);
         if (!isCurrent()) return;
         state.actors = [...actors];
         state.actorAliases = [...aliases];
         state.actorTraces = [...traces];
         state.observations = [...observations];
-        state.facts = facts;
+        state.facts = [...facts];
         state.actorMemoryNow = Date.now();
         const actorMemory = actorMemoryState();
         normalizeActorMemorySelection(actorMemory);
         syncActorMemorySelection(actorMemory);
       } else if (page === 'profiles') {
-        const profiles = controller.listActorProfiles ? [...await controller.listActorProfiles()] : [];
+        const profiles = [...await firstMemoryPage<Record<string, unknown>>('profile-claims', () => controller.listActorProfiles ? controller.listActorProfiles() : Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } })];
         if (!isCurrent()) return;
         state.profiles = profiles;
       } else if (page === 'dreams') {
-        const dreams = controller.listActorDreams ? [...await controller.listActorDreams()] : [];
+        const dreams = [...await firstMemoryPage<Record<string, unknown>>('dream-jobs', () => controller.listActorDreams ? controller.listActorDreams() : Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } })];
         if (!isCurrent()) return;
         state.dreams = dreams;
       } else if (page === 'initialize') {
+        const sourceOptions = initializationOptions();
         const [sources, initialization, sqlite] = await Promise.all([
-          controller.getInitializationSources({ includeInvisibleHistory: state.includeInvisibleHistory }),
+          controller.getInitializationSources(sourceOptions),
           controller.getInitializationState(),
           controller.getSqliteStatus().catch(() => undefined),
         ]);
@@ -1103,7 +1151,7 @@ export function renderMemoryWorkbench(
         state.initialization = initialization;
         if (sqlite) state.sqlite = sqlite;
         state.selectedSourceKinds = state.sources.filter((source) => source.selected).map((source) => source.kind);
-        const estimate = await controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory });
+        const estimate = await controller.getInitializationEstimate(state.selectedSourceKinds, sourceOptions);
         if (!isCurrent()) return;
         state.estimate = estimate;
         const progress = await controller.getCaptureProgress();
@@ -1119,10 +1167,10 @@ export function renderMemoryWorkbench(
           : await Promise.all([
             controller.getLastRecall(),
             controller.getActorRecallDiagnostics ? controller.getActorRecallDiagnostics() : Promise.resolve(null),
-            controller.listGenerationCastPlans ? controller.listGenerationCastPlans() : Promise.resolve([]),
-            controller.listCastPlanAudits ? controller.listCastPlanAudits() : Promise.resolve([]),
-            controller.listRecallCoverageLogs ? controller.listRecallCoverageLogs() : Promise.resolve([]),
-            controller.listMemoryUsageLogs ? controller.listMemoryUsageLogs() : Promise.resolve([]),
+            firstMemoryPage('generation-cast-plans', () => controller.listGenerationCastPlans ? controller.listGenerationCastPlans() : Promise.resolve([]), { orderBy: { field: 'basedOnFloor', direction: 'desc' } }),
+            firstMemoryPage('cast-plan-audits', () => controller.listCastPlanAudits ? controller.listCastPlanAudits() : Promise.resolve([]), { orderBy: { field: 'createdAt', direction: 'desc' } }),
+            firstMemoryPage('recall-coverage-logs', () => controller.listRecallCoverageLogs ? controller.listRecallCoverageLogs() : Promise.resolve([]), { orderBy: { field: 'createdAt', direction: 'desc' } }),
+            firstMemoryPage('memory-usage-logs', () => controller.listMemoryUsageLogs ? controller.listMemoryUsageLogs() : Promise.resolve([]), { orderBy: { field: 'createdAt', direction: 'desc' } }),
           ]);
         if (!isCurrent()) return;
         state.diagnostics = diagnostics;
@@ -1138,12 +1186,12 @@ export function renderMemoryWorkbench(
         } else {
           const [graph, facts] = await Promise.all([
             controller.getRelationshipGraph('', 50),
-            controller.listFacts(),
+            controller.listFactsPage ? controller.listFactsPage({ limit: 50 }).then(page => page.items) : controller.listFacts(),
           ]);
           if (!isCurrent()) return;
           state.graph = graph;
           state.graphStatus = controller.getGraphStatus();
-          state.facts = facts;
+          state.facts = [...facts];
         }
       } else if (page === 'graph') {
         if (state.overview?.bound === false) {
@@ -1152,12 +1200,12 @@ export function renderMemoryWorkbench(
         } else {
           const [graph, facts] = await Promise.all([
             controller.getRelationshipGraph('', 50),
-            controller.listFacts(),
+            controller.listFactsPage ? controller.listFactsPage({ limit: 50 }).then(page => page.items) : controller.listFacts(),
           ]);
           if (!isCurrent()) return;
           state.graph = graph;
           state.graphStatus = controller.getGraphStatus();
-          state.facts = facts;
+          state.facts = [...facts];
           if (!graph.edges.some((edge) => edge.id === state.selectedGraphEdgeId)) state.selectedGraphEdgeId = '';
           if (!graph.edges.some((edge) => edge.id === state.selectedGraphEventId && edge.kind === 'event')) state.selectedGraphEventId = '';
           if (!graph.nodes.some((node) => node.id === state.selectedGraphNodeId)) state.selectedGraphNodeId = '';
@@ -1167,18 +1215,22 @@ export function renderMemoryWorkbench(
           state.audits = [];
           state.usages = [];
         } else {
-          const audits = await controller.listAuditRecords();
+          const audits = controller.loadMemoryPage
+            ? await controller.loadMemoryPage<MemoryAuditRecord>('change-audits', { limit: 50, includeTotal: true, orderBy: { field: 'createdAt', direction: 'desc' } }).then(page => page.items)
+            : await controller.listAuditRecords();
           if (!isCurrent()) return;
-          const usages = await controller.getMainChatUsage();
+          const usages = controller.loadMemoryPage
+            ? await controller.loadMemoryPage<unknown>('usage', { limit: 50, includeTotal: true, orderBy: { field: 'capturedAt', direction: 'desc' } }).then(page => page.items)
+            : await controller.getMainChatUsage();
           if (!isCurrent()) return;
-          state.audits = audits;
-          state.usages = usages;
+          state.audits = [...audits];
+          state.usages = [...usages];
         }
         const sqlite = await controller.getSqliteStatus();
         if (!isCurrent()) return;
         state.sqlite = sqlite;
       } else if (page === 'data') {
-        const sqlite = await controller.getSqliteStatus();
+        const sqlite = await controller.getSqliteStatus({ detailed: true });
         if (!isCurrent()) return;
         state.sqlite = sqlite;
         if (state.overview) state.overview = {
@@ -1189,13 +1241,15 @@ export function renderMemoryWorkbench(
       }
       if (!isCurrent()) return;
     } catch (error) {
+      loadStatus = isCurrent() ? 'error' : 'aborted';
       if (!isCurrent()) return;
       if (background) return;
-      const diagnostic = describeMemoryError(error, 'MEMORY_WORKBENCH_PAGE_FAILED', 'workbench-page');
-      state.errorCode = diagnostic.code;
+      const diagnostic = describeMemoryError(error, 'INTERNAL_ERROR', 'workbench-page');
       state.pageError = diagnostic;
-      toast('error', diagnostic.title, diagnostic.reason, diagnostic.code);
+      toast('error', diagnostic.title, diagnostic.reason, diagnostic.reasonCode);
     } finally {
+      if (!isCurrent() && loadStatus === 'success') loadStatus = 'aborted';
+      finishLoad(loadStatus);
       if (isCurrent()) {
         if (!background) state.pageLoading = false;
         rerender('', background);
@@ -1215,7 +1269,7 @@ export function renderMemoryWorkbench(
         toast('success', '已刷新', '当前页面和工作台状态已经重新读取。', 'MEMORY_WORKBENCH_REFRESHED');
       }
     }
-    catch (error) { const diagnostic = describeMemoryError(error, 'MEMORY_WORKBENCH_REFRESH_FAILED', 'operation'); state.actionError = diagnostic; toast('error', diagnostic.title, diagnostic.reason, diagnostic.code); }
+    catch (error) { const diagnostic = describeMemoryError(error, 'INTERNAL_ERROR', 'operation'); state.actionError = diagnostic; toast('error', diagnostic.title, diagnostic.reason, diagnostic.reasonCode); }
     finally { state.busyAction = ''; rerender(); }
   };
   const runAction = async (action: string, task: () => Promise<void>, successTitle: string, successMessage: string, successCode: string, reload?: () => Promise<void>): Promise<void> => {
@@ -1236,7 +1290,7 @@ export function renderMemoryWorkbench(
       state.actionError = undefined;
       toast('success', successTitle, successMessage, successCode);
     }
-    catch (error) { const diagnostic = describeMemoryError(error, `MEMORY_${action.toUpperCase()}_FAILED`, 'operation'); state.actionError = diagnostic; if (['initialize', 'reinitialize'].includes(action) && reload) await reload().catch(() => undefined); toast('error', diagnostic.title, diagnostic.reason, diagnostic.code); }
+    catch (error) { const diagnostic = describeMemoryError(error, 'INTERNAL_ERROR', 'operation'); state.actionError = diagnostic; if (['initialize', 'reinitialize'].includes(action) && reload) await reload().catch(() => undefined); toast('error', diagnostic.title, diagnostic.reason, diagnostic.reasonCode); }
     finally { state.busyAction = ''; rerender(); }
   };
   const refreshLibrary = async (): Promise<void> => {
@@ -1253,10 +1307,11 @@ export function renderMemoryWorkbench(
     );
   };
   const refreshInitialization = async (preferredKinds?: readonly string[]): Promise<void> => {
+    const sourceOptions = initializationOptions();
     const [overview, initialization, sources, progress, facts, sqlite] = await Promise.all([
       controller.getOverview(),
       controller.getInitializationState(),
-      controller.getInitializationSources({ includeInvisibleHistory: state.includeInvisibleHistory }),
+      controller.getInitializationSources(sourceOptions),
       controller.getCaptureProgress(),
       controller.listFacts(),
       controller.getSqliteStatus().catch(() => undefined),
@@ -1273,7 +1328,7 @@ export function renderMemoryWorkbench(
     state.selectedSourceKinds = nextKinds?.length
       ? [...nextKinds]
       : sources.filter((source) => source.selected).map((source) => source.kind);
-    state.estimate = await controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory });
+    state.estimate = await controller.getInitializationEstimate(state.selectedSourceKinds, sourceOptions);
   };
 
   const renderOverview = (): string => {
@@ -1313,7 +1368,7 @@ export function renderMemoryWorkbench(
       <aside class="stx-memory-overview-aside" aria-label="概览操作与能力状态">
         <section class="stx-memory-overview-aside-section"><h4>下一步操作</h4><p>尚未整理时先初始化；已有记忆时可直接浏览或检查召回。</p><div class="stx-memory-overview-actions"><button class="stx-memory-overview-action is-primary" ${uiControl('button', 'primary')} type="button" data-action="navigate" data-page="initialize"><ss-helper-icon name="wand-magic-sparkles" decorative></ss-helper-icon><span>初始化</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="view-library"><ss-helper-icon name="book-open" decorative></ss-helper-icon><span>查看记忆库</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="navigate" data-page="scenes"><ss-helper-icon name="timeline" decorative></ss-helper-icon><span>场景与事件</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="navigate" data-page="recall"><ss-helper-icon name="magnifying-glass-chart" decorative></ss-helper-icon><span>检查召回</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button></div></section>
         <section class="stx-memory-overview-aside-section"><h4>能力与资源状态</h4><p>当前能力可用性一览。</p><div class="stx-memory-overview-routes">${routeRow('大语言模型（LLM）', 'comments', overview.llmAvailable, overview.llmAvailable ? overview.llmModel ?? overview.llmResource ?? '服务已就绪' : 'LLM 服务暂不可用')}${routeRow('向量资源（嵌入）', 'circle-nodes', overview.embedding?.available, overview.embedding?.available ? overview.embedding.model ?? overview.embedding.resourceId ?? '已配置' : overview.embedding?.blockedReason ?? '未配置向量资源')}${routeRow('重排资源（Rerank）', 'arrow-down-wide-short', overview.rerank?.available, overview.rerank?.available ? overview.rerank.model ?? overview.rerank.resourceId ?? '已配置' : overview.rerank?.blockedReason ?? '未配置重排资源')}</div></section>
-        <section class="stx-memory-overview-aside-section"><h4>快速入口</h4><p>更多查看与管理选项。</p><div class="stx-memory-overview-quick-grid">${shortcut('actors', 'users', '查看人物与别名')}${shortcut('profiles', 'address-card', '画像与关系')}${shortcut('audit', 'list-check', '查看审计记录')}<button class="stx-memory-overview-shortcut" type="button" data-action="refresh-health"><ss-helper-icon name="rotate" decorative></ss-helper-icon><span>刷新运行状态</span></button></div></section>
+        <section class="stx-memory-overview-aside-section"><h4>快速入口</h4><p>更多查看与管理选项。</p><div class="stx-memory-overview-quick-grid">${shortcut('actors', 'users', '查看人物与别名')}${shortcut('profiles', 'address-card', '画像与关系')}${shortcut('audit', 'list-check', '查看审计记录')}</div></section>
       </aside>
     </section>`;
   };
@@ -1493,7 +1548,7 @@ export function renderMemoryWorkbench(
     </article>` : '<p class="stx-memory-muted">当前没有待确认人物。</p>';
     const actorAside = `<aside class="stx-memory-actor-aside" aria-label="待确认归属与最近人物操作"><section class="stx-memory-actor-aside-section"><div class="stx-memory-actor-side-head"><h4>待确认归属</h4><span>${state.pendingActors.length} 条</span></div>${candidateAside}${candidateQueue.length ? `<div class="stx-memory-actor-candidate-queue">${candidateQueue.map(candidate => `<button ${uiControl('button', 'neutral')} type="button" data-action="select-candidate-aside" data-candidate-id="${escapeHtml(candidate.localId)}"><span><strong>${escapeHtml(candidate.displayName)}</strong><small>${candidate.sourceRefs.length} 条证据 · ${Math.round(candidate.confidence * 100)}%</small></span>${renderStatusChip('待确认', 'warning')}</button>`).join('')}</div>` : ''}</section><section class="stx-memory-actor-aside-section"><div class="stx-memory-actor-side-head"><h4>最近人物操作</h4><span>可撤销</span></div>${renderReviews()}</section></aside>`;
     return `<div class="stx-memory-actor-shell">
-      <div class="stx-memory-actor-toolbar"><label class="stx-memory-search-wrap" for="stx-memory-actor-query"><span class="stx-memory-sr-only">搜索人物或别名</span><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><input id="stx-memory-actor-query" ${uiControl('input')} data-actor-input="query" value="${escapeHtml(state.actorQuery)}" placeholder="搜索人物名称或别名"></label><label class="stx-memory-control-wrap"><span class="stx-memory-sr-only">人物状态</span><select ${uiControl('select')} aria-label="人物状态" data-actor-select="status"><option value="" ${state.actorStatus === '' ? 'selected' : ''}>全部状态</option><option value="confirmed" ${state.actorStatus === 'confirmed' ? 'selected' : ''}>已确认</option><option value="pending" ${state.actorStatus === 'pending' ? 'selected' : ''}>待确认</option><option value="unknown" ${state.actorStatus === 'unknown' ? 'selected' : ''}>未识别</option></select></label><div class="stx-memory-actor-counts" aria-label="人物注册表统计"><span><strong>${people.length}</strong> 人物</span><span><strong>${aliasCount}</strong> 别名</span><button ${uiControl('button', state.pendingActors.length ? 'primary' : 'neutral')} type="button" data-action="actor-tab" data-view="pending"><strong>${state.pendingActors.length}</strong> 待确认</button></div><button ${uiControl('button', 'neutral')} type="button" data-action="refresh-actors" ${busy ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新</button></div>
+      <div class="stx-memory-actor-toolbar"><label class="stx-memory-search-wrap" for="stx-memory-actor-query"><span class="stx-memory-sr-only">搜索人物或别名</span><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><input id="stx-memory-actor-query" ${uiControl('input')} data-actor-input="query" value="${escapeHtml(state.actorQuery)}" placeholder="搜索人物名称或别名"></label><label class="stx-memory-control-wrap"><span class="stx-memory-sr-only">人物状态</span><select ${uiControl('select')} aria-label="人物状态" data-actor-select="status"><option value="" ${state.actorStatus === '' ? 'selected' : ''}>全部状态</option><option value="confirmed" ${state.actorStatus === 'confirmed' ? 'selected' : ''}>已确认</option><option value="pending" ${state.actorStatus === 'pending' ? 'selected' : ''}>待确认</option><option value="unknown" ${state.actorStatus === 'unknown' ? 'selected' : ''}>未识别</option></select></label><div class="stx-memory-actor-counts" aria-label="人物注册表统计"><span><strong>${people.length}</strong> 人物</span><span><strong>${aliasCount}</strong> 别名</span><button ${uiControl('button', state.pendingActors.length ? 'primary' : 'neutral')} type="button" data-action="actor-tab" data-view="pending"><strong>${state.pendingActors.length}</strong> 待确认</button></div></div>
       <div class="stx-memory-actor-grid"><section class="stx-memory-actor-list-panel" aria-label="人物与待确认列表"><div class="stx-memory-actor-tabs" role="tablist" aria-label="人物注册表视图"><button ${uiButton('neutral', 'sm')} type="button" role="tab" data-action="actor-tab" data-view="people" aria-selected="${state.actorView === 'people'}">人物 <span>${people.length + systemActors.length}</span></button><button ${uiButton('neutral', 'sm')} type="button" role="tab" data-action="actor-tab" data-view="pending" aria-selected="${state.actorView === 'pending'}">待确认 <span>${state.pendingActors.length}</span></button></div><div class="stx-memory-actor-list" role="tabpanel">${state.actorView === 'people' ? actorList : pendingList}</div></section><section class="stx-memory-actor-inspector" id="${state.actorView === 'people' ? 'stx-memory-actor-inspector' : 'stx-memory-actor-candidate-inspector'}" aria-label="${state.actorView === 'people' ? '人物详情' : '待确认人物详情'}" tabindex="-1">${state.actorView === 'people' ? actorDetail : candidateDetail}</section>${actorAside}</div>${drawer}
     </div>`;
   };
@@ -1517,11 +1572,11 @@ export function renderMemoryWorkbench(
 
   const renderProfiles = (): string => state.profiles.length === 0
     ? renderEmpty('暂无画像增量', '画像必须满足证据重复门槛或高情绪显著度，并且每条声明都引用 Trace。')
-    : `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">L0–L5</span><h3>画像与关系</h3></div><span>${formatNumber(state.profiles.length)} 条声明</span></div><div class="stx-memory-reference-list">${state.profiles.map(profile => `<article class="stx-memory-evidence"><strong>${escapeHtml(String(profile.ownerId ?? profile.fromOwnerId ?? '主体'))}</strong><p>${escapeHtml(String(profile.claim ?? ''))}</p><small>引用：${escapeHtml(Array.isArray(profile.supportingTraceIds) ? profile.supportingTraceIds.join('、') : '无')}</small></article>`).join('')}</div></section>`;
+    : `<section class="stx-memory-panel stx-memory-cold-page-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">L0–L5</span><h3>画像与关系</h3></div><span>${formatNumber(state.profiles.length)} 条声明</span></div><div class="stx-memory-reference-list" data-memory-page-list="profiles">${state.profiles.map(profile => `<article class="stx-memory-evidence"><strong>${escapeHtml(String(profile.ownerId ?? profile.fromOwnerId ?? '主体'))}</strong><p>${escapeHtml(String(profile.claim ?? ''))}</p><small>引用：${escapeHtml(Array.isArray(profile.supportingTraceIds) ? profile.supportingTraceIds.join('、') : '无')}</small></article>`).join('')}</div></section>`;
 
   const renderDreams = (): string => state.dreams.length === 0
     ? renderEmpty('暂无 Dream 任务', 'Dream 默认按主体自动排队；也可以从后续操作入口手动 dry-run。')
-    : `<section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Dream Audit</span><h3>巩固任务</h3></div><span>${formatNumber(state.dreams.length)} 个任务</span></div><div class="stx-memory-reference-list">${state.dreams.map(job => `<article class="stx-memory-evidence"><strong>${escapeHtml(String(job.ownerId ?? '主体'))}</strong>${renderStatusChip(String(job.status ?? 'queued'), job.status === 'applied' ? 'success' : job.status === 'failed' ? 'error' : 'neutral')}<p>阶段：${escapeHtml(String(job.phase ?? 'gather'))}</p><small>任务：${escapeHtml(String(job.id ?? ''))}</small>${controller.runActorDream && job.id ? `<button ${uiControl('button', 'neutral')} type="button" data-action="dream-dry-run" data-job-id="${escapeHtml(String(job.id))}">dry-run 预览</button>` : ''}</article>`).join('')}</div></section>`;
+    : `<section class="stx-memory-panel stx-memory-cold-page-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Dream Audit</span><h3>巩固任务</h3></div><span>${formatNumber(state.dreams.length)} 个任务</span></div><div class="stx-memory-reference-list" data-memory-page-list="dreams">${state.dreams.map(job => `<article class="stx-memory-evidence"><strong>${escapeHtml(String(job.ownerId ?? '主体'))}</strong>${renderStatusChip(String(job.status ?? 'queued'), job.status === 'applied' ? 'success' : job.status === 'failed' ? 'error' : 'neutral')}<p>阶段：${escapeHtml(String(job.phase ?? 'gather'))}</p><small>任务：${escapeHtml(String(job.id ?? ''))}</small>${controller.runActorDream && job.id ? `<button ${uiControl('button', 'neutral')} type="button" data-action="dream-dry-run" data-job-id="${escapeHtml(String(job.id))}">dry-run 预览</button>` : ''}</article>`).join('')}</div></section>`;
 
   const renderLibrary = (): string => renderMemoryLibraryView({
     allFacts: state.facts,
@@ -1536,6 +1591,9 @@ export function renderMemoryWorkbench(
     confirmFactId: state.confirmFactId,
     busyAction: state.busyAction,
     chatLabel: formatChatIdentity(state.overview).label,
+    virtualized: Boolean(popupUi && controller.listFactsPage),
+    totalCount: state.overview?.factCount ?? state.facts.length,
+    ...(state.libraryStats ? { statistics: state.libraryStats } : {}),
   }, {
     kindLabels: FACT_KIND_LABELS,
     statusLabels: FACT_STATUS_LABELS,
@@ -1549,24 +1607,31 @@ export function renderMemoryWorkbench(
     const progress = state.progress;
     const storageUnavailable = state.sqlite?.connected === false
       || state.overview?.status === 'error'
-      || state.overview?.errorCode === 'SQLITE_SERVICE_UNAVAILABLE';
+      || state.overview?.failure?.reasonCode === 'WORKSPACE_DATABASE_UNAVAILABLE';
+    const visibilityNote = state.includeHiddenMessageFloors ? '包含隐藏楼层' : '仅处理可见楼层';
     const summaryNote = settings.summaryBatchMode === 'chars'
       ? `按每批最多 ${formatNumber(settings.summaryBatchChars)} 字符拆分，批次间保留 ${formatNumber(settings.summaryOverlapFloors)} 层前置上下文；自动触发仍按 ${formatNumber(settings.summaryIntervalFloors)} 层间隔判断。`
-      : `按每批 ${formatNumber(settings.summaryBatchFloors)} 层可见用户/助手消息拆分，批次间保留 ${formatNumber(settings.summaryOverlapFloors)} 层前置上下文；自动触发间隔为 ${formatNumber(settings.summaryIntervalFloors)} 层。`;
+      : `按每批 ${formatNumber(settings.summaryBatchFloors)} 层用户/助手正文拆分（${visibilityNote}），批次间保留 ${formatNumber(settings.summaryOverlapFloors)} 层前置上下文；自动触发间隔为 ${formatNumber(settings.summaryIntervalFloors)} 层。`;
     const llmDetails = state.overview && !state.overview.llmAvailable ? readSafeLlmErrorDetails(state.overview) : undefined;
     const chatIdentity = formatChatIdentity(state.overview);
     return renderInitializationView({
       chatLabel: chatIdentity.label,
       chatBound: state.overview?.bound === true,
       workspaceAvailable: !storageUnavailable,
-      workspaceReason: state.sqlite?.lastError
-        ? safeInlineError(state.sqlite.lastError, 'SQLITE_SERVICE_UNAVAILABLE')
-        : state.overview?.errorCode ? safeInlineError(state.overview.errorCode, 'SQLITE_SERVICE_UNAVAILABLE') : undefined,
+      workspaceReason: state.sqlite?.failure
+        ? (() => {
+          const diagnostic = describeSSHelperFailure(state.sqlite.failure);
+          return `${diagnostic.reasonCode} · ${diagnostic.title}：${diagnostic.reason} ${diagnostic.action}`;
+        })()
+        : state.overview?.failure ? (() => {
+          const diagnostic = describeSSHelperFailure(state.overview.failure);
+          return `${diagnostic.reasonCode} · ${diagnostic.title}：${diagnostic.reason} ${diagnostic.action}`;
+        })() : undefined,
       llmAvailable: state.overview?.llmAvailable === true,
       llmReason: llmDetails ? `${llmDetails.code} · ${llmDetails.resource} · ${llmDetails.model}` : undefined,
       sources: state.sources,
       selectedSourceKinds: state.selectedSourceKinds,
-      includeInvisibleHistory: state.includeInvisibleHistory,
+      includeHiddenMessageFloors: state.includeHiddenMessageFloors,
       estimate: state.estimate,
       progress,
       initialized: initialization?.initialized === true,
@@ -1624,7 +1689,7 @@ export function renderMemoryWorkbench(
     return `<div class="stx-memory-card-grid"><section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">当前策略</span><h3>${escapeHtml(translateRecallMode(recall.resolvedMode))}</h3></div>${renderStatusChip(recall.rebuilding ? '重建中' : '运行正常', recall.rebuilding ? 'warning' : 'success')}</div><div class="stx-memory-route-grid">${renderRoute('向量模型', recall.embedding)}${renderRoute('重排序模型', recall.rerank)}</div><div class="stx-memory-metric-grid"><div><span>已建立索引</span><strong>${formatNumber(recall.indexedFacts)}</strong></div><div><span>可索引事实</span><strong>${formatNumber(recall.eligibleFacts)}</strong></div><div><span>待处理</span><strong>${formatNumber(recall.pendingFacts)}</strong></div></div><div class="stx-memory-progress-copy"><span>向量覆盖率</span><strong>${coverage}%</strong></div><progress ${uiControl('progress')} max="100" value="${coverage}">${coverage}%</progress>${recallError ? `<p class="stx-memory-inline-alert" role="alert">错误码：${escapeHtml(safeInlineError(recallError, 'MEMORY_RECALL_DEGRADED'))}</p>` : ''}<div class="stx-memory-actions"><button ${uiControl('button', 'primary')} type="button" data-action="rebuild-index" ${rebuildDisabled ? 'disabled' : ''}><ss-helper-icon name="arrows-rotate" decorative></ss-helper-icon>重建向量索引</button></div>${recall.embedding.available ? '' : '<p class="stx-memory-muted">请先在 LLM 中配置可用的向量模型，再重建索引。</p>'}</section><section class="stx-memory-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">最近召回</span><h3>客观检索诊断</h3></div></div><details><summary>查看原始召回日志</summary>${diagnostic}</details>${recall.batches.length ? `<div class="stx-memory-batch-table"><div class="stx-memory-table-row stx-memory-table-head"><span>批次</span><span>输入</span><span>延迟</span><span>接受</span></div>${recall.batches.map((batch) => `<div class="stx-memory-table-row"><span>#${batch.batchIndex + 1}</span><span>${formatNumber(batch.inputCount)}</span><span>${formatNumber(batch.latencyMs)} 毫秒</span><span>${formatNumber(batch.accepted)} / ${formatNumber(batch.rejected)}</span></div>`).join('')}</div>` : '<p class="stx-memory-muted">暂无向量批次记录。</p>'}</section>${renderGenerationRecallDiagnostics()}</div>`;
   };
   const graphView = (): ReturnType<typeof selectGraphView> => {
-    const graph = localizeLegacyGraphPreview(state.graph ?? { nodes: [], edges: [] });
+    const graph = localizeGraphPreview(state.graph ?? { nodes: [], edges: [] });
     return selectGraphView(graph, state.graphQuery, state.graphKind, state.graphStatusFilter, state.selectedGraphNodeId, state.graphNeighborFocus, state.selectedGraphEdgeId || state.selectedGraphEventId);
   };
   const graphRelationLabel = (edge: MemoryGraphPreview['edges'][number], nodes: ReadonlyMap<string, MemoryGraphPreview['nodes'][number]>): string => {
@@ -1640,7 +1705,7 @@ export function renderMemoryWorkbench(
   };
   const resolveGraphInspectorSelection = () => {
     if (!state.graph) return undefined;
-    const graph = localizeLegacyGraphPreview(state.graph);
+    const graph = localizeGraphPreview(state.graph);
     const view = graphView();
     const nodes = new Map(graph.nodes.map((node) => [node.id, node] as const));
     const selectedNode = state.selectedGraphNodeId ? nodes.get(state.selectedGraphNodeId) : undefined;
@@ -1658,7 +1723,7 @@ export function renderMemoryWorkbench(
     return `<div class="stx-memory-detail-head"><div><span class="stx-memory-kicker">${selectedEvent ? '事件事实' : '事实'}</span><h3 class="stx-memory-graph-marquee" data-graph-marquee title="${escapeHtml(graphRelationLabel(selected, nodes))}"><span>${escapeHtml(graphRelationLabel(selected, nodes))}</span></h3></div>${renderStatusChip(translateFactKind(selected.kind), 'neutral')}</div><div class="stx-memory-detail-summary">${renderStatusChip(translateFactStatus(selected.status), selected.status === 'active' ? 'success' : 'neutral')}<div><span>置信度</span><strong>${Math.round(selected.confidence * 100)}%</strong></div><div><span>${selectedEvent ? '关联高亮' : '相邻关系'}</span><strong>${formatNumber(relationNeighbors.length)}</strong></div></div><section class="stx-memory-detail-section"><div class="stx-memory-section-heading"><div><h4>关联事实</h4><p>${selectedEvent ? '事件两端的全部直接关系会在画布中同步高亮' : '图边不能脱离这条已验证事实独立存在'}</p></div></div>${fact ? `<p class="stx-memory-fact-content">${escapeHtml(fact.content)}</p><div class="stx-memory-evidence-list">${fact.evidence.length ? fact.evidence.map((evidence) => `<article class="stx-memory-evidence"><strong>${renderSourceReference(evidence.sourceRef)}</strong><blockquote>${escapeHtml(evidence.excerpt)}</blockquote></article>`).join('') : '<p class="stx-memory-muted">该事实没有可展示的证据。</p>'}</div>` : '<p class="stx-memory-inline-alert" role="alert">关联事实已变更或正在等待图谱协调；本页不会据此创建替代关系。</p>'}</section><section class="stx-memory-detail-section"><div class="stx-memory-section-heading"><div><h4>节点邻接</h4><p>仅展示同一聊天中由事实背书的相邻边</p></div><span>${formatNumber(relationNeighbors.length)} 条</span></div><div class="stx-memory-reference-list">${relationNeighbors.length ? relationNeighbors.map((edge) => `<button ${uiControl('button', 'neutral')} type="button" data-action="select-graph-edge" data-edge-id="${escapeHtml(edge.id)}">${escapeHtml(graphRelationLabel(edge, nodes))}</button>`).join('') : '<span>暂无其他相邻关系</span>'}</div></section>`;
   };
   const renderGraphInspector = (): string => {
-    const graph = state.graph ? localizeLegacyGraphPreview(state.graph) : undefined;
+    const graph = state.graph ? localizeGraphPreview(state.graph) : undefined;
     const status = state.graphStatus;
     if (!graph || !status) return renderEmpty('正在读取关系图谱', '图谱只会展示当前聊天中由已验证事实派生的关系。');
     const selection = resolveGraphInspectorSelection();
@@ -1686,7 +1751,7 @@ export function renderMemoryWorkbench(
     return `<section class="stx-memory-panel stx-memory-graph-status-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">图谱状态</span><h3>当前聊天</h3></div><div class="stx-memory-graph-status-actions">${renderStatusChip(phaseLabel, phaseTone)}<button class="stx-memory-graph-icon-button" ${uiButton('neutral', 'sm', true)} type="button" data-action="rebuild-graph" aria-label="重建关系图谱" title="重建关系图谱" ${state.busyAction || status.phase === 'rebuilding' ? 'disabled' : ''}><ss-helper-icon name="arrows-rotate" decorative></ss-helper-icon></button></div></div><p class="stx-memory-muted">仅以当前聊天中已验证事实为准；视觉聚类只用于浏览，不会写入记忆。</p><dl class="stx-memory-graph-metric-grid"><div><dt>节点</dt><dd>${formatNumber(graph.nodes.length)}</dd></div><div><dt>已载入关系</dt><dd>${formatNumber(graph.edges.length)} / ${formatNumber(status.edgeCount)}</dd></div><div><dt>最后协调</dt><dd>${escapeHtml(status.lastRebuiltAt ? formatTime(status.lastRebuiltAt) : '尚未完成')}</dd></div></dl>${status.lastError ? '<p class="stx-memory-inline-alert" role="alert">图谱暂时降级，普通整理和召回不受影响。</p>' : ''}<div class="stx-memory-graph-filter-row"><label>类型<select ${uiControl('select')} data-graph-filter="kind"><option value="">全部</option>${kinds.map((kind) => `<option value="${escapeHtml(kind)}" ${state.graphKind === kind ? 'selected' : ''}>${escapeHtml(translateFactKind(kind))}</option>`).join('')}</select></label><label>状态<select ${uiControl('select')} data-graph-filter="status"><option value="">全部</option>${statuses.map((value) => `<option value="${escapeHtml(value)}" ${state.graphStatusFilter === value ? 'selected' : ''}>${escapeHtml(translateFactStatus(value))}</option>`).join('')}</select></label></div></section><section class="stx-memory-panel stx-memory-graph-relations-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">已验证关系</span><h3 data-graph-list-heading>${listLabel}</h3></div><span data-graph-list-count>${formatNumber(listCount)} 条</span></div><div class="stx-memory-graph-list-switch" role="tablist" aria-label="已验证关系显示模式"><button ${uiButton('neutral', 'sm')} type="button" role="tab" data-action="set-graph-list-mode" data-graph-list-mode="edges" aria-selected="${state.graphListMode === 'edges'}"><ss-helper-icon name="link" decorative></ss-helper-icon>边列表</button><button ${uiButton('neutral', 'sm')} type="button" role="tab" data-action="set-graph-list-mode" data-graph-list-mode="events" aria-selected="${state.graphListMode === 'events'}"><ss-helper-icon name="bolt" decorative></ss-helper-icon>事件列表</button></div><div class="stx-memory-graph-list-stack"><div class="stx-memory-graph-edge-list" data-graph-edge-list data-graph-list-mode="edges" data-graph-list-count="${view.edges.length}" ${state.graphListMode === 'edges' ? '' : 'hidden'}>${relationRows}</div><div class="stx-memory-graph-edge-list" data-graph-edge-list data-graph-list-mode="events" data-graph-list-count="${eventEdges.length}" ${state.graphListMode === 'events' ? '' : 'hidden'}>${eventRows}</div></div></section><section class="stx-memory-panel stx-memory-graph-detail-panel" data-graph-inspector-detail>${detail}</section>`;
   };
   const renderGraph = (): string => {
-    const graph = state.graph ? localizeLegacyGraphPreview(state.graph) : undefined;
+    const graph = state.graph ? localizeGraphPreview(state.graph) : undefined;
     const status = state.graphStatus;
     if (!graph || !status) return renderEmpty('正在读取关系图谱', '图谱只会展示当前聊天中由已验证事实派生的关系。');
     if (!status.enabled) return `<section class="stx-memory-panel">${renderEmpty('关系图谱已关闭', '可在“高级 → 关系图谱”中开启；关闭时不会影响普通整理或召回。')}</section>`;
@@ -1803,8 +1868,7 @@ export function renderMemoryWorkbench(
       });
     });
   };
-  const renderAudit = (): string => {
-    const records = state.audits.length ? state.audits.map((record, index) => {
+  const renderAuditRecord = (record: MemoryAuditRecord, index: number): string => {
       const key = `${record.jobId ?? record.id ?? index}:${Number(record.batchIndex ?? index)}`;
       const isActorCapture = record.kind === 'capture-change-set-v0';
       const canRollback = isActorCapture
@@ -1834,17 +1898,39 @@ export function renderMemoryWorkbench(
       const unresolved = rejections.filter(item => (item.status ?? 'unresolved') === 'unresolved' && Boolean(item.id));
       const unresolvedIds = new Set(unresolved.map(item => item.id!));
       const selectedIds = state.selectedRejectionIds.filter(id => unresolvedIds.has(id));
-      const selectedTypes = new Set(unresolved.filter(item => item.id && selectedIds.includes(item.id)).map(item => item.recordType).filter(Boolean));
       const rejectionDetails = rejections.length === 0 ? '' : `<details class="stx-memory-capture-rejections" ${unresolved.length ? 'open' : ''}><summary>失败项 ${unresolved.length} 条待处理 / ${rejections.length} 条总计</summary><div class="stx-memory-rejection-list">${rejections.map((rejection) => {
         const rejectionId = rejection.id ?? '';
         const pending = (rejection.status ?? 'unresolved') === 'unresolved';
         const sourceRefs = rejection.sourceRefs ?? [];
         const statusLabel = pending ? '待处理' : rejection.status === 'repaired' ? '已修复' : rejection.status === 'ignored' ? '已忽略' : '处理中';
-        return `<article class="stx-memory-rejection-item" data-rejection-status="${escapeHtml(rejection.status ?? 'unresolved')}"><label><input ${uiControl('checkbox')} type="checkbox" data-capture-rejection-id="${escapeHtml(rejectionId)}" ${selectedIds.includes(rejectionId) ? 'checked' : ''} ${!pending || !rejectionId || state.busyAction ? 'disabled' : ''}><span><strong>${escapeHtml(String(rejection.recordType ?? '记录'))} · ${escapeHtml(rejection.fieldPath ?? '结构')}</strong><small>${escapeHtml(rejection.message)}</small></span>${renderStatusChip(statusLabel, pending ? 'warning' : rejection.status === 'repaired' ? 'success' : 'neutral')}</label>${sourceRefs.length ? `<div class="stx-memory-rejection-sources">${sourceRefs.map(ref => renderSourceReference(ref)).join('')}</div>` : ''}<details><summary>查看候选快照</summary><pre class="stx-memory-code">${escapeHtml(formatJson(rejection.candidateSnapshot ?? {}))}</pre></details></article>`;
-      }).join('')}</div>${unresolved.length ? `<div class="stx-memory-rejection-actions"><span>已选 ${selectedIds.length} 项 · 预计 ${selectedTypes.size} 次请求</span><button ${uiControl('button', 'primary')} type="button" data-action="repair-capture-rejections" data-audit-id="${escapeHtml(record.id ?? '')}" ${!selectedIds.length || !controller.repairCaptureRejections || state.busyAction ? 'disabled' : ''}>定向修复</button><button ${uiControl('button', 'neutral')} type="button" data-action="ignore-capture-rejections" data-audit-id="${escapeHtml(record.id ?? '')}" ${!selectedIds.length || !controller.ignoreCaptureRejections || state.busyAction ? 'disabled' : ''}>忽略所选</button></div>` : ''}</details>`;
-      return `<article class="stx-memory-audit-item"><div class="stx-memory-audit-heading"><div><span class="stx-memory-kicker">${kicker}</span><h3>${escapeHtml(heading)}</h3></div>${renderStatusChip(`${formatNumber(acceptedCount)} 条事实 · 已接受`, record.outcome === 'partial' ? 'warning' : 'neutral')}</div><dl class="stx-memory-audit-metrics">${metrics.map(([label, value]) => `<div title="${escapeHtml(value)}"><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>${rejectionDetails}<details class="stx-memory-audit-details"><summary>查看技术明细</summary><pre class="stx-memory-code">${escapeHtml(formatJson(record))}</pre></details>${rollback ? `<div class="stx-memory-audit-actions">${rollback}</div>` : ''}</article>`;
-    }).join('') : renderEmpty('暂无捕获审计', '新 Capture 完成后会在这里出现。');
-    return `<div class="stx-memory-page-actions"><p class="stx-memory-muted">合法项已经提交；失败项可在对应 Capture 中选择修复或忽略。</p><button ${uiControl('button', 'neutral')} type="button" data-action="refresh-audit" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新审计</button></div><div class="stx-memory-audit-list">${records}</div><details class="stx-memory-panel stx-memory-usage"><summary>主聊天 Token / usage（${state.usages.length} 条）</summary><pre class="stx-memory-code">${escapeHtml(formatJson(state.usages))}</pre></details>`;
+        const diagnostics = [
+          `reasonCode=${String(rejection.code ?? 'MEMORY_CAPTURE_REJECTED')}`,
+          rejection.requestId ? `requestId=${rejection.requestId}` : '',
+          Number.isInteger(rejection.batchIndex) ? `batchIndex=${rejection.batchIndex}` : '',
+          rejection.recordType ? `collection=${rejection.recordType}` : '',
+          rejection.fieldPath ? `path=${rejection.fieldPath}` : '',
+        ].filter(Boolean).join(' · ');
+        return `<article class="stx-memory-rejection-item" data-rejection-status="${escapeHtml(rejection.status ?? 'unresolved')}"><label><input ${uiControl('checkbox')} type="checkbox" data-capture-rejection-id="${escapeHtml(rejectionId)}" ${selectedIds.includes(rejectionId) ? 'checked' : ''} ${!pending || !rejectionId || state.busyAction ? 'disabled' : ''}><span><strong>${escapeHtml(String(rejection.recordType ?? '记录'))} · ${escapeHtml(rejection.fieldPath ?? '结构')}</strong><small>${escapeHtml(rejection.message)}</small><code>${escapeHtml(diagnostics)}</code></span>${renderStatusChip(statusLabel, pending ? 'warning' : rejection.status === 'repaired' ? 'success' : 'neutral')}</label>${sourceRefs.length ? `<div class="stx-memory-rejection-sources">${sourceRefs.map(ref => renderSourceReference(ref)).join('')}</div>` : ''}</article>`;
+      }).join('')}</div>${unresolved.length ? `<div class="stx-memory-rejection-actions"><span>已选 ${selectedIds.length} 项</span><button ${uiControl('button', 'neutral')} type="button" data-action="ignore-capture-rejections" data-audit-id="${escapeHtml(record.id ?? '')}" ${!selectedIds.length || !controller.ignoreCaptureRejections || state.busyAction ? 'disabled' : ''}>忽略所选</button></div>` : ''}</details>`;
+      const safeTechnicalDetails = {
+        id: record.id,
+        jobId: record.jobId,
+        batchIndex: record.batchIndex,
+        requestId: record.requestId,
+        status: record.status,
+        outcome: record.outcome,
+        acceptedCount,
+        rejectedCount,
+        sourceCount,
+        resource,
+        model,
+      };
+      return `<article class="stx-memory-audit-item"><div class="stx-memory-audit-heading"><div><span class="stx-memory-kicker">${kicker}</span><h3>${escapeHtml(heading)}</h3></div>${renderStatusChip(`${formatNumber(acceptedCount)} 条事实 · 已接受`, record.outcome === 'partial' ? 'warning' : 'neutral')}</div><dl class="stx-memory-audit-metrics">${metrics.map(([label, value]) => `<div title="${escapeHtml(value)}"><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>${rejectionDetails}<details class="stx-memory-audit-details"><summary>查看技术明细</summary><pre class="stx-memory-code">${escapeHtml(formatJson(safeTechnicalDetails))}</pre></details>${rollback ? `<div class="stx-memory-audit-actions">${rollback}</div>` : ''}</article>`;
+  };
+  const renderAudit = (): string => {
+    const records = state.audits.length ? state.audits.map(renderAuditRecord).join('') : renderEmpty('暂无捕获审计', '新 Capture 完成后会在这里出现。');
+    const cold = Boolean(popupUi && controller.loadMemoryPage);
+    return `<div class="stx-memory-page-actions"><p class="stx-memory-muted">合法项已经提交；失败项可在对应 Capture 中选择修复或忽略。</p></div><div class="stx-memory-audit-list" data-memory-page-list="audit">${cold ? '' : records}</div><details class="stx-memory-panel stx-memory-usage"><summary>主聊天 Token / usage（${state.usages.length} 条）</summary>${cold ? '<div class="stx-memory-usage-list" data-memory-page-list="usage"></div>' : `<pre class="stx-memory-code">${escapeHtml(formatJson(state.usages))}</pre>`}</details>`;
   };
   const renderData = (): string => {
     const sqlite = state.sqlite;
@@ -1853,7 +1939,7 @@ export function renderMemoryWorkbench(
     const tableEntries = Object.entries(sqlite.tableCounts).sort(([left], [right]) => left.localeCompare(right));
     const chatUsageRatio = Math.max(0, Math.min(1, sqlite.currentChatUsageRatio));
     const databaseSize = sqlite.databaseSizeBytes > 0 ? formatBytes(sqlite.databaseSizeBytes) : '暂不可用';
-    return `<section class="stx-memory-panel stx-memory-storage-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">SQLite 唯一存储</span><h3>${sqlite.connected ? '已连接' : '不可用'}</h3></div>${renderStatusChip(sqlite.connected ? '服务正常' : '不可用', sqlite.connected ? 'success' : 'error')}</div><dl class="stx-memory-maintenance-grid"><div><dt>SDK / 协议 / Schema</dt><dd>${escapeHtml(sqlite.serverVersion)} / v${sqlite.protocolVersion} / v${sqlite.schemaVersion}</dd></div><div><dt>SQLite / WAL</dt><dd>${escapeHtml(sqlite.sqliteVersion)} / ${escapeHtml(sqlite.walMode)}</dd></div><div><dt>Node.js</dt><dd>${escapeHtml(sqlite.nodeVersion)}</dd></div><div><dt>数据库 / WAL 占用</dt><dd>${escapeHtml(databaseSize)}</dd></div></dl><div class="stx-memory-chat-storage"><div class="stx-memory-chat-storage-head"><span><span class="stx-memory-storage-icon" aria-hidden="true"><ss-helper-icon name="hard-drive" decorative></ss-helper-icon></span><span><small>本聊天记忆占用</small><strong>${escapeHtml(formatBytes(sqlite.currentChatSizeBytes))}</strong></span></span><strong>${escapeHtml(formatPercent(chatUsageRatio))}</strong></div><progress ${uiControl('progress')} max="1" value="${chatUsageRatio}">${escapeHtml(formatPercent(chatUsageRatio))}</progress><p>占当前角色全部 Memory 数据；统计包含事实、证据、批次、Usage、召回日志和向量。</p></div><p class="stx-memory-muted stx-memory-path">相对路径：${escapeHtml(sqlite.databasePath)}</p><div class="stx-memory-progress-copy"><span>向量覆盖率</span><strong>${formatPercent(sqlite.vectorCoverage.ratio)}</strong></div><progress ${uiControl('progress')} max="1" value="${Math.max(0, Math.min(1, sqlite.vectorCoverage.ratio))}">${formatPercent(sqlite.vectorCoverage.ratio)}</progress>${schemaMatches ? '' : '<p class="stx-memory-inline-alert" role="alert">Schema 版本不匹配，请重启酒馆并确认服务端插件已更新。</p>'}${sqlite.lastError ? `<p class="stx-memory-inline-alert" role="alert">最近事务错误：${escapeHtml(safeInlineError(sqlite.lastError, 'MEMORY_SQLITE_TRANSACTION_FAILED'))}</p>` : ''}<details class="stx-memory-table-details"><summary>各表记录数与估算占用</summary><div class="stx-memory-table-list">${tableEntries.length ? tableEntries.map(([name, count]) => `<div><span>${escapeHtml(name)}</span><strong>${formatNumber(count)}</strong><small>${sqlite.tableBytes[name] == null ? 'N/A' : escapeHtml(formatBytes(sqlite.tableBytes[name]!))}</small></div>`).join('') : '<p class="stx-memory-muted">暂无表统计。</p>'}</div></details></section><section class="stx-memory-panel stx-memory-maintenance-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">备份与恢复</span><h3>维护工具</h3></div></div><div class="stx-memory-maintenance-actions"><button class="stx-memory-maintenance-action" ${uiControl('button', 'neutral')} type="button" data-action="export"><span class="stx-memory-maintenance-icon" aria-hidden="true"><ss-helper-icon name="file-export" decorative></ss-helper-icon></span><span><strong>导出 Memory 归档</strong><small>下载完整数据快照</small></span><span class="stx-memory-maintenance-chevron" aria-hidden="true"><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></span></button><button class="stx-memory-maintenance-action" ${uiControl('button', 'neutral')} type="button" data-action="integrity" ${state.busyAction ? 'disabled' : ''}><span class="stx-memory-maintenance-icon" aria-hidden="true"><ss-helper-icon name="shield-halved" decorative></ss-helper-icon></span><span><strong>完整性检查</strong><small>检查 SQLite 数据结构</small></span><span class="stx-memory-maintenance-chevron" aria-hidden="true"><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></span></button></div><div class="stx-memory-integrity-result" aria-live="polite"><span class="stx-memory-state-icon" aria-hidden="true"><ss-helper-icon name="circle-info" decorative></ss-helper-icon></span><span><strong>检查状态</strong><small>${escapeHtml(state.integrityText)}</small></span></div><section class="stx-memory-danger-zone"><div class="stx-memory-danger-heading"><span class="stx-memory-danger-icon" aria-hidden="true"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><span><strong>危险操作</strong><small>执行前需要再次确认，聊天原文不会被删除。</small></span></div><div class="stx-memory-danger-actions">${state.dangerConfirm === 'current' ? `<div class="stx-memory-confirm-panel"><p>确认清空当前聊天来源？其他聊天仍有证据支持的事实会保留。</p><button ${uiControl('button', 'danger')} type="button" data-action="confirm-clear-current">确认清空</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-danger">取消</button></div>` : `<button class="stx-memory-danger-action" ${uiControl('button', 'danger')} type="button" data-action="clear-current"><span class="stx-memory-danger-action-icon" aria-hidden="true"><ss-helper-icon name="eraser" decorative></ss-helper-icon></span><span class="stx-memory-danger-action-label">清空当前聊天来源</span></button>`}${state.dangerConfirm === 'all' ? `<div class="stx-memory-confirm-panel"><p>输入“清空全部记忆”后确认，此操作无法撤销。</p><input ${uiControl('input')} data-clear-all-text placeholder="清空全部记忆"><button ${uiControl('button', 'danger')} type="button" data-action="confirm-clear-all">确认清空全部</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-danger">取消</button></div>` : `<button class="stx-memory-danger-action" ${uiControl('button', 'danger')} type="button" data-action="clear-all"><span class="stx-memory-danger-action-icon" aria-hidden="true"><ss-helper-icon name="trash-can" decorative></ss-helper-icon></span><span class="stx-memory-danger-action-label">清空全部角色记忆</span></button>`}</div></section></section>`;
+    return `<section class="stx-memory-panel stx-memory-storage-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">SQLite 唯一存储</span><h3>${sqlite.connected ? '已连接' : '不可用'}</h3></div>${renderStatusChip(sqlite.connected ? '服务正常' : '不可用', sqlite.connected ? 'success' : 'error')}</div><dl class="stx-memory-maintenance-grid"><div><dt>SDK / 协议 / Schema</dt><dd>${escapeHtml(sqlite.serverVersion)} / v${sqlite.protocolVersion} / v${sqlite.schemaVersion}</dd></div><div><dt>SQLite / WAL</dt><dd>${escapeHtml(sqlite.sqliteVersion)} / ${escapeHtml(sqlite.walMode)}</dd></div><div><dt>Node.js</dt><dd>${escapeHtml(sqlite.nodeVersion)}</dd></div><div><dt>数据库 / WAL 占用</dt><dd>${escapeHtml(databaseSize)}</dd></div></dl><div class="stx-memory-chat-storage"><div class="stx-memory-chat-storage-head"><span><span class="stx-memory-storage-icon" aria-hidden="true"><ss-helper-icon name="hard-drive" decorative></ss-helper-icon></span><span><small>本聊天记忆占用</small><strong>${escapeHtml(formatBytes(sqlite.currentChatSizeBytes))}</strong></span></span><strong>${escapeHtml(formatPercent(chatUsageRatio))}</strong></div><progress ${uiControl('progress')} max="1" value="${chatUsageRatio}">${escapeHtml(formatPercent(chatUsageRatio))}</progress><p>占当前角色全部 Memory 数据；统计包含事实、证据、批次、Usage、召回日志和向量。</p></div><p class="stx-memory-muted stx-memory-path">相对路径：${escapeHtml(sqlite.databasePath)}</p><div class="stx-memory-progress-copy"><span>向量覆盖率</span><strong>${formatPercent(sqlite.vectorCoverage.ratio)}</strong></div><progress ${uiControl('progress')} max="1" value="${Math.max(0, Math.min(1, sqlite.vectorCoverage.ratio))}">${formatPercent(sqlite.vectorCoverage.ratio)}</progress>${schemaMatches ? '' : '<p class="stx-memory-inline-alert" role="alert">Schema 版本不匹配，请重启酒馆并确认服务端插件已更新。</p>'}${sqlite.failure ? (() => { const diagnostic = describeSSHelperFailure(sqlite.failure); return `<p class="stx-memory-inline-alert" role="alert">${escapeHtml(diagnostic.reasonCode)} · ${escapeHtml(diagnostic.title)}：${escapeHtml(diagnostic.reason)} ${escapeHtml(diagnostic.action)}${diagnostic.requestId ? ` · 请求 ID：${escapeHtml(diagnostic.requestId)}` : ''}</p>`; })() : ''}<details class="stx-memory-table-details"><summary>各表记录数与估算占用</summary><div class="stx-memory-table-list">${tableEntries.length ? tableEntries.map(([name, count]) => `<div><span>${escapeHtml(name)}</span><strong>${formatNumber(count)}</strong><small>${sqlite.tableBytes[name] == null ? 'N/A' : escapeHtml(formatBytes(sqlite.tableBytes[name]!))}</small></div>`).join('') : '<p class="stx-memory-muted">暂无表统计。</p>'}</div></details></section><section class="stx-memory-panel stx-memory-maintenance-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">备份与恢复</span><h3>维护工具</h3></div></div><div class="stx-memory-maintenance-actions"><button class="stx-memory-maintenance-action" ${uiControl('button', 'neutral')} type="button" data-action="export"><span class="stx-memory-maintenance-icon" aria-hidden="true"><ss-helper-icon name="file-export" decorative></ss-helper-icon></span><span><strong>导出 Memory 归档</strong><small>下载完整数据快照</small></span><span class="stx-memory-maintenance-chevron" aria-hidden="true"><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></span></button><button class="stx-memory-maintenance-action" ${uiControl('button', 'neutral')} type="button" data-action="integrity" ${state.busyAction ? 'disabled' : ''}><span class="stx-memory-maintenance-icon" aria-hidden="true"><ss-helper-icon name="shield-halved" decorative></ss-helper-icon></span><span><strong>完整性检查</strong><small>检查 SQLite 数据结构</small></span><span class="stx-memory-maintenance-chevron" aria-hidden="true"><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></span></button></div><div class="stx-memory-integrity-result" aria-live="polite"><span class="stx-memory-state-icon" aria-hidden="true"><ss-helper-icon name="circle-info" decorative></ss-helper-icon></span><span><strong>检查状态</strong><small>${escapeHtml(state.integrityText)}</small></span></div><section class="stx-memory-danger-zone"><div class="stx-memory-danger-heading"><span class="stx-memory-danger-icon" aria-hidden="true"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><span><strong>危险操作</strong><small>执行前需要再次确认，聊天原文不会被删除。</small></span></div><div class="stx-memory-danger-actions">${state.dangerConfirm === 'current' ? `<div class="stx-memory-confirm-panel"><p>确认清空当前聊天来源？其他聊天仍有证据支持的事实会保留。</p><button ${uiControl('button', 'danger')} type="button" data-action="confirm-clear-current">确认清空</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-danger">取消</button></div>` : `<button class="stx-memory-danger-action" ${uiControl('button', 'danger')} type="button" data-action="clear-current"><span class="stx-memory-danger-action-icon" aria-hidden="true"><ss-helper-icon name="eraser" decorative></ss-helper-icon></span><span class="stx-memory-danger-action-label">清空当前聊天来源</span></button>`}${state.dangerConfirm === 'all' ? `<div class="stx-memory-confirm-panel"><p>输入“清空全部记忆”后确认，此操作无法撤销。</p><input ${uiControl('input')} data-clear-all-text placeholder="清空全部记忆"><button ${uiControl('button', 'danger')} type="button" data-action="confirm-clear-all">确认清空全部</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-danger">取消</button></div>` : `<button class="stx-memory-danger-action" ${uiControl('button', 'danger')} type="button" data-action="clear-all"><span class="stx-memory-danger-action-icon" aria-hidden="true"><ss-helper-icon name="trash-can" decorative></ss-helper-icon></span><span class="stx-memory-danger-action-label">清空全部角色记忆</span></button>`}</div></section></section>`;
   };
   const renderPage = (): string => {
     if (state.loading) return renderLoading('正在读取记忆工作台…');
@@ -1878,18 +1964,15 @@ export function renderMemoryWorkbench(
     traceMemoryStartup('workbench:render-begin');
     const overview = state.overview;
     const currentPage = PAGES.find((page) => page.id === state.page) ?? INTERNAL_PAGES.find((page) => page.id === state.page) ?? PAGES[0]!;
-    const currentPageIndex = PAGES.findIndex((page) => page.id === state.page);
     const statusTone = overview?.status === 'error' ? 'error' : overview?.status === 'working' ? 'warning' : overview?.status === 'ready' ? 'success' : 'neutral';
     const runtimeDiagnostic = !overview ? undefined : !overview.llmAvailable
-      ? {
-          code: 'LLM_SERVICE_UNAVAILABLE',
-          title: '大语言模型服务不可用',
-          reason: 'Memory 当前无法连接 LLM 插件，自动整理和需要模型的召回步骤会暂停或降级。',
-          action: '请确认 LLM 插件已启用并完成资源配置，然后点击“重新检查”。',
-          retryable: true,
-        } satisfies MemoryErrorDiagnostic
+      ? describeMemoryError(
+          { reasonCode: 'MEMORY_LLM_CLIENT_UNAVAILABLE', stage: 'memory.ui.health' },
+          'MEMORY_LLM_CLIENT_UNAVAILABLE',
+          'health',
+        )
       : overview.status === 'error'
-        ? overview.errorDiagnostic ?? describeMemoryError(overview.error ?? overview.errorCode, overview.errorCode ?? 'MEMORY_RUNTIME_ERROR', 'health')
+        ? overview.errorDiagnostic ?? describeMemoryError(overview.failure, 'INTERNAL_ERROR', 'health')
         : undefined;
     const alertMarkup = runtimeDiagnostic ? `<div class="stx-memory-alert">${renderErrorDetails(runtimeDiagnostic, 'refresh-health')}</div>` : '';
     const chatIdentity = formatChatIdentity(overview);
@@ -1897,23 +1980,369 @@ export function renderMemoryWorkbench(
     const chatStorageRatio = overview?.bound ? formatPercent(overview.currentChatUsageRatio ?? 0) : '—';
     const sceneHeader = state.page === 'scenes' ? getSceneEventsHeader(sceneEventsState()) : undefined;
     const pageDescription = sceneHeader?.description ?? currentPage.description;
-    const pageCounter = sceneHeader?.count ?? (currentPageIndex >= 0 ? `${currentPageIndex + 1} / ${PAGES.length}` : '诊断内页');
     const pageTitle = state.page === 'initialize' ? '初始化记忆' : currentPage.label;
-    const libraryRecallStatus = !state.recall
-      ? renderStatusChip('召回状态未知', 'neutral')
-      : state.recall.rebuilding
-        ? renderStatusChip('索引重建中', 'warning')
-        : state.recall.degradedReason || state.recall.lastError
-          ? renderStatusChip('召回降级', 'warning')
-          : renderStatusChip('召回可用', 'success');
-    const pageHeadingAction = state.page === 'initialize'
-      ? `<button class="stx-memory-initialize-refresh" ${uiButton('neutral', 'sm')} type="button" data-action="refresh-initialization" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新状态</button>`
-      : state.page === 'library'
-        ? `<div class="stx-memory-library-heading-actions">${libraryRecallStatus}<button ${uiButton('neutral', 'sm')} type="button" data-action="refresh-library" ${state.busyAction ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>刷新</button></div>`
-        : `<span class="stx-memory-page-counter">${escapeHtml(pageCounter)}</span>`;
-    root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${renderOverviewRouteStatus('向量模型', overview?.embedding)}${renderOverviewRouteStatus('重排序模型', overview?.rerank)}${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class="stx-memory-nav-meta">${overview?.lastOrganizedAt ? `最近整理<br>${escapeHtml(formatTime(overview.lastOrganizedAt))}` : '仅展示当前已实现能力'}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${pageTitle}</h2><p>${escapeHtml(pageDescription)}</p></div>${pageHeadingAction}</header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section><div class="stx-memory-internal-routes" hidden aria-hidden="true">${INTERNAL_PAGES.map((page) => `<button type="button" data-action="navigate-internal" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}">${page.label}</button>`).join('')}</div></main></div>`;
+    const pageHeadingAction = `<button class='stx-memory-page-refresh' ${uiButton('neutral', 'sm')} type='button' data-action='refresh' ${state.busyAction ? 'disabled' : ''} aria-label='刷新当前页面'><ss-helper-icon name='rotate' decorative></ss-helper-icon>刷新</button>`;
+    root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${renderOverviewRouteStatus('向量模型', overview?.embedding)}${renderOverviewRouteStatus('重排序模型', overview?.rerank)}${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class='stx-memory-nav-meta'>记忆插件 v${escapeHtml(memoryPluginConfig.manifest.version)}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${pageTitle}</h2><p>${escapeHtml(pageDescription)}</p></div>${pageHeadingAction}</header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section><div class="stx-memory-internal-routes" hidden aria-hidden="true">${INTERNAL_PAGES.map((page) => `<button type="button" data-action="navigate-internal" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}">${page.label}</button>`).join('')}</div></main></div>`;
     traceMemoryStartup('workbench:dom-rendered');
     popupUi?.refreshControls(root);
+    const libraryListHost = state.page === 'library' && controller.listFactsPage
+      ? root.querySelector<HTMLElement>('.stx-memory-library-fact-list')
+      : null;
+    if (popupUi && libraryListHost && controller.listFactsPage) {
+      const options = {
+        kindLabels: FACT_KIND_LABELS,
+        statusLabels: FACT_STATUS_LABELS,
+        formatTime: (value: number) => formatTime(value),
+        formatSource: renderLibrarySourceReference,
+        translateRecordStatus,
+      };
+      const where = [
+        ...(state.selectedKinds.length === Object.keys(FACT_KIND_LABELS).length
+          ? []
+          : [{ field: 'kind', op: 'in' as const, value: state.selectedKinds }]),
+        ...(state.selectedStatuses.length === Object.keys(FACT_STATUS_LABELS).length
+          ? []
+          : [{ field: 'status', op: 'in' as const, value: state.selectedStatuses }]),
+      ];
+      const orderBy = state.sort === 'confidence_desc'
+        ? { field: 'confidence', direction: 'desc' as const }
+        : state.sort === 'kind_asc'
+          ? { field: 'kind', direction: 'asc' as const }
+          : { field: 'updatedAt', direction: 'desc' as const };
+      popupUi.mountList<MemoryUiFact>(libraryListHost, {
+        id: `memory-library:${state.overview?.chatKey ?? 'unbound'}`,
+        ariaLabel: '记忆块列表',
+        queryKey: JSON.stringify([
+          state.overview?.chatKey ?? '',
+          state.query.trim(),
+          state.selectedKinds,
+          state.selectedStatuses,
+          state.sort,
+        ]),
+        pageSize: 20,
+        overscan: 6,
+        maxCachedPages: 6,
+        itemHeight: 116,
+        itemGap: 8,
+        selectable: true,
+        selectedKey: state.selectedFactId,
+        getKey: fact => fact.id,
+        loadPage: ({ cursor, limit, signal }) => controller.listFactsPage!({
+          ...(cursor === undefined ? {} : { cursor }),
+          limit,
+          signal,
+          query: state.query.trim(),
+          where,
+          orderBy,
+          includeTotal: true,
+        }),
+        renderItem: (fact, context) => {
+          const shell = document.createElement('div');
+          shell.innerHTML = renderMemoryLibraryFactRow(fact, context.selected, options);
+          return (shell.firstElementChild as HTMLElement | null) ?? shell;
+        },
+        onSelect: (fact) => {
+          state.selectedFactId = fact.id;
+          if (!state.facts.some(item => item.id === fact.id)) state.facts = [...state.facts, fact];
+          if (!state.libraryResults.some(item => item.id === fact.id)) state.libraryResults = [...state.libraryResults, fact];
+          rerender();
+        },
+      });
+      const selectedFact = state.libraryResults.find(item => item.id === state.selectedFactId)
+        ?? state.facts.find(item => item.id === state.selectedFactId);
+      if (selectedFact) {
+        const evidenceHost = root.querySelector<HTMLElement>('[data-memory-detail-list="fact-evidence"]');
+        if (evidenceHost) popupUi.mountList<import('../domain').MemoryEvidence>(evidenceHost, {
+          id: `memory-fact-evidence:${state.overview?.chatKey ?? 'unbound'}`,
+          ariaLabel: '事实来源证据',
+          queryKey: JSON.stringify([state.overview?.chatKey ?? '', selectedFact.id, 'evidence']),
+          pageSize: 20,
+          overscan: 6,
+          maxCachedPages: 6,
+          estimatedItemHeight: 92,
+          getKey: item => item.id,
+          loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!('evidence', {
+            ...(cursor === undefined ? {} : { cursor }),
+            limit,
+            signal,
+            filter: { factId: selectedFact.id },
+            orderBy: { field: 'occurredAt', direction: 'desc' },
+            includeTotal: true,
+          }),
+          renderItem: item => elementFromMarkup(`<blockquote class="stx-memory-library-evidence"><p>${escapeHtml(item.excerpt)}</p><footer>${renderLibrarySourceReference(item.sourceRef, 'evidence')}</footer></blockquote>`),
+        });
+        const mountStaticDetail = <T,>(
+          selector: string,
+          suffix: string,
+          items: readonly T[],
+          key: (item: T, index: number) => string,
+          renderItem: (item: T) => HTMLElement,
+        ): void => {
+          const host = root.querySelector<HTMLElement>(selector);
+          if (!host) return;
+          popupUi.mountList<T>(host, {
+            id: `memory-fact-${suffix}:${state.overview?.chatKey ?? 'unbound'}`,
+            ariaLabel: suffix === 'sources' ? '事实来源引用' : '事实捕获记录',
+            queryKey: JSON.stringify([selectedFact.id, suffix, items.length]),
+            pageSize: 20,
+            overscan: 6,
+            maxCachedPages: 6,
+            estimatedItemHeight: 44,
+            getKey: (item) => key(item, items.indexOf(item)),
+            loadPage: async ({ cursor, limit, signal }) => {
+              if (signal.aborted) throw signal.reason;
+              const offset = cursor ? Number(cursor) : 0;
+              const pageItems = items.slice(offset, offset + limit);
+              const next = offset + pageItems.length;
+              return { items: pageItems, nextCursor: next < items.length ? String(next) : null, total: items.length };
+            },
+            renderItem,
+          });
+        };
+        mountStaticDetail(
+          '[data-memory-detail-list="fact-sources"]',
+          'sources',
+          selectedFact.sourceRefs,
+          source => source,
+          source => elementFromMarkup(`<div class="stx-memory-library-static-row">${renderLibrarySourceReference(source)}</div>`),
+        );
+        mountStaticDetail(
+          '[data-memory-detail-list="fact-batches"]',
+          'batches',
+          selectedFact.auditBatches ?? [],
+          item => `${item.jobId}:${item.batchIndex}`,
+          item => elementFromMarkup(`<button ${uiButton('neutral', 'xs')} type="button" data-action="navigate" data-page="audit"><span>第 ${Math.max(1, Number(item.batchIndex) || 1)} 批 · ${escapeHtml(translateRecordStatus(item.status))}</span><small>${escapeHtml(item.jobId)}</small></button>`),
+        );
+      }
+    }
+    if (popupUi && controller.loadMemoryPage && state.page === 'actors') {
+      const host = root.querySelector<HTMLElement>('.stx-memory-actor-list');
+      if (host) {
+        const pending = state.actorView === 'pending';
+        popupUi.mountList<import('../domain').MemoryOwner | import('../domain').ActorCandidate>(host, {
+          id: `memory-actors:${state.overview?.chatKey ?? 'unbound'}:${state.actorView}`,
+          ariaLabel: pending ? '待确认人物列表' : '人物列表',
+          queryKey: JSON.stringify([state.overview?.chatKey ?? '', state.actorView, state.actorQuery.trim(), state.actorStatus]),
+          pageSize: 20,
+          overscan: 6,
+          maxCachedPages: 6,
+          itemHeight: 70,
+          itemGap: 8,
+          selectable: true,
+          selectedKey: pending ? state.selectedCandidateId : state.selectedActorId,
+          getKey: item => pending ? (item as import('../domain').ActorCandidate).localId : (item as import('../domain').MemoryOwner).id,
+          loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!(
+            pending ? 'actor-candidates' : 'actors',
+            {
+              ...(cursor === undefined ? {} : { cursor }),
+              limit,
+              signal,
+              query: state.actorQuery.trim(),
+              filter: !pending && state.actorStatus ? { status: state.actorStatus } : {},
+              orderBy: { field: 'updatedAt', direction: 'desc' },
+              includeTotal: true,
+            },
+          ),
+          renderItem: (item, context) => {
+            if (pending) {
+              const candidate = item as import('../domain').ActorCandidate;
+              return elementFromMarkup(`<button class="stx-memory-actor-row stx-memory-candidate-row" ${uiControl('button', 'neutral')} type="button" data-action="select-candidate" data-candidate-id="${escapeHtml(candidate.localId)}" aria-selected="${context.selected}"><span class="stx-memory-actor-symbol is-pending" aria-hidden="true"><ss-helper-icon name="user-clock" decorative></ss-helper-icon></span><span class="stx-memory-actor-row-copy"><strong>${escapeHtml(candidate.displayName)}</strong><small>${candidate.sourceRefs.length} 条来源</small></span><span class="stx-memory-actor-row-meta">${renderStatusChip('待确认', 'warning')}<small>${Math.round(candidate.confidence * 100)}%</small></span></button>`);
+            }
+            const actor = item as import('../domain').MemoryOwner;
+            const aliasSummary = actor.aliases.length ? actor.aliases.slice(0, 3).join('、') : '暂无别名';
+            return elementFromMarkup(`<button class="stx-memory-actor-row" ${uiControl('button', 'neutral')} type="button" data-action="select-actor" data-owner-id="${escapeHtml(actor.id)}" aria-selected="${context.selected}"><span class="stx-memory-actor-symbol" aria-hidden="true"><ss-helper-icon name="${actor.kind === 'actor' ? 'user' : actor.kind === 'world' ? 'globe' : actor.kind === 'narrator' ? 'microphone-lines' : actor.kind === 'player' ? 'user-pen' : 'circle-question'}" decorative></ss-helper-icon></span><span class="stx-memory-actor-row-copy"><strong>${escapeHtml(actor.displayName)}</strong><small>${escapeHtml(aliasSummary)}</small></span><span class="stx-memory-actor-row-meta">${renderStatusChip(actor.status === 'confirmed' ? '已确认' : actor.status === 'pending' ? '待确认' : '未识别', actor.status === 'confirmed' ? 'success' : 'warning')}<small>${Math.round(actor.confidence * 100)}%</small></span></button>`);
+          },
+          onSelect: (item) => {
+            if (pending) {
+              const candidate = item as import('../domain').ActorCandidate;
+              state.selectedCandidateId = candidate.localId;
+              if (!state.pendingActors.some(value => value.localId === candidate.localId)) state.pendingActors = [...state.pendingActors, candidate];
+            } else {
+              const actor = item as import('../domain').MemoryOwner;
+              state.selectedActorId = actor.id;
+              if (!state.actors.some(value => value.id === actor.id)) state.actors = [...state.actors, actor];
+            }
+            rerender();
+          },
+        });
+      }
+    }
+    if (popupUi && controller.loadMemoryPage && state.page === 'scenes') {
+      const host = root.querySelector<HTMLElement>('.stx-memory-scene-record-list');
+      if (host) {
+        type SceneRecord = import('../domain').SceneCast | import('../domain').MemoryEpisode | import('../domain').MemoryObservation;
+        const resource: MemoryPageResource = state.sceneCategory === 'event' ? 'episodes' : state.sceneCategory === 'observation' ? 'observations' : 'scene-casts';
+        const orderBy = state.sceneCategory === 'scene' ? { field: 'floor', direction: 'desc' as const } : { field: 'occurredAt', direction: 'desc' as const };
+        popupUi.mountList<SceneRecord>(host, {
+          id: `memory-scenes:${state.overview?.chatKey ?? 'unbound'}:${state.sceneCategory}`,
+          ariaLabel: state.sceneCategory === 'event' ? '结构化事件列表' : state.sceneCategory === 'observation' ? '观察记录列表' : '即时场景列表',
+          queryKey: JSON.stringify([state.overview?.chatKey ?? '', state.sceneCategory, state.sceneQuery.trim(), state.sceneFilter]),
+          pageSize: 20,
+          overscan: 6,
+          maxCachedPages: 6,
+          itemHeight: 116,
+          itemGap: 8,
+          selectable: true,
+          selectedKey: state.sceneCategory === 'event' ? state.selectedEpisodeId : state.sceneCategory === 'observation' ? state.selectedObservationId : state.selectedSceneId,
+          getKey: item => item.id,
+          loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!(resource, {
+            ...(cursor === undefined ? {} : { cursor }),
+            limit,
+            signal,
+            query: state.sceneQuery.trim(),
+            orderBy,
+            includeTotal: true,
+          }),
+          renderItem: (item) => elementFromMarkup(renderSceneEventRecordRow(sceneEventsState(), item)),
+          onSelect: (item) => {
+            if (state.sceneCategory === 'event') {
+              const episode = item as import('../domain').MemoryEpisode;
+              state.selectedEpisodeId = episode.id;
+              if (!state.episodes.some(value => value.id === episode.id)) state.episodes = [...state.episodes, episode];
+            } else if (state.sceneCategory === 'observation') {
+              const observation = item as import('../domain').MemoryObservation;
+              state.selectedObservationId = observation.id;
+              if (!state.observations.some(value => value.id === observation.id)) state.observations = [...state.observations, observation];
+            } else {
+              const scene = item as import('../domain').SceneCast;
+              state.selectedSceneId = scene.id;
+              if (!state.scenes.some(value => value.id === scene.id)) state.scenes = [...state.scenes, scene];
+            }
+            rerender();
+          },
+        });
+      }
+    }
+    if (popupUi && controller.loadMemoryPage && state.page === 'actor-memory') {
+      const host = root.querySelector<HTMLElement>('.stx-memory-actor-memory-trace-list');
+      if (host && state.actorMemorySelectedOwnerId) {
+        const sortField = state.actorMemorySort === 'clarity_desc' ? 'clarity'
+          : state.actorMemorySort === 'confidence_desc' ? 'beliefConfidence'
+            : state.actorMemorySort === 'emotion_desc' ? 'emotionalSalience'
+              : state.actorMemorySort === 'rehearsal_desc' ? 'rehearsalCount'
+                : 'updatedAt';
+        popupUi.mountList<import('../domain').ActorMemoryTrace>(host, {
+          id: `memory-traces:${state.overview?.chatKey ?? 'unbound'}:${state.actorMemorySelectedOwnerId}`,
+          ariaLabel: '角色记忆痕迹列表',
+          queryKey: JSON.stringify([
+            state.overview?.chatKey ?? '',
+            state.actorMemorySelectedOwnerId,
+            state.actorMemoryQuery.trim(),
+            state.actorMemoryKnowledgeMode,
+            state.actorMemoryPrivacy,
+            state.actorMemoryLevel,
+            state.actorMemorySort,
+          ]),
+          pageSize: 20,
+          overscan: 6,
+          maxCachedPages: 6,
+          itemHeight: 112,
+          selectable: true,
+          selectedKey: state.actorMemorySelectedTraceId,
+          getKey: trace => trace.id,
+          loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!('memory-traces', {
+            ...(cursor === undefined ? {} : { cursor }),
+            limit,
+            signal,
+            query: state.actorMemoryQuery.trim(),
+            filter: {
+              ownerId: state.actorMemorySelectedOwnerId,
+              ...(state.actorMemoryKnowledgeMode ? { knowledgeMode: state.actorMemoryKnowledgeMode } : {}),
+              ...(state.actorMemoryPrivacy ? { privacy: state.actorMemoryPrivacy } : {}),
+            },
+            orderBy: { field: sortField, direction: 'desc' },
+            includeTotal: true,
+          }),
+          renderItem: trace => elementFromMarkup(renderActorMemoryTraceRow(actorMemoryState(), trace, {
+            formatTime,
+            renderSourceReference: renderLibrarySourceReference,
+          })),
+          onSelect: async (trace) => {
+            state.actorMemorySelectedTraceId = trace.id;
+            if (!state.actorTraces.some(value => value.id === trace.id)) state.actorTraces = [...state.actorTraces, trace];
+            const [facts, observations] = await Promise.all([
+              controller.loadMemoryPage!<MemoryUiFact>('facts', {
+                limit: 1,
+                where: [{ field: 'recordId', op: 'eq', value: trace.factId }],
+              }),
+              trace.sourceObservationIds.length
+                ? controller.loadMemoryPage!<import('../domain').MemoryObservation>('observations', {
+                    limit: Math.min(500, trace.sourceObservationIds.length),
+                    where: [{ field: 'recordId', op: 'in', value: trace.sourceObservationIds }],
+                  })
+                : Promise.resolve({ items: [], nextCursor: null }),
+            ]);
+            for (const fact of facts.items) if (!state.facts.some(value => value.id === fact.id)) state.facts = [...state.facts, fact];
+            for (const observation of observations.items) if (!state.observations.some(value => value.id === observation.id)) state.observations = [...state.observations, observation];
+            rerender();
+          },
+        });
+      }
+    }
+    if (popupUi && controller.loadMemoryPage && (state.page === 'profiles' || state.page === 'dreams')) {
+      const resource: MemoryPageResource = state.page === 'profiles' ? 'profile-claims' : 'dream-jobs';
+      const host = root.querySelector<HTMLElement>(`[data-memory-page-list="${state.page}"]`);
+      if (host) popupUi.mountList<Record<string, unknown>>(host, {
+        id: `memory-${state.page}:${state.overview?.chatKey ?? 'unbound'}`,
+        ariaLabel: state.page === 'profiles' ? '画像与关系列表' : 'Dream 任务列表',
+        queryKey: JSON.stringify([state.overview?.chatKey ?? '', state.page]),
+        pageSize: 20,
+        overscan: 6,
+        maxCachedPages: 6,
+        estimatedItemHeight: 104,
+        getKey: item => String(item.id ?? `${item.ownerId ?? item.fromOwnerId ?? 'record'}:${item.updatedAt ?? item.createdAt ?? ''}`),
+        loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!(resource, {
+          ...(cursor === undefined ? {} : { cursor }),
+          limit,
+          signal,
+          orderBy: { field: 'updatedAt', direction: 'desc' },
+          includeTotal: true,
+        }),
+        renderItem: (item) => state.page === 'profiles'
+          ? elementFromMarkup(`<article class="stx-memory-evidence"><strong>${escapeHtml(String(item.ownerId ?? item.fromOwnerId ?? '主体'))}</strong><p>${escapeHtml(String(item.claim ?? ''))}</p><small>引用：${escapeHtml(Array.isArray(item.supportingTraceIds) ? item.supportingTraceIds.join('、') : '无')}</small></article>`)
+          : elementFromMarkup(`<article class="stx-memory-evidence"><strong>${escapeHtml(String(item.ownerId ?? '主体'))}</strong>${renderStatusChip(String(item.status ?? 'queued'), item.status === 'applied' ? 'success' : item.status === 'failed' ? 'error' : 'neutral')}<p>阶段：${escapeHtml(String(item.phase ?? 'gather'))}</p><small>任务：${escapeHtml(String(item.id ?? ''))}</small>${controller.runActorDream && item.id ? `<button ${uiControl('button', 'neutral')} type="button" data-action="dream-dry-run" data-job-id="${escapeHtml(String(item.id))}">dry-run 预览</button>` : ''}</article>`),
+      });
+    }
+    if (popupUi && controller.loadMemoryPage && state.page === 'audit') {
+      const auditHost = root.querySelector<HTMLElement>('[data-memory-page-list="audit"]');
+      if (auditHost) popupUi.mountList<MemoryAuditRecord>(auditHost, {
+        id: `memory-audits:${state.overview?.chatKey ?? 'unbound'}`,
+        ariaLabel: 'Capture 审计记录',
+        queryKey: JSON.stringify([state.overview?.chatKey ?? '', 'audit']),
+        pageSize: 20,
+        overscan: 6,
+        maxCachedPages: 6,
+        estimatedItemHeight: 180,
+        getKey: (record) => String(record.id ?? `${record.jobId ?? 'audit'}:${record.batchIndex ?? record.createdAt ?? ''}`),
+        loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!('change-audits', {
+          ...(cursor === undefined ? {} : { cursor }),
+          limit,
+          signal,
+          orderBy: { field: 'createdAt', direction: 'desc' },
+          includeTotal: true,
+        }),
+        renderItem: (record, context) => elementFromMarkup(renderAuditRecord(record, context.index)),
+      });
+      const usageHost = root.querySelector<HTMLElement>('[data-memory-page-list="usage"]');
+      if (usageHost) popupUi.mountList<Record<string, unknown>>(usageHost, {
+        id: `memory-usage:${state.overview?.chatKey ?? 'unbound'}`,
+        ariaLabel: '主聊天 Token 与 usage',
+        queryKey: JSON.stringify([state.overview?.chatKey ?? '', 'usage']),
+        pageSize: 20,
+        overscan: 6,
+        maxCachedPages: 6,
+        estimatedItemHeight: 72,
+        getKey: item => String(item.id ?? `${item.messageId ?? 'usage'}:${item.capturedAt ?? item.createdAt ?? ''}`),
+        loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!('usage', {
+          ...(cursor === undefined ? {} : { cursor }),
+          limit,
+          signal,
+          orderBy: { field: 'capturedAt', direction: 'desc' },
+          includeTotal: true,
+        }),
+        renderItem: item => elementFromMarkup(`<article class="stx-memory-evidence"><strong>${escapeHtml(String(item.messageId ?? item.id ?? '生成记录'))}</strong><small>${escapeHtml(formatTime(Number(item.capturedAt ?? item.createdAt ?? 0)))}</small><pre class="stx-memory-code">${escapeHtml(formatJson(item))}</pre></article>`),
+      });
+    }
     refreshGraphMarquees(root);
     observeGraphMarqueeResize();
     traceMemoryStartup('workbench:controls-refreshed');
@@ -1928,7 +2357,7 @@ export function renderMemoryWorkbench(
       const selectedEdgeId = state.selectedGraphNodeId ? '' : state.selectedGraphEdgeId && view.edges.some((edge) => edge.id === state.selectedGraphEdgeId) ? state.selectedGraphEdgeId : '';
       const selectedEventEdgeId = state.selectedGraphNodeId || selectedEdgeId ? '' : state.selectedGraphEventId && view.edges.some((edge) => edge.id === state.selectedGraphEventId && edge.kind === 'event') ? state.selectedGraphEventId : '';
       graphRenderer = mountRelationshipGraphThree(graphHost, {
-        graph: localizeLegacyGraphPreview(state.graph),
+        graph: localizeGraphPreview(state.graph),
         visibleEdgeIds: new Set(view.edges.map((edge) => edge.id)),
         selectedEdgeId,
         selectedEventEdgeId,
@@ -2443,7 +2872,7 @@ export function renderMemoryWorkbench(
     if (action === 'retry-load') { void loadOverview(); return; }
     if (action === 'retry-page') { void loadPage(state.page); return; }
     if (action === 'dismiss-error') { state.actionError = undefined; rerender(); return; }
-    if (action === 'refresh-health') { void runAction('refresh-health', async () => { state.sqlite = await controller.getSqliteStatus(); await loadOverview(); }, '检查已完成', '工作台状态已重新读取。', 'MEMORY_HEALTH_REFRESHED'); return; }
+    if (action === 'refresh-health') { void runAction('refresh-health', async () => { state.sqlite = await controller.getSqliteStatus({ detailed: true }); await loadOverview(); }, '检查已完成', '工作台状态已重新读取。', 'MEMORY_HEALTH_REFRESHED'); return; }
     if (action === 'jump-to-message') {
       if (!navigateToMessage) return;
       const messageId = actionNode.dataset.messageId?.trim();
@@ -2488,20 +2917,21 @@ export function renderMemoryWorkbench(
     if (action === 'delete-fact') { state.confirmFactId = actionNode.dataset.factId ?? ''; rerender(); return; }
     if (action === 'cancel-delete') { state.confirmFactId = ''; rerender(); return; }
     if (action === 'confirm-delete') { const id = actionNode.dataset.factId ?? ''; void runAction('delete-fact', () => controller.removeFact(id), '记忆已删除', '原聊天消息不受影响。', 'MEMORY_FACT_DELETED', async () => { state.confirmFactId = ''; await refreshFacts(); }); return; }
-    if (action === 'initialize-start') { const selectedKinds = [...state.selectedSourceKinds]; if (!selectedKinds.length || state.busyAction || !state.overview?.llmAvailable) return; void runAction('initialize', () => controller.initialize(selectedKinds, { includeInvisibleHistory: state.includeInvisibleHistory }), '初始化已完成', '当前聊天已经可以使用记忆召回。', 'MEMORY_INITIALIZE_COMPLETED', async () => { await refreshInitialization(selectedKinds); }); return; }
-    if (action === 'initialize-resume') { if (state.busyAction || !state.overview?.llmAvailable) return; void runAction('initialize-resume', () => controller.retry(), '初始化已完成', '已继续处理暂存结果，当前聊天已经可以使用记忆召回。', 'MEMORY_INITIALIZE_RESUMED', async () => { await refreshInitialization(state.selectedSourceKinds); }); return; }
+    if (action === 'initialize-start') { const selectedKinds = [...state.selectedSourceKinds]; const sourceOptions = initializationOptions(); if (!selectedKinds.length || state.busyAction || !state.overview?.llmAvailable) return; void runAction('initialize', () => controller.initialize(selectedKinds, sourceOptions), '初始化已完成', '当前聊天已经可以使用记忆召回。', 'MEMORY_INITIALIZE_COMPLETED', async () => { await refreshInitialization(selectedKinds); }); return; }
+    if (action === 'initialize-resume') { if (state.busyAction || !state.overview?.llmAvailable || state.sqlite?.connected === false || state.overview?.status === 'error') return; void runAction('initialize-resume', () => controller.retry(), '初始化已完成', '已继续处理暂存结果，当前聊天已经可以使用记忆召回。', 'MEMORY_INITIALIZE_RESUMED', async () => { await refreshInitialization(state.selectedSourceKinds); }); return; }
     if (action === 'initialize-cancel') { void runAction('cancel-capture', () => controller.cancelCapture(), '初始化已取消', '已停止继续处理新批次。', 'MEMORY_INITIALIZE_CANCELLED', async () => { await updateProgress(); }); return; }
     if (action === 'view-library') { void loadPage('library'); return; }
+    if (action === 'view-audit') { void loadPage('audit'); return; }
     if (action === 'open-reinitialize') {
       if (state.busyAction || !state.overview?.llmAvailable) return;
-      state.includeInvisibleHistory = false;
       const successfulKinds = state.initialization?.selectedSourceKinds.filter((kind) => state.sources.some((source) => source.kind === kind)) ?? [];
       state.selectedSourceKinds = successfulKinds.length ? successfulKinds : state.sources.filter((source) => source.selected).map((source) => source.kind);
       state.reinitializeOpen = true;
       rerender('#stx-memory-reinitialize-cancel');
+      const sourceOptions = initializationOptions();
       void Promise.all([
-        controller.getInitializationSources({ includeInvisibleHistory: false }),
-        controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: false }),
+        controller.getInitializationSources(sourceOptions),
+        controller.getInitializationEstimate(state.selectedSourceKinds, sourceOptions),
       ]).then(([sources, estimate]) => {
         if (disposed || !state.reinitializeOpen) return;
         state.sources = sources.map((source) => ({ ...source, selected: state.selectedSourceKinds.includes(source.kind) && source.count > 0 }));
@@ -2514,9 +2944,10 @@ export function renderMemoryWorkbench(
     if (action === 'cancel-reinitialize') { state.reinitializeOpen = false; rerender('#stx-memory-reinitialize-trigger'); return; }
     if (action === 'confirm-reinitialize') {
       const selectedKinds = [...state.selectedSourceKinds];
-      if (!selectedKinds.length || state.busyAction || !state.overview?.llmAvailable || Boolean(state.progress && ['queued', 'running', 'paused'].includes(state.progress.status))) return;
+      const sourceOptions = initializationOptions();
+      if (!selectedKinds.length || state.busyAction || !state.overview?.llmAvailable || Boolean(state.progress && ['queued', 'running', 'repairing'].includes(state.progress.status))) return;
       state.reinitializeOpen = false;
-      void runAction('reinitialize', () => controller.reinitialize(selectedKinds, { includeInvisibleHistory: state.includeInvisibleHistory }), '重新初始化已完成', '旧 Memory 数据已替换，当前聊天已经可以使用记忆召回。', 'MEMORY_REINITIALIZE_COMPLETED', async () => { await refreshInitialization(selectedKinds); });
+      void runAction('reinitialize', () => controller.reinitialize(selectedKinds, sourceOptions), '重新初始化已完成', '旧 Memory 数据已替换，当前聊天已经可以使用记忆召回。', 'MEMORY_REINITIALIZE_COMPLETED', async () => { await refreshInitialization(selectedKinds); });
       return;
     }
     if (action === 'rebuild-index') { void runAction('rebuild-index', () => controller.rebuildVectorIndex(), '索引重建已开始', '向量覆盖率会在后台更新。', 'MEMORY_INDEX_REBUILD_STARTED', async () => { await loadPage('recall'); }); return; }
@@ -2542,7 +2973,7 @@ export function renderMemoryWorkbench(
     if (action === 'select-graph-edge') { const edgeId = actionNode.dataset.edgeId ?? ''; const refocus = state.selectedGraphEdgeId === edgeId && !state.selectedGraphNodeId; state.selectedGraphEdgeId = edgeId; state.selectedGraphEventId = ''; state.selectedGraphNodeId = ''; syncGraphUi(true); if (refocus) graphRenderer?.focusEdge(edgeId); return; }
     if (action === 'select-graph-event') { const edgeId = actionNode.dataset.eventEdgeId ?? ''; const refocus = state.selectedGraphEventId === edgeId && !state.selectedGraphNodeId; state.selectedGraphEventId = edgeId; state.selectedGraphEdgeId = ''; state.selectedGraphNodeId = ''; syncGraphUi(true); if (refocus) graphRenderer?.focusEdge(edgeId); return; }
     if (action === 'rebuild-graph') { void runAction('rebuild-graph', () => controller.rebuildGraph(), '关系图谱已重建', '已依据当前聊天的已验证事实重新协调节点和关系边。', 'MEMORY_GRAPH_REBUILT', async () => { await loadPage(state.page === 'recall' ? 'recall' : 'graph'); }); return; }
-    if (action === 'repair-capture-rejections' || action === 'ignore-capture-rejections') {
+    if (action === 'ignore-capture-rejections') {
       const auditId = actionNode.dataset.auditId ?? '';
       const record = state.audits.find(item => item.id === auditId);
       const validIds = new Set((Array.isArray(record?.rejected) ? record.rejected : [])
@@ -2554,13 +2985,7 @@ export function renderMemoryWorkbench(
         toast('warning', '请选择失败项', '至少选择一条待处理记录。', 'MEMORY_CAPTURE_REJECTION_SELECTION_REQUIRED');
         return;
       }
-      if (action === 'repair-capture-rejections' && controller.repairCaptureRejections) {
-        void runAction('repair-capture-rejections', () => controller.repairCaptureRejections!(auditId, rejectionIds), '定向修复已完成', '通过校验的记录已经写入，仍失败的项目继续保留。', 'MEMORY_CAPTURE_REJECTIONS_REPAIRED', async () => {
-          state.selectedRejectionIds = state.selectedRejectionIds.filter(id => !validIds.has(id));
-          await loadPage('audit');
-          await refreshFacts();
-        });
-      } else if (action === 'ignore-capture-rejections' && controller.ignoreCaptureRejections) {
+      if (controller.ignoreCaptureRejections) {
         void runAction('ignore-capture-rejections', () => controller.ignoreCaptureRejections!(auditId, rejectionIds), '失败项已忽略', '这些项目保留在审计中，不会写入记忆。', 'MEMORY_CAPTURE_REJECTIONS_IGNORED', async () => {
           state.selectedRejectionIds = state.selectedRejectionIds.filter(id => !validIds.has(id));
           await loadPage('audit');
@@ -2577,10 +3002,6 @@ export function renderMemoryWorkbench(
         void runAction('rollback-actor-capture', () => controller.rollbackActorCapture!(auditId), 'Capture 已回滚', '多主体事实、观察、痕迹与派生记录已撤销。', 'MEMORY_ACTOR_CAPTURE_ROLLED_BACK', async () => { state.confirmBatchKey = ''; await loadPage('audit'); await refreshFacts(); });
         return;
       }
-      const jobId = actionNode.dataset.jobId ?? '';
-      const batchIndex = Number(actionNode.dataset.batchIndex);
-      if (!jobId || !Number.isInteger(batchIndex)) return;
-      void runAction('rollback', () => controller.rollbackBatch(jobId, batchIndex), '批次已回滚', formatRollbackConfirmation(jobId, batchIndex), 'MEMORY_BATCH_ROLLED_BACK', async () => { state.confirmBatchKey = ''; await loadPage('audit'); await refreshFacts(); });
       return;
     }
     if (action === 'export') { void controller.exportSqliteBackup().then(downloadSqlite).then(() => toast('success', '归档已导出', 'Memory 数据快照已下载。', 'MEMORY_ARCHIVE_EXPORTED')).catch((error) => toast('error', '导出失败', '无法生成 Memory 归档。', safeErrorCode(error, 'MEMORY_EXPORT_FAILED'))); return; }
@@ -2722,21 +3143,28 @@ export function renderMemoryWorkbench(
     if (input.dataset.filter === 'sort') { state.sort = input.value as MemoryLibrarySort; normalizeLibrarySelection(); rerender(); return; }
     if (input.dataset.graphFilter === 'kind') { state.graphKind = input.value; state.selectedGraphEdgeId = ''; state.selectedGraphEventId = ''; state.selectedGraphNodeId = ''; syncGraphUi(); return; }
     if (input.dataset.graphFilter === 'status') { state.graphStatusFilter = input.value; state.selectedGraphEdgeId = ''; state.selectedGraphEventId = ''; state.selectedGraphNodeId = ''; syncGraphUi(); return; }
-    if (input.dataset.option === 'include-invisible-history') {
-      state.includeInvisibleHistory = (input as HTMLInputElement).checked;
+    if (input.dataset.option === 'include-hidden-message-floors') {
+      const includeHiddenMessageFloors = (input as HTMLInputElement).checked;
+      const sourceOptions = { includeHiddenMessageFloors };
+      const selectedKinds = [...state.selectedSourceKinds];
       void Promise.all([
-        controller.getInitializationSources({ includeInvisibleHistory: state.includeInvisibleHistory }),
-        controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory }),
+        controller.getInitializationSources(sourceOptions),
+        controller.getInitializationEstimate(selectedKinds, sourceOptions),
       ]).then(([sources, estimate]) => {
         if (disposed) return;
-        state.sources = sources.map((source) => ({ ...source, selected: state.selectedSourceKinds.includes(source.kind) && source.count > 0 }));
-        state.selectedSourceKinds = state.selectedSourceKinds.filter((kind) => state.sources.some((source) => source.kind === kind && source.count > 0));
+        state.includeHiddenMessageFloors = includeHiddenMessageFloors;
+        state.sources = sources.map((source) => ({ ...source, selected: selectedKinds.includes(source.kind) && source.count > 0 }));
+        state.selectedSourceKinds = selectedKinds.filter((kind) => state.sources.some((source) => source.kind === kind && source.count > 0));
         state.estimate = estimate;
         rerender();
-      }).catch((error) => toast('error', '估算失败', '无法更新初始化消息范围。', safeErrorCode(error, 'MEMORY_ESTIMATE_FAILED')));
+      }).catch((error) => {
+        if (disposed) return;
+        rerender();
+        toast('error', '隐藏楼层选项未更新', '来源或成本估算读取失败，已保留原来的处理范围。', safeErrorCode(error, 'INTERNAL_ERROR'));
+      });
       return;
     }
-    if (input.dataset.sourceKind) { const selected = (input as HTMLInputElement).checked; state.selectedSourceKinds = selected ? [...new Set([...state.selectedSourceKinds, input.dataset.sourceKind])] : state.selectedSourceKinds.filter((kind) => kind !== input.dataset.sourceKind); void controller.getInitializationEstimate(state.selectedSourceKinds, { includeInvisibleHistory: state.includeInvisibleHistory }).then((estimate) => { if (!disposed) { state.estimate = estimate; rerender(); } }).catch((error) => toast('error', '估算失败', '无法更新初始化成本估算。', safeErrorCode(error, 'MEMORY_ESTIMATE_FAILED'))); return; }
+    if (input.dataset.sourceKind) { const selected = (input as HTMLInputElement).checked; state.selectedSourceKinds = selected ? [...new Set([...state.selectedSourceKinds, input.dataset.sourceKind])] : state.selectedSourceKinds.filter((kind) => kind !== input.dataset.sourceKind); void controller.getInitializationEstimate(state.selectedSourceKinds, initializationOptions()).then((estimate) => { if (!disposed) { state.estimate = estimate; rerender(); } }).catch((error) => toast('error', '估算失败', '无法更新初始化成本估算。', safeErrorCode(error, 'INTERNAL_ERROR'))); return; }
   }, { signal: abortController.signal });
   root.addEventListener('pointermove', (event) => {
     const zone = (event.target as HTMLElement).closest<HTMLElement>('[data-actor-memory-zone]');

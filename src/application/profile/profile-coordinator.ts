@@ -27,7 +27,7 @@ export interface ProfileUpdateResult {
 function id(value: string): string { let hash = 2166136261; for (const char of value) { hash ^= char.codePointAt(0) ?? 0; hash = Math.imul(hash, 16777619); } return `profile-claim:${(hash >>> 0).toString(36)}`; }
 function normalizedSalience(value: number): number {
   const candidate = Number.isFinite(value) ? value : 0;
-  return Math.max(0, Math.min(1, candidate > 1 ? candidate / 100 : candidate));
+  return Math.max(0, Math.min(1, candidate));
 }
 
 /** Profile is a trace-backed derived layer; it can never invent unsupported claims. */

@@ -6,7 +6,7 @@ import { MultiActorCaptureService } from '../src/application/actors/multi-actor-
 import { LocationRegistry } from '../src/application/locations';
 import {
   StructuredMemoryCaptureExtractor,
-  type MemoryLlmApi,
+  type MemoryLlmClient,
 } from '../src/application/ingest/llm-extractor';
 import type { SourceBlock } from '../src/application/ingest/types';
 import { MemoryRecallIndex, type RecallFact } from '../src/application/recall/memory-recall-index';
@@ -66,9 +66,9 @@ function parseJsonObject(content: string): unknown {
   throw new Error('模型返回内容无法解析为 JSON 对象。');
 }
 
-function liveLlmApi(config: LiveConfiguration, metrics: Array<Record<string, unknown>>): MemoryLlmApi {
+function liveLlmApi(config: LiveConfiguration, metrics: Array<Record<string, unknown>>): MemoryLlmClient {
   return {
-    async runTask<T>(input: Parameters<MemoryLlmApi['runTask']>[0]) {
+    async runTask<T>(input: Parameters<MemoryLlmClient['runTask']>[0]) {
       const startedAt = performance.now();
       try {
         const messages = input.input.messages.map((message, index) => index === 0 && message.role === 'system'
@@ -117,7 +117,10 @@ function liveLlmApi(config: LiveConfiguration, metrics: Array<Record<string, unk
           meta: { model: payload.model ?? config.model, resourceId: 'test-env-openai-compatible' },
         };
       } catch (error) {
-        return { ok: false as const, error: error instanceof Error ? error.message : String(error) };
+        return {
+          ok: false as const,
+          failure: { reasonCode: 'INTERNAL_ERROR', stage: 'memory.test.live-ten-batch' } as const,
+        };
       }
     },
   };

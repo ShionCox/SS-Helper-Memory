@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { MemoryRecallIndex, type RecallFact } from '../src/application/recall/memory-recall-index'
-import { buildMemoryPrompt } from '../src/application/prompt/build-memory-prompt'
+import { buildMemoryPromptResult } from '../src/application/prompt/build-memory-prompt'
 
 function percentile95(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b)
@@ -41,7 +41,7 @@ describe('recall performance', () => {
       recallTimes.push(performance.now() - recallStart)
 
       const promptStart = performance.now()
-      buildMemoryPrompt(result)
+      buildMemoryPromptResult(result)
       promptTimes.push(performance.now() - promptStart)
     }
 

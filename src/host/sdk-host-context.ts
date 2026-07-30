@@ -54,7 +54,7 @@ export class SdkMemoryHostContext implements MemoryHostContext, MemorySourceRead
     else {
       const character = await this.session.host.character?.read?.() ?? null;
       // `character.read()` can legitimately return null during the brief
-      // transition into an imported/legacy chat. The 1.18 context still
+      // transition into an imported chat. The 1.18 context still
       // exposes a stable character index in that case; keep it as a scoped
       // fallback rather than dropping the workspace binding altogether.
       const characterId = stableId(character?.id) || stableId(context.characterId);

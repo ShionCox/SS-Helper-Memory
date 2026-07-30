@@ -9,6 +9,7 @@ import type {
 } from './domain';
 import type { RecallQuery, RecallResult } from './application/recall';
 import type { MemoryCaptureProgress, MemoryInitializationOptions } from './ui/memory-ui';
+import type { SSHelperFailureContext } from '@ss-helper/sdk';
 
 export interface MemorySqliteStatus {
   connected: boolean;
@@ -30,7 +31,7 @@ export interface MemorySqliteStatus {
     eligibleFacts: number;
     ratio: number;
   };
-  lastError?: string;
+  failure?: SSHelperFailureContext;
 }
 
 export interface MemoryPluginApi {
@@ -68,7 +69,6 @@ export interface MemoryPluginApi {
   cancelCapture(): Promise<void>;
   listAuditRecords(): Promise<Array<Record<string, unknown>>>;
   getMainChatUsage(): Promise<MainChatUsage[]>;
-  rollbackBatch(jobId: string, batchIndex: number): Promise<void>;
   getSqliteStatus(): Promise<MemorySqliteStatus>;
   clearCurrentChatData(): Promise<void>;
   clearAllMemoryData(): Promise<void>;
@@ -77,7 +77,7 @@ export interface MemoryPluginApi {
   updateActorProfile?(ownerId: string): Promise<readonly import('./domain').ProfileClaim[]>;
   enqueueActorDream?(ownerId: string, traceIds?: readonly string[]): Promise<import('./domain').DreamJob>;
   runActorDream?(jobId: string, options?: { readonly dryRun?: boolean; readonly narrative?: boolean }): Promise<import('./application/dream').DreamAudit>;
-  auditActorOutput?(output: string): import('./application/recall').KnowledgeLeakageAudit | null;
+  auditActorOutput?(output: string): Promise<import('./application/recall').KnowledgeLeakageAudit | null>;
   listActors?(): Promise<readonly import('./domain').MemoryOwner[]>;
   listActorAliases?(): Promise<readonly import('./domain').ActorAlias[]>;
   listSceneCasts?(): Promise<readonly import('./domain').SceneCast[]>;

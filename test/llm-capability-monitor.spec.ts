@@ -6,7 +6,7 @@ import {
   type MemoryCapabilitySettings,
 } from '../src/ss-helper/llm-capability-monitor';
 
-const disabled: MemoryCapabilitySettings = { enabled: false, autoOrganize: false, recallMode: 'lexical', rerankMode: 'off' };
+const disabled: MemoryCapabilitySettings = { enabled: false, autoOrganize: false, recallMode: 'lexical', rerankMode: 'off', preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto' };
 
 function unavailableMonitor(): MemoryLlmCapabilityMonitor {
   const response = {
@@ -18,17 +18,16 @@ function unavailableMonitor(): MemoryLlmCapabilityMonitor {
     ],
   };
   return new MemoryLlmCapabilityMonitor({
-    services: { call: vi.fn(async () => response) },
-    events: { subscribe: vi.fn(() => () => {}) },
+    bus: { request: vi.fn(async () => response), subscribe: vi.fn(() => () => {}) },
     host: { events: { subscribe: vi.fn(() => () => {}) } },
   } as unknown as PluginSession, () => disabled);
 }
 
 describe('Memory settings capability policy', () => {
   it.each([
-    [{ enabled: true, autoOrganize: true, recallMode: 'lexical', rerankMode: 'off' }, 'MEMORY_GENERATION_UNAVAILABLE'],
-    [{ enabled: true, autoOrganize: false, recallMode: 'vector', rerankMode: 'off' }, 'MEMORY_EMBEDDING_UNAVAILABLE'],
-    [{ enabled: true, autoOrganize: false, recallMode: 'lexical', rerankMode: 'always' }, 'MEMORY_RERANK_UNAVAILABLE'],
+    [{ enabled: true, autoOrganize: true, recallMode: 'lexical', rerankMode: 'off', preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto' }, 'MEMORY_GENERATION_UNAVAILABLE'],
+    [{ enabled: true, autoOrganize: false, recallMode: 'vector', rerankMode: 'off', preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto' }, 'MEMORY_EMBEDDING_UNAVAILABLE'],
+    [{ enabled: true, autoOrganize: false, recallMode: 'lexical', rerankMode: 'always', preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto' }, 'MEMORY_RERANK_UNAVAILABLE'],
   ] as const)('blocks an unavailable strict setting without persisting it', async (next, code) => {
     const monitor = unavailableMonitor();
     const assessment = await monitor.assess(next, disabled);
@@ -39,7 +38,7 @@ describe('Memory settings capability policy', () => {
 
   it('allows automatic modes and reports both non-obvious degradations', async () => {
     const monitor = unavailableMonitor();
-    await expect(monitor.assess({ enabled: true, autoOrganize: false, recallMode: 'auto', rerankMode: 'adaptive' }, disabled)).resolves.toMatchObject({
+    await expect(monitor.assess({ enabled: true, autoOrganize: false, recallMode: 'auto', rerankMode: 'adaptive', preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto' }, disabled)).resolves.toMatchObject({
       warnings: [
         { code: 'MEMORY_EMBEDDING_DEGRADED', message: expect.stringContaining('LLM') },
         { code: 'MEMORY_RERANK_DEGRADED', message: expect.stringContaining('LLM') },
@@ -76,10 +75,9 @@ describe('Memory settings capability policy', () => {
       ],
     }));
     const monitor = new MemoryLlmCapabilityMonitor({
-      services: { call },
-      events: { subscribe: vi.fn((_token, listener) => { eventListener = listener; return () => { eventListener = undefined; }; }) },
+      bus: { request: call, subscribe: vi.fn((_token, listener) => { eventListener = listener; return () => { eventListener = undefined; }; }) },
       host: { events: { subscribe: vi.fn(() => () => {}) } },
-    } as unknown as PluginSession, () => ({ enabled: true, autoOrganize: true, recallMode: 'vector', rerankMode: 'off' }));
+    } as unknown as PluginSession, () => ({ enabled: true, autoOrganize: true, recallMode: 'vector', rerankMode: 'off', preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto' }));
     const snapshots: Array<Record<string, { value: string; description?: string }>> = [];
     monitor.subscribeStatus((status) => snapshots.push(status as typeof snapshots[number]));
     await monitor.start();
@@ -108,8 +106,7 @@ describe('Memory settings capability policy', () => {
       ],
     };
     const monitor = new MemoryLlmCapabilityMonitor({
-      services: { call: vi.fn(async () => response) },
-      events: { subscribe: vi.fn(() => () => {}) },
+      bus: { request: vi.fn(async () => response), subscribe: vi.fn(() => () => {}) },
       host: { events: { subscribe: vi.fn(() => () => {}) } },
     } as unknown as PluginSession, () => disabled);
     await monitor.start();
@@ -136,8 +133,7 @@ describe('Memory settings capability policy', () => {
     vi.useFakeTimers();
     try {
       const monitor = new MemoryLlmCapabilityMonitor({
-        services: { call: vi.fn(() => new Promise(() => {})) },
-        events: { subscribe: vi.fn(() => () => {}) },
+        bus: { request: vi.fn(() => new Promise(() => {})), subscribe: vi.fn(() => () => {}) },
         host: { events: { subscribe: vi.fn(() => () => {}) } },
       } as unknown as PluginSession, () => disabled);
 

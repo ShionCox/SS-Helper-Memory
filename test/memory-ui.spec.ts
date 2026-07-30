@@ -1,13 +1,11 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
 import {
-  EXPECTED_SQLITE_SCHEMA_VERSION,
   filterAndSortFacts,
   formatAuditResource,
   formatChatIdentity,
   formatSourceReference,
-  formatRollbackConfirmation,
-  localizeLegacyGraphPreview,
+  localizeGraphPreview,
   MEMORY_CAPABILITY_BOUNDARIES,
   readSafeLlmErrorDetails,
   translateChatBinding,
@@ -17,7 +15,8 @@ import {
   translateRecallMode,
   renderMemoryWorkbench,
 } from '../src/ui/memory-ui';
-import type { MemoryInitializationOptions, MemoryUiController, MemoryUiFact } from '../src/ui/memory-ui';
+import type { MemoryUiController, MemoryUiFact } from '../src/ui/memory-ui';
+import { describeMemoryError } from '../src/diagnostics/memory-error';
 
 vi.mock('../src/ui/scene-cast-pixi', () => ({
   mountSceneCastPixi: vi.fn(async () => ({
@@ -263,8 +262,7 @@ describe('Memory UI 展示适配', () => {
     dispose();
   });
 
-  it('展示部分完成失败项，并把所选 ID 交给定向修复和忽略操作', async () => {
-    const repairCaptureRejections = vi.fn(async () => undefined);
+  it('展示部分完成失败项，并把所选 ID 交给忽略操作', async () => {
     const ignoreCaptureRejections = vi.fn(async () => undefined);
     const rejection = {
       id: 'capture-rejection:1',
@@ -289,7 +287,6 @@ describe('Memory UI 展示适配', () => {
         accepted: 2,
         rejected: [rejection],
       }],
-      repairCaptureRejections,
       ignoreCaptureRejections,
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -297,12 +294,7 @@ describe('Memory UI 展示适配', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     container.querySelector<HTMLInputElement>('[data-capture-rejection-id="capture-rejection:1"]')!.click();
-    expect(container.textContent).toContain('预计 1 次请求');
-    (container.querySelector('[data-action="repair-capture-rejections"]') as HTMLButtonElement).click();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(repairCaptureRejections).toHaveBeenCalledWith('change-audit:partial', ['capture-rejection:1']);
-
-    container.querySelector<HTMLInputElement>('[data-capture-rejection-id="capture-rejection:1"]')!.click();
+    expect(container.textContent).not.toContain('定向修复');
     (container.querySelector('[data-action="ignore-capture-rejections"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(ignoreCaptureRejections).toHaveBeenCalledWith('change-audit:partial', ['capture-rejection:1']);
@@ -326,8 +318,10 @@ describe('Memory UI 展示适配', () => {
   it('鉴权错误只提取安全诊断字段且不会要求展示密钥', () => {
     expect(readSafeLlmErrorDetails({
       status: 'error', factCount: 0, lastOrganizedAt: null, pendingJobs: 0, llmAvailable: true,
-      error: 'HTTP 401 resource:openai-main model:gpt-test credential=sk-secret',
-    })).toEqual({ code: '401', resource: 'openai-main', model: 'gpt-test' });
+      failure: { reasonCode: 'AUTH_FAILED', stage: 'provider.http.response' },
+      llmResource: 'openai-main',
+      llmModel: 'gpt-test',
+    })).toEqual({ code: 'AUTH_FAILED', resource: 'openai-main', model: 'gpt-test' });
   });
 
   it('设置页明确展示当前功能边界与实现状态', () => {
@@ -339,14 +333,6 @@ describe('Memory UI 展示适配', () => {
     expect(MEMORY_CAPABILITY_BOUNDARIES.some((item) => item.status === '替代')).toBe(true);
     expect(MEMORY_CAPABILITY_BOUNDARIES.some((item) => item.status === '可用')).toBe(true);
     expect(MEMORY_CAPABILITY_BOUNDARIES.find((item) => item.name === '关系图谱')?.status).toBe('可用');
-  });
-
-  it('明确 SQLite schema v4 与级联批次回滚语义', () => {
-    const confirmation = formatRollbackConfirmation('job:test', 3);
-
-    expect(EXPECTED_SQLITE_SCHEMA_VERSION).toBe(0);
-    expect(confirmation).toContain('第 3 批及其后续批次');
-    expect(confirmation).toContain('之后批次的整理结果也会一并撤销');
   });
 
   it('渲染多主体工作台页面并支持内联事实编辑', async () => {
@@ -361,7 +347,9 @@ describe('Memory UI 展示适配', () => {
     expect([...container.querySelectorAll('[data-action="navigate"]')].slice(0, 3).map((node) => node.getAttribute('data-page'))).toEqual(['overview', 'initialize', 'actors']);
     expect(container.querySelector('[data-action="select-fact"]')).not.toBeNull();
     expect(container.querySelector('[data-action="select-fact"]')?.getAttribute('data-ss-helper-control')).toBe('button');
-    expect(container.querySelector('[data-action="refresh-library"]')?.getAttribute('data-ss-helper-tone')).toBe('neutral');
+    expect(container.querySelector('.stx-memory-page-heading [data-action="refresh"]')?.getAttribute('data-ss-helper-tone')).toBe('neutral');
+    expect(container.querySelector('[data-action="refresh-library"]')).toBeNull();
+    expect(container.querySelector('.stx-memory-nav-meta')?.textContent).toBe('记忆插件 v0.0.1');
     expect(container.querySelectorAll('select[data-ss-helper-control="select"][aria-label]')).toHaveLength(1);
     expect(container.querySelectorAll('[data-action="toggle-filter-menu"]')).toHaveLength(2);
     expect(container.querySelector('[data-filter="query"]')?.getAttribute('data-ss-helper-control')).toBe('input');
@@ -494,7 +482,8 @@ describe('Memory UI 展示适配', () => {
     expect(overview?.querySelector('[data-action="navigate"][data-page="initialize"]')).not.toBeNull();
     expect(overview?.querySelector('[data-action="navigate"][data-page="scenes"]')).not.toBeNull();
     expect(overview?.querySelector('[data-action="navigate"][data-page="recall"]')).not.toBeNull();
-    expect(overview?.querySelector('[data-action="refresh-health"]')).not.toBeNull();
+    expect(overview?.querySelector('[data-action="refresh-health"]')).toBeNull();
+    expect(container.querySelector('.stx-memory-page-heading [data-action="refresh"]')).not.toBeNull();
 
     (overview?.querySelector('[data-action="navigate"][data-page="scenes"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -573,11 +562,12 @@ describe('Memory UI 展示适配', () => {
 
     (container.querySelector('[data-action="scene-set-category"][data-category="event"]') as HTMLButtonElement).click();
     expect(container.textContent).toContain('艾琳在北门交付钥匙');
-    expect(container.querySelector('.stx-memory-page-counter')?.textContent).toBe('1 个结构化事件');
+    expect(container.querySelector('.stx-memory-page-counter')).toBeNull();
+    expect(container.querySelector('.stx-memory-page-heading [data-action="refresh"]')).not.toBeNull();
 
     (container.querySelector('[data-action="scene-set-category"][data-category="observation"]') as HTMLButtonElement).click();
     expect(container.textContent).toContain('钥匙交给你保管');
-    expect(container.querySelector('.stx-memory-page-counter')?.textContent).toBe('1 条观察记录');
+    expect(container.querySelector('.stx-memory-page-counter')).toBeNull();
     dispose();
   });
 
@@ -823,7 +813,7 @@ describe('Memory UI 展示适配', () => {
         listFacts: async () => facts,
       }),
       () => undefined,
-      { close: () => undefined, refreshControls: (root) => { if (root) refreshed.push(root); } },
+      { close: () => undefined, refreshControls: (root: HTMLElement | undefined) => { if (root) refreshed.push(root); } } as never,
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -855,7 +845,7 @@ describe('Memory UI 展示适配', () => {
     (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(container.textContent).toContain('初始化当前聊天');
-    expect(container.textContent).toContain('按每批 5 层可见用户/助手消息拆分');
+    expect(container.textContent).toContain('按每批 5 层用户/助手正文拆分（包含隐藏楼层）');
     expect(container.querySelector('[data-source-kind]')?.getAttribute('data-ss-helper-control')).toBe('checkbox');
     expect(container.querySelector('[data-option="include-invisible-history"]')).toBeNull();
     expect(container.querySelector('.stx-memory-init-estimate')).not.toBeNull();
@@ -887,7 +877,7 @@ describe('Memory UI 展示适配', () => {
       nodes: [{ id: 'node-a', label: '白夕小时' }, { id: 'node-b', label: 'tomorrow_outing_split' }],
       edges: [{ id: 'edge-a', from: 'node-a', to: 'node-b', predicate: 'plans_to', kind: 'goal' as const, status: 'active' as const, confidence: 0.9, backingFactId: 'fact-1' }],
     };
-    expect(localizeLegacyGraphPreview(graph)).toMatchObject({
+    expect(localizeGraphPreview(graph)).toMatchObject({
       nodes: [{ label: '白夕小时' }, { label: '相关对象' }],
       edges: [{ predicate: '目标' }],
     });
@@ -1001,44 +991,6 @@ describe('Memory UI 展示适配', () => {
     dispose();
   });
 
-  it('初始化开关默认关闭、实时刷新计数，并把本次选项传给控制器', async () => {
-    const container = document.createElement('div');
-    document.body.append(container);
-    const sourceOptions: boolean[] = [];
-    const estimateOptions: boolean[] = [];
-    const initializeOptions: MemoryInitializationOptions[] = [];
-    const dispose = renderMemoryWorkbench(container, workbenchController({
-      getInitializationSources: async (options) => {
-        const enabled = options?.includeInvisibleHistory === true;
-        sourceOptions.push(enabled);
-        return [{ kind: 'message', label: '聊天消息', count: enabled ? 2 : 1, rawCount: 3, defaultCount: 1, excludedCount: enabled ? 1 : 2, selected: true }];
-      },
-      getInitializationEstimate: async (_kinds, options) => {
-        const enabled = options?.includeInvisibleHistory === true;
-        estimateOptions.push(enabled);
-        return { messageCount: enabled ? 2 : 1, batchCount: 1, tokenLow: 10, tokenHigh: 20 };
-      },
-      initialize: async (_kinds, options) => { initializeOptions.push({ ...options }); },
-    }));
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    const toggle = container.querySelector<HTMLInputElement>('[data-option="include-invisible-history"]')!;
-    expect(toggle.checked).toBe(false);
-    expect(container.textContent).toContain('1 / 3 条');
-    toggle.checked = true;
-    toggle.dispatchEvent(new Event('change', { bubbles: true }));
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(sourceOptions.at(-1)).toBe(true);
-    expect(estimateOptions.at(-1)).toBe(true);
-    expect(container.textContent).toContain('2 / 3 条');
-    (container.querySelector('[data-action="initialize-start"]') as HTMLButtonElement).click();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(initializeOptions).toEqual([{ includeInvisibleHistory: true }]);
-    dispose();
-  });
-
   it('初始化标题提供 SDK 刷新按钮并重新读取真实状态', async () => {
     const container = document.createElement('div');
     document.body.append(container);
@@ -1055,7 +1007,7 @@ describe('Memory UI 展示适配', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(container.querySelector('.stx-memory-page-heading h2')?.textContent).toBe('初始化记忆');
-    const refresh = container.querySelector<HTMLButtonElement>('[data-action="refresh-initialization"]')!;
+    const refresh = container.querySelector<HTMLButtonElement>('.stx-memory-page-heading [data-action="refresh"]')!;
     expect(refresh.getAttribute('data-ss-helper-control')).toBe('button');
     expect(refresh.querySelector('ss-helper-icon[name="rotate"]')).not.toBeNull();
     refresh.click();
@@ -1063,13 +1015,14 @@ describe('Memory UI 展示适配', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(stateCalls).toBeGreaterThanOrEqual(2);
-    expect(notifications.some((notification) => notification.code === 'MEMORY_INITIALIZATION_REFRESHED')).toBe(true);
+    expect(notifications.some((notification) => notification.code === 'MEMORY_WORKBENCH_REFRESHED')).toBe(true);
     dispose();
   });
 
   it('暂停任务展示断点阶段并提供继续操作', async () => {
     const container = document.createElement('div');
     document.body.append(container);
+    const reinitialize = vi.fn(async () => undefined);
     const dispose = renderMemoryWorkbench(container, workbenchController({
       getInitializationState: async () => ({
         initialized: false,
@@ -1078,6 +1031,7 @@ describe('Memory UI 展示适配', () => {
         attempts: [{ jobId: 'init-paused', status: 'paused', updatedAt: 30, totalBatches: 4, selectedSourceKinds: ['message'] }],
       }),
       getCaptureProgress: async () => ({ status: 'paused', jobId: 'init-paused', batchIndex: 2, totalBatches: 4, processedCount: 8, elapsedMs: 4000 }),
+      reinitialize,
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
     (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
@@ -1085,12 +1039,22 @@ describe('Memory UI 展示适配', () => {
 
     expect(container.textContent).toContain('断点已保留');
     expect(container.querySelector('[data-action="initialize-resume"]')).not.toBeNull();
+    const reinitializeTrigger = container.querySelector<HTMLButtonElement>('[data-action="open-reinitialize"]')!;
+    expect(reinitializeTrigger).not.toBeNull();
     expect(container.querySelectorAll('.stx-memory-init-pipeline-step.is-done')).toHaveLength(1);
-    expect(container.querySelectorAll('.stx-memory-init-pipeline-step.is-active')).toHaveLength(1);
+    expect(container.querySelectorAll('.stx-memory-init-pipeline-step.is-stopped')).toHaveLength(1);
+    expect(container.querySelectorAll('.stx-memory-init-pipeline-step.is-active')).toHaveLength(0);
+    reinitializeTrigger.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const confirm = container.querySelector<HTMLButtonElement>('[data-action="confirm-reinitialize"]')!;
+    expect(confirm.disabled).toBe(false);
+    confirm.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(reinitialize).toHaveBeenCalledTimes(1);
     dispose();
   });
 
-  it('选择事实后保留记忆列表的滚动位置', async () => {
+  it('选择事实后保留 SDK 虚拟记忆列表的真实滚动位置', async () => {
     const facts: MemoryUiFact[] = Array.from({ length: 8 }, (_, index) => ({
       id: `fact-${index + 1}`,
       kind: 'state',
@@ -1103,17 +1067,56 @@ describe('Memory UI 展示适配', () => {
     }));
     const container = document.createElement('div');
     document.body.append(container);
+    const mountedLists = new Map<string, HTMLElement>();
+    const popupUi = {
+      refreshControls: () => undefined,
+      mountList: (host: HTMLElement, definition: {
+        id: string;
+        selectedKey?: string;
+        loadPage: (request: { limit: number; signal: AbortSignal }) => Promise<{ items: readonly MemoryUiFact[] }>;
+        renderItem: (item: MemoryUiFact, context: { index: number; selected: boolean; focused: boolean }) => HTMLElement;
+      }) => {
+        let element = mountedLists.get(definition.id);
+        if (!element) {
+          element = document.createElement('div');
+          element.className = 'stx-popup-list';
+          mountedLists.set(definition.id, element);
+          if (definition.id.startsWith('memory-library:')) {
+            void definition.loadPage({ limit: 20, signal: new AbortController().signal }).then((page) => {
+              element!.replaceChildren(...page.items.map((item, index) => definition.renderItem(item, {
+                index,
+                selected: definition.selectedKey === item.id,
+                focused: false,
+              })));
+            });
+          }
+        } else if (!element.isConnected) {
+          // Chromium clears a detached scrolling element before the stable SDK
+          // list instance is attached to the freshly rendered host.
+          element.scrollTop = 0;
+        }
+        host.replaceChildren(element);
+        if (definition.id.startsWith('memory-library:')) {
+          for (const row of element.querySelectorAll<HTMLElement>('[data-fact-id]')) {
+            row.setAttribute('aria-selected', String(row.dataset.factId === definition.selectedKey));
+          }
+        }
+        return { element, refresh: () => undefined, scrollToKey: async () => undefined, dispose: () => undefined };
+      },
+    } as never;
     const dispose = renderMemoryWorkbench(container, workbenchController({
       getOverview: async () => ({ status: 'ready', bound: true, factCount: facts.length, currentChatSizeBytes: 1024, currentChatUsageRatio: 0.5, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: true }),
       listFacts: async () => facts,
-    }));
+      listFactsPage: async () => ({ items: facts, nextCursor: null, total: facts.length }),
+    }), undefined, popupUi);
     await new Promise((resolve) => setTimeout(resolve, 0));
-    const list = container.querySelector<HTMLElement>('.stx-memory-fact-list')!;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const list = container.querySelector<HTMLElement>('.stx-memory-library-fact-list > .stx-popup-list')!;
     list.scrollTop = 240;
     (container.querySelectorAll('.stx-memory-library-fact-list [data-action="select-fact"]')[4] as HTMLButtonElement).click();
-    expect(container.querySelector<HTMLElement>('.stx-memory-fact-list')?.scrollTop).toBe(240);
+    expect(container.querySelector<HTMLElement>('.stx-memory-library-fact-list > .stx-popup-list')?.scrollTop).toBe(240);
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(container.querySelector<HTMLElement>('.stx-memory-fact-list')?.scrollTop).toBe(240);
+    expect(container.querySelector<HTMLElement>('.stx-memory-library-fact-list > .stx-popup-list')?.scrollTop).toBe(240);
     expect(container.querySelector('[data-fact-id="fact-5"]')?.getAttribute('aria-selected')).toBe('true');
     dispose();
   });
@@ -1153,6 +1156,42 @@ describe('Memory UI 展示适配', () => {
     dispose();
   });
 
+  it('隐藏楼层选项同步刷新来源与估算，并按当前选择提交初始化', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const sourceOptions: Array<boolean | undefined> = [];
+    const estimateOptions: Array<boolean | undefined> = [];
+    const initializeOptions: Array<boolean | undefined> = [];
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getInitializationSources: async (options) => {
+        sourceOptions.push(options?.includeHiddenMessageFloors);
+        const included = options?.includeHiddenMessageFloors !== false;
+        return [{ kind: 'message', label: '聊天消息', count: included ? 119 : 78, rawCount: 119, defaultCount: 119, excludedCount: included ? 0 : 41, selected: true }];
+      },
+      getInitializationEstimate: async (_kinds, options) => {
+        estimateOptions.push(options?.includeHiddenMessageFloors);
+        return { messageCount: options?.includeHiddenMessageFloors === false ? 78 : 119, batchCount: 12, tokenLow: 100, tokenHigh: 200 };
+      },
+      initialize: async (_kinds, options) => { initializeOptions.push(options?.includeHiddenMessageFloors); },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const hiddenOption = container.querySelector<HTMLInputElement>('[data-option="include-hidden-message-floors"]')!;
+    expect(hiddenOption.checked).toBe(true);
+    hiddenOption.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(container.querySelector('.stx-memory-init-source-count')?.textContent).toContain('78 / 119');
+    expect(sourceOptions.at(-1)).toBe(false);
+    expect(estimateOptions.at(-1)).toBe(false);
+
+    (container.querySelector('[data-action="initialize-start"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(initializeOptions).toEqual([false]);
+    dispose();
+  });
+
   it('成功初始化保持为主状态，最近失败只出现在活动列表', async () => {
     const container = document.createElement('div');
     document.body.append(container);
@@ -1162,11 +1201,11 @@ describe('Memory UI 展示适配', () => {
         lastCompletedAt: 20,
         selectedSourceKinds: ['message'],
         attempts: [
-          { jobId: 'init-failed', status: 'failed', updatedAt: 30, totalBatches: 2, selectedSourceKinds: ['message'], error: 'SCHEMA_VALIDATION_FAILED: unsafe details' },
+          { jobId: 'init-failed', status: 'failed', updatedAt: 30, totalBatches: 2, selectedSourceKinds: ['message'], failure: { reasonCode: 'SCHEMA_VALIDATION_FAILED', stage: 'llm.structured.validate' } },
           { jobId: 'init-ok', status: 'completed', updatedAt: 20, totalBatches: 3, selectedSourceKinds: ['message'] },
         ],
       }),
-      getCaptureProgress: async () => ({ status: 'failed', jobId: 'init-failed', batchIndex: 1, totalBatches: 2, processedCount: 2, elapsedMs: 100, error: 'SCHEMA_VALIDATION_FAILED' }),
+      getCaptureProgress: async () => ({ status: 'failed', jobId: 'init-failed', batchIndex: 1, totalBatches: 2, processedCount: 2, elapsedMs: 100, failure: { reasonCode: 'SCHEMA_VALIDATION_FAILED', stage: 'llm.structured.validate' } }),
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
     (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
@@ -1561,7 +1600,7 @@ describe('Memory UI 展示适配', () => {
       id: 'trace-su-station', workspaceId: 'workspace:1', chatKey: 'chat:1', ownerId: 'owner-su', factId: 'fact-role-memory',
       sourceObservationIds: ['observation-88'], knowledgeMode: 'experienced' as const, privacy: 'public' as const,
       strength: 90, clarity: 96, beliefConfidence: .95, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1,
-      floor: 88, createdAt: updatedAt - 500, updatedAt,
+      floor: 88, learnedAt: updatedAt - 500, createdAt: updatedAt - 500, updatedAt,
     }]);
     const listObservations = vi.fn(async () => [{
       id: 'observation-88', workspaceId: 'workspace:1', episodeId: 'episode-88', sourceRef: 'message:88',
@@ -1639,8 +1678,8 @@ describe('Memory UI 展示适配', () => {
       getOverview: async () => ({ status: 'ready', bound: true, factCount: 1, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: false }),
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(container.textContent).toContain('大语言模型服务不可用');
-    expect(container.textContent).toContain('LLM_SERVICE_UNAVAILABLE');
+    expect(container.textContent).toContain('Memory 无法连接 LLM 服务');
+    expect(container.textContent).toContain('MEMORY_LLM_CLIENT_UNAVAILABLE');
     dispose();
   });
 
@@ -1650,20 +1689,18 @@ describe('Memory UI 展示适配', () => {
     const dispose = renderMemoryWorkbench(container, workbenchController({
       getOverview: async () => ({
         status: 'error', bound: false, factCount: 0, lastOrganizedAt: null, pendingJobs: 0, llmAvailable: true,
-        errorDiagnostic: {
-          code: 'WORKSPACE_NOT_FOUND',
-          title: '当前聊天的记忆工作区初始化失败',
-          reason: '当前聊天的数据集合尚未创建。',
-          action: '点击重新检查以自动补建。',
-          retryable: true,
-        },
+        errorDiagnostic: describeMemoryError(
+          { reasonCode: 'WORKSPACE_NOT_FOUND', stage: 'memory.chat-bind' },
+          'WORKSPACE_NOT_FOUND',
+          'chat-bind',
+        ),
       }),
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(container.textContent).toContain('当前聊天的记忆工作区初始化失败');
+    expect(container.textContent).toContain('工作区数据不存在');
     expect(container.textContent).toContain('WORKSPACE_NOT_FOUND');
-    expect(container.textContent).toContain('原因：当前聊天的数据集合尚未创建。');
-    expect(container.textContent).toContain('处理建议：点击重新检查以自动补建。');
+    expect(container.textContent).toContain('原因：请求的工作区、集合或记录尚未创建。');
+    expect(container.textContent).toContain('处理建议：先初始化对应工作区后重试。');
     dispose();
   });
 });

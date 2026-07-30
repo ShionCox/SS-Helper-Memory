@@ -1,9 +1,10 @@
 import type { MemoryTokenUsage } from '../../domain';
+import { createSSHelperError, describeSSHelperFailure } from '@ss-helper/sdk';
 import {
   MEMORY_PLUGIN_ID,
   MEMORY_RERANK_TASK,
-  readMemoryLlmApi,
-  type MemoryLlmApi,
+  readMemoryLlmClient,
+  type MemoryLlmClient,
 } from '../ingest/llm-extractor';
 import {
   MemoryRecallIndex,
@@ -186,13 +187,13 @@ function updateCandidate(
 /** 组合本地硬过滤、向量扫描、RRF 与可选 LLM 重排，并保证失败时可降级。 */
 export class SemanticRecallService {
   private readonly graph: GraphRecallCandidateProvider | undefined;
-  private readonly getLlm: () => MemoryLlmApi | null;
+  private readonly getLlm: () => MemoryLlmClient | null;
 
   constructor(
     private readonly index: MemoryRecallIndex,
     private readonly vectors: MemoryVectorIndexService,
-    graphOrGetLlm?: GraphRecallCandidateProvider | (() => MemoryLlmApi | null),
-    getLlm: () => MemoryLlmApi | null = readMemoryLlmApi,
+    graphOrGetLlm?: GraphRecallCandidateProvider | (() => MemoryLlmClient | null),
+    getLlm: () => MemoryLlmClient | null = readMemoryLlmClient,
   ) {
     if (typeof graphOrGetLlm === 'function') this.getLlm = graphOrGetLlm;
     else {
@@ -230,7 +231,11 @@ export class SemanticRecallService {
           degradedReason = '没有达到动态阈值的向量候选，已退回词法召回。';
         }
       } catch (error) {
-        degradedReason = error instanceof Error ? error.message : String(error);
+        const diagnostic = describeSSHelperFailure(error, {
+          reasonCode: 'INTERNAL_ERROR',
+          stage: 'memory.recall.vector',
+        });
+        degradedReason = `${diagnostic.reasonCode} · ${diagnostic.title}`;
       }
     }
 
@@ -356,7 +361,7 @@ export class SemanticRecallService {
                 budget: { maxLatencyMs: rerankTimeoutMs },
                 enqueue: { displayMode: 'silent' },
               }), rerankTimeoutMs, 'memory_rerank');
-              if (!response.ok) throw new Error(response.error || 'memory_rerank 失败。');
+              if (!response.ok) throw createSSHelperError(response.failure.reasonCode, response.failure);
               const seen = new Set<number>();
               const valid = response.results
                 .filter(item => {
@@ -396,7 +401,11 @@ export class SemanticRecallService {
             }
           }
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
+          const diagnostic = describeSSHelperFailure(error, {
+            reasonCode: 'INTERNAL_ERROR',
+            stage: 'memory.recall.rerank',
+          });
+          const message = `${diagnostic.reasonCode} · ${diagnostic.title}`;
           degradedReason = degradedReason || message;
           rerankDiagnostic = {
             requested: true,

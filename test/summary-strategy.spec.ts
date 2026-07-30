@@ -22,6 +22,7 @@ describe('Memory 总结策略', () => {
       message(5),
     ];
     expect(visibleConversationMessages(sources).map((source) => source.floor)).toEqual([1, 5]);
+    expect(visibleConversationMessages(sources, { includeHiddenMessageFloors: true }).map((source) => source.floor)).toEqual([1, 2, 5]);
   });
 
   it('显式开启时将 system 历史正文按原始 floor 纳入批次，但不纳入 tool/reasoning', () => {

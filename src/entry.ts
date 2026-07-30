@@ -1,16 +1,12 @@
 import {
   bootstrapSSHelper,
+  describeSSHelperFailure,
   ensureHostedCore,
-  SSHelperError,
-  waitForTavernReady,
   type SessionBootstrap,
 } from '@ss-helper/sdk';
 import { MemoryRuntime } from './host/memory-runtime';
 import { logger, traceMemoryStartup } from './host/runtime-feedback';
 import { MEMORY_PLUGIN_DESCRIPTOR, type MemoryHostCapability } from './ss-helper/plugin';
-
-const FIRST_SESSION_TIMEOUT_MS = 10_000;
-const POST_READY_START_DELAY_MS = 250;
 
 let runtime: MemoryRuntime | null = null;
 let bootstrap: SessionBootstrap<MemoryHostCapability> | null = null;
@@ -26,53 +22,29 @@ function stopRuntime(candidate: MemoryRuntime | null): void {
   candidate.stop();
 }
 
-function safeCode(error: unknown, fallback = 'MEMORY_START_FAILED'): string {
-  const value = error && typeof error === 'object' && 'code' in error ? (error as { readonly code?: unknown }).code : undefined;
-  return typeof value === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/u.test(value) ? value : fallback;
-}
-
 function showActivationFailure(session: SessionBootstrap<MemoryHostCapability>['current'], error: unknown): void {
+  const diagnostic = describeSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.startup' });
   try {
     session.ui.showToast({
       level: 'error',
-      title: 'Memory 启动失败',
-      message: 'Memory 未能完成启动；酒馆其余功能不受影响。',
-      code: safeCode(error),
+      title: diagnostic.title,
+      message: `${diagnostic.reason} ${diagnostic.action}`,
+      code: diagnostic.reasonCode,
     });
   } catch {
     // Core may be reconnecting; the structured console diagnostic below remains available.
   }
 }
 
-/**
- * APP_READY is emitted while SillyTavern is still completing its own final
- * render pass. Yield one bounded browser turn before Memory touches Core DOM
- * contributions, so an extension never competes with the initialization
- * overlay for the same lifecycle turn. Node-side callers remain immediate.
- */
-function deferBrowserStartupAfterReady(signal: AbortSignal): Promise<void> {
-  if (typeof window === 'undefined') return Promise.resolve();
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signal.removeEventListener('abort', finish);
-      resolve();
-    };
-    const timer = setTimeout(finish, POST_READY_START_DELAY_MS);
-    signal.addEventListener('abort', finish, { once: true });
-  });
-}
-
-async function activate(session: SessionBootstrap<MemoryHostCapability>['current'], version: number): Promise<MemoryRuntime | null> {
+async function activate(session: SessionBootstrap<MemoryHostCapability>['current'], version: number, signal: AbortSignal): Promise<MemoryRuntime | null> {
   traceMemoryStartup('activate:begin');
   stopRuntime(runtime);
   const next = new MemoryRuntime(session);
+  next.registerEarlyMessageRecallAction();
   startingRuntime = next;
   let connected: boolean;
   try {
+    if (signal.aborted || version !== lifecycleVersion) { stopRuntime(next); return null; }
     connected = await next.start();
   } finally {
     if (startingRuntime === next) startingRuntime = null;
@@ -100,7 +72,6 @@ export function start(): Promise<MemoryRuntime | null> {
   let resolveFirst!: (value: MemoryRuntime | null) => void;
   let rejectFirst!: (reason?: unknown) => void;
   let firstSettled = false;
-  let firstTimer: ReturnType<typeof setTimeout> | undefined;
   const first = new Promise<MemoryRuntime | null>((resolve, reject) => { resolveFirst = resolve; rejectFirst = reject; });
   // The first session is normally awaited below. Attach a side handler as well
   // so an unusually slow bridge cannot surface an early timeout as unhandled.
@@ -108,13 +79,11 @@ export function start(): Promise<MemoryRuntime | null> {
   const resolveFirstOnce = (value: MemoryRuntime | null): void => {
     if (firstSettled) return;
     firstSettled = true;
-    if (firstTimer !== undefined) clearTimeout(firstTimer);
     resolveFirst(value);
   };
   const rejectFirstOnce = (error: unknown): void => {
     if (firstSettled) return;
     firstSettled = true;
-    if (firstTimer !== undefined) clearTimeout(firstTimer);
     rejectFirst(error);
   };
   const attempt = {
@@ -129,29 +98,16 @@ export function start(): Promise<MemoryRuntime | null> {
   pending = (async () => {
     let nextBootstrap: SessionBootstrap<MemoryHostCapability> | null = null;
     try {
-      traceMemoryStartup('start:wait-app-ready');
-      await waitForTavernReady({ signal: controller.signal });
-      traceMemoryStartup('start:app-ready');
-      if (controller.signal.aborted || version !== lifecycleVersion) return null;
-      traceMemoryStartup('start:defer-browser-turn');
-      await deferBrowserStartupAfterReady(controller.signal);
-      traceMemoryStartup('start:deferred-browser-turn');
-      if (controller.signal.aborted || version !== lifecycleVersion) return null;
       await ensureHostedCore();
       traceMemoryStartup('start:core-ready');
       if (controller.signal.aborted || version !== lifecycleVersion) return null;
-      firstTimer = setTimeout(() => rejectFirstOnce(new SSHelperError(
-        'BOOTSTRAP_CALLBACK_TIMEOUT',
-        'Memory did not receive its first Core session before the deadline',
-        { timeoutMs: FIRST_SESSION_TIMEOUT_MS },
-      )), FIRST_SESSION_TIMEOUT_MS);
       nextBootstrap = await bootstrapSSHelper(MEMORY_PLUGIN_DESCRIPTOR, (session) => {
         traceMemoryStartup('start:first-session');
-        void activate(session, version)
+        void activate(session, version, controller.signal)
           .then(resolveFirstOnce)
           .catch((error) => {
             showActivationFailure(session, error);
-            logger.error('Memory 会话激活失败。', error);
+            logger.error('Memory 会话激活失败。', { reasonCode: describeSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.startup' }).reasonCode });
             rejectFirstOnce(error);
           });
       }, { signal: controller.signal });
@@ -161,16 +117,17 @@ export function start(): Promise<MemoryRuntime | null> {
       }
       bootstrap = nextBootstrap;
       void nextBootstrap.closed.catch((error) => {
-        logger.warn('Memory Core 重连已关闭。', { code: safeCode(error, 'MEMORY_CORE_RECONNECT_CLOSED') });
+        logger.warn('Memory Core 重连已关闭。', {
+          reasonCode: describeSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.session.closed' }).reasonCode,
+        });
       });
       return await first;
     } catch (error) {
       if (nextBootstrap && bootstrap !== nextBootstrap) nextBootstrap.dispose();
       if (controller.signal.aborted || version !== lifecycleVersion) return null;
-      logger.error('Memory 启动失败。', error);
+      logger.error('Memory 启动失败。', { reasonCode: describeSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.startup' }).reasonCode });
       throw error;
     } finally {
-      if (firstTimer !== undefined) clearTimeout(firstTimer);
       if (activeStartAttempt === attempt) activeStartAttempt = null;
       if (startPromise === pending) startPromise = null;
     }
@@ -199,7 +156,9 @@ export function stop(): void {
 
 function autoStart(): void {
   traceMemoryStartup('entry:auto-start');
-  void start().catch((error) => logger.error('Memory 自动启动失败。', error));
+  void start().catch((error) => {
+    logger.error('Memory 自动启动失败。', { reasonCode: describeSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.startup' }).reasonCode });
+  });
 }
 
 if (typeof window !== 'undefined') {

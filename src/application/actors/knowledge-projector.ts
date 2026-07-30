@@ -1,4 +1,4 @@
-import { FIXED_OWNER_IDS, type ActorMemoryTrace, type MemoryEpisode, type MemoryFactKind, type MemoryKnowledgeMode, type MemoryObservation, type MemoryOwner, type MemoryPrivacy } from '../../domain';
+import { FIXED_OWNER_IDS, type ActorMemoryTrace, type MemoryEpisode, type MemoryKnowledgeMode, type MemoryObservation, type MemoryOwner, type MemoryPrivacy } from '../../domain';
 import type { MemoryFact } from '../../domain';
 
 export interface ProjectionInput {
@@ -25,7 +25,7 @@ export interface ProjectionResult {
 
 const clamp = (value: number): number => Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0));
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0));
-const normalizedSalience = (value: number): number => clamp01(value > 1 ? value / 100 : value);
+const normalizedSalience = (value: number): number => clamp01(value);
 const PRIVACY_RANK: Record<MemoryPrivacy, number> = { public: 0, limited: 1, private: 2, secret: 3 };
 
 function traceId(ownerId: string, factId: string): string { return `trace:${ownerId}:${factId}`; }
@@ -72,13 +72,9 @@ export class KnowledgeProjector {
       // Entity references in an ordinary message describe who/what a fact is
       // about; they do not prove that the referenced actor knows it. Only a
       // card/world/state fact may explicitly seed a bounded actor trace.
-      const actorEntityKeys = [...new Set(fact.entityKeys.filter(key => key.startsWith('owner:actor:')))];
       const subjectOwnerId = fact.subjectEntityId?.startsWith('owner:actor:')
         ? fact.subjectEntityId
-        // Compatibility for older card facts that predate subjectEntityId:
-        // seed only when exactly one actor reference exists. Multiple actor
-        // entities could be subject/object and must not all receive knowledge.
-        : actorEntityKeys.length === 1 ? actorEntityKeys[0] : undefined;
+        : undefined;
       const explicitOwners = worldScoped && subjectOwnerId ? new Set<string>([subjectOwnerId]) : new Set<string>();
       const add = (ownerId: string, mode: MemoryKnowledgeMode, privacy: MemoryPrivacy, reason: ProjectionDecision['reason'], observationIds: readonly string[]): void => {
         if (!ownerId) return;
@@ -123,11 +119,11 @@ export class KnowledgeProjector {
             .filter((value): value is number => Number.isFinite(value))
             .sort((left, right) => left - right)[0] ?? fact.validFrom ?? fact.freshestEvidenceAt;
           const trace: ActorMemoryTrace = {
-            id: traceId(ownerId, fact.id), workspaceId: input.workspaceId, ownerId, factId: fact.id,
+            id: traceId(ownerId, fact.id), workspaceId: input.workspaceId, chatKey: fact.chatKey, ownerId, factId: fact.id,
             sourceObservationIds: [...new Set(value.observations.filter(Boolean))], knowledgeMode: value.mode, privacy: value.privacy,
             strength: clamp(baseStrength * (0.7 + clamp01(fact.confidence) * 0.3)), clarity: clamp(baseStrength),
             beliefConfidence: clamp01(fact.confidence), emotionalSalience: normalizedSalience(Number((fact as MemoryFact & { emotionalSalience?: number }).emotionalSalience ?? 0)),
-            rehearsalCount: 0, traceRevision: 1, ...(floor === undefined ? {} : { floor }), ...(learnedAt === undefined ? {} : { learnedAt }), createdAt: timestamp, updatedAt: timestamp,
+            rehearsalCount: 0, traceRevision: 1, ...(floor === undefined ? {} : { floor }), learnedAt, createdAt: timestamp, updatedAt: timestamp,
           };
           traces.push(trace);
           decisions.push({ factId: fact.id, ownerId, mode: value.mode, privacy: value.privacy, reason: value.reason, observationIds: trace.sourceObservationIds });
@@ -186,6 +182,7 @@ export class KnowledgeProjector {
         const trace: ActorMemoryTrace = {
           id: traceId(ownerId, fact.id),
           workspaceId: input.workspaceId,
+          chatKey: fact.chatKey,
           ownerId,
           factId: fact.id,
           sourceObservationIds: [...new Set(value.observations.filter(Boolean))],
@@ -198,7 +195,7 @@ export class KnowledgeProjector {
           rehearsalCount: 0,
           traceRevision: 1,
           ...(floor === undefined ? {} : { floor }),
-          ...(learnedAt === undefined ? {} : { learnedAt }),
+          learnedAt,
           createdAt: timestamp,
           updatedAt: timestamp,
         };

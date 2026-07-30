@@ -1,4 +1,5 @@
-import type { MemoryTokenUsage } from '../../domain';
+import type { AutomaticIngestRejection, MemoryTokenUsage } from '../../domain';
+import { createSSHelperError, type SSHelperFailureContext } from '@ss-helper/sdk';
 import type {
   MemoryExtractionInput,
   SourceBlock,
@@ -9,9 +10,15 @@ import type {
   StructuredEpisode,
   StructuredLocationCandidate,
 } from './types';
+import {
+  buildSupportedEvidenceDirectory,
+  evidenceSpanById,
+  type SupportedEvidenceDirectory,
+} from './supported-evidence-directory';
 
 export const MEMORY_PLUGIN_ID = 'stx_memory';
 export const MEMORY_CAPTURE_TASK = 'memory_capture';
+export const MEMORY_CAPTURE_REPAIR_TASK = 'memory_capture_repair';
 export const MEMORY_EMBED_TASK = 'memory_embed';
 export const MEMORY_RERANK_TASK = 'memory_rerank';
 export const MEMORY_CAPTURE_MAX_TOKENS = 4_096;
@@ -24,15 +31,17 @@ export interface MemoryLlmMeta {
   model?: string;
   latencyMs?: number;
   fallbackUsed?: boolean;
-}
-
-function stableDiagnosticKey(value: string): string {
-  let result = 2166136261;
-  for (const character of value.normalize('NFKC')) {
-    result ^= character.codePointAt(0) ?? 0;
-    result = Math.imul(result, 16777619);
-  }
-  return (result >>> 0).toString(36);
+  attemptCount?: number;
+  repairCount?: number;
+  transport?: 'json_schema' | 'json_object' | 'tavern_json_schema' | 'prompt_only';
+  validationOutcome?: 'complete' | 'partial';
+  itemRejections?: Array<{
+    collection: string;
+    itemIndex: number;
+    issues: Array<{ path: string; keyword: string; expected: string }>;
+    sourceRefs: string[];
+  }>;
+  parentRequestId?: string;
 }
 
 export interface MemoryLlmUsage {
@@ -43,8 +52,7 @@ export interface MemoryLlmUsage {
 
 export type MemoryLlmFailure = {
   ok: false;
-  error: string;
-  reasonCode?: string;
+  failure: SSHelperFailureContext;
   retryable?: boolean;
   fallbackUsed?: boolean;
   meta?: MemoryLlmMeta;
@@ -73,7 +81,7 @@ export type MemoryRerankResult = {
   usage?: MemoryLlmUsage;
 } | MemoryLlmFailure;
 
-export interface MemoryLlmApi {
+export interface MemoryLlmClient {
   runTask<T>(input: {
     consumer: string;
     taskKey: string;
@@ -83,6 +91,8 @@ export interface MemoryLlmApi {
     schema: object;
     budget: { maxTokens: number; maxLatencyMs?: number };
     enqueue: { displayMode: 'compact' | 'silent' };
+    route?: { resourceId?: string; model?: string };
+    parentRequestId?: string;
   }): Promise<{
     ok: true;
     data: T;
@@ -90,8 +100,7 @@ export interface MemoryLlmApi {
     usage?: MemoryLlmUsage;
   } | {
     ok: false;
-    error: string;
-    reasonCode?: string;
+    failure: SSHelperFailureContext;
     retryable?: boolean;
     meta?: MemoryLlmMeta;
   }>;
@@ -123,11 +132,11 @@ export interface MemoryLlmApi {
   };
 }
 
-let configuredLlmApi: MemoryLlmApi | null = null;
+let configuredLlmApi: MemoryLlmClient | null = null;
 export const MEMORY_LLM_ROUTE_DIAGNOSTIC_TIMEOUT_MS = 3_000;
 
-export function configureMemoryLlmApi(api: MemoryLlmApi | null): void { configuredLlmApi = api; }
-export function readMemoryLlmApi(): MemoryLlmApi | null { return configuredLlmApi; }
+export function configureMemoryLlmClient(api: MemoryLlmClient | null): void { configuredLlmApi = api; }
+export function readMemoryLlmClient(): MemoryLlmClient | null { return configuredLlmApi; }
 
 export interface MemoryLlmRouteDiagnostic {
   available: boolean;
@@ -139,19 +148,6 @@ export interface MemoryLlmRouteDiagnostic {
 export interface MemoryRecallRouteDiagnostics {
   embedding: MemoryLlmRouteDiagnostic;
   rerank: MemoryLlmRouteDiagnostic;
-}
-
-export class MemoryLlmTaskError extends Error {
-  readonly code: string;
-
-  constructor(
-    message: string,
-    readonly details: { reasonCode?: string; resourceId?: string; model?: string } = {},
-  ) {
-    super(message);
-    this.name = 'MemoryLlmTaskError';
-    this.code = details.reasonCode?.toUpperCase() || 'MEMORY_LLM_TASK_FAILED';
-  }
 }
 
 async function readRouteWithDeadline<T>(operation: () => Promise<T> | T): Promise<T | undefined> {
@@ -174,7 +170,7 @@ async function readRouteDiagnostic(
   taskKind: MemoryLlmTaskKind,
   requiredCapabilities: string[],
 ): Promise<MemoryLlmRouteDiagnostic> {
-  const llm = readMemoryLlmApi();
+  const llm = readMemoryLlmClient();
   if (!llm) return { available: false, blockedReason: 'LLMHub 未加载或版本过旧' };
   if (!llm.inspect?.previewRoute) return { available: false, blockedReason: '当前 LLM 不支持资源状态检查，请更新 LLM 插件' };
   const route = await readRouteWithDeadline(() => llm.inspect!.previewRoute({
@@ -210,17 +206,27 @@ function safeJson(value: unknown): string {
   return JSON.stringify(value).replace(/[<>&]/g, character => ({ '<': '\\u003c', '>': '\\u003e', '&': '\\u0026' })[character]!);
 }
 
-function serializeExtractionInput(input: MemoryExtractionInput): string {
+function serializeExtractionInput(input: MemoryExtractionInput, evidenceDirectory: SupportedEvidenceDirectory): string {
   const writableSourceRefs = [...new Set(input.writableSourceRefs ?? input.sources.map(source => source.id))];
   const writableSourceRefSet = new Set(writableSourceRefs);
+  const repairActorRefs = input.repair?.referenceDirectory
+    ? new Set(input.repair.referenceDirectory.allowedActorRefs.map(item => item.referenceId))
+    : undefined;
+  const repairLocationRefs = input.repair?.referenceDirectory
+    ? new Set(input.repair.referenceDirectory.allowedLocationRefs.map(item => item.referenceId))
+    : undefined;
+  const visibleActors = (input.knownActorContext ?? [])
+    .filter(actor => !repairActorRefs || repairActorRefs.has(actor.referenceId));
+  const visibleLocations = (input.knownLocationContext ?? [])
+    .filter(location => !repairLocationRefs || repairLocationRefs.has(location.referenceId));
   const actorRefMap = new Map<string, string>();
-  for (const actor of input.knownActorContext ?? []) {
+  for (const actor of visibleActors) {
     for (const value of [actor.referenceId, actor.ownerId, actor.canonicalName, ...actor.aliases]) {
       if (value?.trim()) actorRefMap.set(value.trim(), actor.referenceId);
     }
   }
   const locationRefMap = new Map<string, string>();
-  for (const location of input.knownLocationContext ?? []) {
+  for (const location of visibleLocations) {
     for (const value of [location.referenceId, location.locationId, location.canonicalName, ...location.aliases]) {
       if (value?.trim()) locationRefMap.set(value.trim(), location.referenceId);
     }
@@ -230,18 +236,44 @@ function serializeExtractionInput(input: MemoryExtractionInput): string {
   return safeJson({
     allowedSourceRefs: writableSourceRefs,
     contextOnlySourceRefs: input.sources.map(source => source.id).filter(sourceRef => !writableSourceRefSet.has(sourceRef)),
-    knownActors: (input.knownActorContext ?? []).map(actor => ({
+    knownActors: visibleActors.map(actor => ({
       ref: actor.referenceId,
       canonicalName: actor.canonicalName,
       aliases: actor.aliases,
       status: actor.status,
     })),
-    knownLocations: (input.knownLocationContext ?? []).map(location => ({
+    knownLocations: visibleLocations.map(location => ({
       ref: location.referenceId,
       canonicalName: location.canonicalName,
       aliases: location.aliases,
       status: location.status,
     })),
+    ...(input.repair?.referenceDirectory ? {
+      repairAttempt: {
+        attempt: input.repair.attempt ?? 1,
+        maxAttempts: input.repair.maxAttempts ?? 2,
+        mode: input.repair.mode ?? 'targeted',
+      },
+      supportedReferences: {
+        actors: input.repair.referenceDirectory.allowedActorRefs.map(item => ({
+          ref: item.referenceId,
+          name: item.canonicalName,
+          aliases: item.aliases,
+          sourceRefs: item.sourceRefs,
+        })),
+        locations: input.repair.referenceDirectory.allowedLocationRefs.map(item => ({
+          ref: item.referenceId,
+          name: item.canonicalName,
+          aliases: item.aliases,
+          sourceRefs: item.sourceRefs,
+        })),
+        episodes: input.repair.referenceDirectory.allowedEpisodeRefs.map(item => ({
+          ref: item.referenceId,
+          summary: item.summary,
+          sourceRefs: item.sourceRefs,
+        })),
+      },
+    } : {}),
     existingMemoryContext: (input.existingMemoryContext ?? []).map(item => ({
       referenceId: item.referenceId,
       kind: item.kind,
@@ -272,9 +304,14 @@ function serializeExtractionInput(input: MemoryExtractionInput): string {
       ...(source.actorRefs?.length ? { actorRefs: source.actorRefs.map(mapActorRef).filter(Boolean) } : {}),
       ...(source.locationRefs?.length ? { locationRefs: source.locationRefs.map(mapLocationRef).filter(Boolean) } : {}),
       ...(source.visibility ? { visibility: source.visibility } : {}),
-      content: source.content,
+      ...(writableSourceRefSet.has(source.id)
+        ? {
+          evidenceSpans: evidenceDirectory.spans
+            .filter(span => span.sourceRef === source.id)
+            .map(span => ({ evidenceSpanId: span.evidenceSpanId, text: span.text })),
+        }
+        : { contextText: source.content }),
     })),
-    ...(input.repairRequest ? { repairRequest: input.repairRequest } : {}),
   });
 }
 
@@ -315,30 +352,39 @@ function sourceRefSchema(sourceRefs: readonly string[]): Record<string, unknown>
  * have fewer ways to violate the contract. Machine timestamps are not model
  * fields at all.
  */
-export function buildStructuredCaptureSchema(sourceRefs: readonly string[]): object {
+export function buildStructuredCaptureSchema(
+  sourceRefs: readonly string[],
+  evidenceDirectory?: SupportedEvidenceDirectory,
+): object {
   const sourceRef = sourceRefSchema(sourceRefs);
+  const evidenceSpanId = {
+    type: 'string',
+    minLength: 1,
+    maxLength: 80,
+    ...(evidenceDirectory?.spans.length
+      ? { enum: evidenceDirectory.spans.map(span => span.evidenceSpanId) }
+      : {}),
+  };
   const localId = { type: 'string', minLength: 1, maxLength: 80, pattern: '^[A-Za-z0-9_.:-]+$' };
   const actorCandidate = {
     type: 'object', additionalProperties: false,
-    required: ['localId', 'displayName', 'aliases', 'sourceRef', 'evidenceExcerpt', 'confidence'],
+    required: ['localId', 'displayName', 'aliases', 'evidenceSpanId', 'confidence'],
     properties: {
       localId,
       displayName: requiredString(80),
       aliases: stringArray(12, 80),
-      sourceRef,
-      evidenceExcerpt: requiredString(800),
+      evidenceSpanId,
       confidence: { type: 'number', minimum: 0, maximum: 1 },
     },
   };
   const locationCandidate = {
     type: 'object', additionalProperties: false,
-    required: ['localId', 'displayName', 'aliases', 'sourceRef', 'evidenceExcerpt', 'confidence'],
+    required: ['localId', 'displayName', 'aliases', 'evidenceSpanId', 'confidence'],
     properties: {
       localId,
       displayName: requiredString(120),
       aliases: stringArray(12, 120),
-      sourceRef,
-      evidenceExcerpt: requiredString(800),
+      evidenceSpanId,
       confidence: { type: 'number', minimum: 0, maximum: 1 },
     },
   };
@@ -373,12 +419,11 @@ export function buildStructuredCaptureSchema(sourceRefs: readonly string[]): obj
   const claim = {
     type: 'object', additionalProperties: false,
     required: [
-      'localId', 'sourceRef', 'episodeLocalId', 'kind', 'subjectRef', 'subjectText',
-      'predicateKey', 'objectRef', 'objectText', 'content', 'evidenceExcerpt', 'knowledge', 'confidence', 'stableAnchor',
+      'localId', 'episodeLocalId', 'kind', 'subjectRef', 'subjectText',
+      'predicateKey', 'objectRef', 'objectText', 'content', 'evidenceSpanId', 'knowledge', 'confidence', 'stableAnchor',
     ],
     properties: {
       localId,
-      sourceRef,
       episodeLocalId: fixedString(80),
       kind: { type: 'string', enum: [...FACT_KINDS] },
       subjectRef: fixedString(120),
@@ -387,7 +432,7 @@ export function buildStructuredCaptureSchema(sourceRefs: readonly string[]): obj
       objectRef: fixedString(120),
       objectText: fixedString(160),
       content: requiredString(280, 6),
-      evidenceExcerpt: requiredString(2_000),
+      evidenceSpanId,
       knowledge,
       confidence: { type: 'number', minimum: 0, maximum: 1 },
       stableAnchor: { type: 'boolean' },
@@ -406,193 +451,246 @@ export function buildStructuredCaptureSchema(sourceRefs: readonly string[]): obj
   };
 }
 
-function asRecords(input: unknown): Array<Record<string, unknown>> {
-  return Array.isArray(input)
-    ? input.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
-    : [];
-}
+const optionalString = (value: string): string | undefined => value === '' ? undefined : value;
 
-function cleanString(value: unknown, maxLength: number): string {
-  const cleaned = String(value ?? '').normalize('NFKC').replace(/[\u0000-\u001f\u007f]/gu, '').trim();
-  // Truncate by Unicode code points, not UTF-16 code units, so an astral CJK
-  // character at the boundary cannot be split into an invalid lone surrogate.
-  return Array.from(cleaned).slice(0, maxLength).join('');
-}
-
-function cleanArray(value: unknown, maxItems: number, maxLength: number): string[] {
-  return Array.isArray(value)
-    ? [...new Set(value.map(item => cleanString(item, maxLength)).filter(Boolean))].slice(0, maxItems)
-    : [];
-}
-
-function normalizeConfidence(value: unknown, fallback = 0.6): number {
-  if (value === undefined || value === null || value === '') return fallback;
-  const parsed = typeof value === 'string' ? Number(value.trim().replace(/%$/u, '')) : Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(0, Math.min(1, parsed > 1 && parsed <= 100 ? parsed / 100 : parsed));
-}
-
-function repairExactExcerpt(candidate: unknown, sourceRef: string, sources: readonly SourceBlock[], anchors: readonly unknown[]): string {
-  const source = sources.find(item => item.id === sourceRef);
-  if (!source) return cleanString(candidate, 2_000);
-  const requested = cleanString(candidate, 2_000);
-  if (requested && source.content.includes(requested)) return requested;
-  // Do not replace a missing quote with a merely similar paragraph. That can
-  // turn a hallucinated Claim into apparently exact evidence. Presentation-only
-  // differences are repaired later by the server's unique punctuation-insensitive
-  // locator; semantic/token-overlap guesses must remain rejected.
-  void anchors;
-  return requested;
-}
-
-function normalizeKnowledge(value: unknown): StructuredClaimKnowledge {
-  const row = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-  // Missing/invalid epistemic metadata must fail closed. Treating malformed
-  // output as asserted/public can broadcast a private or uncertain statement.
-  const mode = KNOWLEDGE_MODES.includes(row.mode as never) ? row.mode as StructuredClaimKnowledge['mode'] : 'unknown';
-  const privacy = PRIVACY_LEVELS.includes(row.privacy as never) ? row.privacy as StructuredClaimKnowledge['privacy'] : 'limited';
+function copyKnowledge(value: StructuredClaimKnowledge & {
+  speakerRef: string;
+  viewpointRef: string;
+}): StructuredClaimKnowledge {
   return {
-    mode,
-    privacy,
-    ownerRefs: cleanArray(row.ownerRefs, 24, 80),
-    speakerRef: cleanString(row.speakerRef, 80) || undefined,
-    viewpointRef: cleanString(row.viewpointRef ?? row.viewportRef, 80) || undefined,
-    observerRefs: cleanArray(row.observerRefs, 24, 80),
-    presentRefs: cleanArray(row.presentRefs, 24, 80),
-    mentionedRefs: cleanArray(row.mentionedRefs, 24, 80),
+    mode: value.mode,
+    privacy: value.privacy,
+    ownerRefs: [...value.ownerRefs],
+    speakerRef: optionalString(value.speakerRef),
+    viewpointRef: optionalString(value.viewpointRef),
+    observerRefs: [...value.observerRefs],
+    presentRefs: [...value.presentRefs],
+    mentionedRefs: [...value.mentionedRefs],
   };
 }
 
-function normalizedActor(row: Record<string, unknown>, sources: readonly SourceBlock[]): StructuredActorCandidate {
-  const sourceRef = cleanString(row.sourceRef ?? (Array.isArray(row.sourceRefs) ? row.sourceRefs[0] : ''), 180);
-  const displayName = cleanString(row.displayName, 80);
+export function buildStructuredRepairSchema(
+  sourceRefs: readonly string[],
+  collection: 'actorCandidates' | 'locationCandidates' | 'episodes' | 'claims',
+  maxItems: number,
+  referenceDirectory?: import('./types').SupportedReferenceDirectory,
+  evidenceDirectory?: SupportedEvidenceDirectory,
+): object {
+  const captureSchema = buildStructuredCaptureSchema(sourceRefs, evidenceDirectory) as {
+    properties: Record<string, { items: object }>;
+  };
+  const itemSchema = structuredClone(captureSchema.properties[collection]?.items);
+  if (!itemSchema) throw new Error(`未知的结构化修复集合：${collection}`);
+  if (referenceDirectory && collection === 'episodes') {
+    const properties = (itemSchema as { properties: Record<string, Record<string, unknown>> }).properties;
+    const actorRefs = uniqueSchemaValues([
+      ...referenceDirectory.allowedActorRefs.map(item => item.referenceId),
+      'player', 'world', 'narrator',
+    ]);
+    for (const field of ['participantRefs', 'presentRefs', 'mentionedRefs']) {
+      properties[field] = {
+        ...properties[field],
+        items: { type: 'string', enum: actorRefs },
+      };
+    }
+    properties.locationRef = {
+      type: 'string',
+      enum: uniqueSchemaValues(['', ...referenceDirectory.allowedLocationRefs.map(item => item.referenceId)]),
+    };
+  }
+  if (referenceDirectory && collection === 'claims') {
+    const properties = (itemSchema as { properties: Record<string, Record<string, unknown>> }).properties;
+    const actorRefs = uniqueSchemaValues([
+      ...referenceDirectory.allowedActorRefs.map(item => item.referenceId),
+      'player', 'world', 'narrator',
+    ]);
+    const entityRefs = uniqueSchemaValues([
+      '', ...actorRefs, ...referenceDirectory.allowedLocationRefs.map(item => item.referenceId),
+    ]);
+    properties.subjectRef = { type: 'string', enum: entityRefs };
+    properties.objectRef = { type: 'string', enum: entityRefs };
+    properties.episodeLocalId = {
+      type: 'string',
+      enum: uniqueSchemaValues(['', ...referenceDirectory.allowedEpisodeRefs.map(item => item.referenceId)]),
+    };
+    const knowledge = properties.knowledge as {
+      properties: Record<string, Record<string, unknown>>;
+    };
+    for (const field of ['ownerRefs', 'observerRefs', 'presentRefs', 'mentionedRefs']) {
+      knowledge.properties[field] = {
+        ...knowledge.properties[field],
+        items: { type: 'string', enum: actorRefs },
+      };
+    }
+    knowledge.properties.speakerRef = { type: 'string', enum: uniqueSchemaValues(['', ...actorRefs]) };
+    knowledge.properties.viewpointRef = { type: 'string', enum: uniqueSchemaValues(['', ...actorRefs]) };
+  }
   return {
-    localId: cleanString(row.localId, 80),
-    displayName,
-    aliases: cleanArray(row.aliases, 12, 80),
-    sourceRef,
-    evidenceExcerpt: repairExactExcerpt(row.evidenceExcerpt ?? (Array.isArray(row.evidenceExcerpts) ? row.evidenceExcerpts[0] : ''), sourceRef, sources, [displayName]),
-    confidence: normalizeConfidence(row.confidence, 0.35),
+    type: 'object',
+    additionalProperties: false,
+    required: ['items'],
+    properties: {
+      items: {
+        type: 'array',
+        minItems: 1,
+        maxItems: Math.min(10, Math.max(1, Math.trunc(maxItems))),
+        items: itemSchema,
+      },
+    },
   };
 }
 
-function normalizedLocation(row: Record<string, unknown>, sources: readonly SourceBlock[]): StructuredLocationCandidate {
-  const sourceRef = cleanString(row.sourceRef ?? (Array.isArray(row.sourceRefs) ? row.sourceRefs[0] : ''), 180);
-  const displayName = cleanString(row.displayName, 120);
-  return {
-    localId: cleanString(row.localId, 80),
-    displayName,
-    aliases: cleanArray(row.aliases, 12, 120),
-    sourceRef,
-    evidenceExcerpt: repairExactExcerpt(row.evidenceExcerpt ?? (Array.isArray(row.evidenceExcerpts) ? row.evidenceExcerpts[0] : ''), sourceRef, sources, [displayName]),
-    confidence: normalizeConfidence(row.confidence),
-  };
+function uniqueSchemaValues(values: readonly string[]): string[] {
+  return [...new Set(values)];
 }
 
-function normalizedEpisode(row: Record<string, unknown>): StructuredEpisode {
-  return {
-    localId: cleanString(row.localId, 80),
-    sourceRefs: cleanArray(row.sourceRefs ?? (row.sourceRef ? [row.sourceRef] : []), 12, 180),
-    participantRefs: cleanArray(row.participantRefs, 24, 80),
-    presentRefs: cleanArray(row.presentRefs, 24, 80),
-    mentionedRefs: cleanArray(row.mentionedRefs, 24, 80),
-    locationRef: cleanString(row.locationRef ?? row.location, 120) || undefined,
-    storyTimeText: cleanString(row.storyTimeText ?? row.storyTime, 120) || undefined,
-    summary: cleanString(row.summary ?? row.description ?? row.title, 800),
+/**
+ * Decodes an already Schema-validated capture without repairing model output.
+ * Empty strings are the only declared wire sentinel and map to optional domain
+ * fields; every other value is copied exactly.
+ */
+export function normalizeStructuredCapture(
+  value: unknown,
+  sources: readonly SourceBlock[],
+  evidenceDirectory?: SupportedEvidenceDirectory,
+  responseMeta?: MemoryLlmMeta,
+): StructuredCaptureResult {
+  const responseContext = {
+    ...(responseMeta?.requestId ? { requestId: responseMeta.requestId } : {}),
+    ...(responseMeta?.parentRequestId ? { parentRequestId: responseMeta.parentRequestId } : {}),
+    ...(responseMeta?.resourceId ? { resourceId: responseMeta.resourceId } : {}),
+    ...(responseMeta?.model ? { model: responseMeta.model } : {}),
   };
-}
-
-function normalizedClaim(row: Record<string, unknown>, sources: readonly SourceBlock[]): StructuredClaim {
-  const sourceRef = cleanString(row.sourceRef ?? (Array.isArray(row.sourceRefs) ? row.sourceRefs[0] : ''), 180);
-  const subjectRef = cleanString(row.subjectRef, 120);
-  const subjectText = cleanString(row.subjectText ?? row.subjectKey, 120);
-  const predicateKey = cleanString(row.predicateKey, 120);
-  const objectRef = cleanString(row.objectRef, 120);
-  const objectText = cleanString(row.objectText ?? row.objectKey, 160);
-  const content = cleanString(row.content, 280);
-  const rawKind = cleanString(row.kind, 40);
-  const kindAliases: Readonly<Record<string, StructuredClaim['kind']>> = {
-    action: 'event', plan: 'goal', emotion: 'state', trait: 'other', ability: 'capability', rule: 'world_rule',
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw createSSHelperError('SCHEMA_VALIDATION_FAILED', {
+      stage: 'memory.capture.map',
+      path: '$',
+      keyword: 'type',
+      expected: 'object',
+      ...responseContext,
+    });
+  }
+  const row = value as {
+    actorCandidates: Array<Omit<StructuredActorCandidate, 'evidenceExcerpt' | 'sourceRef'> & { evidenceSpanId: string }>;
+    locationCandidates: Array<Omit<StructuredLocationCandidate, 'evidenceExcerpt' | 'sourceRef'> & { evidenceSpanId: string }>;
+    episodes: Array<StructuredEpisode & { locationRef: string; storyTimeText: string }>;
+    claims: Array<Omit<StructuredClaim, 'evidenceExcerpt' | 'sourceRef'> & {
+      evidenceSpanId: string;
+      episodeLocalId: string;
+      subjectRef: string;
+      subjectText: string;
+      objectRef: string;
+      objectText: string;
+      knowledge: StructuredClaimKnowledge & { speakerRef: string; viewpointRef: string };
+    }>;
   };
-  // Preserve an unknown value so the server validator can audit invalid_enum;
-  // silently coercing arbitrary labels to `other` hides provider/schema bugs.
-  const kind = FACT_KINDS.includes(rawKind as never)
-    ? rawKind as StructuredClaim['kind']
-    : kindAliases[rawKind] ?? rawKind as StructuredClaim['kind'];
-  return {
-    localId: cleanString(row.localId, 80),
-    sourceRef,
-    episodeLocalId: cleanString(row.episodeLocalId, 80) || undefined,
-    kind,
-    subjectRef: subjectRef || undefined,
-    subjectText: subjectText || undefined,
-    predicateKey,
-    objectRef: objectRef || undefined,
-    objectText: objectText || undefined,
-    content,
-    evidenceExcerpt: repairExactExcerpt(row.evidenceExcerpt, sourceRef, sources, [subjectText, predicateKey, objectText, content]),
-    knowledge: normalizeKnowledge(row.knowledge ?? row),
-    confidence: normalizeConfidence(row.confidence),
-    stableAnchor: row.stableAnchor === true || row.stable === true,
-  };
-}
-
-export function normalizeStructuredCapture(value: unknown, sources: readonly SourceBlock[]): StructuredCaptureResult {
-  const row = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-  const allActorCandidates = asRecords(row.actorCandidates);
-  const allLocationCandidates = asRecords(row.locationCandidates);
-  const allEpisodes = asRecords(row.episodes);
-  const allClaims = asRecords(row.claims);
-  const limits = { actorCandidates: 24, locationCandidates: 24, episodes: 16, claims: 32 } as const;
-  const overflowRejections: NonNullable<StructuredCaptureResult['rejections']> = [];
-  for (const [field, values] of Object.entries({
-    actorCandidates: allActorCandidates,
-    locationCandidates: allLocationCandidates,
-    episodes: allEpisodes,
-    claims: allClaims,
-  }) as Array<[keyof typeof limits, Array<Record<string, unknown>>]>) {
-    const limit = limits[field];
-    if (values.length <= limit) continue;
-    overflowRejections.push({
-      id: `capture-schema-overflow:${field}:${stableDiagnosticKey(sources.map(source => source.id).join('|'))}:${values.length}`,
-      index: -1,
-      recordType: 'batch',
-      code: 'invalid_shape',
-      fieldPath: field,
-      message: `${field} 输出 ${values.length} 条，超过单批上限 ${limit}；仅处理前 ${limit} 条并将本批标记为部分完成。`,
+  if (![row.actorCandidates, row.locationCandidates, row.episodes, row.claims].every(Array.isArray)) {
+    throw createSSHelperError('SCHEMA_VALIDATION_FAILED', {
+      stage: 'memory.capture.map',
+      path: '$',
+      keyword: 'required',
+      expected: 'actorCandidates, locationCandidates, episodes, claims',
+      ...responseContext,
+    });
+  }
+  const evidenceRejections: AutomaticIngestRejection[] = [];
+  const rejectEvidence = (
+    collection: 'actorCandidates' | 'locationCandidates' | 'claims',
+    recordType: 'actor' | 'location' | 'claim',
+    index: number,
+  ): void => {
+    const path = `$.${collection}[${index}].evidenceSpanId`;
+    const requestScope = responseMeta?.requestId
+      ?? `${sources[0]?.chatKey ?? 'unknown'}:${evidenceDirectory?.evidenceSetHash ?? 'no-evidence'}`;
+    evidenceRejections.push({
+      id: `evidence:${requestScope}:${collection}:${index}`,
+      index,
+      code: 'schema_validation_failed',
+      message: '证据片段不属于当前允许的闭集。',
+      recordType,
+      fieldPath: path,
+      issues: [{ path, keyword: 'enum', expected: 'supported evidence span' }],
       sourceRefs: sources.map(source => source.id),
-      candidateSnapshot: { field, actual: values.length, maximum: limit },
+      ...responseContext,
       status: 'unresolved',
       repairAttempts: 0,
     });
+  };
+  const actorCandidates: StructuredActorCandidate[] = [];
+  for (const [index, item] of row.actorCandidates.entries()) {
+    const span = evidenceDirectory && evidenceSpanById(evidenceDirectory, item.evidenceSpanId);
+    if (!span) {
+      rejectEvidence('actorCandidates', 'actor', index);
+      continue;
+    }
+    actorCandidates.push({
+      localId: item.localId,
+      displayName: item.displayName,
+      aliases: [...item.aliases],
+      sourceRef: span.sourceRef,
+      evidenceExcerpt: span.text,
+      confidence: item.confidence,
+    });
   }
-  const rawActorCandidates = allActorCandidates.slice(0, limits.actorCandidates);
-  const rawLocationCandidates = allLocationCandidates.slice(0, limits.locationCandidates);
-  const rawEpisodes = allEpisodes.slice(0, limits.episodes);
-  const rawClaims = allClaims.slice(0, limits.claims);
-  const actorCandidates = rawActorCandidates.map(item => normalizedActor(item, sources));
-  const locationCandidates = rawLocationCandidates.map(item => normalizedLocation(item, sources));
-  const episodes = rawEpisodes.map(normalizedEpisode);
-  const claims = rawClaims.map(item => normalizedClaim(item, sources));
-  const normalizedShape = { actorCandidates, locationCandidates, episodes, claims };
-  let deterministicRepairs = 0;
-  try {
-    if (JSON.stringify(normalizedShape) !== JSON.stringify({
-      actorCandidates: row.actorCandidates ?? [],
-      locationCandidates: row.locationCandidates ?? [],
-      episodes: row.episodes ?? [],
-      claims: row.claims ?? [],
-    })) deterministicRepairs = 1;
-  } catch { deterministicRepairs = 1; }
+  const locationCandidates: StructuredLocationCandidate[] = [];
+  for (const [index, item] of row.locationCandidates.entries()) {
+    const span = evidenceDirectory && evidenceSpanById(evidenceDirectory, item.evidenceSpanId);
+    if (!span) {
+      rejectEvidence('locationCandidates', 'location', index);
+      continue;
+    }
+    locationCandidates.push({
+      localId: item.localId,
+      displayName: item.displayName,
+      aliases: [...item.aliases],
+      sourceRef: span.sourceRef,
+      evidenceExcerpt: span.text,
+      confidence: item.confidence,
+    });
+  }
+  const claims: StructuredClaim[] = [];
+  for (const [index, item] of row.claims.entries()) {
+    const span = evidenceDirectory && evidenceSpanById(evidenceDirectory, item.evidenceSpanId);
+    if (!span) {
+      rejectEvidence('claims', 'claim', index);
+      continue;
+    }
+    claims.push({
+      localId: item.localId,
+      sourceRef: span.sourceRef,
+      episodeLocalId: optionalString(item.episodeLocalId),
+      kind: item.kind,
+      subjectRef: optionalString(item.subjectRef),
+      subjectText: optionalString(item.subjectText),
+      predicateKey: item.predicateKey,
+      objectRef: optionalString(item.objectRef),
+      objectText: optionalString(item.objectText),
+      content: item.content,
+      evidenceExcerpt: span.text,
+      knowledge: copyKnowledge(item.knowledge),
+      confidence: item.confidence,
+      stableAnchor: item.stableAnchor,
+    });
+  }
   return {
-    ...normalizedShape,
-    ...(overflowRejections.length > 0 ? { rejections: overflowRejections } : {}),
+    actorCandidates,
+    locationCandidates,
+    episodes: row.episodes.map(item => ({
+      localId: item.localId,
+      sourceRefs: [...item.sourceRefs],
+      participantRefs: [...item.participantRefs],
+      presentRefs: [...item.presentRefs],
+      mentionedRefs: [...item.mentionedRefs],
+      locationRef: optionalString(item.locationRef),
+      storyTimeText: optionalString(item.storyTimeText),
+      summary: item.summary,
+    })),
+    claims,
+    ...(evidenceRejections.length > 0 ? { rejections: evidenceRejections } : {}),
     diagnostics: {
       parser: 'claim-json',
-      deterministicRepairs,
-      automaticRepairCalls: 0,
-      automaticallyRepaired: 0,
-      firstPassRejections: 0,
+      deterministicRepairs: 0,
+      schemaRepairCalls: 0,
       transportMode: 'json_object_validated',
     },
   };
@@ -615,7 +713,7 @@ function auditFromResponse(response: { meta?: MemoryLlmMeta; usage?: MemoryLlmUs
   };
 }
 
-function systemPrompt(input: MemoryExtractionInput, retryInstruction = ''): string {
+function systemPrompt(input: MemoryExtractionInput): string {
   return [
     '你是 SS-Helper 的多角色长期记忆 Claim 捕获器。只提取已经发生或已经明确成立、且对未来剧情有检索价值的内容。',
     '最终只返回一个 JSON 对象，固定包含 actorCandidates、locationCandidates、episodes、claims 四个数组。不要 Markdown，不要解释。',
@@ -624,76 +722,124 @@ function systemPrompt(input: MemoryExtractionInput, retryInstruction = ''): stri
     '新人物必须具有持续身份、能独立行动、说话、思考或知情；“重构体”“表情的话”、物品、材料、食物、地点、状态和抽象概念都不是人物。',
     '新地点必须是可持续定位的场所，普通方位词“这里、外面、前方”不是地点。',
     '剧情选项、控制文本、状态栏标题、未来可能性和 OOC 指令不得作为已发生事件。cast_manifest 只用于人物目录；state_snapshot 只可产生当前状态 Claim。',
-    '模型不得输出 Unix 时间、occurredAt、validFrom、validUntil、数据库 ID、Observation、Evidence 或 Trace；这些全部由服务器根据 sourceRef 确定性生成。',
+    '模型不得输出 Unix 时间、occurredAt、validFrom、validUntil、数据库 ID、Observation、Evidence、Trace，actorCandidate/locationCandidate/claim 也不得输出 sourceRef；这些全部由服务器根据 evidenceSpanId 确定性生成。',
     'episode 只描述事件容器；机器时间和楼层由服务器计算。storyTimeText 只保存“灾变第十八日黄昏”等剧情内时间。',
     'claim 是一个可独立检索的单一主张。数量、百分比、库存、位置、能力、弱点、目标、承诺、关系、状态变化必须分开输出。',
     '重大事件中的已下达命令、明确分工和已采用安全措施具有长期检索价值，必须提取。多名角色各自承担监控、保护、分析等任务时，应分别形成 event、goal 或 commitment Claim，不得因其发生在当前应对阶段而省略。',
     'predicateKey、subjectText、objectText 必须使用简洁的简体中文自然词，不要输出英文或 snake_case。',
     '数字必须忠实保留证据精度，不得把“百分之四十五”改写成“四十到五十”。同一批同一状态先出现估计值、后出现精确值时，必须输出后续精确 Claim。',
     'claim.subjectRef 与 objectRef 用于 knownActors、knownLocations 或本次候选 localId；普通物品、群体和规则使用 subjectText/objectText。subjectRef 和 subjectText 至少一个非空。明确人物关系必须填写 objectRef，不得只把人物姓名写进 objectText。',
-    'evidenceExcerpt 必须逐字复制 sourceRef 对应正文的一段连续原文；不得概括、翻译或从旧记忆补证据。',
+    'actorCandidate、locationCandidate 和 claim 只选择 sourceBlocks 中已有的 evidenceSpanId，不得输出 sourceRef，不得复制、概括、翻译或自行补写证据。服务器会由 evidenceSpanId 确定性回填来源和原始证据正文。',
     '公开发言用 self_reported；明确在场的听者使用 observerRefs；内心独白仅归属 speakerRef 且 privacy 为 private/secret；传闻使用 believed/suspected。',
     '重复旧记忆不要输出；状态变化输出新的 Claim，服务器负责 supersede，不要删除或修改旧事实。',
     '无法确定的可选字符串必须输出空字符串，数组输出空数组；不得输出 null，不得新增字段。',
     ...(input.graphLlmRelationEnabled === true ? [
       '明确的主体—关系—客体应输出 relationship/location/world_rule/goal/commitment/capability/event Claim；不得只凭共现推断关系。',
     ] : []),
-    ...(input.repairRequest ? [
-      '这是一次自动定向修复。只输出 repairRequest.items 中列出的 localId 与 recordType，已通过的记录不得重新输出；其他数组保持空数组。',
-      '逐项根据 candidateSnapshot、fieldPath、message 与 sourceBlocks 修复。证据或引用无法确认时不要输出该项。',
-    ] : []),
-    retryInstruction,
-  ].filter(Boolean).join('\n');
+  ].join('\n');
 }
 
-const STRUCTURED_RETRY_REASONS = new Set([
-  'structured_output_empty', 'structured_output_truncated', 'invalid_json', 'schema_validation_failed',
-]);
-
 export class StructuredMemoryCaptureExtractor {
-  constructor(private readonly getLlm: () => MemoryLlmApi | null = readMemoryLlmApi) {}
+  constructor(private readonly getLlm: () => MemoryLlmClient | null = readMemoryLlmClient) {}
 
   async extract(input: MemoryExtractionInput): Promise<StructuredCaptureResult> {
     const llm = this.getLlm();
-    if (!llm) throw new Error('LLMHub 不可用，无法执行 memory_capture。');
-    const schema = buildStructuredCaptureSchema(input.writableSourceRefs ?? input.sources.map(source => source.id));
-    const run = (retryInstruction = '') => llm.runTask<unknown>({
+    if (!llm) throw createSSHelperError('MEMORY_LLM_CLIENT_UNAVAILABLE', { stage: 'memory.capture.llm' });
+    const sourceRefs = input.writableSourceRefs ?? input.sources.map(source => source.id);
+    const evidenceDirectory = buildSupportedEvidenceDirectory(input.sources, sourceRefs);
+    const schema = input.repair
+      ? buildStructuredRepairSchema(
+        sourceRefs,
+        input.repair.collection,
+        input.repair.maxItems,
+        input.repair.referenceDirectory,
+        evidenceDirectory,
+      )
+      : buildStructuredCaptureSchema(sourceRefs, evidenceDirectory);
+    const repairInstruction = input.repair ? [
+      input.repair.mode === 'conservative'
+        ? '这是第二次且最后一次保守修复。只重新提取一个目标项目；可选字段没有直接证据时必须留空，引用数组只能保留 supportedReferences 中的成员。'
+        : '这是第一次定向重新提取。只依据本次 sourceBlocks 重新生成一个目标项目；不要复用、猜测或补写上一轮失败 JSON。',
+      `目标集合：${input.repair.collection}`,
+      `修复次数：${input.repair.attempt ?? 1}/${input.repair.maxAttempts ?? 2}`,
+      `安全校验问题：${safeJson(input.repair.issues.slice(0, 16))}`,
+      'supportedReferences 是当前字段唯一允许使用的闭集。必须逐字复制 ref；目录外实体不得引用或猜测，无法确认时字符串用空字符串、数组用空数组。',
+      '只返回 {"items":[...]}，items 中只允许出现目标集合对应的项目。',
+    ].join('\n') : '';
+    const response = await llm.runTask<unknown>({
       consumer: MEMORY_PLUGIN_ID,
-      taskKey: MEMORY_CAPTURE_TASK,
-      taskDescription: input.repairRequest ? '多角色记忆 Claim 自动定向修复' : '多角色事件与 Claim 捕获',
+      taskKey: input.repair ? MEMORY_CAPTURE_REPAIR_TASK : MEMORY_CAPTURE_TASK,
+      taskDescription: input.repair ? '局部结构化捕获修复' : '多角色事件与 Claim 捕获',
       taskKind: 'generation',
       input: { messages: [
-        { role: 'system', content: systemPrompt(input, retryInstruction) },
-        { role: 'user', content: serializeExtractionInput(input) },
+        { role: 'system', content: input.repair ? `${systemPrompt(input)}\n${repairInstruction}` : systemPrompt(input) },
+        { role: 'user', content: serializeExtractionInput(input, evidenceDirectory) },
       ] },
       schema,
-      budget: { maxTokens: MEMORY_CAPTURE_MAX_TOKENS, maxLatencyMs: 180_000 },
+      budget: { maxTokens: input.repair ? 2_048 : MEMORY_CAPTURE_MAX_TOKENS, maxLatencyMs: 180_000 },
       enqueue: { displayMode: 'compact' },
+      ...(input.repair?.parentRequestId ? { parentRequestId: input.repair.parentRequestId } : {}),
+      ...(input.repair && (input.repair.resourceId || input.repair.model) ? {
+        route: {
+          ...(input.repair.resourceId ? { resourceId: input.repair.resourceId } : {}),
+          ...(input.repair.model ? { model: input.repair.model } : {}),
+        },
+      } : {}),
     });
-
-    let response = await run();
-    let automaticRepairCalls = 0;
-    if (!response.ok && STRUCTURED_RETRY_REASONS.has(String(response.reasonCode ?? '').trim())) {
-      automaticRepairCalls = 1;
-      response = await run([
-        '上一轮输出未通过结构校验。现在重新生成最小完整 JSON。',
-        '只能使用 Schema 声明字段；所有必填字段必须存在；可选业务值使用空字符串或空数组，绝对不要输出 null。',
-      ].join('\n'));
-    }
     if (!response.ok) {
-      throw new MemoryLlmTaskError(response.error || 'memory_capture 执行失败。', {
-        reasonCode: response.reasonCode,
-        resourceId: response.meta?.resourceId,
-        model: response.meta?.model,
-      });
+      throw createSSHelperError(
+        response.failure.reasonCode,
+        {
+          ...response.failure,
+          stage: response.failure.stage || (input.repair ? 'memory.repair.llm' : 'memory.capture.llm'),
+        },
+      );
     }
-    const writable = new Set(input.writableSourceRefs ?? input.sources.map(source => source.id));
-    const capture = normalizeStructuredCapture(response.data, input.sources.filter(source => writable.has(source.id)));
+    const writable = new Set(sourceRefs);
+    const normalizedData = input.repair
+      ? {
+        actorCandidates: input.repair.collection === 'actorCandidates' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
+        locationCandidates: input.repair.collection === 'locationCandidates' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
+        episodes: input.repair.collection === 'episodes' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
+        claims: input.repair.collection === 'claims' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
+      }
+      : response.data;
+    const capture = normalizeStructuredCapture(
+      normalizedData,
+      input.sources.filter(source => writable.has(source.id)),
+      evidenceDirectory,
+      response.meta,
+    );
+    const schemaRejections = (response.meta?.itemRejections ?? []).map((item, index) => ({
+      id: `schema:${response.meta?.requestId ?? 'unknown'}:${item.collection}:${item.itemIndex}:${index}`,
+      index: item.itemIndex,
+      code: 'schema_validation_failed' as const,
+      message: `结构化项目未通过 Schema：${item.issues.map(issue => `${issue.path} ${issue.keyword} expected ${issue.expected}`).join('; ')}`,
+      recordType: item.collection === 'actorCandidates' ? 'actor' as const
+        : item.collection === 'locationCandidates' ? 'location' as const
+          : item.collection === 'episodes' ? 'episode' as const
+            : item.collection === 'claims' ? 'claim' as const
+              : 'batch' as const,
+      ...(item.issues[0]?.path ? { fieldPath: item.issues[0].path } : {}),
+      issues: item.issues.map(issue => ({
+        path: issue.path,
+        keyword: issue.keyword,
+        expected: issue.expected,
+      })),
+      sourceRefs: [...item.sourceRefs],
+      ...(response.meta?.requestId ? { requestId: response.meta.requestId } : {}),
+      ...(response.meta?.parentRequestId ? { parentRequestId: response.meta.parentRequestId } : {}),
+      ...(response.meta?.resourceId ? { resourceId: response.meta.resourceId } : {}),
+      ...(response.meta?.model ? { model: response.meta.model } : {}),
+      status: 'unresolved' as const,
+      repairAttempts: 0,
+    }));
     return {
       ...capture,
+      rejections: [...(capture.rejections ?? []), ...schemaRejections],
       diagnostics: {
         ...capture.diagnostics,
-        automaticRepairCalls,
+        schemaRepairCalls: response.meta?.repairCount ?? 0,
         transportMode: 'json_object_validated',
       },
       audit: auditFromResponse(response),

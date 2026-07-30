@@ -30,4 +30,15 @@ describe('主聊天 usage 采集', () => {
       cacheReadTokens: null, cacheWriteTokens: null, totalTokens: null,
     });
   });
+
+  it('为含中文和空格的聊天键生成 Workspace 可接受的 ASCII record id', () => {
+    const usage = captureMainChatUsage(
+      '小時 - 2026-04-23 imported - SS-Helper 复测',
+      { messageId: '回复 1' },
+      [{ mesid: '回复 1', extra: { token_count: 8 } }],
+      3000,
+    );
+    expect(usage?.id).toMatch(/^[A-Za-z0-9_.!~*'()%:-]+$/u);
+    expect(usage?.id).not.toContain('小時');
+  });
 });

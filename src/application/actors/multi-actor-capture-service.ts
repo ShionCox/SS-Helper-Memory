@@ -22,7 +22,6 @@ import {
   type MemoryPrivacy,
 } from '../../domain';
 import type {
-  CaptureRepairRequest,
   ExistingMemoryContextItem,
   KnownActorContextItem,
   KnownLocationContextItem,
@@ -32,6 +31,7 @@ import type {
   StructuredClaim,
   StructuredEpisode,
   StructuredLocationCandidate,
+  RepairFieldAction,
 } from '../ingest/types';
 import { filterSourceBlocks } from '../ingest/source-blocks';
 import type { StructuredMemoryCaptureExtractor } from '../ingest/llm-extractor';
@@ -40,6 +40,10 @@ import { ActorRegistry, deriveActorAliases, isPlausibleActorName } from './actor
 import { KnowledgeProjector } from './knowledge-projector';
 import { LocationRegistry, deriveLocationAliases, isPlausibleLocationName } from '../locations';
 import type { MultiActorMemoryRepository } from '../../infrastructure';
+import {
+  buildSupportedReferenceDirectory,
+  referenceDirectoryAllows,
+} from './supported-reference-directory';
 
 function hash(value: string): string {
   const normalized = value.normalize('NFKC');
@@ -82,10 +86,11 @@ function record(value: unknown): Record<string, unknown> {
 }
 function finite(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value); }
 function validConfidence(value: unknown): value is number { return finite(value) && value >= 0 && value <= 1; }
-function localPromptRef(prefix: 'actor' | 'location', persistenceId: string): string { return `${prefix}:${hash(persistenceId)}`; }
+function localPromptRef(prefix: 'actor' | 'location', index: number): string {
+  const marker = prefix === 'actor' ? 'A' : 'L';
+  return `${marker}${String(index + 1).padStart(2, '0')}`;
+}
 
-const PRIVACY_LEVELS = ['public', 'limited', 'private', 'secret'] as const satisfies readonly MemoryPrivacy[];
-const KNOWLEDGE_MODES = ['asserted', 'self_reported', 'heard', 'experienced', 'inferred', 'believed', 'suspected', 'unknown'] as const satisfies readonly MemoryKnowledgeMode[];
 const FACT_KINDS = new Set<MemoryFact['kind']>([
   'identity', 'relationship', 'location', 'world_rule', 'state', 'goal',
   'commitment', 'preference', 'capability', 'event', 'other',
@@ -98,6 +103,8 @@ interface PreparedCapture {
   claims: StructuredClaim[];
   rejections: AutomaticIngestRejection[];
   deterministicRepairs: number;
+  fieldActions: RepairFieldAction[];
+  candidateSetHash?: string;
 }
 
 interface MaterializedClaim {
@@ -128,6 +135,9 @@ export interface MultiActorCaptureResult {
   readonly outcome: 'complete' | 'partial';
   readonly rejections: readonly AutomaticIngestRejection[];
   readonly acceptedLocalIds: Readonly<Record<'actor' | 'location' | 'episode' | 'claim', readonly string[]>>;
+  readonly candidateSetHash?: string;
+  readonly resolutionMode?: import('../../domain').RepairResolutionMode;
+  readonly fieldActions?: readonly RepairFieldAction[];
   readonly changeAudit?: import('../../infrastructure').ChangeAudit;
 }
 
@@ -135,17 +145,16 @@ export interface MultiActorCaptureInput {
   readonly workspaceId: string;
   readonly chatKey: string;
   readonly sources: readonly SourceBlock[];
+  readonly includeHiddenMessageFloors?: boolean;
   readonly writableSourceRefs?: readonly string[];
   readonly existingMemoryContext?: readonly ExistingMemoryContextItem[];
   readonly graphLlmRelationEnabled?: boolean;
   readonly currentFloor?: number;
   readonly sceneEpoch?: string;
-  readonly includeInvisibleHistory?: boolean;
   readonly captureJobId?: string;
+  readonly captureJob?: Record<string, unknown>;
   readonly idempotencyKey?: string;
-  /** A targeted repair is an atomic child of the original Capture audit. */
-  readonly parentChangeSetId?: string;
-  readonly repairRequest?: CaptureRepairRequest;
+  readonly repair?: import('../ingest/types').MemoryExtractionInput['repair'];
 }
 
 function rejection(
@@ -173,38 +182,9 @@ function rejection(
     fieldPath,
     sourceRefs,
     ...(allowedValues ? { allowedValues: [...allowedValues] } : {}),
-    candidateSnapshot: snapshot,
     status,
     repairAttempts: 0,
     ...(status === 'ignored' ? { ignoredAt: Date.now() } : {}),
-  };
-}
-
-function mergeByLocalId<T extends { localId: string }>(left: readonly T[], right: readonly T[]): T[] {
-  const rows = new Map<string, T>();
-  for (const item of [...left, ...right]) if (item.localId) rows.set(item.localId, item);
-  return [...rows.values()];
-}
-
-/**
- * Repair prompts are advisory only. The server remains the write authority and
- * accepts exactly the record type/localId pairs requested by the user. This
- * prevents a one-item repair from becoming a second broad Capture.
- */
-function restrictCaptureToRepairRequest(
-  structured: StructuredCaptureResult,
-  repairRequest: CaptureRepairRequest,
-): StructuredCaptureResult {
-  const allowed = new Set(repairRequest.items.map(item => `${item.recordType}:${item.localId}`));
-  const accepts = (recordType: 'actor' | 'location' | 'episode' | 'claim', localId: string): boolean =>
-    allowed.has(`${recordType}:${localId}`)
-    && (!repairRequest.recordType || repairRequest.recordType === recordType);
-  return {
-    ...structured,
-    actorCandidates: structured.actorCandidates.filter(item => accepts('actor', item.localId)),
-    locationCandidates: structured.locationCandidates.filter(item => accepts('location', item.localId)),
-    episodes: structured.episodes.filter(item => accepts('episode', item.localId)),
-    claims: structured.claims.filter(item => accepts('claim', item.localId)),
   };
 }
 
@@ -344,39 +324,6 @@ function locateExactEvidenceExcerpt(source: string, proposed: string): string | 
   return exact || undefined;
 }
 
-/**
- * Small prompt-local references are opaque hashes, so models occasionally
- * transpose two characters even while the surrounding evidence names the
- * correct entity. Optimal-string-alignment distance catches that single typo
- * without turning reference repair into broad fuzzy entity matching.
- */
-function damerauLevenshteinDistance(left: string, right: string): number {
-  if (left === right) return 0;
-  if (!left) return right.length;
-  if (!right) return left.length;
-  const rows = Array.from({ length: left.length + 1 }, () => Array<number>(right.length + 1).fill(0));
-  for (let index = 0; index <= left.length; index += 1) rows[index]![0] = index;
-  for (let index = 0; index <= right.length; index += 1) rows[0]![index] = index;
-  for (let row = 1; row <= left.length; row += 1) {
-    for (let column = 1; column <= right.length; column += 1) {
-      const substitution = left[row - 1] === right[column - 1] ? 0 : 1;
-      rows[row]![column] = Math.min(
-        rows[row - 1]![column]! + 1,
-        rows[row]![column - 1]! + 1,
-        rows[row - 1]![column - 1]! + substitution,
-      );
-      if (
-        row > 1 && column > 1
-        && left[row - 1] === right[column - 2]
-        && left[row - 2] === right[column - 1]
-      ) {
-        rows[row]![column] = Math.min(rows[row]![column]!, rows[row - 2]![column - 2]! + 1);
-      }
-    }
-  }
-  return rows[left.length]![right.length]!;
-}
-
 function namesMentionedInText(names: readonly string[], value: string): string[] {
   return unique(names
     .map(name => name.trim())
@@ -394,32 +341,6 @@ function actorNamedInDirective(names: readonly string[], value: string): boolean
     if (new RegExp(`(?:^|[\\s“”‘’，。！？；：、])${escaped}(?=$|[\\s“”‘’，。！？；：、])`, 'u').test(value)) return true;
   }
   return false;
-}
-
-/**
- * Repair only when both signals agree: the malformed id has one uniquely close
- * directory id and that entity is explicitly named in the Claim/evidence. Any
- * non-close reference or tie remains unresolved and follows the audit path.
- */
-function repairPromptEntityReference(
-  malformedRef: string,
-  claimText: string,
-  namesByRef: ReadonlyMap<string, readonly string[]>,
-): string | undefined {
-  const prefix = malformedRef.includes(':') ? `${malformedRef.split(':', 1)[0]}:` : '';
-  const candidates = [...namesByRef.entries()]
-    .filter(([referenceId]) => !prefix || referenceId.startsWith(prefix))
-    .map(([referenceId, names]) => ({
-      referenceId,
-      names: namesMentionedInText(names, claimText),
-      distance: damerauLevenshteinDistance(malformedRef, referenceId),
-    }));
-  const named = candidates.filter(candidate => candidate.names.length > 0);
-  const close = named
-    .filter(candidate => candidate.distance <= 1)
-    .sort((left, right) => left.distance - right.distance || right.names[0]!.length - left.names[0]!.length);
-  if (close.length === 1 || (close[0] && close[1] && close[0].distance < close[1].distance)) return close[0]!.referenceId;
-  return undefined;
 }
 
 function claimQuality(claim: StructuredClaim, subjectResolved: boolean): number {
@@ -741,9 +662,9 @@ export class MultiActorCaptureService {
       .filter(owner => !prioritySet.has(owner.id))
       .sort((left, right) => (left.canonicalName ?? left.displayName).localeCompare(right.canonicalName ?? right.displayName, 'zh-CN'));
     return [...prioritized, ...remaining]
-      .slice(0, 96)
-      .map(owner => ({
-        referenceId: localPromptRef('actor', owner.id),
+      .slice(0, 128)
+      .map((owner, index) => ({
+        referenceId: localPromptRef('actor', index),
         ownerId: owner.id,
         canonicalName: owner.canonicalName ?? owner.displayName,
         aliases: unique([...owner.aliases, ...deriveActorAliases(owner.canonicalName ?? owner.displayName)]).slice(0, 16),
@@ -779,9 +700,9 @@ export class MultiActorCaptureService {
       .filter(location => !prioritySet.has(location.id))
       .sort((left, right) => left.canonicalName.localeCompare(right.canonicalName, 'zh-CN'));
     return [...prioritized, ...remaining]
-      .slice(0, 96)
-      .map(location => ({
-        referenceId: localPromptRef('location', location.id),
+      .slice(0, 128)
+      .map((location, index) => ({
+        referenceId: localPromptRef('location', index),
         locationId: location.id,
         canonicalName: location.canonicalName,
         aliases: unique([...location.aliases, ...deriveLocationAliases(location.canonicalName)]).slice(0, 16),
@@ -799,13 +720,15 @@ export class MultiActorCaptureService {
   ): PreparedCapture {
     const rejections: AutomaticIngestRejection[] = structuredClone(structured.rejections ?? []);
     let deterministicRepairs = 0;
+    const fieldActions: RepairFieldAction[] = [];
+    const conservative = input.repair?.mode === 'conservative';
+    const referenceDirectory = input.repair?.referenceDirectory;
     const sourceById = new Map(sources.map(source => [source.id, source]));
     const actorRefs = new Set(knownActors.map(actor => actor.referenceId));
     const locationRefs = new Set(knownLocations.map(location => location.referenceId));
     const entityLocalIds = new Set<string>([...actorRefs, ...locationRefs, 'world', 'narrator', 'player']);
     const episodeLocalIds = new Set<string>();
     const claimLocalIds = new Set<string>();
-    const ignoredEntityNamesByRef = new Map<string, string>();
     const actorCandidates: StructuredActorCandidate[] = [];
     const locationCandidates: StructuredLocationCandidate[] = [];
 
@@ -851,7 +774,6 @@ export class MultiActorCaptureService {
         aliases: candidate.aliases,
       });
       if (!knownDirectoryActor && !actorEvidenceAccepted) {
-        ignoredEntityNamesByRef.set(candidate.localId, candidate.displayName);
         rejections.push(rejection(
           input, 'actor', index, 'invalid_shape',
           '新人物候选缺少明确命名、说话、思考或行动证据，已自动忽略。',
@@ -921,7 +843,6 @@ export class MultiActorCaptureService {
         evidence: candidate.evidenceExcerpt,
       });
       if (!knownDirectoryLocation && !locationEvidenceAccepted) {
-        ignoredEntityNamesByRef.set(candidate.localId, candidate.displayName);
         rejections.push(rejection(
           input, 'location', index, 'invalid_shape',
           '新地点候选缺少与名称绑定的位置证据，已自动忽略。',
@@ -942,8 +863,37 @@ export class MultiActorCaptureService {
       } : candidate);
     }
 
+    const episodeEntityNamesByRef = new Map<string, readonly string[]>();
+    for (const actor of knownActors) {
+      episodeEntityNamesByRef.set(actor.referenceId, unique([actor.canonicalName, ...actor.aliases]).filter(Boolean));
+    }
+    for (const actor of actorCandidates) {
+      episodeEntityNamesByRef.set(actor.localId, unique([actor.displayName, ...actor.aliases]).filter(Boolean));
+    }
+    for (const location of knownLocations) {
+      episodeEntityNamesByRef.set(location.referenceId, unique([location.canonicalName, ...location.aliases]).filter(Boolean));
+    }
+    for (const location of locationCandidates) {
+      episodeEntityNamesByRef.set(location.localId, unique([location.displayName, ...location.aliases]).filter(Boolean));
+    }
+    const episodeReferenceSupported = (ref: string, sources: readonly SourceBlock[]): boolean => {
+      if (['world', 'narrator', 'player'].includes(ref)) return true;
+      const names = episodeEntityNamesByRef.get(ref) ?? [];
+      return sources.some(source => {
+        if (namesMentionedInText(names, source.content).length > 0) return true;
+        const metadata = actorRefs.has(ref)
+          ? source.actorRefs ?? []
+          : [...(source.locationRefs ?? []), ...(source.transition?.locationKeys ?? [])];
+        return metadata.some(value => value === ref || names.some(name =>
+          actorRefs.has(ref)
+            ? normalizeActorName(name) === normalizeActorName(value)
+            : normalizeLocationName(name) === normalizeLocationName(value)));
+      });
+    };
+
     const episodes: StructuredEpisode[] = [];
-    for (const [index, episode] of structured.episodes.entries()) {
+    for (const [index, originalEpisode] of structured.episodes.entries()) {
+      let episode = originalEpisode;
       const validSources = unique(episode.sourceRefs.filter(ref => sourceById.has(ref)));
       if (!episode.localId || validSources.length === 0 || validSources.length !== episode.sourceRefs.length || !validSources.some(ref => writableSourceRefs.has(ref))) {
         rejections.push(rejection(input, 'episode', index, !episode.localId ? 'invalid_shape' : 'invalid_reference', !episode.localId ? '事件缺少 localId。' : '事件引用了不存在或不可写的来源。', !episode.localId ? 'localId' : 'sourceRefs', episode, [...writableSourceRefs]));
@@ -958,42 +908,82 @@ export class MultiActorCaptureService {
         continue;
       }
       episodeLocalIds.add(episode.localId);
-      const cleanActorRefs = (refs: readonly string[]): string[] => {
-        const filtered = refs.filter(ref => actorRefs.has(ref) || ['world', 'narrator', 'player'].includes(ref));
-        if (filtered.length !== refs.length) deterministicRepairs += refs.length - filtered.length;
-        return unique(filtered);
-      };
-      let locationRef = episode.locationRef ?? '';
-      if (locationRef && !locationRefs.has(locationRef)) {
-        const known = this.locationRegistry.resolveMention(locationRef);
-        if (known && !known.ambiguous) {
-          locationRef = localPromptRef('location', known.location.id);
-          deterministicRepairs += 1;
-        } else {
-          locationRef = '';
+      const episodeSources = validSources
+        .map(ref => sourceById.get(ref))
+        .filter((source): source is SourceBlock => Boolean(source));
+      if (conservative && referenceDirectory) {
+        const filterActorField = (
+          field: 'participantRefs' | 'presentRefs' | 'mentionedRefs',
+          values: readonly string[],
+        ): string[] => {
+          const filtered = unique(values.filter(ref =>
+            (referenceDirectoryAllows(referenceDirectory, 'actor', ref)
+              && (actorRefs.has(ref) || ['world', 'narrator', 'player'].includes(ref)))
+            && episodeReferenceSupported(ref, episodeSources)));
+          if (filtered.length !== unique(values).length) {
+            fieldActions.push({
+              path: `episodes[${index}].${field}`,
+              action: 'filter',
+              reason: '移除没有来源支持的可选人物引用',
+            });
+            deterministicRepairs += 1;
+          }
+          return filtered;
+        };
+        episode = {
+          ...episode,
+          participantRefs: filterActorField('participantRefs', episode.participantRefs),
+          presentRefs: filterActorField('presentRefs', episode.presentRefs),
+          mentionedRefs: filterActorField('mentionedRefs', episode.mentionedRefs),
+        };
+        if (episode.locationRef
+          && (!referenceDirectoryAllows(referenceDirectory, 'location', episode.locationRef)
+            || !episodeReferenceSupported(episode.locationRef, episodeSources))) {
+          episode = { ...episode, locationRef: undefined };
+          fieldActions.push({
+            path: `episodes[${index}].locationRef`,
+            action: 'clear',
+            reason: '清空没有来源支持的可选地点引用',
+          });
           deterministicRepairs += 1;
         }
+      }
+      const episodeActorRefs = unique([
+        ...episode.participantRefs,
+        ...episode.presentRefs,
+        ...episode.mentionedRefs,
+      ]);
+      const invalidActorRef = episodeActorRefs.find(ref => !actorRefs.has(ref) && !['world', 'narrator', 'player'].includes(ref));
+      if (invalidActorRef) {
+        rejections.push(rejection(input, 'episode', index, 'invalid_reference', '事件包含不属于本次人物目录的引用。', 'participantRefs', episode, [...actorRefs, 'player', 'world', 'narrator']));
+        continue;
+      }
+      const unsupportedActorRef = episodeActorRefs.find(ref => !episodeReferenceSupported(ref, episodeSources));
+      if (unsupportedActorRef) {
+        rejections.push(rejection(input, 'episode', index, 'entity_ref_unsupported', '事件人物引用没有得到来源正文或来源实体元数据支持。', 'participantRefs', episode, [...actorRefs, 'player', 'world', 'narrator']));
+        continue;
+      }
+      const locationRef = episode.locationRef ?? '';
+      if (locationRef && !locationRefs.has(locationRef)) {
+        rejections.push(rejection(input, 'episode', index, 'invalid_reference', '事件地点不属于本次地点目录。', 'locationRef', episode, [...locationRefs]));
+        continue;
+      }
+      if (locationRef && !episodeReferenceSupported(locationRef, episodeSources)) {
+        rejections.push(rejection(input, 'episode', index, 'entity_ref_unsupported', '事件地点引用没有得到来源正文或来源实体元数据支持。', 'locationRef', episode, [...locationRefs]));
+        continue;
       }
       episodes.push({
         ...episode,
         sourceRefs: validSources,
-        participantRefs: cleanActorRefs(episode.participantRefs),
-        presentRefs: cleanActorRefs(episode.presentRefs),
-        mentionedRefs: cleanActorRefs(episode.mentionedRefs),
+        participantRefs: unique(episode.participantRefs),
+        presentRefs: unique(episode.presentRefs),
+        mentionedRefs: unique(episode.mentionedRefs),
         locationRef: locationRef || undefined,
         storyTimeText: episode.storyTimeText?.trim() || undefined,
       });
     }
 
     const episodeIds = new Set(episodes.map(episode => episode.localId));
-    const episodesBySource = new Map<string, StructuredEpisode[]>();
-    for (const episode of episodes) {
-      for (const sourceRef of episode.sourceRefs) {
-        const values = episodesBySource.get(sourceRef) ?? [];
-        values.push(episode);
-        episodesBySource.set(sourceRef, values);
-      }
-    }
     const actorNamesByRef = new Map<string, string[]>();
     for (const actor of knownActors) {
       actorNamesByRef.set(actor.referenceId, unique([actor.canonicalName, ...actor.aliases]).filter(Boolean));
@@ -1012,6 +1002,27 @@ export class MultiActorCaptureService {
       ...actorNamesByRef.entries(),
       ...locationNamesByRef.entries(),
     ]);
+    const actorPersistentByRef = new Map(knownActors.map(actor => [actor.referenceId, actor.ownerId]));
+    const locationPersistentByRef = new Map(knownLocations.map(location => [location.referenceId, location.locationId]));
+    const referenceSupported = (ref: string, source: SourceBlock, evidence: string): boolean => {
+      if (['world', 'narrator', 'player'].includes(ref)) return true;
+      const names = entityNamesByRef.get(ref) ?? [];
+      if (namesMentionedInText(names, `${source.content}\n${evidence}`).length > 0) return true;
+      const actorId = actorPersistentByRef.get(ref);
+      const actorMetadata = [
+        ...(source.actorRefs ?? []),
+        source.perspective?.speakerOwnerRef,
+        source.perspective?.viewpointOwnerRef,
+        ...(source.perspective?.observerOwnerRefs ?? []),
+        ...(source.perspective?.presentOwnerRefs ?? []),
+        ...(source.perspective?.mentionedOwnerRefs ?? []),
+      ].filter((value): value is string => Boolean(value));
+      if (actorId && actorMetadata.some(value => value === actorId || value === ref || names.some(name => normalizeActorName(name) === normalizeActorName(value)))) return true;
+      const locationId = locationPersistentByRef.get(ref);
+      const locationMetadata = [...(source.locationRefs ?? []), ...(source.transition?.locationKeys ?? [])];
+      return Boolean(locationId && locationMetadata.some(value =>
+        value === locationId || value === ref || names.some(name => normalizeLocationName(name) === normalizeLocationName(value))));
+    };
 
     const claims: StructuredClaim[] = [];
     for (const [index, originalClaim] of structured.claims.entries()) {
@@ -1044,25 +1055,25 @@ export class MultiActorCaptureService {
       }
       let subjectRef = claim.subjectRef ?? '';
       let subjectText = claim.subjectText ?? '';
+      if (conservative && referenceDirectory && subjectRef
+        && (!referenceDirectoryAllows(referenceDirectory, 'entity', subjectRef)
+          || !referenceSupported(subjectRef, source, claim.evidenceExcerpt))
+        && claim.kind !== 'relationship' && subjectText.trim()) {
+        subjectRef = '';
+        fieldActions.push({
+          path: `claims[${index}].subjectRef`,
+          action: 'clear',
+          reason: '保留有来源支持的主体文本并清空无支持的可选实体引用',
+        });
+        deterministicRepairs += 1;
+      }
       if (subjectRef && !actorRefs.has(subjectRef) && !locationRefs.has(subjectRef) && !['world', 'narrator', 'player'].includes(subjectRef)) {
-        const ignoredName = ignoredEntityNamesByRef.get(subjectRef);
-        const repairedRef = ignoredName
-          ? undefined
-          : repairPromptEntityReference(subjectRef, `${claim.content}\n${claim.evidenceExcerpt}`, entityNamesByRef);
-        if (ignoredName) {
-          if (!subjectText.trim()) subjectText = ignoredName;
-          subjectRef = '';
-          deterministicRepairs += 1;
-        } else if (repairedRef) {
-          subjectRef = repairedRef;
-          deterministicRepairs += 1;
-        } else if (subjectText) {
-          subjectRef = '';
-          deterministicRepairs += 1;
-        } else {
-          rejections.push(rejection(input, 'claim', index, 'invalid_reference', 'Claim subjectRef 不在人物/地点目录或本次候选中。', 'subjectRef', claim, [...actorRefs, ...locationRefs]));
-          continue;
-        }
+        rejections.push(rejection(input, 'claim', index, 'invalid_reference', 'Claim subjectRef 不在人物/地点目录或本次候选中。', 'subjectRef', claim, [...actorRefs, ...locationRefs]));
+        continue;
+      }
+      if (subjectRef && !referenceSupported(subjectRef, source, claim.evidenceExcerpt)) {
+        rejections.push(rejection(input, 'claim', index, 'entity_ref_unsupported', 'Claim subjectRef 没有得到来源正文或来源实体元数据支持。', 'subjectRef', claim, [...actorRefs, ...locationRefs]));
+        continue;
       }
       if (claim.kind === 'relationship' && (!subjectRef || (!actorRefs.has(subjectRef) && subjectRef !== 'player'))) {
         rejections.push(rejection(input, 'claim', index, 'invalid_reference', 'relationship Claim 的主体必须是可解析的人物或玩家。', 'subjectRef', claim, [...actorRefs, 'player']));
@@ -1070,39 +1081,29 @@ export class MultiActorCaptureService {
       }
       let objectRef = claim.objectRef ?? '';
       let objectText = claim.objectText ?? '';
+      if (conservative && referenceDirectory && objectRef
+        && (!referenceDirectoryAllows(referenceDirectory, 'entity', objectRef)
+          || !referenceSupported(objectRef, source, claim.evidenceExcerpt))
+        && claim.kind !== 'relationship' && objectText.trim()) {
+        objectRef = '';
+        fieldActions.push({
+          path: `claims[${index}].objectRef`,
+          action: 'clear',
+          reason: '保留有来源支持的客体文本并清空无支持的可选实体引用',
+        });
+        deterministicRepairs += 1;
+      }
       if (objectRef && !actorRefs.has(objectRef) && !locationRefs.has(objectRef) && !['world', 'narrator', 'player'].includes(objectRef)) {
-        const ignoredName = ignoredEntityNamesByRef.get(objectRef);
-        const repairedRef = ignoredName
-          ? undefined
-          : repairPromptEntityReference(objectRef, `${claim.content}\n${claim.evidenceExcerpt}`, entityNamesByRef);
-        if (ignoredName) {
-          if (!objectText.trim()) objectText = ignoredName;
-          objectRef = '';
-          deterministicRepairs += 1;
-        } else if (repairedRef) {
-          objectRef = repairedRef;
-          deterministicRepairs += 1;
-        } else if (objectText.trim()) {
-          objectRef = '';
-          deterministicRepairs += 1;
-        } else {
-          rejections.push(rejection(input, 'claim', index, 'invalid_reference', 'Claim objectRef 不在人物/地点目录或本次候选中。', 'objectRef', claim, [...actorRefs, ...locationRefs]));
-          continue;
-        }
+        rejections.push(rejection(input, 'claim', index, 'invalid_reference', 'Claim objectRef 不在人物/地点目录或本次候选中。', 'objectRef', claim, [...actorRefs, ...locationRefs]));
+        continue;
+      }
+      if (objectRef && !referenceSupported(objectRef, source, claim.evidenceExcerpt)) {
+        rejections.push(rejection(input, 'claim', index, 'entity_ref_unsupported', 'Claim objectRef 没有得到来源正文或来源实体元数据支持。', 'objectRef', claim, [...actorRefs, ...locationRefs]));
+        continue;
       }
       if (!objectRef && claim.kind === 'relationship') {
-        const namedObjects = [...actorNamesByRef.entries()]
-          .filter(([referenceId]) => referenceId !== subjectRef)
-          .map(([referenceId, names]) => ({ referenceId, names: namesMentionedInText(names, `${objectText}\n${claim.evidenceExcerpt}`) }))
-          .filter(item => item.names.length > 0)
-          .sort((left, right) => right.names[0]!.length - left.names[0]!.length);
-        if (namedObjects.length === 1 || (namedObjects[0] && namedObjects[1] && namedObjects[0].names[0]!.length > namedObjects[1].names[0]!.length)) {
-          objectRef = namedObjects[0]!.referenceId;
-          deterministicRepairs += 1;
-        } else {
-          rejections.push(rejection(input, 'claim', index, 'invalid_reference', 'relationship Claim 必须具有唯一可解析的 objectRef。', 'objectRef', claim, [...actorRefs, ...locationRefs]));
-          continue;
-        }
+        rejections.push(rejection(input, 'claim', index, 'invalid_reference', 'relationship Claim 必须具有唯一可解析的 objectRef。', 'objectRef', claim, [...actorRefs, ...locationRefs]));
+        continue;
       }
       // A valid prompt-local reference is authoritative. Do not rewrite it to
       // whichever actor happens to be mentioned first in the sentence; that
@@ -1113,27 +1114,71 @@ export class MultiActorCaptureService {
       }
       let episodeLocalId = claim.episodeLocalId ?? '';
       if (episodeLocalId && !episodeIds.has(episodeLocalId)) {
-        const matched = episodesBySource.get(claim.sourceRef) ?? [];
-        episodeLocalId = matched.length === 1 ? matched[0]!.localId : '';
+        episodeLocalId = '';
+        fieldActions.push({
+          path: `claims[${index}].episodeLocalId`,
+          action: 'clear',
+          reason: '清空无法可靠重建的可选事件关联',
+        });
         deterministicRepairs += 1;
       }
-      const claimText = `${claim.content}\n${claim.evidenceExcerpt}`;
+      if (episodeLocalId && !episodeIds.has(episodeLocalId)) {
+        rejections.push(rejection(input, 'claim', index, 'dependency_invalid', 'Claim episodeLocalId 不属于本次已接受事件。', 'episodeLocalId', claim, [...episodeIds]));
+        continue;
+      }
       const allowedOwnerRef = (ref: string | undefined): string | undefined => {
         const value = ref?.trim();
         if (!value) return undefined;
-        if (actorRefs.has(value) || ['world', 'narrator', 'player'].includes(value)) return value;
-        const repaired = repairPromptEntityReference(value, claimText, actorNamesByRef);
-        if (repaired) deterministicRepairs += 1;
-        return repaired;
+        return (actorRefs.has(value) || ['world', 'narrator', 'player'].includes(value))
+          && referenceSupported(value, source, claim.evidenceExcerpt)
+          ? value
+          : undefined;
       };
       const allowedOwnerRefs = (refs: readonly string[]): string[] => {
-        const resolved = refs.map(allowedOwnerRef).filter((value): value is string => Boolean(value));
-        if (resolved.length !== refs.length) deterministicRepairs += refs.length - resolved.length;
-        return unique(resolved);
+        return unique(refs.map(allowedOwnerRef).filter((value): value is string => Boolean(value)));
       };
       const speakerRef = allowedOwnerRef(claim.knowledge.speakerRef);
       const viewpointRef = allowedOwnerRef(claim.knowledge.viewpointRef);
-      let ownerRefs = allowedOwnerRefs(claim.knowledge.ownerRefs);
+      let knowledgeOwnerRefs = claim.knowledge.ownerRefs;
+      let knowledgeObserverRefs = claim.knowledge.observerRefs;
+      let knowledgePresentRefs = claim.knowledge.presentRefs;
+      let knowledgeMentionedRefs = claim.knowledge.mentionedRefs;
+      if (conservative && referenceDirectory) {
+        const filterKnowledgeField = (
+          field: 'ownerRefs' | 'observerRefs' | 'presentRefs' | 'mentionedRefs',
+          values: readonly string[],
+        ): string[] => {
+          const filtered = unique(values.filter(ref =>
+            referenceDirectoryAllows(referenceDirectory, 'actor', ref)
+            && Boolean(allowedOwnerRef(ref))));
+          if (filtered.length !== unique(values).length) {
+            fieldActions.push({
+              path: `claims[${index}].knowledge.${field}`,
+              action: 'filter',
+              reason: '移除没有来源支持的可选知识主体引用',
+            });
+            deterministicRepairs += 1;
+          }
+          return filtered;
+        };
+        knowledgeOwnerRefs = filterKnowledgeField('ownerRefs', knowledgeOwnerRefs);
+        knowledgeObserverRefs = filterKnowledgeField('observerRefs', knowledgeObserverRefs);
+        knowledgePresentRefs = filterKnowledgeField('presentRefs', knowledgePresentRefs);
+        knowledgeMentionedRefs = filterKnowledgeField('mentionedRefs', knowledgeMentionedRefs);
+      }
+      let ownerRefs = allowedOwnerRefs(knowledgeOwnerRefs);
+      const knowledgeInputs = [
+        ...(claim.knowledge.speakerRef ? [claim.knowledge.speakerRef] : []),
+        ...(claim.knowledge.viewpointRef ? [claim.knowledge.viewpointRef] : []),
+        ...knowledgeOwnerRefs,
+        ...knowledgeObserverRefs,
+        ...knowledgePresentRefs,
+        ...knowledgeMentionedRefs,
+      ];
+      if (knowledgeInputs.some(ref => !allowedOwnerRef(ref))) {
+        rejections.push(rejection(input, 'claim', index, 'entity_ref_unsupported', 'Claim knowledge 中存在无来源支持或不属于人物目录的引用。', 'knowledge', claim, [...actorRefs, 'player', 'world', 'narrator']));
+        continue;
+      }
       const requiresSpeaker = claim.knowledge.privacy === 'private'
         || claim.knowledge.privacy === 'secret'
         || claim.knowledge.mode === 'self_reported'
@@ -1150,9 +1195,9 @@ export class MultiActorCaptureService {
         ownerRefs,
         speakerRef,
         viewpointRef,
-        observerRefs: allowedOwnerRefs(claim.knowledge.observerRefs),
-        presentRefs: allowedOwnerRefs(claim.knowledge.presentRefs),
-        mentionedRefs: allowedOwnerRefs(claim.knowledge.mentionedRefs),
+        observerRefs: allowedOwnerRefs(knowledgeObserverRefs),
+        presentRefs: allowedOwnerRefs(knowledgePresentRefs),
+        mentionedRefs: allowedOwnerRefs(knowledgeMentionedRefs),
       };
       if (claimLocalIds.has(claim.localId)) {
         rejections.push(rejection(input, 'claim', index, 'duplicate_proposal', 'Claim localId 在同一 Capture 中重复。', 'localId', claim));
@@ -1170,16 +1215,35 @@ export class MultiActorCaptureService {
       });
     }
 
-    return { actorCandidates, locationCandidates, episodes, claims, rejections, deterministicRepairs };
+    return {
+      actorCandidates,
+      locationCandidates,
+      episodes,
+      claims,
+      rejections,
+      deterministicRepairs,
+      fieldActions,
+      ...(referenceDirectory?.candidateSetHash ? { candidateSetHash: referenceDirectory.candidateSetHash } : {}),
+    };
   }
 
-  private async extractAndRepair(
+  private async extractAndValidate(
     input: MultiActorCaptureInput,
     sources: readonly SourceBlock[],
     writableSourceRefs: ReadonlySet<string>,
     knownActors: readonly KnownActorContextItem[],
     knownLocations: readonly KnownLocationContextItem[],
   ): Promise<{ prepared: PreparedCapture; structured: StructuredCaptureResult }> {
+    const repair = input.repair ? {
+      ...input.repair,
+      referenceDirectory: input.repair.referenceDirectory
+        ?? buildSupportedReferenceDirectory(
+          sources.filter(source => writableSourceRefs.has(source.id)),
+          knownActors,
+          knownLocations,
+        ),
+    } : undefined;
+    const scopedInput: MultiActorCaptureInput = repair ? { ...input, repair } : input;
     const extractionInput = {
       chatKey: input.chatKey,
       sources,
@@ -1188,15 +1252,10 @@ export class MultiActorCaptureService {
       knownLocationContext: knownLocations,
       ...(input.existingMemoryContext ? { existingMemoryContext: input.existingMemoryContext } : {}),
       ...(input.graphLlmRelationEnabled === undefined ? {} : { graphLlmRelationEnabled: input.graphLlmRelationEnabled }),
-      ...(input.repairRequest ? { repairRequest: input.repairRequest } : {}),
+      ...(repair === undefined ? {} : { repair }),
     };
-    const rawExtracted = await this.extractor.extract(extractionInput);
-    const extracted = input.repairRequest
-      ? restrictCaptureToRepairRequest(rawExtracted, input.repairRequest)
-      : rawExtracted;
-    // Deterministic enrichment belongs to ordinary Capture only. A targeted
-    // repair must not discover or write unrelated Claims from the same source.
-    const deterministicClaims = input.repairRequest ? [] : extractExplicitDirectiveClaims(
+    const extracted = await this.extractor.extract(extractionInput);
+    const deterministicClaims = extractExplicitDirectiveClaims(
       sources,
       writableSourceRefs,
       knownActors,
@@ -1210,59 +1269,17 @@ export class MultiActorCaptureService {
         deterministicRepairs: (extracted.diagnostics?.deterministicRepairs ?? 0) + deterministicClaims.length,
       },
     };
-    const firstPrepared = this.prepare(input, first, sources, writableSourceRefs, knownActors, knownLocations);
-    const firstPassUnresolved = firstPrepared.rejections
-      .filter(item => (item.status ?? 'unresolved') === 'unresolved');
-    if (input.repairRequest || firstPassUnresolved.length === 0) return { prepared: firstPrepared, structured: first };
-
-    const repairRequest: CaptureRepairRequest = {
-      items: firstPassUnresolved.map(item => ({
-        rejectionId: item.id ?? `rejection:${item.index}`,
-        recordType: (item.recordType ?? 'claim') as 'actor' | 'location' | 'episode' | 'claim',
-        localId: String(item.candidateSnapshot?.localId ?? ''),
-        code: item.code,
-        ...(item.fieldPath ? { fieldPath: item.fieldPath } : {}),
-        message: item.message,
-        ...(item.candidateSnapshot ? { candidateSnapshot: item.candidateSnapshot } : {}),
-      })).filter(item => item.localId),
+    return {
+      prepared: this.prepare(scopedInput, first, sources, writableSourceRefs, knownActors, knownLocations),
+      structured: first,
     };
-    if (repairRequest.items.length === 0) return { prepared: firstPrepared, structured: first };
-    let repair: StructuredCaptureResult;
-    try {
-      repair = await this.extractor.extract({ ...extractionInput, repairRequest });
-    } catch {
-      return { prepared: firstPrepared, structured: first };
-    }
-    const allowedRepairIds = new Set(repairRequest.items.map(item => `${item.recordType}:${item.localId}`));
-    const repairedActors = repair.actorCandidates.filter(item => allowedRepairIds.has(`actor:${item.localId}`));
-    const repairedLocations = repair.locationCandidates.filter(item => allowedRepairIds.has(`location:${item.localId}`));
-    const repairedEpisodes = repair.episodes.filter(item => allowedRepairIds.has(`episode:${item.localId}`));
-    const repairedClaims = repair.claims.filter(item => allowedRepairIds.has(`claim:${item.localId}`));
-    const merged: StructuredCaptureResult = {
-      actorCandidates: mergeByLocalId(firstPrepared.actorCandidates, repairedActors),
-      locationCandidates: mergeByLocalId(firstPrepared.locationCandidates, repairedLocations),
-      episodes: mergeByLocalId(firstPrepared.episodes, repairedEpisodes),
-      claims: mergeByLocalId(firstPrepared.claims, repairedClaims),
-      diagnostics: {
-        ...first.diagnostics,
-        automaticRepairCalls: (first.diagnostics?.automaticRepairCalls ?? 0) + 1,
-        firstPassRejections: firstPassUnresolved.length,
-      },
-      audit: repair.audit ?? first.audit,
-    };
-    const prepared = this.prepare(input, merged, sources, writableSourceRefs, knownActors, knownLocations);
-    const remainingUnresolved = prepared.rejections
-      .filter(item => (item.status ?? 'unresolved') === 'unresolved').length;
-    const repairedCount = Math.max(0, firstPassUnresolved.length - remainingUnresolved);
-    merged.diagnostics = { ...merged.diagnostics, automaticallyRepaired: repairedCount };
-    return { prepared, structured: merged };
   }
 
   async capture(input: MultiActorCaptureInput): Promise<MultiActorCaptureResult> {
     const encodedChatKey = encodeURIComponent(input.chatKey);
     const sources = filterSourceBlocks(
       input.sources.filter(source => source.chatKey === input.chatKey && source.content.trim()),
-      { includeInvisibleHistory: input.includeInvisibleHistory === true },
+      { includeHiddenMessageFloors: input.includeHiddenMessageFloors === true },
     );
     const sourceIds = new Set(sources.map(source => source.id));
     const writableSourceRefs = new Set(
@@ -1270,24 +1287,19 @@ export class MultiActorCaptureService {
         ? sourceIds
         : input.writableSourceRefs.filter(sourceRef => sourceIds.has(sourceRef)),
     );
-    // 定向修复同样需要可信目录来解析被选中的人物和地点；模型输出仍会
-    // 由 repairRequest 按 recordType + localId 严格过滤，不会扩展修复范围。
     this.discoverTrustedDirectories(sources.filter(source => writableSourceRefs.has(source.id)));
     const knownActors = this.actorDirectory(sources);
     const knownLocations = this.locationDirectory(sources);
     const actorIdByPromptRef = new Map(knownActors.filter(item => item.ownerId).map(item => [item.referenceId, item.ownerId!]));
     const locationIdByPromptRef = new Map(knownLocations.filter(item => item.locationId).map(item => [item.referenceId, item.locationId!]));
 
-    let prepared: PreparedCapture;
-    let structured: StructuredCaptureResult;
-    try {
-      ({ prepared, structured } = await this.extractAndRepair(input, sources, writableSourceRefs, knownActors, knownLocations));
-    } catch (error) {
-      throw Object.assign(new Error('memory_capture Claim 结构化请求不可用。'), {
-        code: 'MEMORY_CAPTURE_LLM_UNAVAILABLE',
-        cause: error,
-      });
-    }
+    const { prepared, structured } = await this.extractAndValidate(
+      input,
+      sources,
+      writableSourceRefs,
+      knownActors,
+      knownLocations,
+    );
 
     const acceptedLocalIds: Record<'actor' | 'location' | 'episode' | 'claim', string[]> = {
       actor: [], location: [], episode: [], claim: [],
@@ -1667,17 +1679,29 @@ export class MultiActorCaptureService {
       claimLocalIds: [...acceptedLocalIds.claim],
       capturedAt: Date.now(),
     };
-    const unresolved = prepared.rejections.filter(item => (item.status ?? 'unresolved') === 'unresolved');
+    const checkpoint = input.captureJob?.checkpoint && typeof input.captureJob.checkpoint === 'object'
+      ? input.captureJob.checkpoint as Record<string, unknown>
+      : undefined;
+    const batchIndex = Number(checkpoint?.lastScannedBatch ?? checkpoint?.batchIndex);
+    const auditedRejections = prepared.rejections.map(item => ({
+      ...item,
+      ...(Number.isInteger(item.batchIndex) ? {} : Number.isInteger(batchIndex) ? { batchIndex } : {}),
+      ...(!item.requestId && structured.audit?.requestId ? { requestId: structured.audit.requestId } : {}),
+      ...(!item.resourceId && structured.audit?.resourceId ? { resourceId: structured.audit.resourceId } : {}),
+      ...(!item.model && structured.audit?.model ? { model: structured.audit.model } : {}),
+    }));
+    const unresolved = auditedRejections.filter(item => (item.status ?? 'unresolved') === 'unresolved');
     const outcome = unresolved.length > 0 ? 'partial' as const : 'complete' as const;
     let changeAudit: import('../../infrastructure').ChangeAudit | undefined;
     if (this.repository) {
       changeAudit = await this.repository.commitCapture({
         envelope,
+        capturePhase: input.repair ? 'repair' : 'capture',
         ...(input.captureJobId ? { captureJobId: input.captureJobId } : {}),
+        ...(input.captureJob ? { captureJob: input.captureJob } : {}),
         ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
-        ...(input.parentChangeSetId ? { parentChangeSetId: input.parentChangeSetId } : {}),
         outcome,
-        rejections: prepared.rejections,
+        rejections: auditedRejections,
         owners: this.registry.listOwners(),
         aliases: this.registry.listAliases(),
         pendingCandidates: this.registry.listPending(),
@@ -1710,8 +1734,14 @@ export class MultiActorCaptureService {
       },
       audit: structured.audit,
       outcome,
-      rejections: prepared.rejections,
+      rejections: auditedRejections,
       acceptedLocalIds,
+      ...(prepared.candidateSetHash ? { candidateSetHash: prepared.candidateSetHash } : {}),
+      ...(outcome === 'complete' && prepared.fieldActions.length > 0
+        ? { resolutionMode: 'degraded' as const, fieldActions: prepared.fieldActions }
+        : input.repair && outcome === 'complete'
+          ? { resolutionMode: 'repaired' as const }
+          : {}),
       ...(changeAudit ? { changeAudit } : {}),
     };
   }

@@ -1,4 +1,10 @@
-import type { AutomaticIngestRejection, MemoryTokenUsage } from '../../domain';
+import type {
+  AutomaticIngestRejection,
+  MemoryTokenUsage,
+} from '../../domain';
+
+export type { RepairFieldAction, RepairResolutionMode } from '../../domain';
+export type { SupportedEvidenceDirectory, SupportedEvidenceSpan } from './supported-evidence-directory';
 
 export type SourceBlockKind = 'message' | 'state' | 'host_card' | 'persona' | 'worldbook';
 export type SourceBlockRole = 'user' | 'assistant' | 'system' | 'tool' | 'metadata';
@@ -202,25 +208,10 @@ export interface StructuredCaptureResult {
   diagnostics?: {
     parser?: string;
     deterministicRepairs?: number;
-    automaticRepairCalls?: number;
-    automaticallyRepaired?: number;
-    firstPassRejections?: number;
+    schemaRepairCalls?: number;
     transportMode?: 'native_strict' | 'json_object_validated' | 'prompt_json' | 'unknown';
   };
   audit?: MemoryExtractionAudit;
-}
-
-export interface CaptureRepairRequest {
-  recordType?: 'actor' | 'location' | 'episode' | 'claim';
-  items: Array<{
-    rejectionId: string;
-    recordType: 'actor' | 'location' | 'episode' | 'claim';
-    localId: string;
-    code: string;
-    fieldPath?: string;
-    message: string;
-    candidateSnapshot?: Record<string, unknown>;
-  }>;
 }
 
 /**
@@ -256,6 +247,38 @@ export interface KnownActorContextItem {
   status: 'confirmed' | 'pending';
 }
 
+export interface SupportedReferenceItem {
+  referenceId: string;
+  canonicalName: string;
+  aliases: string[];
+  sourceRefs: string[];
+}
+
+export interface SupportedEpisodeReference {
+  referenceId: string;
+  summary: string;
+  sourceRefs: string[];
+}
+
+/**
+ * A repair-local closed set. It contains only references supported by the
+ * current source window; it is shared by the prompt, dynamic schema and final
+ * business validation.
+ */
+export interface SupportedReferenceDirectory {
+  allowedActorRefs: SupportedReferenceItem[];
+  allowedLocationRefs: SupportedReferenceItem[];
+  allowedEpisodeRefs: SupportedEpisodeReference[];
+  candidateSetHash: string;
+}
+
+export interface RepairAttemptContext {
+  attempt?: number;
+  maxAttempts?: number;
+  mode?: 'targeted' | 'conservative';
+  referenceDirectory?: SupportedReferenceDirectory;
+}
+
 export interface MemoryExtractionInput {
   chatKey: string;
   sources: readonly SourceBlock[];
@@ -273,8 +296,14 @@ export interface MemoryExtractionInput {
   knownLocationContext?: readonly KnownLocationContextItem[];
   /** Enables source-grounded relation-fact guidance in the existing single call. */
   graphLlmRelationEnabled?: boolean;
-  /** User-selected failed rows only; never used by automatic background Capture. */
-  repairRequest?: CaptureRepairRequest;
+  repair?: RepairAttemptContext & {
+    collection: 'actorCandidates' | 'locationCandidates' | 'episodes' | 'claims';
+    issues: Array<{ path: string; keyword: string; expected: string }>;
+    parentRequestId?: string;
+    resourceId?: string;
+    model?: string;
+    maxItems: number;
+  };
 }
 
 /** Validated extraction output that can either be staged or committed. */

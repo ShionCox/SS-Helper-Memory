@@ -1,11 +1,11 @@
-import type { PopupUiContext, WorkspaceRecoveryRepairResult } from '@ss-helper/sdk';
+import { describeSSHelperFailure, type PopupUiContext, type SSHelperFailureContext } from '@ss-helper/sdk';
 
 export interface MemoryWorkspaceRecoveryInput {
-  readonly errorCode?: string;
+  readonly failure?: SSHelperFailureContext;
 }
 
 export interface MemoryWorkspaceRecoveryController {
-  repair(): Promise<WorkspaceRecoveryRepairResult>;
+  repair(): Promise<{ readonly backupId: string; readonly requiresReload: true }>;
 }
 
 type Notify = (notification: {
@@ -14,11 +14,6 @@ type Notify = (notification: {
   readonly message: string;
   readonly code: string;
 }) => void;
-
-function safeCode(error: unknown, fallback = 'WORKSPACE_RECOVERY_FAILED'): string {
-  const value = error && typeof error === 'object' && 'code' in error ? (error as { readonly code?: unknown }).code : undefined;
-  return typeof value === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/u.test(value) ? value : fallback;
-}
 
 function button(label: string, tone: 'neutral' | 'danger' | 'primary' = 'neutral'): HTMLButtonElement {
   const value = document.createElement('button');
@@ -53,7 +48,11 @@ export function renderMemoryWorkspaceRecovery(
     const title = document.createElement('h3');
     title.textContent = armed ? '请再次确认恢复' : 'Memory 工作区需要恢复';
     const detail = document.createElement('p');
-    detail.textContent = `检测到可恢复的工作区故障（${input.errorCode ?? 'WORKSPACE_UNAVAILABLE'}）。记忆功能已安全停用，酒馆其余功能可以继续使用。`;
+    const diagnostic = describeSSHelperFailure(input.failure, {
+      reasonCode: 'WORKSPACE_UNAVAILABLE',
+      stage: 'memory.workspace.recovery',
+    });
+    detail.textContent = `${diagnostic.reasonCode} · ${diagnostic.title}：${diagnostic.reason} ${diagnostic.action}`;
     const warning = document.createElement('p');
     warning.textContent = '重新初始化会先完整备份当前 _ss-helper-v0 目录（包括数据库、WAL/SHM 和密钥），随后创建新的工作区。加密凭据需要重新录入。';
     const controls = document.createElement('div');
@@ -88,9 +87,9 @@ export function renderMemoryWorkspaceRecovery(
             repairing = false;
             confirm.disabled = false;
             back.disabled = false;
-            const code = safeCode(error);
-            status.textContent = `恢复未完成（${code}）。原始目录未被自动删除。`;
-            notify({ level: 'error', title: 'Memory 工作区恢复失败', message: '未完成重新初始化；请稍后重试或检查备份目录。', code });
+            const diagnostic = describeSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.workspace.recovery' });
+            status.textContent = `恢复未完成（${diagnostic.reasonCode}）。原始目录未被自动删除。`;
+            notify({ level: 'error', title: diagnostic.title, message: `${diagnostic.reason} ${diagnostic.action}`, code: diagnostic.reasonCode });
           });
       });
       controls.append(back, confirm);

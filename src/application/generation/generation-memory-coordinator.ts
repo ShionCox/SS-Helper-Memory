@@ -3,9 +3,11 @@ import type {
   ActorRecallResponse,
   CastPlanningSettings,
   GenerationCastPlan,
+  GenerationRecallIntentKind,
   GenerationRecallIntentPlan,
   MemoryFact,
   MemoryEpisode,
+  PreparedRecallAttempt,
   RecallCoverageLog,
   RecallCoverageResult,
   SceneCast,
@@ -15,9 +17,11 @@ import type {
 import type { SourceBlock } from '../ingest/types';
 import type { ActorMemoryPromptResult } from '../prompt';
 import { CastCandidateResolver, GenerationCastPlanner, SceneStateReducer } from '../actors';
-import { planRecallIntentByRules, RecallCoverageVerifier } from '../recall';
+import { LlmRecallIntentPlanner, planRecallIntent, RecallCoverageVerifier } from '../recall';
+import { createSSHelperError, readSSHelperFailure } from '@ss-helper/sdk';
 
 export interface PreparedGenerationMemory {
+  readonly query: string;
   readonly sceneState: SceneState;
   readonly sceneCast: SceneCast;
   readonly castPlan: GenerationCastPlan;
@@ -25,6 +29,9 @@ export interface PreparedGenerationMemory {
   readonly recalled: ActorRecallResponse;
   readonly coverage: RecallCoverageResult;
   readonly expanded: boolean;
+  readonly recallSkippedReason?: 'recent_context_sufficient' | 'no_relevant_memory';
+  readonly expansionSkippedReason?: 'no_new_candidates';
+  readonly attempts: readonly PreparedRecallAttempt[];
   readonly prompt: ActorMemoryPromptResult;
 }
 
@@ -59,6 +66,7 @@ export interface GenerationMemoryCoordinatorDependencies {
   readonly listFacts: () => Promise<readonly MemoryFact[]>;
   readonly listTraces: () => Promise<readonly ActorMemoryTrace[]>;
   readonly resolveOwnerName: (name: string) => string | undefined;
+  readonly listKnownOwners?: () => readonly { readonly ownerId: string; readonly names: readonly string[] }[];
   readonly recall: (input: {
     readonly query: string;
     readonly scene: SceneCast;
@@ -67,8 +75,10 @@ export interface GenerationMemoryCoordinatorDependencies {
     readonly maxItems: number;
     readonly now: number;
     readonly minimumRetrievalLevel?: 1 | 2 | 3 | 4;
+    readonly coverageExpansion?: boolean;
+    readonly excludedFactIds?: readonly string[];
   }) => Promise<ActorRecallResponse>;
-  readonly buildPrompt: (response: ActorRecallResponse, castPlan: GenerationCastPlan, maxChars: number) => ActorMemoryPromptResult;
+  readonly buildPrompt: (response: ActorRecallResponse, castPlan: GenerationCastPlan, maxChars: number, intentKind: GenerationRecallIntentKind) => ActorMemoryPromptResult;
   readonly isCurrent?: () => boolean;
   readonly commitPrepared: (input: {
     readonly state: SceneState;
@@ -93,10 +103,22 @@ export interface PrepareGenerationMemoryInput {
 
 function unique(values: Iterable<string>): string[] { return [...new Set([...values].filter(Boolean))]; }
 
-function staleGenerationScopeError(): Error & { code: string } {
-  return Object.assign(new Error('生成前记忆准备所属聊天已变化，已丢弃旧结果。'), {
-    code: 'MEMORY_STALE_GENERATION_SCOPE',
+function staleGenerationScopeError(): Error {
+  return createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', {
+    stage: 'memory.generation.scope',
   });
+}
+
+async function generationStage<T>(stage: string, operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (cause) {
+    const failure = readSSHelperFailure(cause, {
+      reasonCode: 'INTERNAL_ERROR',
+      stage: `memory.generation.${stage}`,
+    })!;
+    throw createSSHelperError(failure.reasonCode, failure);
+  }
 }
 
 function planningScene(scene: SceneCast, state: SceneState): SceneCast {
@@ -135,9 +157,9 @@ export class GenerationMemoryCoordinator {
     };
     assertCurrent();
     const now = input.now ?? Date.now();
-    const sources = await this.dependencies.collectSources(input.chatKey);
+    const sources = await generationStage('collect_sources', () => this.dependencies.collectSources(input.chatKey));
     assertCurrent();
-    const sceneResolution = await this.sceneStateReducer.resolve({
+    const sceneResolution = await generationStage('resolve_scene', () => this.sceneStateReducer.resolve({
       workspaceId: input.workspaceId,
       chatKey: input.chatKey,
       currentFloor: input.currentFloor,
@@ -146,12 +168,12 @@ export class GenerationMemoryCoordinator {
       actorScanLookbackFloors: input.settings.actorScanLookbackFloors,
       persistPresenceUntilTransition: input.settings.persistPresenceUntilTransition,
       persist: false,
-    });
+    }));
     assertCurrent();
-    const [episodes, facts] = await Promise.all([
+    const [episodes, facts] = await generationStage('load_memory', () => Promise.all([
       this.dependencies.listEpisodes(),
       this.dependencies.listFacts(),
-    ]);
+    ]));
     assertCurrent();
     const relatedOwners = relatedOwnersFromFacts(facts, sceneResolution.state, now);
     const candidates = this.candidateResolver.resolve({
@@ -167,7 +189,7 @@ export class GenerationMemoryCoordinator {
       actorScanLookbackFloors: input.settings.actorScanLookbackFloors,
     });
     const latestEpisode = [...episodes].sort((left, right) => (right.floorEnd ?? right.floorStart ?? 0) - (left.floorEnd ?? left.floorStart ?? 0))[0];
-    const castPlan = await this.castPlanner.plan({
+    const castPlan = await generationStage('plan_cast', () => this.castPlanner.plan({
       workspaceId: input.workspaceId,
       chatKey: input.chatKey,
       currentFloor: input.currentFloor,
@@ -180,15 +202,29 @@ export class GenerationMemoryCoordinator {
       newActorRequested: newActorRequested(input.userMessage),
       settings: input.settings,
       now,
-    });
+    }));
     assertCurrent();
-    const intent = planRecallIntentByRules(input.userMessage, { castPlan, resolveOwnerName: this.dependencies.resolveOwnerName, entityKeys: sceneResolution.state.locationKeys });
+    const recentConversation = sources
+      .filter(source => source.kind === 'message' && source.visibility !== 'hidden')
+      .slice(-4)
+      .map(source => ({ role: source.role, content: source.content.slice(0, 1_600) }));
+    const entityKeys = unique([
+      ...sceneResolution.state.locationKeys,
+      ...facts.flatMap(fact => fact.entityKeys).filter(key => input.userMessage.normalize('NFKC').toLocaleLowerCase().includes(key.normalize('NFKC').toLocaleLowerCase())),
+    ]);
+    const intent = await generationStage('plan_recall_intent', () => planRecallIntent(input.userMessage, new LlmRecallIntentPlanner(), {
+      castPlan,
+      resolveOwnerName: this.dependencies.resolveOwnerName,
+      entityKeys,
+      knownOwners: this.dependencies.listKnownOwners?.() ?? [],
+      recentConversation,
+    }));
     const scene = planningScene(sceneResolution.sceneCast, sceneResolution.state);
-    const first = await this.dependencies.recall({ query: input.userMessage, scene, castPlan, intentPlan: intent, maxItems: input.maxItems, now });
+    const first = await generationStage('recall_primary', () => this.dependencies.recall({ query: input.userMessage, scene, castPlan, intentPlan: intent, maxItems: input.maxItems, now }));
     assertCurrent();
-    const traces = await this.dependencies.listTraces();
+    const traces = await generationStage('load_traces', () => this.dependencies.listTraces());
     assertCurrent();
-    const verified = await this.coverageVerifier.verifyWithExpansion({ castPlan, intent, response: first, traces }, async () => {
+    const verified = await generationStage('verify_coverage', () => this.coverageVerifier.verifyWithExpansion({ castPlan, intent, response: first, traces }, async () => {
       assertCurrent();
       const expanded = await this.dependencies.recall({
         query: input.userMessage,
@@ -198,10 +234,12 @@ export class GenerationMemoryCoordinator {
         maxItems: Math.min(30, input.maxItems + 2),
         now,
         minimumRetrievalLevel: intent.graphHops > 0 ? 4 : 2,
+        coverageExpansion: true,
+        excludedFactIds: [...new Set((first.candidatePartitions ?? []).flatMap(partition => partition.candidates.map(candidate => candidate.factId)))],
       });
       assertCurrent();
       return expanded;
-    });
+    }));
     assertCurrent();
     const coverageLog: RecallCoverageLog = {
       id: `recall-coverage:${castPlan.id}`,
@@ -212,16 +250,29 @@ export class GenerationMemoryCoordinator {
       expanded: verified.expanded,
       createdAt: now,
     };
-    const prompt = this.dependencies.buildPrompt(verified.results, castPlan, input.maxChars);
+    const prompt = this.dependencies.buildPrompt(verified.results, castPlan, input.maxChars, intent.intentKind);
     assertCurrent();
-    await this.dependencies.commitPrepared({
+    await generationStage('commit_prepared', () => this.dependencies.commitPrepared({
       state: sceneResolution.state,
       ...(sceneResolution.transition ? { transition: sceneResolution.transition } : {}),
       plan: castPlan,
       coverage: coverageLog,
       ...(this.dependencies.isCurrent ? { isCurrent: this.dependencies.isCurrent } : {}),
-    });
+    }));
     assertCurrent();
-    return { sceneState: sceneResolution.state, sceneCast: scene, castPlan, intent, recalled: verified.results, coverage: verified.coverage, expanded: verified.expanded, prompt };
+    return {
+      query: input.userMessage,
+      sceneState: sceneResolution.state,
+      sceneCast: scene,
+      castPlan,
+      intent,
+      recalled: verified.results,
+      coverage: verified.coverage,
+      expanded: verified.expanded,
+      ...(intent.recentContextSatisfied ? { recallSkippedReason: 'recent_context_sufficient' as const } : prompt.includedTraceIds.length === 0 ? { recallSkippedReason: 'no_relevant_memory' as const } : {}),
+      ...(verified.expansionSkippedReason ? { expansionSkippedReason: verified.expansionSkippedReason } : {}),
+      attempts: verified.attempts,
+      prompt,
+    };
   }
 }

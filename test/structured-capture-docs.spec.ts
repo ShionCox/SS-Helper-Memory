@@ -9,7 +9,8 @@ describe('structured Capture documentation contract', () => {
     const llmAgents = readFileSync(new URL('../../SS-Helper-LLM/AGENTS.md', import.meta.url), 'utf8');
 
     expect(guide).toContain('未知 `kind` 不会自动变成 `other`');
-    expect(guide).toContain('会自动重试一次');
+    expect(guide).toContain('最多进行三次真实调用');
+    expect(guide).toContain('resolutionMode: degraded');
     expect(rootAgents).toContain('SS-Helper-Memory/docs/structured-capture.md');
     expect(memoryAgents).toContain('docs/structured-capture.md');
     expect(llmAgents).toContain('../SS-Helper-Memory/docs/structured-capture.md');

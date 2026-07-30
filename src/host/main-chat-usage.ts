@@ -21,7 +21,14 @@ function text(...values: unknown[]): string | undefined {
 }
 
 function safeId(value: string): string {
-  return value.replace(/[^\p{L}\p{N}_.:-]+/gu, '_').slice(0, 160);
+  const encoded = encodeURIComponent(value);
+  if (encoded.length <= 160) return encoded || '_';
+  let hash = 0x811c9dc5;
+  for (const byte of new TextEncoder().encode(value)) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${encoded.slice(0, 144)}:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 }
 
 /**

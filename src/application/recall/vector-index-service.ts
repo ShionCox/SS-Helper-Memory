@@ -1,11 +1,12 @@
 import type { MemoryFact, MemoryFactVectorCoverage, MemoryTokenUsage } from '../../domain';
+import { createSSHelperError, describeSSHelperFailure, readSSHelperFailure } from '@ss-helper/sdk';
 import { MemoryRepository } from '../../infrastructure';
 import {
   MEMORY_EMBED_TASK,
   MEMORY_PLUGIN_ID,
-  readMemoryLlmApi,
+  readMemoryLlmClient,
   readMemoryRecallRouteDiagnostics,
-  type MemoryLlmApi,
+  type MemoryLlmClient,
   type MemoryLlmMeta,
 } from '../ingest/llm-extractor';
 
@@ -13,7 +14,10 @@ import {
 // rebuild batches. A 3s deadline caused healthy Qwen3 requests to be aborted
 // mid-rebuild and left the physical vector table only partially populated.
 const EMBEDDING_TIMEOUT_MS = 15_000;
-const VECTOR_BATCH_SIZE = 32;
+// The browser plugin bus serializes every vector component. Keep rebuild pages
+// small enough that a 1024-dimension response can cross that boundary without
+// consuming the request deadline on structured-clone/validation work.
+const VECTOR_BATCH_SIZE = 8;
 const VECTOR_TOP_K = 60;
 const QUERY_CACHE_SIZE = 64;
 const QUERY_CACHE_TTL_MS = 10 * 60 * 1_000;
@@ -143,7 +147,7 @@ export class MemoryVectorIndexService {
 
   constructor(
     private readonly repository: MemoryRepository,
-    private readonly getLlm: () => MemoryLlmApi | null = readMemoryLlmApi,
+    private readonly getLlm: () => MemoryLlmClient | null = readMemoryLlmClient,
     private readonly getRoutes: typeof readMemoryRecallRouteDiagnostics = readMemoryRecallRouteDiagnostics,
   ) {}
 
@@ -238,7 +242,9 @@ export class MemoryVectorIndexService {
   }
 
   async rebuildFacts(chatKey: string, factIds: readonly string[]): Promise<void> {
-    if (!this.active || !chatKey) throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
+    if (!this.active || !chatKey) throw createSSHelperError('WORKSPACE_UNAVAILABLE', {
+      stage: 'memory.vector.rebuild',
+    });
     if (this.rebuildPromise) await this.rebuildPromise;
     await this.waitForSyncIdle();
     const operation = (async (): Promise<void> => {
@@ -246,7 +252,11 @@ export class MemoryVectorIndexService {
       const route = (await this.getRoutes()).embedding;
       const llm = this.getLlm();
       if (!route.available || !route.resourceId || !route.model || route.blockedReason || !llm?.embed) {
-        throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
+        throw createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', {
+          stage: 'memory.vector.route',
+          resourceId: route.resourceId,
+          model: route.model,
+        });
       }
       const facts = (await Promise.all([...new Set(factIds)].map((factId) => this.repository.getFact(chatKey, factId))))
         .filter((fact): fact is MemoryFact => Boolean(fact && (fact.status === 'active' || fact.status === 'pending')));
@@ -285,8 +295,12 @@ export class MemoryVectorIndexService {
           })));
           this.rememberEmbeddingTarget(chatKey, route.resourceId, route.model, { resourceId, model });
         }
-      } catch {
-        throw Object.assign(new Error('向量索引修复已排队。'), { code: 'VECTOR_INDEX_REPAIR_PENDING' });
+      } catch (error) {
+        const failure = readSSHelperFailure(error, {
+          reasonCode: 'INTERNAL_ERROR',
+          stage: 'memory.vector.rebuild',
+        })!;
+        throw createSSHelperError(failure.reasonCode, failure);
       }
     })();
     let tracked!: Promise<void>;
@@ -394,7 +408,7 @@ export class MemoryVectorIndexService {
           budget: { maxLatencyMs: EMBEDDING_TIMEOUT_MS },
           enqueue: { displayMode: 'silent' },
         }), EMBEDDING_TIMEOUT_MS, '事实 embedding');
-        if (!response.ok) throw new Error(response.error || '事实 embedding 失败。');
+        if (!response.ok) throw createSSHelperError(response.failure.reasonCode, response.failure);
         if (response.vectors.length !== facts.length) {
           throw new Error(`embedding 返回 ${response.vectors.length} 条向量，预期 ${facts.length} 条。`);
         }
@@ -440,7 +454,11 @@ export class MemoryVectorIndexService {
       const coverage = await this.repository.getFactVectorCoverage(chatKey, target);
       status({ rebuilding: false, coverage, pendingFacts: coverage.missing + coverage.stale });
     } catch (error) {
-      status({ rebuilding: false, lastError: error instanceof Error ? error.message : String(error) });
+      const diagnostic = describeSSHelperFailure(error, {
+        reasonCode: 'INTERNAL_ERROR',
+        stage: 'memory.vector.rebuild',
+      });
+      status({ rebuilding: false, lastError: `${diagnostic.reasonCode} · ${diagnostic.title}` });
     }
   }
 
@@ -502,7 +520,7 @@ export class MemoryVectorIndexService {
       budget: { maxLatencyMs: EMBEDDING_TIMEOUT_MS },
       enqueue: { displayMode: 'silent' },
     }), EMBEDDING_TIMEOUT_MS, '查询 embedding');
-    if (!response.ok) throw new Error(response.error || '查询 embedding 失败。');
+    if (!response.ok) throw createSSHelperError(response.failure.reasonCode, response.failure);
     if (response.vectors.length !== 1) throw new Error('查询 embedding 返回数量不为 1。');
     const resourceId = response.meta?.resourceId ?? route.resourceId;
     const model = response.meta?.model ?? response.model ?? route.model;

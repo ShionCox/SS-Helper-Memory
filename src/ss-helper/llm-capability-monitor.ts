@@ -12,9 +12,8 @@ export type MemoryCapabilitySettings = {
   autoOrganize: boolean;
   recallMode: 'auto' | 'lexical' | 'vector' | 'hybrid';
   rerankMode: 'off' | 'adaptive' | 'always';
-  /** Optional for backward-compatible capability probes from older callers. */
-  preExtractReferenceEnabled?: boolean;
-  preExtractReferenceMode?: 'auto' | 'lexical' | 'vector' | 'hybrid';
+  preExtractReferenceEnabled: boolean;
+  preExtractReferenceMode: 'auto' | 'lexical' | 'vector' | 'hybrid';
 };
 export interface MemorySettingsNotice { readonly title: string; readonly message: string; readonly code: string; }
 export interface MemorySettingsAssessment { readonly blocked?: MemorySettingsNotice; readonly warnings: readonly MemorySettingsNotice[]; }
@@ -92,7 +91,7 @@ export class MemoryLlmCapabilityMonitor {
 
   async start(): Promise<void> {
     try {
-      this.unsubscribeEvent = this.session.events.subscribe(LLM_CAPABILITY_STATUS_CHANGED_V0, (payload) => {
+      this.unsubscribeEvent = this.session.bus.subscribe(LLM_CAPABILITY_STATUS_CHANGED_V0, (payload) => {
         if (payload.revision <= this.revision) return;
         this.scheduleRefresh();
       });
@@ -158,7 +157,7 @@ export class MemoryLlmCapabilityMonitor {
     const settings = this.readSettings();
     let response: LlmCapabilityStatusResponse | undefined;
     try {
-      response = await readStatusWithDeadline(this.session.services.call(LLM_CAPABILITY_STATUS_V0, {
+      response = await readStatusWithDeadline(this.session.bus.request(LLM_CAPABILITY_STATUS_V0, {
         checks: [
           { id: 'generation', taskKey: 'memory_extract', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] },
           { id: 'embedding', taskKey: 'memory_embed', taskKind: 'embedding', requiredCapabilities: ['embeddings'] },

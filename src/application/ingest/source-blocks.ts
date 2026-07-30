@@ -172,22 +172,38 @@ export function sanitizeSourceContent(value: string): string {
   return content.replace(/\n{3,}/g, '\n\n').trim();
 }
 
-export interface SourceFilterOptions {
-  /** Allow Tavern's historical system messages, while retaining safety filters. */
-  includeInvisibleHistory?: boolean;
+export interface SourceBlockFilterOptions {
+  /**
+   * 初始化可显式读取酒馆中被隐藏的普通用户/助手楼层。
+   * 工具、推理、系统与控制块无论如何都不会因此放行。
+   */
+  includeHiddenMessageFloors?: boolean;
 }
 
-/** 只保留用户授权且模型可见的来源块；不可见历史正文仅在显式开启时保留。 */
-export function filterSourceBlocks(blocks: readonly SourceBlock[], options: SourceFilterOptions = {}): SourceBlock[] {
+function isConversationFloor(block: SourceBlock): boolean {
+  return block.kind === 'message'
+    && (block.role === 'user' || block.role === 'assistant')
+    && block.messageType !== 'tool'
+    && block.messageType !== 'reasoning'
+    && block.messageType !== 'system';
+}
+
+/** 只保留用户授权的正文来源块，并始终阻断工具、推理、系统和控制内容。 */
+export function filterSourceBlocks(
+  blocks: readonly SourceBlock[],
+  options: SourceBlockFilterOptions = {},
+): SourceBlock[] {
   return blocks.flatMap((block): SourceBlock[] => {
+    const hidden = block.hidden === true || block.visibility === 'hidden';
+    const allowHiddenFloor = options.includeHiddenMessageFloors === true && isConversationFloor(block);
     if (
-      block.hidden
-      || (block.visibility === 'control' && !(options.includeInvisibleHistory === true && (block.role === 'system' || block.messageType === 'system')))
-      || (block.visibility === 'hidden' && options.includeInvisibleHistory !== true)
+      block.visibility === 'control'
+      || (hidden && !allowHiddenFloor)
       || block.messageType === 'tool'
       || block.messageType === 'reasoning'
       || block.role === 'tool'
-      || ((block.role === 'system' || block.messageType === 'system') && options.includeInvisibleHistory !== true)
+      || block.role === 'system'
+      || block.messageType === 'system'
     ) return [];
     const content = sanitizeSourceContent(block.content);
     if (!content) return [];

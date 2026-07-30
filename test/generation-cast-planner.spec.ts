@@ -63,6 +63,21 @@ describe('GenerationCastPlanner', () => {
     expect(plan.likelyOwnerIds).toContain('actor:b');
   });
 
+  it('uses the configured 0.72 gate for deterministic and director-proposed likely actors', async () => {
+    const planner = new GenerationCastPlanner({
+      plan: vi.fn<CastDirector['plan']>().mockResolvedValue({ requiredOwnerIds: ['actor:a'], likelyOwnerIds: ['actor:b', 'actor:c'], backgroundOwnerIds: [] }),
+    });
+    const candidates = [candidate('actor:a', 0.8), candidate('actor:b', 0.72), candidate('actor:c', 0.71)];
+    const directed = await planner.plan(input(resolution(candidates), '继续'));
+    expect(directed.likelyOwnerIds).toEqual(['actor:b']);
+    expect(directed.backgroundOwnerIds).toContain('actor:c');
+
+    const fastPlanner = new GenerationCastPlanner();
+    const deterministic = await fastPlanner.plan({ ...input(resolution(candidates), '继续'), settings: { ...DEFAULT_CAST_SETTINGS, castPlanningMode: 'fast' } });
+    expect(deterministic.likelyOwnerIds).toEqual(['actor:b']);
+    expect(deterministic.backgroundOwnerIds).toContain('actor:c');
+  });
+
   it('falls back to the deterministic plan when the director fails', async () => {
     const planDirector = vi.fn<CastDirector['plan']>().mockRejectedValue(new Error('timeout'));
     const planner = new GenerationCastPlanner({ plan: planDirector });

@@ -35,7 +35,7 @@ describe('multi-actor generation memory flow', () => {
     ];
     const memory = fact('fact:a', 'A记得加油站有三台加油机，其中一台被汽车残骸压垮。');
     const trace: ActorMemoryTrace = {
-      id: 'trace:a', workspaceId: 'workspace', ownerId: a.id, factId: memory.id,
+      id: 'trace:a', workspaceId: 'workspace', chatKey: 'chat', ownerId: a.id, factId: memory.id,
       sourceObservationIds: ['observation:a'], knowledgeMode: 'experienced', privacy: 'private', strength: 90,
       clarity: 100, beliefConfidence: 1, emotionalSalience: 20, rehearsalCount: 0, traceRevision: 1,
       learnedAt: 1, createdAt: 1, updatedAt: 1,

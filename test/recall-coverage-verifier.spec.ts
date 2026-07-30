@@ -10,7 +10,7 @@ function fact(id: string, content: string): MemoryFact {
 }
 
 function trace(id: string, ownerId: string, factId: string, privacy: ActorMemoryTrace['privacy'] = 'public'): ActorMemoryTrace {
-  return { id, workspaceId: 'workspace', ownerId, factId, sourceObservationIds: ['o'], knowledgeMode: 'experienced', privacy, strength: 90, clarity: 100, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: 1, updatedAt: 1 };
+  return { id, workspaceId: 'workspace', chatKey: 'chat', ownerId, factId, sourceObservationIds: ['o'], knowledgeMode: 'experienced', privacy, strength: 90, clarity: 100, beliefConfidence: 1, emotionalSalience: 0, rehearsalCount: 0, traceRevision: 1, learnedAt: 1, createdAt: 1, updatedAt: 1 };
 }
 
 function castPlan(): GenerationCastPlan {
@@ -57,6 +57,7 @@ describe('RecallCoverageVerifier', () => {
     expect(result.expanded).toBe(true);
     expect(result.coverage.covered).toBe(true);
     expect(result.results.diagnostics.coverage?.covered).toBe(true);
+    expect(result.attempts.map(attempt => attempt.kind)).toEqual(['primary', 'coverage_expansion']);
   });
 
   it('fails closed on a private trace in a public-only partition and does not request expansion', () => {
@@ -65,5 +66,32 @@ describe('RecallCoverageVerifier', () => {
     expect(coverage.covered).toBe(false);
     expect(coverage.privacyViolations).toEqual([expect.objectContaining({ ownerId: B, traceId: 'trace-b' })]);
     expect(coverage.requiresExpansion).toBe(false);
+  });
+
+  it('does not require the viewpoint actor for a world-scoped question', () => {
+    const data = response(false);
+    const actorPacket = data.response.actors[0]!.packets[0]!;
+    const worldIntent: GenerationRecallIntentPlan = {
+      ...intent(), intentKind: 'world_knowledge', topicTerms: ['加油站'],
+      ownerScope: { ownerIds: ['owner:world', 'owner:narrator'], requiredOwnerIds: [], fallback: 'public_relevance' },
+      subQueries: [{ id: 'world', query: '加油站是什么', targetOwnerIds: ['owner:world', 'owner:narrator'], targetKinds: ['world_rule'] }],
+    };
+    const worldResponse: ActorRecallResponse = {
+      ...data.response,
+      request: { ...data.response.request, intentPlan: worldIntent },
+      world: { ...data.response.world, packets: [actorPacket] },
+      actors: [],
+    };
+    const coverage = new RecallCoverageVerifier().verify({ castPlan: castPlan(), intent: worldIntent, response: worldResponse, traces: data.traces });
+    expect(coverage.missingOwnerIds).toEqual([]);
+    expect(coverage.covered).toBe(true);
+  });
+
+  it('skips a coverage pass that produces no new facts', async () => {
+    const first = response(false);
+    const result = await new RecallCoverageVerifier().verifyWithExpansion({ castPlan: castPlan(), intent: intent(), response: first.response, traces: first.traces }, async () => first.response);
+    expect(result.expanded).toBe(false);
+    expect(result.expansionSkippedReason).toBe('no_new_candidates');
+    expect(result.attempts).toHaveLength(1);
   });
 });

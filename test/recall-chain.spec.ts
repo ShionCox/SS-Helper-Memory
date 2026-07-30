@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { MemoryRecallIndex, type RecallFact } from '../src/application/recall/memory-recall-index'
-import { buildMemoryPrompt } from '../src/application/prompt/build-memory-prompt'
+import { buildMemoryPromptResult } from '../src/application/prompt/build-memory-prompt'
 
 const NOW = Date.parse('2026-07-12T12:00:00.000Z')
 
@@ -478,7 +478,7 @@ describe('memory prompt', () => {
     expect(Object.isFrozen(result.items)).toBe(true)
     expect(Object.isFrozen(result.items[0])).toBe(true)
 
-    const prompt = buildMemoryPrompt(result)
+    const prompt = buildMemoryPromptResult(result).prompt
     expect(prompt).toContain('【稳定前提】')
     expect(prompt).toContain('【当前相关事实】')
     expect(prompt).toContain('【进行中事项】')
@@ -489,11 +489,10 @@ describe('memory prompt', () => {
 
   it('does not inject anything when recall is empty', () => {
     const result = new MemoryRecallIndex([]).recall({ chatKey: 'chat-a', query: '任意问题', now: NOW })
-    expect(buildMemoryPrompt(result)).toBe('')
+    expect(buildMemoryPromptResult(result).prompt).toBe('')
   })
 
   it('enforces a hard character budget without cutting a fact line', async () => {
-    const { buildMemoryPromptResult } = await import('../src/application/prompt/build-memory-prompt')
     const index = new MemoryRecallIndex([
       fact({ id: 'first', kind: 'relationship', content: '爱丽丝信任罗兰。', entityKeys: ['character:alice', 'character:roland'] }),
       fact({ id: 'second', kind: 'relationship', content: '爱丽丝与罗兰约定在黎明前会合。', entityKeys: ['character:alice', 'character:roland'] }),

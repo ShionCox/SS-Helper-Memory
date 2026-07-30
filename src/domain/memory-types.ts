@@ -164,25 +164,73 @@ export interface MemoryEvidence {
 }
 
 export type MemoryJobType = 'initialize' | 'incremental';
-export type MemoryJobStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed';
+export type MemoryJobStatus = 'queued' | 'running' | 'repairing' | 'needs_repair' | 'needs_review' | 'paused' | 'completed' | 'failed';
 export type MemoryJobOutcome = 'complete' | 'partial';
-export type MemoryInitializationPhase = 'capture';
+export type MemoryInitializationPhase = 'capture' | 'repair';
+export type RepairResolutionMode = 'repaired' | 'degraded' | 'ignored';
+
+export interface RepairFieldAction {
+  path: string;
+  action: 'clear' | 'filter';
+  reason: string;
+}
 
 export interface MemoryJobCheckpoint {
   batchIndex: number;
+  lastScannedBatch?: number;
+  completedBatchCount?: number;
+  pendingRepairCount?: number;
+  retryableRepairCount?: number;
+  exhaustedRepairCount?: number;
+  reviewRequiredCount?: number;
+  unresolvedRejectionCount?: number;
+  repairedCount?: number;
+  degradedCount?: number;
+  ignoredCount?: number;
   totalBatches?: number;
   processedCount: number;
   lastSourceRef?: string;
   overlapSourceRefs?: string[];
   metadataSourceRefs?: string[];
   selectedSourceGroupIds?: string[];
-  /** Initialization-only; optional for backwards-compatible resume of old jobs. */
-  includeInvisibleHistory?: boolean;
+  /** 初始化任务是否包含酒馆中已隐藏的普通用户/助手楼层。 */
+  includeHiddenMessageFloors?: boolean;
   /** 总结窗口的聊天楼层边界；用于断点恢复和进度诊断。 */
   summaryStartFloor?: number;
   summaryEndFloor?: number;
   summaryEndMessageId?: string;
   phase?: MemoryInitializationPhase;
+}
+
+export interface CaptureRepairQueueRecord {
+  id: string;
+  workspaceId: string;
+  chatKey: string;
+  jobId: string;
+  batchIndex: number;
+  collection: 'actorCandidates' | 'locationCandidates' | 'episodes' | 'claims' | 'batch';
+  itemIndex: number;
+  issues: Array<{ path: string; keyword: string; expected: string }>;
+  sourceRefs: string[];
+  fallbackSourceRefs: string[];
+  originalRequestId?: string;
+  originalResourceId?: string;
+  originalModel?: string;
+  rejectionId?: string;
+  rejectionIds?: string[];
+  repairRequestId?: string;
+  status: 'queued' | 'running' | 'resolved' | 'unresolved' | 'ignored';
+  attemptCount: number;
+  maxAttempts?: number;
+  candidateSetHash?: string;
+  evidenceSetHash?: string;
+  repairPolicyVersion?: number;
+  resolutionMode?: RepairResolutionMode;
+  fieldActions?: RepairFieldAction[];
+  resolvedAt?: number;
+  failure?: SSHelperFailureContext;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface MemoryJob {
@@ -194,7 +242,7 @@ export interface MemoryJob {
   rejectionCount?: number;
   rejections?: readonly AutomaticIngestRejection[];
   checkpoint: MemoryJobCheckpoint;
-  error?: string;
+  failure?: SSHelperFailureContext;
   createdAt: number;
   updatedAt: number;
 }
@@ -239,6 +287,8 @@ export interface MainChatUsage {
   messageId: string;
   /** 与本次生成前最近一次 recall_log 关联；没有注入时可缺省。 */
   recallLogId?: string;
+  /** 与本条 AI 回复原子提交的完整召回审计。 */
+  generationRecallDetailId?: string;
   promptTokens: number | null;
   completionTokens: number | null;
   cacheReadTokens: number | null;
@@ -324,10 +374,19 @@ export interface AutomaticIngestRejection {
   message: string;
   recordType?: 'batch' | 'actor' | 'location' | 'episode' | 'claim' | 'observation' | 'fact';
   fieldPath?: string;
+  issues?: Array<{
+    path: string;
+    keyword: string;
+    expected: string;
+  }>;
   sourceRefs?: string[];
   allowedValues?: string[];
   /** Only known Capture fields are retained; no prompt/provider payloads. */
-  candidateSnapshot?: Record<string, unknown>;
+  requestId?: string;
+  parentRequestId?: string;
+  resourceId?: string;
+  model?: string;
+  batchIndex?: number;
   status?: 'unresolved' | 'repairing' | 'repaired' | 'ignored';
   repairAttempts?: number;
   lastAttemptAt?: number;
@@ -348,6 +407,8 @@ export type AutomaticProposalErrorCode =
   | 'invalid_shape'
   | 'invalid_enum'
   | 'invalid_reference'
+  | 'entity_ref_unsupported'
+  | 'schema_validation_failed'
   | 'dependency_invalid'
   | 'unknown_field'
   | 'batch_invalid_json'
@@ -369,8 +430,7 @@ export type AutomaticProposalValidation =
 export type ReconciliationDecision = 'insert' | 'duplicate' | 'supersede' | 'pending';
 
 export interface ReconciliationCandidate {
-  /** Optional on legacy callers; current Capture always supplies the fact kind. */
-  kind?: MemoryFactKind;
+  kind: MemoryFactKind;
   canonicalKey: string;
   slotKey?: string;
   content: string;
@@ -399,3 +459,4 @@ export interface ManualFactInput {
   stableAnchor?: boolean;
   scope?: FactScope;
 }
+import type { SSHelperFailureContext } from '@ss-helper/sdk';
