@@ -12,7 +12,7 @@ describe('deterministic inventory snapshot parser', () => {
     const row = source('message:4', 4, [
       '【当前物资快照】',
       '食物: 高热量压缩口粮（约29天份）、瓶装水x22、真空包装食品若干（肉类x15包、蔬菜x10包）、新鲜生菜x2kg',
-      '特殊道具: 隔离箱（已丢弃）',
+      '特殊道具: 隔离箱（已丢弃）、蘑菇孢子包x2（已接种）、豆类种子x120粒（已播种）、普通生菜x120株、紫色营养液x400ml（剩余）',
       '【角色状态】',
       '白夕小时：健康',
     ].join('\n'));
@@ -26,6 +26,10 @@ describe('deterministic inventory snapshot parser', () => {
     expect(byName.get('蔬菜')).toMatchObject({ amount: 10, unit: '包' });
     expect(byName.get('新鲜生菜')).toMatchObject({ amount: 2, unit: 'kg' });
     expect(byName.get('隔离箱')).toMatchObject({ operation: 'remove' });
+    expect(byName.get('蘑菇孢子包')).toMatchObject({ amount: 2, unit: '个' });
+    expect(byName.get('豆类种子')).toMatchObject({ amount: 120, unit: '粒' });
+    expect(byName.get('普通生菜')).toMatchObject({ amount: 120, unit: '株' });
+    expect(byName.get('紫色营养液')).toMatchObject({ amount: 400, unit: 'ml' });
   });
 
   it('ignores ordinary narrative dates and harvest forecasts outside the explicit snapshot section', () => {

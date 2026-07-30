@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildEvidenceWindowHash,
   buildSupportedEvidenceDirectory,
   evidenceSpanById,
   evidenceSpanFor,
@@ -30,6 +31,14 @@ describe('SupportedEvidenceDirectory', () => {
     expect(directory.spans.map(span => span.sourceRef)).toEqual(['message:writable']);
     expect(evidenceSpanById(directory, directory.spans[0]!.evidenceSpanId)?.sourceRef).toBe('message:writable');
     expect(evidenceSpanFor(directory, directory.spans[0]!.evidenceSpanId, 'message:context')).toBeUndefined();
+  });
+
+  it('changes the review hash when read-only neighbouring context changes', () => {
+    const writable = source('message:writable', '可写证据。');
+    const first = buildEvidenceWindowHash([writable, source('message:context', '旧上下文。')], [writable.id]);
+    const second = buildEvidenceWindowHash([writable, source('message:context', '新上下文。')], [writable.id]);
+    expect(first).not.toBe(second);
+    expect(buildSupportedEvidenceDirectory([writable], [writable.id]).spans).toHaveLength(1);
   });
 
   it('rejects duplicate evidence span identifiers before model execution', () => {

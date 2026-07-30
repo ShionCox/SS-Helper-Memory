@@ -43,6 +43,7 @@ export interface InitializationViewProgress {
   pendingRepairCount?: number;
   retryableRepairCount?: number;
   exhaustedRepairCount?: number;
+  quarantinedCount?: number;
   reviewRequiredCount?: number;
   unresolvedRejectionCount?: number;
   repairedCount?: number;
@@ -151,8 +152,8 @@ function recordStatusLabel(status: InitializationProgressStatus): string {
     queued: '已排队',
     running: '进行中',
     repairing: '修复中',
-    needs_repair: '待修复',
-    needs_review: '待审阅',
+    needs_repair: '部分完成',
+    needs_review: '已隔离',
     paused: '已暂停',
     completed: '已完成',
     failed: '失败',
@@ -249,11 +250,17 @@ function renderActivities(model: InitializationViewModel): string {
   if (!items.length) {
     return '<div class="stx-memory-init-empty is-activity"><ss-helper-icon name="clock-rotate-left" decorative></ss-helper-icon><strong>暂无初始化记录</strong><p>完成初始化后会在这里保留最近 5 次活动。</p></div>';
   }
-  return items.map((attempt) => {
-    const icon = attempt.status === 'completed' ? 'circle-check' : attempt.status === 'failed' ? 'circle-xmark' : attempt.status === 'paused' ? 'circle-pause' : attempt.status === 'cancelled' ? 'ban' : 'clock';
-    return `<article class="stx-memory-init-activity is-${attempt.status}">
+  return items.map((attempt, index) => {
+    const pendingCount = index === 0 || model.progress?.jobId === attempt.jobId
+      ? Math.max(0, model.progress?.retryableRepairCount ?? model.progress?.pendingRepairCount ?? 0)
+      : undefined;
+    const status = (attempt.status === 'needs_repair' || attempt.status === 'needs_review') && pendingCount === 0
+      ? 'completed'
+      : attempt.status;
+    const icon = status === 'completed' ? 'circle-check' : status === 'failed' ? 'circle-xmark' : status === 'paused' ? 'circle-pause' : status === 'cancelled' ? 'ban' : 'clock';
+    return `<article class="stx-memory-init-activity is-${status}">
       <span class="stx-memory-init-activity-icon"><ss-helper-icon name="${icon}" decorative></ss-helper-icon></span>
-      <div><div class="stx-memory-init-activity-head"><strong>${recordStatusLabel(attempt.status)}</strong><time datetime="${new Date(attempt.updatedAt).toISOString()}">${escapeHtml(formatTime(attempt.updatedAt))}</time></div>
+      <div><div class="stx-memory-init-activity-head"><strong>${recordStatusLabel(status)}</strong><time datetime="${new Date(attempt.updatedAt).toISOString()}">${escapeHtml(formatTime(attempt.updatedAt))}</time></div>
       <p>${formatNumber(attempt.totalBatches)} 批 · ${escapeHtml(sourceNames(model, attempt.selectedSourceKinds).join('、') || '全部可用来源')} · ${attempt.includeHiddenMessageFloors === false ? '仅可见聊天正文' : '聊天正文含隐藏楼层'}</p>
       ${attempt.failure ? `<small>${escapeHtml(describeSSHelperFailure(attempt.failure).reasonCode)}</small>` : ''}</div>
     </article>`;
@@ -301,7 +308,7 @@ function renderSetup(model: InitializationViewModel): string {
     ${renderActionBar(`${model.selectedSourceKinds.length} 组来源 · ${totalSelectedItems(model)} 项`, selectedNames.join('、') || '尚未选择来源', `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-start" ${startDisabled ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>${failed ? '重新尝试初始化' : '开始初始化'}</button>`)}`;
 }
 
-function renderProgress(model: InitializationViewModel, paused: boolean, needsRepair = false, needsReview = false): string {
+function renderProgress(model: InitializationViewModel, paused: boolean, needsRepair = false): string {
   const progress = model.progress;
   const totalBatches = Math.max(0, progress?.totalBatches ?? model.estimate?.batchCount ?? 0);
   const batchIndex = Math.max(0, progress?.batchIndex ?? 0);
@@ -312,12 +319,10 @@ function renderProgress(model: InitializationViewModel, paused: boolean, needsRe
   const repairing = progress?.phase === 'repair' || progress?.status === 'repairing' || progress?.status === 'needs_repair';
   const stage = deriveInitializationStage(progress, model.submitting, false);
   const lockedKinds = model.selectedSourceKinds.length ? model.selectedSourceKinds : model.attempts[0]?.selectedSourceKinds ?? [];
-  const halted = paused || needsRepair || needsReview;
-  const heading = needsReview ? '部分记忆需要人工审阅' : needsRepair ? '部分记忆已可召回' : paused ? '初始化已暂停' : repairing ? '正在修复格式失败项' : queued ? '正在提交模型请求' : '正在提取并写入结构化记忆';
-  const heroCopy = needsReview
-    ? '模型修复次数已经用完；合法记忆仍可召回，剩余项目不会被猜测或自动改绑。'
-    : needsRepair
-    ? '正常批次已经保存；未解决项不会写入，可继续处理或稍后人工审阅。'
+  const halted = paused || needsRepair;
+  const heading = needsRepair ? '部分记忆已可召回' : paused ? '初始化已暂停' : repairing ? '正在修复格式失败项' : queued ? '正在提交模型请求' : '正在提取并写入结构化记忆';
+  const heroCopy = needsRepair
+    ? '正常批次已经保存；未解决项将由 AI 自动复核，仍不合法的内容会被隔离。'
     : paused
       ? '已保留完成批次和整理进度，无需重复提取。'
       : repairing
@@ -327,15 +332,15 @@ function renderProgress(model: InitializationViewModel, paused: boolean, needsRe
   const repairedCount = Math.max(0, progress?.repairedCount ?? 0);
   const degradedCount = Math.max(0, progress?.degradedCount ?? 0);
   const exhaustedCount = Math.max(0, progress?.exhaustedRepairCount ?? 0);
-  const reviewCount = Math.max(0, progress?.reviewRequiredCount ?? 0);
+  const quarantinedCount = Math.max(0, progress?.quarantinedCount ?? progress?.unresolvedRejectionCount ?? progress?.reviewRequiredCount ?? 0);
   const ignoredCount = Math.max(0, progress?.ignoredCount ?? 0);
   const degradedNotice = degradedCount > 0
     ? `<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="shield-halved" decorative></ss-helper-icon></span><div><strong>已安全降级 ${formatNumber(degradedCount)} 项</strong><p>仅省略了缺少来源支持的可选引用；没有猜测或改绑实体。</p></div></div>`
     : '';
-  const repairSummary = needsRepair || needsReview
-    ? `<dl class="stx-memory-init-estimate"><div><dt>可继续处理</dt><dd>${formatNumber(pendingCount)}</dd></div><div><dt>已直接修复</dt><dd>${formatNumber(repairedCount)}</dd></div><div><dt>已安全降级</dt><dd>${formatNumber(degradedCount)}</dd></div><div><dt>已达上限</dt><dd>${formatNumber(exhaustedCount)}</dd></div><div><dt>需人工审阅</dt><dd>${formatNumber(reviewCount)}</dd></div><div><dt>已忽略</dt><dd>${formatNumber(ignoredCount)}</dd></div></dl>`
+  const repairSummary = needsRepair
+    ? `<dl class="stx-memory-init-estimate"><div><dt>可继续处理</dt><dd>${formatNumber(pendingCount)}</dd></div><div><dt>已直接修复</dt><dd>${formatNumber(repairedCount)}</dd></div><div><dt>已安全降级</dt><dd>${formatNumber(degradedCount)}</dd></div><div><dt>已达上限</dt><dd>${formatNumber(exhaustedCount)}</dd></div><div><dt>已隔离</dt><dd>${formatNumber(quarantinedCount)}</dd></div><div><dt>已忽略</dt><dd>${formatNumber(ignoredCount)}</dd></div></dl>`
     : '';
-  return `<div class="stx-memory-init-scroll"><div class="stx-memory-init-progress-hero"><span class="stx-memory-init-progress-icon is-${halted ? 'paused' : 'running'}"><ss-helper-icon name="${needsRepair || needsReview ? 'triangle-exclamation' : paused ? 'pause' : repairing ? 'screwdriver-wrench' : 'wand-magic-sparkles'}" decorative></ss-helper-icon></span><div><span class="stx-memory-kicker">${needsReview ? '需审阅' : needsRepair ? '待处理' : paused ? '可继续' : repairing ? '部分记忆已可召回' : '正在捕获记忆'}</span><h2>${heading}</h2><p>${heroCopy}</p></div>${statusChip(needsReview ? '待审阅' : needsRepair ? '待修复' : paused ? '断点已保留' : repairing ? '定向修复中' : '任务进行中', halted ? 'warning' : 'neutral')}</div>
+  return `<div class="stx-memory-init-scroll"><div class="stx-memory-init-progress-hero"><span class="stx-memory-init-progress-icon is-${halted ? 'paused' : 'running'}"><ss-helper-icon name="${needsRepair ? 'triangle-exclamation' : paused ? 'pause' : repairing ? 'screwdriver-wrench' : 'wand-magic-sparkles'}" decorative></ss-helper-icon></span><div><span class="stx-memory-kicker">${needsRepair ? '待处理' : paused ? '可继续' : repairing ? '部分记忆已可召回' : '正在捕获记忆'}</span><h2>${heading}</h2><p>${heroCopy}</p></div>${statusChip(needsRepair ? '待修复' : paused ? '断点已保留' : repairing ? '定向修复中' : '任务进行中', halted ? 'warning' : 'neutral')}</div>
     ${needsRepair ? `<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><div><strong>部分可召回 · 仍有 ${formatNumber(pendingCount)} 项待修复</strong><p>合法记忆已持久化；继续处理不会重复扫描已经完成的批次。</p></div></div>` : paused ? '<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><div><strong>任务因可重试错误暂停</strong><p>继续后会从断点恢复，并沿用本次来源范围。</p></div></div>' : ''}
     ${degradedNotice}
     ${repairSummary}
@@ -356,20 +361,22 @@ function renderProgress(model: InitializationViewModel, paused: boolean, needsRe
     <div class="stx-memory-init-locked"><span>已锁定来源</span><strong>${escapeHtml(sourceNames(model, lockedKinds).join('、') || '无')}</strong></div>
     ${renderSection('处理阶段', '当前阶段会随批次进度更新。', renderPipeline(stage), statusChip(`${percent}%`))}
     ${renderSection('本次任务估算', '来源在任务开始后锁定。', renderEstimate(model, lockedKinds))}</div>
-    ${renderActionBar(needsReview ? `${formatNumber(reviewCount)} 项需要人工审阅` : needsRepair ? `部分可召回 · ${formatNumber(pendingCount)} 项待修复` : paused ? '可以安全继续' : '正在后台处理当前聊天', needsReview ? '模型不会继续猜测这些必需语义项' : needsRepair ? '继续时只处理未解决的修复队列' : paused ? '继续后从现有断点恢复' : '关闭页面不会改变聊天原文', halted
-      ? needsReview
-        ? `<button ${uiControl('button', 'primary')} type="button" data-action="view-audit"><ss-helper-icon name="clipboard-list" decorative></ss-helper-icon>查看审计记录</button>`
-        : `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-resume" ${model.busy || !model.llmAvailable || !model.workspaceAvailable ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>${needsRepair ? '继续处理' : '继续初始化'}</button>${needsRepair || paused ? `<button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${model.busy || !model.llmAvailable || !model.workspaceAvailable ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>重新初始化</button>` : ''}`
+    ${renderActionBar(needsRepair ? `部分可召回 · ${formatNumber(pendingCount)} 项待修复` : paused ? '可以安全继续' : '正在后台处理当前聊天', needsRepair ? '继续时只处理未解决的修复队列' : paused ? '继续后从现有断点恢复' : '关闭页面不会改变聊天原文', halted
+      ? `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-resume" ${model.busy || !model.llmAvailable || !model.workspaceAvailable ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>${needsRepair ? '继续处理' : '继续初始化'}</button>${needsRepair || paused ? `<button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${model.busy || !model.llmAvailable || !model.workspaceAvailable ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>重新初始化</button>` : ''}`
       : `<button ${uiControl('button', 'danger')} type="button" data-action="initialize-cancel"><ss-helper-icon name="stop" decorative></ss-helper-icon>取消任务</button>`)}`;
 }
 
-function renderCompleted(model: InitializationViewModel): string {
+function renderCompleted(model: InitializationViewModel, partial = false): string {
   const successfulKinds = model.successfulSourceKinds.length ? model.successfulSourceKinds : model.selectedSourceKinds;
   const completedAttempt = model.attempts.find((attempt) => attempt.status === 'completed');
   const degradedCount = Math.max(0, model.progress?.degradedCount ?? 0);
-  return `<div class="stx-memory-init-scroll"><div class="stx-memory-init-success-hero"><span class="stx-memory-init-success-icon"><ss-helper-icon name="check" decorative></ss-helper-icon></span><div><span class="stx-memory-kicker">初始化状态</span><h2>当前聊天已初始化</h2><p>完成于 ${escapeHtml(formatTime(model.lastCompletedAt))}，记忆召回已经可用。</p></div>${statusChip('召回可用', 'success')}</div>
+  const quarantinedCount = Math.max(0, model.progress?.quarantinedCount ?? model.progress?.unresolvedRejectionCount ?? model.progress?.reviewRequiredCount ?? 0);
+  const ignoredCount = Math.max(0, model.progress?.ignoredCount ?? 0);
+  const completedAt = model.lastCompletedAt ?? (partial ? model.attempts[0]?.updatedAt : undefined);
+  return `<div class="stx-memory-init-scroll"><div class="stx-memory-init-success-hero"><span class="stx-memory-init-success-icon"><ss-helper-icon name="check" decorative></ss-helper-icon></span><div><span class="stx-memory-kicker">初始化状态</span><h2>当前聊天已初始化</h2><p>完成于 ${escapeHtml(formatTime(completedAt))}，记忆召回已经可用。</p></div>${statusChip(partial ? '部分完成 · 召回可用' : '召回可用', 'success')}</div>
     <dl class="stx-memory-init-estimate is-completed"><div><dt>来源覆盖</dt><dd>${successfulKinds.length} / ${model.sources.length}</dd></div><div><dt>记忆事实</dt><dd>${formatNumber(model.factCount)}</dd></div><div><dt>占用空间</dt><dd>${escapeHtml(formatBytes(model.storageBytes))}</dd></div><div><dt>完成批次</dt><dd>${formatNumber(completedAttempt?.totalBatches ?? model.estimate?.batchCount ?? 0)}</dd></div></dl>
     <div class="stx-memory-init-success-note"><ss-helper-icon name="circle-check" decorative></ss-helper-icon><span>最近失败的初始化任务只会保留在右侧活动记录，不会覆盖这次有效初始化。</span></div>
+    ${partial || quarantinedCount > 0 || ignoredCount > 0 ? `<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="shield-halved" decorative></ss-helper-icon></span><div><strong>自动复核已完成</strong><p>已隔离 ${formatNumber(quarantinedCount)} 项等待证据变化，已忽略 ${formatNumber(ignoredCount)} 项；它们不会进入召回或 Prompt，也不需要人工处理。</p></div></div>` : ''}
     ${degradedCount > 0 ? `<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="shield-halved" decorative></ss-helper-icon></span><div><strong>已安全降级 ${formatNumber(degradedCount)} 项</strong><p>仅省略缺少来源支持的可选引用；核心记忆已通过完整校验，没有猜测或改绑实体。</p></div></div>` : ''}
     ${renderSection('已完成的处理流程', '当前聊天已经具备结构化记忆和角色知情边界。', renderPipeline({ activeIndex: -1, allDone: true, halted: false }))}
     ${renderSection('已使用来源', '重新初始化时会优先恢复这次成功使用的来源范围。', renderSourceCards(model, successfulKinds, true, true), statusChip(`${successfulKinds.length} 组`, 'success'))}</div>
@@ -396,18 +403,20 @@ function renderDrawer(model: InitializationViewModel): string {
 }
 
 export function renderInitializationView(model: InitializationViewModel): string {
-  const needsRepair = model.progress?.status === 'needs_repair'
-    || (!model.initialized && model.attempts[0]?.status === 'needs_repair');
-  const needsReview = model.progress?.status === 'needs_review'
-    || (!model.initialized && model.attempts[0]?.status === 'needs_review');
+  const pendingRepairCount = Math.max(0, model.progress?.retryableRepairCount ?? model.progress?.pendingRepairCount ?? 0);
+  const legacyRepairTerminal = model.progress?.status === 'needs_repair' || model.progress?.status === 'needs_review'
+    || (!model.initialized && (model.attempts[0]?.status === 'needs_repair' || model.attempts[0]?.status === 'needs_review'));
+  const needsRepair = legacyRepairTerminal && pendingRepairCount > 0;
+  const completedWithIsolation = legacyRepairTerminal && pendingRepairCount === 0;
+  const completedPartial = model.progress?.status === 'completed' && model.progress.outcome === 'partial';
   const paused = model.progress?.status === 'paused'
     || (!model.initialized && model.attempts[0]?.status === 'paused');
   const running = model.submitting || Boolean(model.progress && ['queued', 'running', 'repairing'].includes(model.progress.status));
   const primary = running ? renderProgress(model, false)
     : needsRepair ? renderProgress(model, false, true)
-      : needsReview ? renderProgress(model, false, false, true)
       : paused ? renderProgress(model, true)
-      : model.initialized ? renderCompleted(model)
+      : completedWithIsolation ? renderCompleted(model, true)
+      : model.initialized ? renderCompleted(model, completedPartial)
         : renderSetup(model);
   return `<div class="stx-memory-initialize-shell">
     ${renderReadiness(model)}

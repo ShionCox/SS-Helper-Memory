@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createSSHelperError } from '@ss-helper/sdk';
 import type { ActorMemoryTrace, CaptureRepairQueueRecord, MemoryFact, MemoryJob, MemoryRecallLog } from '../src/domain';
 import type { ExistingMemoryContextItem, SourceBlock } from '../src/application/ingest/types';
+import { buildEvidenceWindowHash } from '../src/application/ingest/supported-evidence-directory';
 import { MEMORY_DEFAULT_SETTINGS } from '../src/ss-helper/settings';
 
 type TestRecallRoutes = {
@@ -681,7 +682,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     app.stop();
   });
 
-  it('初始化事实全部被拒绝且没有 AI 可重试项时进入 needs_review', async () => {
+  it('初始化只有不可修复低质量项时自动忽略并正常完成', async () => {
     state.sources = [{ ...message(1), floor: 1, content: '白夕小时确认地下储油库仍有约百分之四十五燃油。' }];
     const { MemoryApplication } = await import('../src/application/memory-application');
     const repository = new FakeRepository();
@@ -710,7 +711,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
         owners: [], pendingCandidates: [], episodes: [], observations: [], facts: [], traces: [],
         sceneCast: { id: 'scene:failed', workspaceId: 'character:c1', chatKey: 'chat-a', floor: 1, members: [], viewpointOwnerId: 'owner:unknown', speakerOwnerIds: [], presentOwnerIds: [], mentionedOwnerIds: [], createdAt: now },
         outcome: 'partial' as const,
-        rejections: [{ index: 0, recordType: 'claim' as const, code: 'invalid_confidence' as const, message: '缺少 confidence', status: 'unresolved' as const }],
+        rejections: [{ index: 0, recordType: 'claim' as const, code: 'quality_below_threshold' as const, message: '质量不足', status: 'unresolved' as const }],
         acceptedLocalIds: { actor: [], episode: [], observation: [], fact: [] },
         changeAudit: { id: 'change-audit:empty-facts' },
       })),
@@ -722,14 +723,14 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     await expect(app.initialize(['message'])).resolves.toBeUndefined();
     expect(rollbackChangeSet).not.toHaveBeenCalled();
     expect(captureJobs.at(-1)).toMatchObject({
-      status: 'needs_review',
-      outcome: 'partial',
+      status: 'completed',
+      outcome: 'complete',
       checkpoint: {
         batchIndex: 1,
         lastScannedBatch: 1,
         completedBatchCount: 1,
         processedCount: 1,
-        phase: 'repair',
+        phase: 'capture',
         pendingRepairCount: 0,
       },
     });
@@ -1113,7 +1114,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     app.stop();
   });
 
-  it('恢复中断的 running 修复，并按队列项独立提交部分成功状态', async () => {
+  it('把同集合相邻失败项合并复核，并分别提交修复与隔离状态', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const app = new MemoryApplication(new FakeRepository() as never);
     connectHost(app);
@@ -1129,7 +1130,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
         id: 'repair:queued', workspaceId: 'character:c1', chatKey: 'chat-a', jobId: 'job:repair',
         batchIndex: 0, collection: 'claims', itemIndex: 1,
         issues: [{ path: 'claims[1].content', keyword: 'minLength', expected: '非空正文' }],
-        sourceRefs: ['message:1'], fallbackSourceRefs: [], rejectionId: 'rejection:queued',
+        sourceRefs: ['message:2'], fallbackSourceRefs: [], rejectionId: 'rejection:queued',
         status: 'queued', attemptCount: 0, createdAt: 1, updatedAt: 1,
       },
     ];
@@ -1140,22 +1141,12 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
         queue[index] = structuredClone(next);
       }),
     };
-    const executeActorCapture = vi.fn()
-      .mockResolvedValueOnce({
-        acceptedLocalIds: { actor: [], location: [], episode: [], claim: ['claim:fixed'] },
-        rejections: [],
-        audit: { requestId: 'request:fixed' },
-      })
-      .mockResolvedValueOnce({
-        acceptedLocalIds: { actor: [], location: [], episode: [], claim: [] },
-        rejections: [{ index: 0, status: 'unresolved' }],
-        audit: { requestId: 'request:unresolved' },
-      })
-      .mockResolvedValueOnce({
-        acceptedLocalIds: { actor: [], location: [], episode: [], claim: [] },
-        rejections: [{ index: 0, status: 'unresolved' }],
-        audit: { requestId: 'request:unresolved:second' },
-      });
+    const executeActorCapture = vi.fn().mockResolvedValueOnce({
+      acceptedLocalIds: { actor: [], location: [], item: [], episode: [], claim: ['claim:fixed'], inventory: [] },
+      repairDecisions: [{ repairId: 'repair:running', action: 'emit', localId: 'claim:fixed', sourceRefs: ['message:1'] }],
+      rejections: [{ index: 1, status: 'unresolved' }],
+      audit: { requestId: 'request:grouped' },
+    });
     const internal = app as unknown as {
       captureVersion: number;
       activeCaptureProgress?: {
@@ -1172,36 +1163,36 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
         captureVersion: number,
         chatKey: string,
       ): Promise<{ resolvedRejectionIds: Set<string>; remaining: number }>;
+      retryEvidenceChangedCaptureRepairs(
+        repository: typeof repairRepository,
+        sources: readonly SourceBlock[],
+        settings: typeof MEMORY_DEFAULT_SETTINGS,
+        captureVersion: number,
+        chatKey: string,
+        includeHiddenMessageFloors: boolean,
+      ): Promise<void>;
     };
     internal.executeActorCapture = executeActorCapture;
 
     const outcome = await internal.runDeferredCaptureRepairs(
       repairRepository,
       'job:repair',
-      [{ ...message(1), floor: 1 }],
+      [{ ...message(1), floor: 1 }, { ...message(2), floor: 2 }],
       { ...MEMORY_DEFAULT_SETTINGS, graphEnabled: false, graphLlmRelationEnabled: false },
       internal.captureVersion,
       'chat-a',
     );
 
-    expect(executeActorCapture).toHaveBeenCalledTimes(3);
+    expect(executeActorCapture).toHaveBeenCalledTimes(1);
     expect(executeActorCapture.mock.calls.map(([, input]) => input)).toEqual([
       expect.objectContaining({
-        idempotencyKey: 'capture:job:repair:repair:repair:running:1',
-        repair: expect.objectContaining({ collection: 'claims', attempt: 1, maxAttempts: 2, mode: 'targeted', maxItems: 1 }),
-      }),
-      expect.objectContaining({
-        idempotencyKey: 'capture:job:repair:repair:repair:queued:1',
-        repair: expect.objectContaining({ collection: 'claims', attempt: 1, maxAttempts: 2, mode: 'targeted', maxItems: 1 }),
-      }),
-      expect.objectContaining({
-        idempotencyKey: 'capture:job:repair:repair:repair:queued:2',
-        repair: expect.objectContaining({ collection: 'claims', attempt: 2, maxAttempts: 2, mode: 'conservative', maxItems: 1 }),
+        idempotencyKey: 'capture:job:repair:repair:repair:queued,repair:running:1',
+        repair: expect.objectContaining({ collection: 'claims', attempt: 1, maxAttempts: 1, mode: 'targeted', maxItems: 2 }),
       }),
     ]);
     expect(queue).toEqual([
-      expect.objectContaining({ id: 'repair:running', status: 'resolved', attemptCount: 1, repairRequestId: 'request:fixed' }),
-      expect.objectContaining({ id: 'repair:queued', status: 'unresolved', attemptCount: 2, repairRequestId: 'request:unresolved:second' }),
+      expect.objectContaining({ id: 'repair:running', status: 'resolved', attemptCount: 1, repairRequestId: 'request:grouped' }),
+      expect.objectContaining({ id: 'repair:queued', status: 'unresolved', attemptCount: 1, waitingForEvidenceChange: true, repairRequestId: 'request:grouped' }),
     ]);
     expect(Object.hasOwn(queue[0]!, 'failure')).toBe(false);
     expect(internal.activeCaptureProgress).toMatchObject({
@@ -1211,6 +1202,15 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     });
     expect([...outcome.resolvedRejectionIds]).toEqual(['rejection:running']);
     expect(outcome.remaining).toBe(0);
+    await internal.retryEvidenceChangedCaptureRepairs(
+      repairRepository,
+      [{ ...message(1), floor: 1 }, { ...message(2), floor: 2 }],
+      MEMORY_DEFAULT_SETTINGS,
+      internal.captureVersion,
+      'chat-a',
+      false,
+    );
+    expect(executeActorCapture).toHaveBeenCalledTimes(1);
   });
 
   it('修复结果的最终状态提交失败后保留 running，并用同一幂等键续跑', async () => {
@@ -1276,7 +1276,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     ]);
   });
 
-  it('取消或传输中断不消耗修复机会，并在恢复后使用同一幂等键续跑', async () => {
+  it('取消和可重试网络中断不消耗修复机会，并在恢复后使用同一幂等键续跑', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const app = new MemoryApplication(new FakeRepository() as never);
     connectHost(app);
@@ -1295,6 +1295,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     };
     const executeActorCapture = vi.fn()
       .mockRejectedValueOnce(createSSHelperError('CANCELLED', { stage: 'memory.capture.cancel' }))
+      .mockRejectedValueOnce(createSSHelperError('HTTP_CONNECT_FAILED', { stage: 'llm.provider.connect' }))
       .mockResolvedValueOnce({
         acceptedLocalIds: { actor: [], location: [], episode: [], claim: ['claim:fixed'] },
         rejections: [],
@@ -1327,15 +1328,21 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     });
     expect(queue[0]).toMatchObject({ status: 'queued', attemptCount: 0 });
 
+    await expect(run()).rejects.toMatchObject({
+      details: expect.objectContaining({ reasonCode: 'HTTP_CONNECT_FAILED' }),
+    });
+    expect(queue[0]).toMatchObject({ status: 'queued', attemptCount: 0 });
+
     await expect(run()).resolves.toMatchObject({ remaining: 0 });
     expect(queue[0]).toMatchObject({ status: 'resolved', attemptCount: 1 });
     expect(executeActorCapture.mock.calls.map(([, input]) => input.idempotencyKey)).toEqual([
       'capture:job:repair:repair:repair:cancelled:1',
       'capture:job:repair:repair:repair:cancelled:1',
+      'capture:job:repair:repair:repair:cancelled:1',
     ]);
   });
 
-  it('前置实体已耗尽时仍阻断下游修复且不消耗下游尝试', async () => {
+  it('前置实体已隔离时不阻断下游 AI 作出 drop 决策', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const app = new MemoryApplication(new FakeRepository() as never);
     connectHost(app);
@@ -1345,21 +1352,28 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
         batchIndex: 0, collection: 'actorCandidates', itemIndex: 0,
         issues: [{ path: 'actorCandidates[0]', keyword: 'entityRef', expected: 'source-supported ref' }],
         sourceRefs: ['message:1'], fallbackSourceRefs: [], rejectionId: 'rejection:actor',
-        status: 'unresolved', attemptCount: 2, maxAttempts: 2, createdAt: 1, updatedAt: 1,
+        status: 'unresolved', attemptCount: 1, maxAttempts: 1, waitingForEvidenceChange: true, createdAt: 1, updatedAt: 1,
       },
       {
         id: 'repair:claim-dependent', workspaceId: 'character:c1', chatKey: 'chat-a', jobId: 'job:repair',
         batchIndex: 0, collection: 'claims', itemIndex: 0,
         issues: [{ path: 'claims[0].subjectRef', keyword: 'entityRef', expected: 'source-supported ref' }],
         sourceRefs: ['message:1'], fallbackSourceRefs: [], rejectionId: 'rejection:claim',
-        status: 'queued', attemptCount: 0, maxAttempts: 2, createdAt: 1, updatedAt: 1,
+        status: 'queued', attemptCount: 0, maxAttempts: 1, createdAt: 1, updatedAt: 1,
       },
     ];
     const repairRepository = {
       listCaptureRepairQueue: vi.fn(async () => structuredClone(queue)),
-      updateCaptureRepairRecord: vi.fn(),
+      updateCaptureRepairRecord: vi.fn(async (next: CaptureRepairQueueRecord) => {
+        const index = queue.findIndex(record => record.id === next.id);
+        queue[index] = structuredClone(next);
+      }),
     };
-    const executeActorCapture = vi.fn();
+    const executeActorCapture = vi.fn(async () => ({
+      acceptedLocalIds: { actor: [], location: [], item: [], episode: [], claim: [], inventory: [] },
+      repairDecisions: [{ repairId: 'repair:claim-dependent', action: 'drop' }],
+      rejections: [],
+    }));
     const internal = app as unknown as {
       captureVersion: number;
       executeActorCapture: typeof executeActorCapture;
@@ -1382,11 +1396,59 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       internal.captureVersion,
       'chat-a',
     )).resolves.toMatchObject({ remaining: 0 });
-    expect(executeActorCapture).not.toHaveBeenCalled();
-    expect(queue[1]).toMatchObject({ status: 'queued', attemptCount: 0 });
+    expect(executeActorCapture).toHaveBeenCalledTimes(1);
+    expect(queue[0]).toMatchObject({ status: 'unresolved', waitingForEvidenceChange: true });
+    expect(queue[1]).toMatchObject({ status: 'ignored', attemptCount: 1, resolutionMode: 'ignored' });
   });
 
-  it('旧记录 attemptCount=1 可继续第二次保守修复并使用独立幂等键', async () => {
+  it('硬校验已忽略的复核候选不会再次进入隔离队列', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    const queue: CaptureRepairQueueRecord[] = [{
+      id: 'repair:duplicate', workspaceId: 'character:c1', chatKey: 'chat-a', jobId: 'job:repair',
+      batchIndex: 0, collection: 'claims', itemIndex: 0,
+      issues: [{ path: 'claims[0]', keyword: 'duplicate', expected: 'new supported claim' }],
+      sourceRefs: ['message:1'], fallbackSourceRefs: [], rejectionId: 'rejection:duplicate',
+      status: 'queued', attemptCount: 0, maxAttempts: 1, createdAt: 1, updatedAt: 1,
+    }];
+    const repairRepository = {
+      listCaptureRepairQueue: vi.fn(async () => structuredClone(queue)),
+      updateCaptureRepairRecord: vi.fn(async (next: CaptureRepairQueueRecord) => { queue[0] = structuredClone(next); }),
+    };
+    const executeActorCapture = vi.fn(async () => ({
+      acceptedLocalIds: { actor: [], location: [], item: [], episode: [], claim: [], inventory: [] },
+      repairDecisions: [{ repairId: 'repair:duplicate', action: 'emit', localId: 'claim:duplicate', itemIndex: 0, sourceRefs: ['message:1'] }],
+      rejections: [{ index: 0, recordType: 'claim', code: 'duplicate_proposal', status: 'ignored' }],
+      audit: { requestId: 'request:duplicate' },
+    }));
+    const internal = app as unknown as {
+      captureVersion: number;
+      executeActorCapture: typeof executeActorCapture;
+      runDeferredCaptureRepairs(
+        repository: typeof repairRepository,
+        jobId: string,
+        sources: readonly SourceBlock[],
+        settings: typeof MEMORY_DEFAULT_SETTINGS,
+        captureVersion: number,
+        chatKey: string,
+      ): Promise<{ remaining: number }>;
+    };
+    internal.executeActorCapture = executeActorCapture;
+
+    await internal.runDeferredCaptureRepairs(
+      repairRepository,
+      'job:repair',
+      [{ ...message(1), floor: 1 }],
+      MEMORY_DEFAULT_SETTINGS,
+      internal.captureVersion,
+      'chat-a',
+    );
+
+    expect(queue[0]).toMatchObject({ status: 'ignored', attemptCount: 1, waitingForEvidenceChange: false, resolutionMode: 'ignored' });
+  });
+
+  it('隔离记录只在证据哈希变化后执行最后一次保守复核', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const app = new MemoryApplication(new FakeRepository() as never);
     connectHost(app);
@@ -1395,7 +1457,9 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       batchIndex: 0, collection: 'episodes', itemIndex: 0,
       issues: [{ path: 'episodes[0].locationRef', keyword: 'entityRef', expected: 'source-supported ref' }],
       sourceRefs: ['message:1'], fallbackSourceRefs: [], rejectionId: 'rejection:legacy-second',
-      status: 'unresolved', attemptCount: 1, createdAt: 1, updatedAt: 1,
+      status: 'unresolved', attemptCount: 1, maxAttempts: 1,
+      waitingForEvidenceChange: true, evidenceRetryUsed: false, evidenceSetHash: 'old-evidence',
+      createdAt: 1, updatedAt: 1,
     }];
     const repairRepository = {
       listCaptureRepairQueue: vi.fn(async () => structuredClone(queue)),
@@ -1414,24 +1478,26 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     const internal = app as unknown as {
       captureVersion: number;
       executeActorCapture: typeof executeActorCapture;
-      runDeferredCaptureRepairs(
+      finalizeActorCaptureResults: ReturnType<typeof vi.fn>;
+      retryEvidenceChangedCaptureRepairs(
         repository: typeof repairRepository,
-        jobId: string,
         sources: readonly SourceBlock[],
         settings: typeof MEMORY_DEFAULT_SETTINGS,
         captureVersion: number,
         chatKey: string,
-      ): Promise<{ remaining: number; degraded: number }>;
+        includeHiddenMessageFloors: boolean,
+      ): Promise<void>;
     };
     internal.executeActorCapture = executeActorCapture;
+    internal.finalizeActorCaptureResults = vi.fn(async () => undefined);
 
-    const outcome = await internal.runDeferredCaptureRepairs(
+    await internal.retryEvidenceChangedCaptureRepairs(
       repairRepository,
-      'job:repair',
       [{ ...message(1), floor: 1 }],
       { ...MEMORY_DEFAULT_SETTINGS, graphEnabled: false, graphLlmRelationEnabled: false },
       internal.captureVersion,
       'chat-a',
+      false,
     );
 
     expect(executeActorCapture).toHaveBeenCalledWith(expect.any(Array), expect.objectContaining({
@@ -1442,10 +1508,84 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       status: 'resolved',
       attemptCount: 2,
       maxAttempts: 2,
+      evidenceRetryUsed: true,
+      waitingForEvidenceChange: false,
       resolutionMode: 'degraded',
       candidateSetHash: 'candidate-hash',
       fieldActions: [{ path: 'episodes[0].locationRef', action: 'clear' }],
     });
-    expect(outcome).toMatchObject({ remaining: 0, degraded: 1 });
+    expect(internal.finalizeActorCaptureResults).toHaveBeenCalledTimes(1);
+  });
+
+  it('证据未变化不复核，变化后的最后一次硬校验失败会自动忽略', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    const source = { ...message(1), floor: 1 };
+    const currentHash = buildEvidenceWindowHash([source], [source.id]);
+    const queue: CaptureRepairQueueRecord[] = [{
+      id: 'repair:quarantined', workspaceId: 'character:c1', chatKey: 'chat-a', jobId: 'job:repair',
+      batchIndex: 0, collection: 'claims', itemIndex: 0,
+      issues: [{ path: 'claims[0].evidenceSpanId', keyword: 'enum', expected: 'supported evidence span' }],
+      sourceRefs: [source.id], fallbackSourceRefs: [], rejectionId: 'rejection:quarantined',
+      status: 'unresolved', attemptCount: 1, maxAttempts: 1,
+      waitingForEvidenceChange: true, evidenceRetryUsed: false,
+      createdAt: 1, updatedAt: 1,
+    }];
+    const repairRepository = {
+      listCaptureRepairQueue: vi.fn(async () => structuredClone(queue)),
+      updateCaptureRepairRecord: vi.fn(async (next: CaptureRepairQueueRecord) => {
+        queue[0] = structuredClone(next);
+      }),
+    };
+    const executeActorCapture = vi.fn(async () => ({
+      acceptedLocalIds: { actor: [], location: [], item: [], episode: [], claim: [], inventory: [] },
+      repairDecisions: [{ repairId: 'repair:quarantined', action: 'emit', localId: 'claim:hallucinated', sourceRefs: ['message:1'] }],
+      rejections: [{ index: 0, status: 'unresolved', code: 'excerpt_mismatch' }],
+      audit: { requestId: 'request:final-failure' },
+    }));
+    const internal = app as unknown as {
+      captureVersion: number;
+      executeActorCapture: typeof executeActorCapture;
+      finalizeActorCaptureResults: ReturnType<typeof vi.fn>;
+      retryEvidenceChangedCaptureRepairs(
+        repository: typeof repairRepository,
+        sources: readonly SourceBlock[],
+        settings: typeof MEMORY_DEFAULT_SETTINGS,
+        captureVersion: number,
+        chatKey: string,
+        includeHiddenMessageFloors: boolean,
+      ): Promise<void>;
+    };
+    internal.executeActorCapture = executeActorCapture;
+    internal.finalizeActorCaptureResults = vi.fn(async () => undefined);
+
+    await internal.retryEvidenceChangedCaptureRepairs(
+      repairRepository, [source], MEMORY_DEFAULT_SETTINGS, internal.captureVersion, 'chat-a', false,
+    );
+    expect(executeActorCapture).not.toHaveBeenCalled();
+    expect(queue[0]?.evidenceSetHash).toBe(currentHash);
+
+    await internal.retryEvidenceChangedCaptureRepairs(
+      repairRepository, [source], MEMORY_DEFAULT_SETTINGS, internal.captureVersion, 'chat-a', false,
+    );
+    expect(executeActorCapture).not.toHaveBeenCalled();
+
+    await internal.retryEvidenceChangedCaptureRepairs(
+      repairRepository,
+      [source, { ...message(2), floor: 2, content: '相邻楼层补充了新的上下文证据。' }],
+      MEMORY_DEFAULT_SETTINGS,
+      internal.captureVersion,
+      'chat-a',
+      false,
+    );
+    expect(executeActorCapture).toHaveBeenCalledTimes(1);
+    expect(queue[0]).toMatchObject({
+      status: 'ignored',
+      attemptCount: 2,
+      evidenceRetryUsed: true,
+      waitingForEvidenceChange: false,
+      resolutionMode: 'ignored',
+    });
   });
 });

@@ -33,33 +33,33 @@ LLM 插件不会提取代码围栏、拼接 JSON，也不会修正枚举、数�
 Memory 对 Schema 合法项再执行一次业务校验。合法事实、证据、Trace、根 ChangeSet、repair descriptor 和扫描 checkpoint 在一个 Workspace commit 中提交。
 
 - 即使一个 batch 没有合法事实，也要原子提交 repair descriptor 和 `lastScannedBatch`。
-- checkpoint 同时记录扫描进度、全部 unresolved rejection，以及可重试、已耗尽、需审阅、已修复、已降级和已忽略计数。
+- checkpoint 同时记录扫描进度、全部 unresolved rejection，以及可重试、隔离、已修复、已降级和已忽略计数。
 - 已扫描 batch 在刷新、续跑或聊天重绑后不得重复调用模型。
-- 仍有 AI 可重试项时状态为 `needs_repair`；次数耗尽或只剩必需语义项时为 `needs_review`。
-- 队列清空或用户明确忽略剩余项后才能进入 `completed`。
+- 仍有立即可执行的 AI 复核项时状态为 `needs_repair`；只剩隔离项时任务以 `completed + partial` 完成。
+- 隔离项不进入召回和 Prompt，也不要求人工处理；来源窗口变化时自动获得最后一次复核机会。
 
-修复队列接收 `schema_validation_failed`、`entity_ref_unsupported`、`invalid_reference`、`excerpt_mismatch` 和 `dependency_invalid`。同一请求、批次、集合和项目的多个字段问题聚合为一个队列项。
+修复队列接收能够定位到来源的结构、枚举、引用、证据和依赖错误。重复、低质量、缺少来源和跨聊天来源的候选直接标记 `ignored`，不消耗复核调用。同一请求、批次、集合和项目的多个字段问题聚合为一个队列项。
 
-未知 `kind` 不会自动变成 `other`；只有模型明确输出合法枚举值时才接受。每个失败项目最多进行三次真实调用：一次普通 Capture、一次定向重新提取、一次保守修复。禁止叠加修复、路由回退或无限重试。
+未知 `kind` 不会自动变成 `other`；只有模型明确输出合法枚举值时才接受。每个失败项目最多进行三次真实调用：一次普通 Capture、一次定向 AI 复核、证据发生变化后的一次保守复核。禁止在证据未变化时重复调用。
 
 ## 延后定向修复
 
-全部 batch 扫描完成后，Memory 按人物、地点、事件、Claim 的依赖顺序处理 `capture-repair-queue`。每个队列项独立调用；前置依赖尚未解决时延后且不消耗尝试次数。
+全部 batch 扫描完成后，Memory 按人物、地点、事件、Claim 的依赖顺序处理 `capture-repair-queue`。同集合且来源窗口重叠的项目每次最多合并四条；隔离的前置实体不阻断下游重新提取。
 
-加载旧 Job 时会从 unresolved rejection 补建缺失队列。旧策略已经耗尽的项目在证据闭集策略 v1 下只增加一次机会，策略版本未变化时不得再次重置。
+加载旧 Job 时会从 unresolved rejection 补建缺失队列。旧策略已经尝试过的项目按 v2 策略转为隔离；只有证据闭集哈希变化时才释放最后一次机会。
 
 修复提示只包含：
 
 - 原 Capture 中该类型的字段规则与精简 item Schema。
-- 出错集合、项目序号和安全的 `{ path, keyword, expected }`。
+- 出错集合、`repairId` 和安全的 `{ path, keyword, expected }`。
 - 可信来源锚点前后的楼层正文。
 - 由当前来源正文或来源元数据支持的动态闭集：规范名、去重别名、短引用和支持来源。
 
 同一动态闭集同时用于 Prompt、修复 JSON Schema 的 `enum` 和最终业务校验。整个 Workspace 中存在、但当前来源不支持的实体不会进入闭集；无法可靠重建的事件引用只允许空字符串。
 
-修复输入不包含完整失败 JSON、错误字段原值、无关批次正文、旧 Prompt、密钥或日志原文。第一次修复只依据来源窗口、目标集合、安全字段路径和闭集重新提取一个项目；第二次只反馈最新 `{ path, keyword, expected }` 并要求可选字段无证据时留空。语义失败消耗尝试次数；取消、超时、Core 不可用和 Workspace 冲突不消耗。
+修复输入不包含完整失败 JSON、错误字段原值、无关批次正文、旧 Prompt、密钥或日志原文。独立 `memory_capture_repair` 路由对每个 `repairId` 返回 `emit` 或 `drop`：`emit` 必须附带一条重新提取的候选并再次通过全部硬校验，`drop` 不写入任何记录。未配置独立路由时由 LLM 全局路由回退并记录实际资源。语义失败消耗尝试次数；取消、超时、Core 不可用和 Workspace 冲突不消耗。
 
-第二次修复后，仅允许确定性安全降级：清空无支持的可选地点或事件关联、过滤可选人物/Knowledge 引用，以及在已有来源支持文本时清空非 relationship Claim 的可选实体引用。降级后必须重新通过完整 Schema、来源和业务校验，并记录 `resolutionMode: degraded` 与字段动作。relationship 主客体、私密/自述/听闻 Claim 的必需 speaker，以及清空后核心语义不成立的项目禁止降级，继续保持 `unresolved`。任何阶段都禁止模糊匹配、自动别名改绑或选择“最接近”的实体。
+证据变化后的最后一次复核仍失败时自动标记 `ignored`。确定性安全降级仍可清空无支持的可选地点或事件关联、过滤可选人物/Knowledge 引用，并必须重新通过完整 Schema、来源和业务校验，同时记录 `resolutionMode: degraded`。任何阶段都禁止模糊匹配、自动别名改绑或选择“最接近”的实体。
 
 ## 请求内实体引用
 

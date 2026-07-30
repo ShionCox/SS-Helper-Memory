@@ -9,7 +9,7 @@ import {
   type ChatMessageSnapshot,
   type FinalPromptSnapshot,
 } from '@ss-helper/sdk';
-import { DEFAULT_CAST_SETTINGS, FIXED_OWNER_IDS, deriveMemoryGraphProjection } from '../domain';
+import { DEFAULT_CAST_SETTINGS, FIXED_OWNER_IDS, deriveMemoryGraphProjection, isAiRepairableProposalCode } from '../domain';
 import type {
   MainChatUsage,
   ManualFactInput,
@@ -59,8 +59,8 @@ import {
   visibleConversationMessages,
   type SummaryProgress,
 } from './ingest/summary-strategy';
-import type { SourceBlock } from './ingest/types';
-import { buildSupportedEvidenceDirectory } from './ingest/supported-evidence-directory';
+import type { SourceBlock, StructuredRepairDecision } from './ingest/types';
+import { buildEvidenceWindowHash } from './ingest/supported-evidence-directory';
 import { buildMatchedInventoryPrompt } from './inventory';
 import { selectSourceGroups, summarizeSourceGroups } from '../host/source-adapter';
 import type { MemoryPluginApi, MemorySqliteStatus } from '../index';
@@ -786,7 +786,16 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         : [];
       const rejections = sourceRejections.map((rejection) => {
         const record = rejection.id ? queueByRejectionId.get(rejection.id) : undefined;
-        if (!record || (record.status !== 'resolved' && record.status !== 'ignored')) return rejection;
+        if (!record) {
+          return (rejection.status ?? 'unresolved') === 'unresolved'
+            && !isAiRepairableProposalCode(rejection.code)
+            ? { ...rejection, status: 'ignored' as const, ignoredAt: Date.now(), waitingForEvidenceChange: false }
+            : rejection;
+        }
+        if (record.waitingForEvidenceChange === true) {
+          return { ...rejection, status: 'unresolved' as const, waitingForEvidenceChange: true, repairAttempts: record.attemptCount };
+        }
+        if (record.status !== 'resolved' && record.status !== 'ignored') return rejection;
         return record.status === 'ignored'
           ? {
             ...rejection,
@@ -804,14 +813,12 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       const unresolvedCount = rejections.filter(rejection =>
         (rejection.status ?? 'unresolved') === 'unresolved').length;
       const counts = this.captureRepairQueueCounts(queue);
-      const reviewRequiredCount = counts.exhausted + counts.dependencyReview + rejections.filter(rejection =>
-        (rejection.status ?? 'unresolved') === 'unresolved'
-        && (!rejection.id || !counts.linkedRejectionIds.has(rejection.id))).length;
+      const reviewRequiredCount = 0;
       const recoveredJob = { ...job };
       delete recoveredJob.failure;
       await repository.upsertCaptureJob({
         ...recoveredJob,
-        status: counts.retryable > 0 ? 'needs_repair' : unresolvedCount > 0 ? 'needs_review' : 'completed',
+        status: counts.retryable > 0 ? 'needs_repair' : 'completed',
         outcome: unresolvedCount > 0 ? 'partial' : 'complete',
         rejectionCount: unresolvedCount,
         rejections,
@@ -821,6 +828,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           pendingRepairCount: counts.retryable,
           retryableRepairCount: counts.retryable,
           exhaustedRepairCount: counts.exhausted,
+          quarantinedCount: counts.quarantined,
           reviewRequiredCount,
           unresolvedRejectionCount: unresolvedCount,
           repairedCount: rejections.filter(rejection => rejection.status === 'repaired').length,
@@ -836,8 +844,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   private captureRepairQueueCounts(queue: readonly CaptureRepairQueueRecord[]): {
     retryable: number;
     exhausted: number;
-    dependencyReview: number;
-    linkedRejectionIds: Set<string>;
+    quarantined: number;
   } {
     const rank = (collection: CaptureRepairQueueRecord['collection']): number =>
       ({ actorCandidates: 0, locationCandidates: 1, itemCandidates: 2, episodes: 3, claims: 4, inventoryOperations: 5, batch: 6 })[collection];
@@ -847,23 +854,22 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         candidate.id !== record.id
         && rank(candidate.collection) < rank(record.collection)
         && (candidate.status === 'queued' || candidate.status === 'running' || candidate.status === 'unresolved')
+        && candidate.waitingForEvidenceChange !== true
+        && candidate.attemptCount < (candidate.maxAttempts ?? 1)
         && [...candidate.sourceRefs, ...candidate.fallbackSourceRefs].some(sourceRef => sources.has(sourceRef)));
     };
     const active = (record: CaptureRepairQueueRecord): boolean =>
       (record.status === 'queued' || record.status === 'running' || record.status === 'unresolved')
-      && record.attemptCount < (record.maxAttempts ?? 2);
+      && record.waitingForEvidenceChange !== true
+      && record.attemptCount < (record.maxAttempts ?? 1);
     return {
       retryable: queue.filter(record => active(record) && blocker(record) === undefined).length,
       exhausted: queue.filter(record =>
-        record.status === 'unresolved' && record.attemptCount >= (record.maxAttempts ?? 2)).length,
-      dependencyReview: queue.filter(record => {
-        if (!active(record)) return false;
-        const dependency = blocker(record);
-        return dependency?.status === 'unresolved'
-          && dependency.attemptCount >= (dependency.maxAttempts ?? 2);
-      }).length,
-      linkedRejectionIds: new Set(queue.flatMap(record =>
-        record.rejectionIds?.length ? record.rejectionIds : record.rejectionId ? [record.rejectionId] : [])),
+        record.status === 'unresolved'
+        && record.waitingForEvidenceChange !== true
+        && record.attemptCount >= (record.maxAttempts ?? 1)).length,
+      quarantined: queue.filter(record =>
+        record.status === 'unresolved' && record.waitingForEvidenceChange === true).length,
     };
   }
 
@@ -872,6 +878,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     jobId: string,
     record: CaptureRepairQueueRecord,
     attemptCount: number,
+    resolution: 'repaired' | 'ignored' | 'quarantined' = 'repaired',
   ): Promise<void> {
     const auditRepository = repository as unknown as {
       listChangeAudits?: MultiActorMemoryRepository['listChangeAudits'];
@@ -881,8 +888,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       || typeof auditRepository.updateCaptureAuditRejections !== 'function') {
       await repository.updateCaptureRepairRecord({
         ...record,
-        status: 'resolved',
-        resolvedAt: Date.now(),
+        status: resolution === 'ignored' ? 'ignored' : resolution === 'repaired' ? 'resolved' : 'unresolved',
+        ...(resolution === 'ignored' ? { resolutionMode: 'ignored' as const } : {}),
+        ...(resolution === 'quarantined' ? { waitingForEvidenceChange: true } : {}),
+        ...(resolution === 'quarantined' ? {} : { resolvedAt: Date.now() }),
         updatedAt: Date.now(),
       });
       return;
@@ -913,9 +922,12 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         matched.add(rejection.id);
         return {
           ...rejection,
-          status: 'repaired' as const,
+          status: resolution === 'quarantined' ? 'unresolved' as const : resolution,
           repairAttempts: attemptCount,
-          repairedAt: resolvedAt,
+          waitingForEvidenceChange: resolution === 'quarantined',
+          ...(resolution === 'ignored' ? { ignoredAt: resolvedAt }
+            : resolution === 'repaired' ? { repairedAt: resolvedAt }
+              : {}),
         };
       });
       await auditRepository.updateCaptureAuditRejections.call(repository, String(audit.id ?? ''), updated);
@@ -926,6 +938,71 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         batchIndex: record.batchIndex,
         collection: record.collection,
       });
+    }
+  }
+
+  private async retryEvidenceChangedCaptureRepairs(
+    repository: MultiActorMemoryRepository,
+    allSources: readonly SourceBlock[],
+    settings: MemoryGlobalSettings,
+    captureVersion: number,
+    chatKey: string,
+    includeHiddenMessageFloors: boolean,
+  ): Promise<void> {
+    if (typeof repository.listCaptureRepairQueue !== 'function'
+      || typeof repository.updateCaptureRepairRecord !== 'function') return;
+    const releasedJobIds = new Set<string>();
+    for (const record of await repository.listCaptureRepairQueue()) {
+      if (record.status !== 'unresolved'
+        || record.waitingForEvidenceChange !== true
+        || record.evidenceRetryUsed === true) continue;
+      const sources = this.repairSourceWindow([record], allSources, settings);
+      const writableSourceRefs = [...new Set(record.sourceRefs.length > 0 ? record.sourceRefs : record.fallbackSourceRefs)]
+        .filter(ref => sources.some(source => source.id === ref));
+      if (sources.length === 0 || writableSourceRefs.length === 0) {
+        await this.resolveCaptureRepairAudit(repository, record.jobId, {
+          ...record,
+          status: 'ignored',
+          resolutionMode: 'ignored',
+          waitingForEvidenceChange: false,
+          resolvedAt: Date.now(),
+          updatedAt: Date.now(),
+        }, record.attemptCount, 'ignored');
+        continue;
+      }
+      const evidenceSetHash = buildEvidenceWindowHash(sources, writableSourceRefs);
+      if (!record.evidenceSetHash) {
+        await repository.updateCaptureRepairRecord({ ...record, evidenceSetHash, updatedAt: Date.now() });
+        continue;
+      }
+      if (evidenceSetHash === record.evidenceSetHash) continue;
+      await repository.updateCaptureRepairRecord({
+        ...record,
+        status: 'queued',
+        maxAttempts: record.attemptCount + 1,
+        evidenceRetryUsed: true,
+        waitingForEvidenceChange: false,
+        updatedAt: Date.now(),
+      });
+      releasedJobIds.add(record.jobId);
+    }
+    for (const jobId of releasedJobIds) {
+      const repair = await this.runDeferredCaptureRepairs(
+        repository,
+        jobId,
+        allSources,
+        settings,
+        captureVersion,
+        chatKey,
+        includeHiddenMessageFloors,
+      );
+      if (repair.results.length > 0) {
+        await this.finalizeActorCaptureResults(repair.results, allSources, captureVersion, chatKey);
+      }
+    }
+    if (releasedJobIds.size > 0) {
+      this.activeCaptureProgress = null;
+      this.emitOverviewChanged();
     }
   }
 
@@ -943,22 +1020,39 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     remaining: number;
     degraded: number;
   }> {
-    if (!settings.structuredRepairEnabled) {
-      const queue = await repository.listCaptureRepairQueue(jobId);
-      const pending = queue
-        .filter(record => record.status === 'queued' || record.status === 'unresolved' || record.status === 'running').length;
-      const degraded = queue.filter(record => record.status === 'resolved' && record.resolutionMode === 'degraded').length;
-      return { results: [], resolvedRejectionIds: new Set(), remaining: pending, degraded };
-    }
     await repository.reconcileCaptureRepairQueue?.(jobId);
     const rank = (collection: CaptureRepairQueueRecord['collection']): number =>
       ({ actorCandidates: 0, locationCandidates: 1, itemCandidates: 2, episodes: 3, claims: 4, inventoryOperations: 5, batch: 6 })[collection];
+    if (!settings.structuredRepairEnabled) {
+      const queue = await repository.listCaptureRepairQueue(jobId);
+      for (const record of queue.filter(item => item.status !== 'resolved' && item.status !== 'ignored')) {
+        await this.resolveCaptureRepairAudit(repository, jobId, {
+          ...record,
+          status: 'ignored',
+          resolutionMode: 'ignored',
+          waitingForEvidenceChange: false,
+          resolvedAt: Date.now(),
+          updatedAt: Date.now(),
+        }, record.attemptCount, 'ignored');
+      }
+      return { results: [], resolvedRejectionIds: new Set(), remaining: 0, degraded: 0 };
+    }
+    const isActive = (record: CaptureRepairQueueRecord): boolean =>
+      record.waitingForEvidenceChange !== true
+      && (record.status === 'queued' || record.status === 'running' || record.status === 'unresolved')
+      && record.attemptCount < (record.maxAttempts ?? 1);
+    const dependencyPending = (record: CaptureRepairQueueRecord, queue: readonly CaptureRepairQueueRecord[]): boolean => {
+      const sourceSet = new Set([...record.sourceRefs, ...record.fallbackSourceRefs]);
+      return queue.some(candidate =>
+        candidate.id !== record.id
+        && rank(candidate.collection) < rank(record.collection)
+        && isActive(candidate)
+        && [...candidate.sourceRefs, ...candidate.fallbackSourceRefs].some(ref => sourceSet.has(ref)));
+    };
     const eligibleQueue = async (): Promise<CaptureRepairQueueRecord[]> =>
       (await repository.listCaptureRepairQueue(jobId))
         .filter(record => record.collection !== 'batch')
-        .filter(record => (record.status === 'running' && record.attemptCount < (record.maxAttempts ?? 2))
-          || ((record.status === 'queued' || record.status === 'unresolved')
-            && record.attemptCount < (record.maxAttempts ?? 2)))
+        .filter(isActive)
         .sort((left, right) => rank(left.collection) - rank(right.collection)
           || left.batchIndex - right.batchIndex
           || left.itemIndex - right.itemIndex);
@@ -973,47 +1067,65 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       madeProgress = false;
       const pending = await eligibleQueue();
       if (pending.length === 0) break;
-      for (const record of pending) {
       const liveQueue = await repository.listCaptureRepairQueue(jobId);
-      const sourceSet = new Set([...record.sourceRefs, ...record.fallbackSourceRefs]);
-      const dependencyPending = liveQueue.some(candidate =>
-        candidate.id !== record.id
-        && rank(candidate.collection) < rank(record.collection)
-        && (candidate.status === 'queued' || candidate.status === 'running' || candidate.status === 'unresolved')
-        && [...candidate.sourceRefs, ...candidate.fallbackSourceRefs].some(ref => sourceSet.has(ref)));
-      if (dependencyPending) continue;
-      const maxAttempts = record.maxAttempts ?? 2;
+      const record = pending.find(candidate => !dependencyPending(candidate, liveQueue));
+      if (!record) break;
+      const maxAttempts = record.maxAttempts ?? 1;
       const attemptNo = record.attemptCount + 1;
-      const sources = this.repairSourceWindow([record], allSources, settings);
+      const seedWindowIds = new Set(this.repairSourceWindow([record], allSources, settings).map(source => source.id));
+      const group = pending.filter(candidate => {
+        if (candidate.collection !== record.collection
+          || candidate.attemptCount + 1 !== attemptNo
+          || (candidate.maxAttempts ?? 1) !== maxAttempts
+          || candidate.evidenceRetryUsed !== record.evidenceRetryUsed
+          || dependencyPending(candidate, liveQueue)) return false;
+        const candidateWindow = this.repairSourceWindow([candidate], allSources, settings);
+        return candidate.id === record.id || candidateWindow.some(source => seedWindowIds.has(source.id));
+      }).slice(0, Math.min(4, settings.structuredRepairMaxItems));
+      const sources = this.repairSourceWindow(group, allSources, settings);
       const writableSourceRefs = [...new Set(
-        record.sourceRefs.length > 0 ? record.sourceRefs : record.fallbackSourceRefs,
+        group.flatMap(candidate => candidate.sourceRefs.length > 0 ? candidate.sourceRefs : candidate.fallbackSourceRefs),
       )].filter(ref => sources.some(source => source.id === ref));
       if (sources.length === 0 || writableSourceRefs.length === 0) {
-        await repository.updateCaptureRepairRecord({
-          ...record,
-          status: 'queued',
-          failure: {
-            reasonCode: 'MEMORY_REPAIR_SOURCE_UNAVAILABLE',
-            stage: 'memory.repair.source-window',
-            batchIndex: record.batchIndex,
-            collection: record.collection,
-          },
-          updatedAt: Date.now(),
-        });
+        for (const candidate of group) {
+          await repository.updateCaptureRepairRecord({
+            ...candidate,
+            status: 'queued',
+            failure: {
+              reasonCode: 'MEMORY_REPAIR_SOURCE_UNAVAILABLE',
+              stage: 'memory.repair.source-window',
+              batchIndex: candidate.batchIndex,
+              collection: candidate.collection,
+            },
+            updatedAt: Date.now(),
+          });
+        }
         continue;
       }
       madeProgress = true;
-      const evidenceSetHash = buildSupportedEvidenceDirectory(sources, writableSourceRefs).evidenceSetHash;
+      const evidenceSetHash = buildEvidenceWindowHash(sources, writableSourceRefs);
+      const evidenceSetHashes = new Map(group.map((candidate) => {
+        const candidateSources = this.repairSourceWindow([candidate], allSources, settings);
+        const candidateWritableSourceRefs = [...new Set(
+          candidate.sourceRefs.length > 0 ? candidate.sourceRefs : candidate.fallbackSourceRefs,
+        )].filter(ref => candidateSources.some(source => source.id === ref));
+        return [candidate.id, candidateSources.length > 0 && candidateWritableSourceRefs.length > 0
+          ? buildEvidenceWindowHash(candidateSources, candidateWritableSourceRefs)
+          : evidenceSetHash] as const;
+      }));
       // Keep attemptCount unchanged while work is in flight. If the process is
       // interrupted, or the final queue-state write fails, the durable
       // `running` row remains eligible and reuses the same Capture idempotency
       // key on the next resume.
-      await repository.updateCaptureRepairRecord({
-        ...record,
-        status: 'running',
-        evidenceSetHash,
-        updatedAt: Date.now(),
-      });
+      for (const candidate of group) {
+        await repository.updateCaptureRepairRecord({
+          ...candidate,
+          status: 'running',
+          evidenceSetHash: evidenceSetHashes.get(candidate.id)!,
+          waitingForEvidenceChange: false,
+          updatedAt: Date.now(),
+        });
+      }
       this.activeCaptureProgress = {
         status: 'repairing',
         jobId,
@@ -1034,17 +1146,16 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           writableSourceRefs,
           repair: {
             collection: record.collection as Exclude<CaptureRepairQueueRecord['collection'], 'batch'>,
-            issues: record.issues.slice(0, 16),
+            issues: group.flatMap(candidate => candidate.issues).slice(0, 16),
+            targets: group.map(candidate => ({ repairId: candidate.id, issues: candidate.issues.slice(0, 16) })),
             attempt: attemptNo,
             maxAttempts,
-            mode: attemptNo >= maxAttempts ? 'conservative' : 'targeted',
+            mode: record.evidenceRetryUsed === true ? 'conservative' : 'targeted',
             ...(record.originalRequestId ? { parentRequestId: record.originalRequestId } : {}),
-            ...(record.originalResourceId ? { resourceId: record.originalResourceId } : {}),
-            ...(record.originalModel ? { model: record.originalModel } : {}),
-            maxItems: 1,
+            maxItems: group.length,
           },
           graphLlmRelationEnabled: settings.graphEnabled && settings.graphLlmRelationEnabled,
-          idempotencyKey: `capture:${jobId}:repair:${record.id}:${attemptNo}`,
+          idempotencyKey: `capture:${jobId}:repair:${group.map(candidate => candidate.id).sort().join(',')}:${attemptNo}`,
           includeHiddenMessageFloors,
         });
       } catch (error) {
@@ -1052,29 +1163,48 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           reasonCode: 'REPAIR_UNRESOLVED',
           stage: 'memory.repair.execute',
         })!;
-        const failureCode = SS_HELPER_DIAGNOSTICS[failure.reasonCode].transportCode;
-        const interrupted = failureCode === 'ABORTED'
+        const diagnostic = SS_HELPER_DIAGNOSTICS[failure.reasonCode];
+        const failureCode = diagnostic.transportCode;
+        const interrupted = diagnostic.retryable
+          || failureCode === 'ABORTED'
           || failureCode === 'TIMEOUT'
           || failureCode === 'CORE_UNAVAILABLE'
-          || failureCode === 'CONFLICT';
-        await repository.updateCaptureRepairRecord({
-          ...record,
-          status: interrupted ? 'queued' : 'unresolved',
-          attemptCount: interrupted ? record.attemptCount : attemptNo,
-          maxAttempts,
-          failure: {
-            ...failure,
-            batchIndex: record.batchIndex,
-            collection: record.collection,
-          },
-          updatedAt: Date.now(),
-        });
+          || failureCode === 'CONFLICT'
+          || failureCode === 'STALE_SESSION';
+        for (const candidate of group) {
+          const finalFailure = !interrupted && candidate.evidenceRetryUsed === true;
+          const nextRecord: CaptureRepairQueueRecord = {
+            ...candidate,
+            status: interrupted ? 'queued' : finalFailure ? 'ignored' : 'unresolved',
+            attemptCount: interrupted ? candidate.attemptCount : attemptNo,
+            maxAttempts,
+            evidenceSetHash: evidenceSetHashes.get(candidate.id)!,
+            waitingForEvidenceChange: !interrupted && !finalFailure,
+            ...(finalFailure ? { resolutionMode: 'ignored' as const, resolvedAt: Date.now() } : {}),
+            failure: {
+              ...failure,
+              batchIndex: candidate.batchIndex,
+              collection: candidate.collection,
+            },
+            updatedAt: Date.now(),
+          };
+          await repository.updateCaptureRepairRecord(nextRecord);
+          if (!interrupted) {
+            await this.resolveCaptureRepairAudit(
+              repository,
+              jobId,
+              nextRecord,
+              attemptNo,
+              finalFailure ? 'ignored' : 'quarantined',
+            );
+            completedRecordIds.add(candidate.id);
+          }
+        }
         // Cancellation, timeout and Workspace transport/concurrency failures
         // do not consume a semantic repair attempt. Stop the current
         // repair phase and let the job resume the same queue record later with
         // its stable Capture idempotency key.
         if (interrupted) throw error;
-        if (attemptNo >= maxAttempts) completedRecordIds.add(record.id);
         processed = completedRecordIds.size;
         this.activeCaptureProgress = {
           status: 'repairing',
@@ -1097,8 +1227,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
             : record.collection === 'episodes' ? 'episode'
               : record.collection === 'inventoryOperations' ? 'inventory'
                 : 'claim';
-      const succeeded = result.acceptedLocalIds[recordType].length > 0
-        && !result.rejections.some(rejection => (rejection.status ?? 'unresolved') === 'unresolved');
       const latestIssues = result.rejections.flatMap(rejection =>
         rejection.issues?.map(issue => ({
           path: issue.path,
@@ -1109,53 +1237,94 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           keyword: rejection.code ?? 'validation',
           expected: '符合来源支持规则的结构化字段',
         }]).slice(0, 16);
-      const recordWithoutFailure = { ...record };
-      delete recordWithoutFailure.failure;
-      const nextRecord: CaptureRepairQueueRecord = {
-        ...recordWithoutFailure,
-        status: succeeded ? 'running' : 'unresolved',
-        attemptCount: attemptNo,
-        maxAttempts,
-        ...(result.candidateSetHash ? { candidateSetHash: result.candidateSetHash } : {}),
-        ...(succeeded ? { resolutionMode: result.resolutionMode ?? 'repaired' as const } : {}),
-        ...(succeeded && result.fieldActions?.length ? { fieldActions: [...result.fieldActions] } : {}),
-        ...(!succeeded && latestIssues.length > 0 ? { issues: latestIssues } : {}),
-        ...(result.audit?.requestId ? { repairRequestId: result.audit.requestId } : {}),
-        ...(!succeeded ? {
-          failure: {
-            reasonCode: 'REPAIR_UNRESOLVED',
-            stage: 'memory.repair.validate',
-            batchIndex: record.batchIndex,
-            collection: record.collection,
-          } satisfies SSHelperFailureContext,
-        } : {}),
-        updatedAt: Date.now(),
-      };
-      await repository.updateCaptureRepairRecord(nextRecord);
-      if (succeeded) {
+      const declaredDecisions = result.repairDecisions ?? [];
+      const compatibilityDecision: StructuredRepairDecision[] = declaredDecisions.length === 0 && group.length === 1
+        && result.acceptedLocalIds[recordType][0]
+        ? [{
+          repairId: group[0]!.id,
+          action: 'emit' as const,
+          localId: result.acceptedLocalIds[recordType][0],
+          sourceRefs: group[0]!.sourceRefs.length > 0 ? group[0]!.sourceRefs : group[0]!.fallbackSourceRefs,
+        }]
+        : [];
+      const decisions = new Map([...declaredDecisions, ...compatibilityDecision]
+        .map(decision => [decision.repairId, decision] as const));
+      for (const candidate of group) {
+        const decision = decisions.get(candidate.id);
+        const targetSources = new Set(candidate.sourceRefs.length > 0 ? candidate.sourceRefs : candidate.fallbackSourceRefs);
+        const decisionSourcesSupported = Boolean(decision?.sourceRefs?.length)
+          && decision!.sourceRefs!.every(sourceRef => targetSources.has(sourceRef));
+        const ignoredByValidator = decision?.action === 'emit'
+          && Number.isInteger(decision.itemIndex)
+          && result.rejections.some(rejection => rejection.index === decision.itemIndex
+            && (rejection.recordType ?? recordType) === recordType
+            && rejection.status === 'ignored');
+        const succeeded = decision?.action === 'emit'
+          && !ignoredByValidator
+          && Boolean(decision.localId)
+          && decisionSourcesSupported
+          && result.acceptedLocalIds[recordType].includes(decision.localId!);
+        const dropped = decision?.action === 'drop' || ignoredByValidator;
+        const finalFailure = !succeeded && !dropped && candidate.evidenceRetryUsed === true;
+        const recordWithoutFailure = { ...candidate };
+        delete recordWithoutFailure.failure;
+        const nextRecord: CaptureRepairQueueRecord = {
+          ...recordWithoutFailure,
+          status: succeeded ? 'running' : dropped || finalFailure ? 'ignored' : 'unresolved',
+          attemptCount: attemptNo,
+          maxAttempts,
+          evidenceSetHash: evidenceSetHashes.get(candidate.id)!,
+          waitingForEvidenceChange: !succeeded && !dropped && !finalFailure,
+          ...(result.candidateSetHash ? { candidateSetHash: result.candidateSetHash } : {}),
+          ...(succeeded ? { resolutionMode: result.resolutionMode ?? 'repaired' as const } : {}),
+          ...(dropped || finalFailure ? { resolutionMode: 'ignored' as const, resolvedAt: Date.now() } : {}),
+          ...(succeeded && result.fieldActions?.length ? { fieldActions: [...result.fieldActions] } : {}),
+          ...(!succeeded && !dropped && latestIssues.length > 0 ? { issues: latestIssues } : {}),
+          ...(result.audit?.requestId ? { repairRequestId: result.audit.requestId } : {}),
+          ...(!succeeded && !dropped ? {
+            failure: {
+              reasonCode: 'REPAIR_UNRESOLVED',
+              stage: 'memory.repair.validate',
+              batchIndex: candidate.batchIndex,
+              collection: candidate.collection,
+            } satisfies SSHelperFailureContext,
+          } : {}),
+          updatedAt: Date.now(),
+        };
+        await repository.updateCaptureRepairRecord(nextRecord);
+        if (succeeded || dropped || finalFailure) {
         try {
           // The Change Audit is the source of truth for job projections. Updating
           // it also resolves the linked queue row in the same Workspace commit.
-          await this.resolveCaptureRepairAudit(repository, jobId, nextRecord, attemptNo);
+          await this.resolveCaptureRepairAudit(
+            repository,
+            jobId,
+            nextRecord,
+            attemptNo,
+            succeeded ? 'repaired' : 'ignored',
+          );
         } catch (error) {
           const failure = readSSHelperFailure(error, {
             reasonCode: 'MEMORY_CAPTURE_INTEGRITY_FAILED',
             stage: 'memory.repair.audit-writeback',
           })!;
           await repository.updateCaptureRepairRecord({
-            ...record,
+            ...candidate,
             status: 'queued',
-            attemptCount: record.attemptCount,
+            attemptCount: candidate.attemptCount,
             failure,
             updatedAt: Date.now(),
           });
           throw error;
         }
-        for (const rejectionId of record.rejectionIds?.length
-          ? record.rejectionIds
-          : record.rejectionId ? [record.rejectionId] : []) resolvedRejectionIds.add(rejectionId);
+          for (const rejectionId of candidate.rejectionIds?.length
+            ? candidate.rejectionIds
+            : candidate.rejectionId ? [candidate.rejectionId] : []) resolvedRejectionIds.add(rejectionId);
+        } else {
+          await this.resolveCaptureRepairAudit(repository, jobId, nextRecord, attemptNo, 'quarantined');
+        }
+        completedRecordIds.add(candidate.id);
       }
-      if (succeeded || attemptNo >= maxAttempts) completedRecordIds.add(record.id);
       processed = completedRecordIds.size;
       this.activeCaptureProgress = {
         status: 'repairing',
@@ -1169,7 +1338,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       };
       this.emitOverviewChanged();
       if (processed % 10 === 0) await new Promise<void>(resolve => setTimeout(resolve, 0));
-      }
     }
     const finalQueue = await repository.listCaptureRepairQueue(jobId);
     const remaining = this.captureRepairQueueCounts(finalQueue).retryable;
@@ -2737,6 +2905,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         : {}),
       ...(latest.checkpoint.retryableRepairCount !== undefined ? { retryableRepairCount: latest.checkpoint.retryableRepairCount } : {}),
       ...(latest.checkpoint.exhaustedRepairCount !== undefined ? { exhaustedRepairCount: latest.checkpoint.exhaustedRepairCount } : {}),
+      ...(latest.checkpoint.quarantinedCount !== undefined ? { quarantinedCount: latest.checkpoint.quarantinedCount } : {}),
       ...(latest.checkpoint.reviewRequiredCount !== undefined ? { reviewRequiredCount: latest.checkpoint.reviewRequiredCount } : {}),
       ...(latest.checkpoint.unresolvedRejectionCount !== undefined ? { unresolvedRejectionCount: latest.checkpoint.unresolvedRejectionCount } : {}),
       ...(latest.checkpoint.repairedCount !== undefined ? { repairedCount: latest.checkpoint.repairedCount } : {}),
@@ -2769,6 +2938,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           accepted: Object.values(acceptedCounts).reduce<number>((total, value) => total + Number(value ?? 0), 0),
           rejected,
           sourceRefs: Array.isArray(metadata.sourceRefs) ? metadata.sourceRefs : [],
+          ...(typeof metadata.requestId === 'string' ? { requestId: metadata.requestId } : {}),
+          ...(typeof metadata.resourceId === 'string' ? { resourceId: metadata.resourceId } : {}),
+          ...(typeof metadata.model === 'string' ? { model: metadata.model } : {}),
+          ...(typeof metadata.fallbackUsed === 'boolean' ? { fallbackUsed: metadata.fallbackUsed } : {}),
         };
       })
       : [];
@@ -3646,6 +3819,17 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ? selectAutomaticSummaryWindow(allSources, existingProgress, strategy)
       : undefined;
     const sources = automaticWindow?.sources ?? (mode === 'incremental' ? [] : allSources);
+    await this.retryEvidenceChangedCaptureRepairs(
+      actorRepository,
+      allSources,
+      captureSettings,
+      captureVersion,
+      chatKey,
+      includeHiddenMessageFloors,
+    ).catch((error) => logger.warn(
+      '隔离记忆将在下次证据变化时继续复核。',
+      readSSHelperFailure(error, { reasonCode: 'REPAIR_UNRESOLVED', stage: 'memory.repair.evidence-change' }),
+    ));
     if (sources.length === 0) return;
     const summaryOptions = {
       includeHiddenMessageFloors,
@@ -3714,10 +3898,25 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
               .map(rejectionId => [rejectionId, record] as const)));
           const rejections = (repairBaseJob.rejections ?? []).map(rejection => {
             const queueRecord = rejection.id ? queueByRejectionId.get(rejection.id) : undefined;
-            if (!queueRecord || queueRecord.status !== 'resolved') return rejection;
+            if (!queueRecord) return rejection;
+            if (queueRecord.waitingForEvidenceChange === true) return {
+              ...rejection,
+              status: 'unresolved' as const,
+              waitingForEvidenceChange: true,
+              repairAttempts: queueRecord.attemptCount,
+            };
+            if (queueRecord.status === 'ignored') return {
+              ...rejection,
+              status: 'ignored' as const,
+              waitingForEvidenceChange: false,
+              repairAttempts: queueRecord.attemptCount,
+              ignoredAt: queueRecord.resolvedAt ?? Date.now(),
+            };
+            if (queueRecord.status !== 'resolved') return rejection;
             return {
               ...rejection,
               status: 'repaired' as const,
+              waitingForEvidenceChange: false,
               repairAttempts: queueRecord.attemptCount,
               repairedAt: queueRecord.resolvedAt ?? Date.now(),
             };
@@ -3726,20 +3925,19 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           const repairCounts = this.captureRepairQueueCounts(finalQueue);
           const retryableRepairCount = repairCounts.retryable;
           const exhaustedRepairCount = repairCounts.exhausted;
-          const reviewRequiredCount = exhaustedRepairCount + repairCounts.dependencyReview + rejections.filter(rejection =>
-            (rejection.status ?? 'unresolved') === 'unresolved'
-            && (!rejection.id || !repairCounts.linkedRejectionIds.has(rejection.id))).length;
+          const reviewRequiredCount = 0;
           const repairedCount = rejections.filter(rejection => rejection.status === 'repaired').length;
           const ignoredCount = rejections.filter(rejection => rejection.status === 'ignored').length;
           const nextStatus = retryableRepairCount > 0
             ? 'needs_repair' as const
-            : unresolvedCount > 0 ? 'needs_review' as const : 'completed' as const;
+            : 'completed' as const;
           const nextCheckpoint = {
             ...baseCheckpoint,
             phase: 'repair' as const,
             pendingRepairCount: retryableRepairCount,
             retryableRepairCount,
             exhaustedRepairCount,
+            quarantinedCount: repairCounts.quarantined,
             reviewRequiredCount,
             unresolvedRejectionCount: unresolvedCount,
             repairedCount,
@@ -3909,10 +4107,14 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         };
         this.emitOverviewChanged();
       }
-      let finalRejections = aggregatedRejections;
+      let finalRejections = aggregatedRejections.map(rejection =>
+        (rejection.status ?? 'unresolved') === 'unresolved'
+          && !isAiRepairableProposalCode(rejection.code)
+          ? { ...rejection, status: 'ignored' as const, ignoredAt: Date.now(), waitingForEvidenceChange: false }
+          : rejection);
       const initiallyRepairable = finalRejections.filter(rejection =>
         (rejection.status ?? 'unresolved') === 'unresolved'
-        && ['schema_validation_failed', 'entity_ref_unsupported', 'invalid_reference', 'excerpt_mismatch', 'dependency_invalid'].includes(rejection.code)).length;
+        && isAiRepairableProposalCode(rejection.code)).length;
       if (initiallyRepairable > 0) {
         checkpoint = {
           ...checkpoint,
@@ -3960,14 +4162,26 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
             .map(rejectionId => [rejectionId, record] as const)));
         finalRejections = finalRejections.map(rejection => {
           const queueRecord = rejection.id ? queueByRejectionId.get(rejection.id) : undefined;
-          return queueRecord?.status === 'resolved'
-            ? {
+          if (queueRecord?.waitingForEvidenceChange === true) return {
+            ...rejection,
+            status: 'unresolved' as const,
+            waitingForEvidenceChange: true,
+            repairAttempts: queueRecord.attemptCount,
+          };
+          if (queueRecord?.status === 'ignored') return {
+            ...rejection,
+            status: 'ignored' as const,
+            waitingForEvidenceChange: false,
+            repairAttempts: queueRecord.attemptCount,
+            ignoredAt: queueRecord.resolvedAt ?? Date.now(),
+          };
+          return queueRecord?.status === 'resolved' ? {
               ...rejection,
               status: 'repaired' as const,
+              waitingForEvidenceChange: false,
               repairAttempts: queueRecord.attemptCount,
               repairedAt: queueRecord.resolvedAt ?? Date.now(),
-            }
-            : rejection;
+            } : rejection;
         });
         const repairCounts = this.captureRepairQueueCounts(repairQueue);
         const retryableRepairCount = repairCounts.retryable;
@@ -3977,9 +4191,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           pendingRepairCount: retryableRepairCount,
           retryableRepairCount,
           exhaustedRepairCount,
-          reviewRequiredCount: exhaustedRepairCount + repairCounts.dependencyReview + finalRejections.filter(rejection =>
-            (rejection.status ?? 'unresolved') === 'unresolved'
-            && (!rejection.id || !repairCounts.linkedRejectionIds.has(rejection.id))).length,
+          quarantinedCount: repairCounts.quarantined,
+          reviewRequiredCount: 0,
           unresolvedRejectionCount: finalRejections.filter(rejection => (rejection.status ?? 'unresolved') === 'unresolved').length,
           repairedCount: finalRejections.filter(rejection => rejection.status === 'repaired').length,
           degradedCount: repair.degraded,
@@ -4020,7 +4233,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       const retryableRepairCount = checkpoint.retryableRepairCount ?? checkpoint.pendingRepairCount ?? 0;
       const nextStatus = retryableRepairCount > 0
         ? 'needs_repair' as const
-        : unresolvedCount > 0 ? 'needs_review' as const : 'completed' as const;
+        : 'completed' as const;
       if (unresolvedCount > 0) {
         checkpoint = {
           ...checkpoint,

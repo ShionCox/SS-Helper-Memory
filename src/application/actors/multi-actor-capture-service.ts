@@ -1,4 +1,5 @@
 import {
+  isAutoIgnoredProposalCode,
   createCanonicalKey,
   createFactSlotKey,
   decideFactReconciliation,
@@ -51,6 +52,7 @@ import {
   referenceDirectoryAllows,
 } from './supported-reference-directory';
 import {
+  canonicalInventoryName,
   inventoryItemId,
   inventoryStateId,
   normalizeInventoryName,
@@ -158,6 +160,7 @@ export interface MultiActorCaptureResult {
   readonly candidateSetHash?: string;
   readonly resolutionMode?: import('../../domain').RepairResolutionMode;
   readonly fieldActions?: readonly RepairFieldAction[];
+  readonly repairDecisions?: StructuredCaptureResult['repairDecisions'];
   readonly changeAudit?: import('../../infrastructure').ChangeAudit;
 }
 
@@ -193,6 +196,9 @@ function rejection(
     ...('sourceRefs' in snapshot && Array.isArray(snapshot.sourceRefs) ? snapshot.sourceRefs.map(String) : []),
     ...('sourceRef' in snapshot && String(snapshot.sourceRef ?? '').trim() ? [String(snapshot.sourceRef).trim()] : []),
   ]);
+  const resolvedStatus = status === 'unresolved' && isAutoIgnoredProposalCode(code)
+    ? 'ignored' as const
+    : status;
   return {
     id: `capture-rejection:${hash(`${input.captureJobId ?? input.chatKey}:${recordType}:${index}:${fieldPath}:${JSON.stringify(snapshot)}`)}`,
     index,
@@ -202,9 +208,9 @@ function rejection(
     fieldPath,
     sourceRefs,
     ...(allowedValues ? { allowedValues: [...allowedValues] } : {}),
-    status,
+    status: resolvedStatus,
     repairAttempts: 0,
-    ...(status === 'ignored' ? { ignoredAt: Date.now() } : {}),
+    ...(resolvedStatus === 'ignored' ? { ignoredAt: Date.now() } : {}),
   };
 }
 
@@ -670,19 +676,22 @@ function mergeDeterministicInventory(
     evidenceExcerpt: proposal.command.evidenceExcerpt ?? proposal.itemName,
     confidence: 1,
   }));
-  const deterministicKeys = new Set(proposals.map(proposal => `${proposal.source.id}\0${normalizeInventoryName(proposal.itemName)}`));
+  const deterministicKeys = new Set(proposals.map(proposal => `${proposal.source.id}\0${canonicalInventoryName(proposal.itemName)}`));
   const extractedItems = extracted.itemCandidates ?? [];
   const extractedOperations = extracted.inventoryOperations ?? [];
   const extractedNames = new Map(extractedItems.map(item => [item.localId, item.displayName]));
   for (const item of knownInventory) extractedNames.set(item.referenceId, item.canonicalName);
   return {
     ...extracted,
-    itemCandidates: [...extractedItems, ...itemCandidates],
+    itemCandidates: [
+      ...extractedItems.filter(item => !deterministicKeys.has(`${item.sourceRef}\0${canonicalInventoryName(item.displayName)}`)),
+      ...itemCandidates,
+    ],
     inventoryOperations: [
       ...inventoryOperations,
       ...extractedOperations.filter(operation => {
         const name = extractedNames.get(operation.itemRef);
-        return !name || !deterministicKeys.has(`${operation.sourceRef}\0${normalizeInventoryName(name)}`);
+        return !name || !deterministicKeys.has(`${operation.sourceRef}\0${canonicalInventoryName(name)}`);
       }),
     ],
     diagnostics: {
@@ -2087,6 +2096,10 @@ export class MultiActorCaptureService {
         ...(input.captureJobId ? { captureJobId: input.captureJobId } : {}),
         ...(input.captureJob ? { captureJob: input.captureJob } : {}),
         ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+        ...(structured.audit?.requestId ? { requestId: structured.audit.requestId } : {}),
+        ...(structured.audit?.resourceId ? { resourceId: structured.audit.resourceId } : {}),
+        ...(structured.audit?.model ? { model: structured.audit.model } : {}),
+        ...(structured.audit?.fallbackUsed === undefined ? {} : { fallbackUsed: structured.audit.fallbackUsed }),
         outcome,
         rejections: auditedRejections,
         owners: this.registry.listOwners(),
@@ -2135,6 +2148,7 @@ export class MultiActorCaptureService {
         : input.repair && outcome === 'complete'
           ? { resolutionMode: 'repaired' as const }
           : {}),
+      ...(structured.repairDecisions ? { repairDecisions: structured.repairDecisions } : {}),
       ...(changeAudit ? { changeAudit } : {}),
     };
   }

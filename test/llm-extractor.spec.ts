@@ -24,7 +24,7 @@ describe('StructuredMemoryCaptureExtractor', () => {
     const runTask = vi.fn(async (_input: Parameters<MemoryLlmClient['runTask']>[0]) => ({
       ok: true as const,
       data: emptyCapture,
-      meta: { requestId: 'req', resourceId: 'resource', model: 'model', latencyMs: 42 },
+      meta: { requestId: 'req', resourceId: 'resource', model: 'model', latencyMs: 42, fallbackUsed: true },
       usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
     }));
     const result = await new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmClient)).extract({
@@ -36,7 +36,7 @@ describe('StructuredMemoryCaptureExtractor', () => {
       taskKey: 'memory_capture',
       budget: { maxTokens: MEMORY_CAPTURE_MAX_TOKENS, maxLatencyMs: 180_000 },
     });
-    expect(result.audit).toMatchObject({ requestId: 'req', resourceId: 'resource', model: 'model', latencyMs: 42 });
+    expect(result.audit).toMatchObject({ requestId: 'req', resourceId: 'resource', model: 'model', latencyMs: 42, fallbackUsed: true });
     expect(result.audit?.usage).toMatchObject({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
   });
 
@@ -97,19 +97,24 @@ describe('StructuredMemoryCaptureExtractor', () => {
     expect(JSON.stringify(result.rejections)).not.toContain('rawValue');
   });
 
-  it('uses a dedicated one-shot repair task with safe issues, source floors and the original route', async () => {
+  it('uses an independently routed repair task with explicit emit decisions and safe source evidence', async () => {
     const runTask = vi.fn(async (input: Parameters<MemoryLlmClient['runTask']>[0]): Promise<any> => {
-      const evidenceSpanId = (input.schema as any).properties.items.items.properties.evidenceSpanId.enum[0];
+      const decisionSchema = (input.schema as any).properties.decisions.items;
+      const evidenceSpanId = decisionSchema.properties.items.items.properties.evidenceSpanId.enum[0];
       return {
         ok: true as const,
         data: {
-        items: [{
-          localId: 'actor-violet',
-          displayName: '紫罗',
-          aliases: [],
-          evidenceSpanId,
-          confidence: 0.98,
-        }],
+          decisions: [{
+            repairId: 'repair:actor:1',
+            action: 'emit',
+            items: [{
+              localId: 'actor-violet',
+              displayName: '紫罗',
+              aliases: [],
+              evidenceSpanId,
+              confidence: 0.98,
+            }],
+          }],
         },
         meta: {
         requestId: 'repair-request',
@@ -130,6 +135,7 @@ describe('StructuredMemoryCaptureExtractor', () => {
       repair: {
         collection: 'actorCandidates',
         issues: [{ path: '$.actorCandidates[0].displayName', keyword: 'required', expected: 'property to be present' }],
+        targets: [{ repairId: 'repair:actor:1', issues: [{ path: '$.actorCandidates[0].displayName', keyword: 'required', expected: 'property to be present' }] }],
         parentRequestId: 'capture-request',
         resourceId: 'resource-1',
         model: 'model-1',
@@ -143,19 +149,58 @@ describe('StructuredMemoryCaptureExtractor', () => {
     expect(request).toMatchObject({
       taskKey: MEMORY_CAPTURE_REPAIR_TASK,
       parentRequestId: 'capture-request',
-      route: { resourceId: 'resource-1', model: 'model-1' },
       budget: { maxTokens: 2_048, maxLatencyMs: 180_000 },
       schema: {
-        required: ['items'],
-        properties: { items: { minItems: 1, maxItems: 1 } },
+        required: ['decisions'],
+        properties: { decisions: { minItems: 1, maxItems: 1 } },
       },
     });
-    expect((request.schema as any).properties.items.items.properties).not.toHaveProperty('sourceRef');
+    expect(request).not.toHaveProperty('route');
+    expect((request.schema as any).properties.decisions.items.properties.items.items.properties).not.toHaveProperty('sourceRef');
     expect(messages[0]?.content).toContain('$.actorCandidates[0].displayName');
     expect(messages[1]?.content).toContain('紫罗能够净化空气');
     expect(messages.map(message => message.content).join('\n')).not.toContain('"rawFailure":');
     expect(result.actorCandidates).toEqual([expect.objectContaining({ localId: 'actor-violet', displayName: '紫罗' })]);
+    expect(result.repairDecisions).toEqual([{
+      repairId: 'repair:actor:1', action: 'emit', localId: 'actor-violet', itemIndex: 0, sourceRefs: ['message:1'],
+    }]);
     expect(result.audit?.requestId).toBe('repair-request');
+  });
+
+  it('drops a later repair decision that reuses an emitted localId', async () => {
+    const runTask = vi.fn(async (input: Parameters<MemoryLlmClient['runTask']>[0]): Promise<any> => {
+      const decisionSchema = (input.schema as any).properties.decisions.items;
+      const evidenceSpanId = decisionSchema.properties.items.items.properties.evidenceSpanId.enum[0];
+      const item = { localId: 'actor-violet', displayName: '紫罗', aliases: [], evidenceSpanId, confidence: 0.98 };
+      return {
+        ok: true as const,
+        data: { decisions: [
+          { repairId: 'repair:actor:1', action: 'emit', items: [item] },
+          { repairId: 'repair:actor:2', action: 'emit', items: [item] },
+        ] },
+      };
+    });
+    const issues = [{ path: '$.actorCandidates[0]', keyword: 'required', expected: 'valid actor' }];
+    const result = await new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmClient)).extract({
+      chatKey: source.chatKey,
+      sources: [source],
+      writableSourceRefs: [source.id],
+      repair: {
+        collection: 'actorCandidates',
+        issues,
+        targets: [
+          { repairId: 'repair:actor:1', issues },
+          { repairId: 'repair:actor:2', issues },
+        ],
+        maxItems: 2,
+      },
+    });
+
+    expect(result.actorCandidates).toHaveLength(1);
+    expect(result.repairDecisions).toEqual([
+      { repairId: 'repair:actor:1', action: 'emit', localId: 'actor-violet', itemIndex: 0, sourceRefs: ['message:1'] },
+      { repairId: 'repair:actor:2', action: 'drop' },
+    ]);
   });
 
   it('does not retry non-structural authentication failures and preserves the reason', async () => {

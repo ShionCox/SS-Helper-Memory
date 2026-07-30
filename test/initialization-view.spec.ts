@@ -138,13 +138,14 @@ describe('initialization view', () => {
     expect(html).toContain('部分记忆已可召回');
     expect(html).toContain('部分可召回 · 仍有 3 项待修复');
     expect(html).toContain('待修复 3 项');
+    expect(html).toContain('未解决项将由 AI 自动复核');
     expect(html).toContain('继续处理');
     expect(html).toContain('data-action="open-reinitialize"');
     expect(html).not.toContain('任务因可重试错误暂停');
     expect(html).not.toContain('初始化已暂停');
   });
 
-  it('renders exhausted and review counts without offering another AI retry', () => {
+  it('normalizes legacy review state with no pending repair into non-blocking partial completion', () => {
     const html = renderInitializationView(model({
       progress: {
         status: 'needs_review',
@@ -160,18 +161,45 @@ describe('initialization view', () => {
         repairedCount: 13,
         degradedCount: 55,
         exhaustedRepairCount: 4,
-        reviewRequiredCount: 22,
+        quarantinedCount: 22,
+        reviewRequiredCount: 0,
         unresolvedRejectionCount: 22,
         ignoredCount: 3,
       },
       attempts: [{ jobId: 'job-review', status: 'needs_review', updatedAt: 10, totalBatches: 8, selectedSourceKinds: ['message'] }],
     }));
-    expect(html).toContain('部分记忆需要人工审阅');
-    expect(html).toContain('<dt>可继续处理</dt><dd>0</dd>');
-    expect(html).toContain('<dt>已直接修复</dt><dd>13</dd>');
-    expect(html).toContain('<dt>已达上限</dt><dd>4</dd>');
-    expect(html).toContain('<dt>需人工审阅</dt><dd>22</dd>');
-    expect(html).toContain('data-action="view-audit"');
+    expect(html).toContain('部分完成 · 召回可用');
+    expect(html).toContain('已隔离 22 项等待证据变化');
+    expect(html).toContain('也不需要人工处理');
+    expect(html).toContain('stx-memory-init-activity is-completed');
+    expect(html).toContain('1970/1/1');
+    expect(html).not.toContain('尚未完成');
+    expect(html).not.toContain('待审阅');
+    expect(html).not.toContain('需人工审阅');
+    expect(html).not.toContain('data-action="view-audit"');
+    expect(html).not.toContain('data-action="initialize-resume"');
+  });
+
+  it('normalizes a stale needs_repair job with zero pending items into completed recall', () => {
+    const html = renderInitializationView(model({
+      progress: {
+        status: 'needs_repair',
+        jobId: 'job-stale',
+        batchIndex: 4,
+        totalBatches: 4,
+        processedCount: 18,
+        elapsedMs: 5000,
+        outcome: 'partial',
+        pendingRepairCount: 0,
+        retryableRepairCount: 0,
+        quarantinedCount: 2,
+      },
+      attempts: [{ jobId: 'job-stale', status: 'needs_repair', updatedAt: 10, totalBatches: 4, selectedSourceKinds: ['message'] }],
+    }));
+    expect(html).toContain('当前聊天已初始化');
+    expect(html).toContain('已隔离 2 项等待证据变化');
+    expect(html).toContain('stx-memory-init-activity is-completed');
+    expect(html).not.toContain('仍有 0 项待修复');
     expect(html).not.toContain('data-action="initialize-resume"');
   });
 
@@ -200,6 +228,26 @@ describe('initialization view', () => {
     expect((html.match(/stx-memory-init-activity is-/g) ?? [])).toHaveLength(5);
     expect(html).toContain('已安全降级 2 项');
     expect(html).toContain('没有猜测或改绑实体');
+  });
+
+  it('keeps completed partial tasks visibly marked as partial', () => {
+    const html = renderInitializationView(model({
+      initialized: true,
+      progress: {
+        status: 'completed',
+        jobId: 'job-partial',
+        batchIndex: 4,
+        totalBatches: 4,
+        processedCount: 18,
+        elapsedMs: 6000,
+        outcome: 'partial',
+        quarantinedCount: 2,
+      },
+      attempts: [{ jobId: 'job-partial', status: 'completed', updatedAt: 10, totalBatches: 4, selectedSourceKinds: ['message'] }],
+    }));
+
+    expect(html).toContain('部分完成 · 召回可用');
+    expect(html).toContain('已隔离 2 项等待证据变化');
   });
 
   it('keeps sources browseable but disables submission when capabilities are unavailable', () => {

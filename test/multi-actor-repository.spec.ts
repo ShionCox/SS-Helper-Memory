@@ -233,6 +233,29 @@ describe('multi-actor repository transaction semantics', () => {
     expect(await repository.listSceneStates()).toEqual([]);
   });
 
+  it('persists the actual capture route and fallback decision in the change audit', async () => {
+    const repository = new MultiActorMemoryRepository(port());
+    repository.bind('w', 'chat');
+    await repository.open();
+
+    const audit = await repository.commitCapture({
+      ...commit(40, 0),
+      capturePhase: 'repair',
+      requestId: 'repair-request',
+      resourceId: 'repair-resource',
+      model: 'repair-model',
+      fallbackUsed: true,
+    });
+
+    expect(audit.metadata).toMatchObject({
+      capturePhase: 'repair',
+      requestId: 'repair-request',
+      resourceId: 'repair-resource',
+      model: 'repair-model',
+      fallbackUsed: true,
+    });
+  });
+
   it('merges trace history and rolls back derived records with the same ChangeSet', async () => {
     const workspace = port();
     const repository = new MultiActorMemoryRepository(workspace); repository.bind('w', 'chat'); await repository.open();
@@ -421,7 +444,7 @@ describe('multi-actor repository transaction semantics', () => {
     });
   });
 
-  it('reconciliation restores historical repairAttempts when rebuilding a missing queue row', async () => {
+  it('reconciliation quarantines a historical attempted repair until evidence changes', async () => {
     const workspace = port();
     const repository = new MultiActorMemoryRepository(workspace);
     repository.bind('w', 'chat');
@@ -455,7 +478,13 @@ describe('multi-actor repository transaction semantics', () => {
     await workspace.delete({ collection: 'capture-repair-queue', recordId: created!.id });
 
     const [rebuilt] = await repository.reconcileCaptureRepairQueue('capture-job:legacy-attempt');
-    expect(rebuilt).toMatchObject({ attemptCount: 1, maxAttempts: 2, status: 'queued' });
+    expect(rebuilt).toMatchObject({
+      attemptCount: 1,
+      maxAttempts: 1,
+      status: 'unresolved',
+      waitingForEvidenceChange: true,
+      evidenceRetryUsed: false,
+    });
   });
 
   it('reconciliation coalesces one-based rejection diagnostics with the zero-based queue batch', async () => {

@@ -6,6 +6,7 @@ import {
   type StoreRecord as WorkspaceRecord,
 } from './memory-store';
 import {
+  AI_REPAIRABLE_PROPOSAL_CODES,
   ACTIVE_CONFIDENCE_THRESHOLD,
   MAX_FACT_CONTENT_LENGTH,
   createCanonicalKey,
@@ -46,13 +47,7 @@ import { MEMORY_WORKSPACE_COLLECTIONS } from './memory-workspace-schema';
 import type { MemoryPage, MemoryPageRequest } from '../ui/memory-page';
 
 const COLLECTIONS = MEMORY_WORKSPACE_COLLECTIONS;
-const REPAIRABLE_REJECTION_CODES = new Set<AutomaticIngestRejection['code']>([
-  'schema_validation_failed',
-  'entity_ref_unsupported',
-  'invalid_reference',
-  'excerpt_mismatch',
-  'dependency_invalid',
-]);
+const REPAIRABLE_REJECTION_CODES = new Set<AutomaticIngestRejection['code']>(AI_REPAIRABLE_PROPOSAL_CODES);
 
 function isRepairCaptureAudit(metadata: Record<string, unknown>, captureJobId: string): boolean {
   const baseTransactionKey = String(metadata.baseTransactionKey ?? metadata.transactionKey ?? '');
@@ -83,6 +78,8 @@ function repairDependencyBlocker(
     candidate.id !== record.id
     && repairCollectionRank(candidate.collection) < repairCollectionRank(record.collection)
     && (candidate.status === 'queued' || candidate.status === 'running' || candidate.status === 'unresolved')
+    && candidate.waitingForEvidenceChange !== true
+    && candidate.attemptCount < (candidate.maxAttempts ?? 1)
     && [...candidate.sourceRefs, ...candidate.fallbackSourceRefs].some(sourceRef => sources.has(sourceRef)));
 }
 
@@ -152,6 +149,10 @@ interface CaptureCommit {
   /** Next durable checkpoint, committed atomically with this batch's facts. */
   readonly captureJob?: Record<string, unknown>;
   readonly idempotencyKey?: string;
+  readonly requestId?: string;
+  readonly resourceId?: string;
+  readonly model?: string;
+  readonly fallbackUsed?: boolean;
   readonly outcome?: 'complete' | 'partial';
   readonly rejections?: readonly AutomaticIngestRejection[];
   readonly owners: readonly MemoryOwner[];
@@ -816,8 +817,17 @@ export class MultiActorMemoryRepository {
         }
         continue;
       }
-      captureAudits.push({ id: String(row.id ?? ''), rejections });
-      for (const item of rejections) {
+      const classifiedRejections = rejections.map((item) => {
+        if ((item.status ?? 'unresolved') !== 'unresolved' || REPAIRABLE_REJECTION_CODES.has(item.code)) return item;
+        return {
+          ...item,
+          status: 'ignored' as const,
+          ignoredAt: item.ignoredAt ?? Date.now(),
+          waitingForEvidenceChange: false,
+        };
+      });
+      captureAudits.push({ id: String(row.id ?? ''), rejections: classifiedRejections });
+      for (const item of classifiedRejections) {
         if ((item.status ?? 'unresolved') !== 'unresolved' || !REPAIRABLE_REJECTION_CODES.has(item.code)) continue;
         const collection = repairCollection(item);
         const metadataBatchIndex = Number(metadata.batchIndex);
@@ -890,7 +900,12 @@ export class MultiActorMemoryRepository {
           || right.updatedAt - left.updatedAt;
       })[0];
       const timestamp = Date.now();
-      const policyUpgrade = previous && (previous.repairPolicyVersion ?? 0) < 1;
+      const policyUpgrade = previous && (previous.repairPolicyVersion ?? 0) < 2;
+      const priorAttemptCount = previous?.attemptCount ?? group.repairAttempts;
+      const legacyNeedsQuarantine = (policyUpgrade || !previous)
+        && previous?.status !== 'resolved'
+        && previous?.status !== 'ignored'
+        && priorAttemptCount > 0;
       const record: CaptureRepairQueueRecord = {
         ...(previous ?? {
           id: `capture-repair:${stableRecordHash(key)}`,
@@ -927,11 +942,15 @@ export class MultiActorMemoryRepository {
         ...(group.originalRequestId ? { originalRequestId: group.originalRequestId } : {}),
         ...(group.originalResourceId ? { originalResourceId: group.originalResourceId } : {}),
         ...(group.originalModel ? { originalModel: group.originalModel } : {}),
-        repairPolicyVersion: 1,
-        maxAttempts: policyUpgrade && (previous?.attemptCount ?? group.repairAttempts) >= (previous?.maxAttempts ?? 2)
-          ? (previous?.attemptCount ?? group.repairAttempts) + 1
-          : previous?.maxAttempts ?? (group.repairAttempts >= 2 ? group.repairAttempts + 1 : 2),
-        ...(policyUpgrade && previous?.status === 'unresolved' ? { status: 'queued' as const } : {}),
+        repairPolicyVersion: 2,
+        maxAttempts: legacyNeedsQuarantine
+          ? Math.max(1, priorAttemptCount)
+          : policyUpgrade ? Math.max(1, (previous?.attemptCount ?? 0) + 1) : previous?.maxAttempts ?? 1,
+        ...(legacyNeedsQuarantine ? {
+          status: 'unresolved' as const,
+          waitingForEvidenceChange: true,
+          evidenceRetryUsed: false,
+        } : {}),
         updatedAt: timestamp,
       };
       await this.updateCaptureRepairRecord(record);
@@ -1145,17 +1164,15 @@ export class MultiActorMemoryRepository {
         });
         const retryableRepairCount = queue.filter(item =>
           (item.status === 'queued' || item.status === 'running' || item.status === 'unresolved')
-          && item.attemptCount < (item.maxAttempts ?? 2)
+          && item.waitingForEvidenceChange !== true
+          && item.attemptCount < (item.maxAttempts ?? 1)
           && repairDependencyBlocker(item, queue) === undefined).length;
-        const exhaustedRepairCount = queue.filter(item => item.status === 'unresolved' && item.attemptCount >= (item.maxAttempts ?? 2)).length;
-        const dependencyReviewCount = queue.filter(item => {
-          if (!((item.status === 'queued' || item.status === 'running' || item.status === 'unresolved')
-            && item.attemptCount < (item.maxAttempts ?? 2))) return false;
-          const blocker = repairDependencyBlocker(item, queue);
-          return blocker?.status === 'unresolved' && blocker.attemptCount >= (blocker.maxAttempts ?? 2);
-        }).length;
-        const reviewRequiredCount = exhaustedRepairCount + dependencyReviewCount + jobRejections.filter(item =>
-          (item.status ?? 'unresolved') === 'unresolved' && !REPAIRABLE_REJECTION_CODES.has(item.code)).length;
+        const exhaustedRepairCount = queue.filter(item => item.status === 'unresolved'
+          && item.waitingForEvidenceChange !== true
+          && item.attemptCount >= (item.maxAttempts ?? 1)).length;
+        const quarantinedCount = queue.filter(item => item.status === 'unresolved'
+          && item.waitingForEvidenceChange === true).length;
+        const reviewRequiredCount = 0;
         const repairedCount = jobRejections.filter(item => item.status === 'repaired').length;
         const degradedCount = queue.filter(item => item.resolutionMode === 'degraded').length;
         const ignoredCount = jobRejections.filter(item => item.status === 'ignored').length;
@@ -1167,7 +1184,7 @@ export class MultiActorMemoryRepository {
           // must count only work that still requires attention.
           value: asPlain({
             ...jobValue,
-            status: retryableRepairCount > 0 ? 'needs_repair' : jobUnresolvedCount > 0 ? 'needs_review' : 'completed',
+            status: retryableRepairCount > 0 ? 'needs_repair' : 'completed',
             outcome: jobOutcome,
             rejectionCount: jobUnresolvedCount,
             rejections: jobRejections,
@@ -1177,6 +1194,7 @@ export class MultiActorMemoryRepository {
               pendingRepairCount: retryableRepairCount,
               retryableRepairCount,
               exhaustedRepairCount,
+              quarantinedCount,
               reviewRequiredCount,
               unresolvedRejectionCount: jobUnresolvedCount,
               repairedCount,
@@ -1927,6 +1945,10 @@ export class MultiActorMemoryRepository {
         transactionKey,
         baseTransactionKey,
         requestDigest,
+        ...(commit.requestId ? { requestId: commit.requestId } : {}),
+        ...(commit.resourceId ? { resourceId: commit.resourceId } : {}),
+        ...(commit.model ? { model: commit.model } : {}),
+        ...(commit.fallbackUsed === undefined ? {} : { fallbackUsed: commit.fallbackUsed }),
         ...(retryAttempt > 0 ? { retryAttempt, retriedTransactionKey: baseTransactionKey } : {}),
         sourceRefs: [...commit.envelope.sourceRefs],
         inventoryEventIds: (commit.inventoryEvents ?? []).map(event => event.id),

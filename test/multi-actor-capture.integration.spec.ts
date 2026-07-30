@@ -988,7 +988,15 @@ describe('Claim-based multi actor capture', () => {
         return { id: `audit:${commit.envelope.sourceRefs.join(':')}`, entries: [] };
       },
     };
-    const captureService = service('inventory-golden-w', { extract: async () => empty() }, repository);
+    const captureService = service('inventory-golden-w', { extract: async (input: any) => ({
+      ...empty(),
+      itemCandidates: [{
+        localId: 'model-water', displayName: `瓶装水x${input.sources[0].content.includes('x22') ? 22 : 20}`, aliases: [], category: 'food', sourceRef: input.sources[0].id, evidenceExcerpt: input.sources[0].content.includes('x22') ? '瓶装水x22' : '瓶装水x20', confidence: 0.99,
+      }],
+      inventoryOperations: [{
+        localId: 'model-water-operation', itemRef: 'model-water', operation: 'set', measureKind: 'quantity', amount: input.sources[0].content.includes('x22') ? 22 : 20, rawAmount: input.sources[0].content.includes('x22') ? 'x22' : 'x20', unit: '个', precision: 'exact', reason: 'recount', sourceRef: input.sources[0].id, evidenceExcerpt: input.sources[0].content.includes('x22') ? '瓶装水x22' : '瓶装水x20', confidence: 0.99,
+      }],
+    }) }, repository);
     const snapshot = (id: string, floor: number, ration: number, water: number) => source({
       id, floor, createdAt: floor * 1_000, kind: 'state', role: 'metadata', semanticSection: 'state_snapshot', actorRefs: [], locationRefs: [],
       content: `【当前物资快照】\n食物: 高热量压缩口粮（约${ration}天份）、瓶装水x${water}\n【角色状态】\n小时：健康`,
@@ -1002,6 +1010,8 @@ describe('Claim-based multi actor capture', () => {
     const waterState = inventoryStates.find(state => itemsById.get(state.itemId)?.canonicalName === '瓶装水');
     expect(rationState).toMatchObject({ amount: 28, measureKind: 'coverage_days', updatedAtFloor: 6, revision: 2 });
     expect(waterState).toMatchObject({ amount: 20, measureKind: 'quantity', updatedAtFloor: 6, revision: 2 });
+    expect(inventoryItems.map(item => item.canonicalName)).not.toContain('瓶装水x22');
+    expect(inventoryItems.map(item => item.canonicalName)).not.toContain('瓶装水x20');
     expect(inventoryEvents.filter(event => event.itemId === rationState.itemId).map(event => ({ after: event.afterAmount, floor: event.floor, sourceRef: event.sourceRef }))).toEqual([
       { after: 29, floor: 4, sourceRef: 'message:4' },
       { after: 28, floor: 6, sourceRef: 'message:6' },

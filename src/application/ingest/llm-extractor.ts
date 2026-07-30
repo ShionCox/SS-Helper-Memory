@@ -515,6 +515,7 @@ export function buildStructuredRepairSchema(
   maxItems: number,
   referenceDirectory?: import('./types').SupportedReferenceDirectory,
   evidenceDirectory?: SupportedEvidenceDirectory,
+  repairIds: readonly string[] = ['repair-item-1'],
 ): object {
   const captureSchema = buildStructuredCaptureSchema(sourceRefs, evidenceDirectory) as {
     properties: Record<string, { items: object }>;
@@ -565,16 +566,32 @@ export function buildStructuredRepairSchema(
     knowledge.properties.speakerRef = { type: 'string', enum: uniqueSchemaValues(['', ...actorRefs]) };
     knowledge.properties.viewpointRef = { type: 'string', enum: uniqueSchemaValues(['', ...actorRefs]) };
   }
+  const allowedRepairIds = uniqueSchemaValues(repairIds.map(value => value.trim()).filter(Boolean));
+  if (allowedRepairIds.length === 0) allowedRepairIds.push('repair-item-1');
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['items'],
+    required: ['decisions'],
     properties: {
-      items: {
+      decisions: {
         type: 'array',
         minItems: 1,
-        maxItems: Math.min(10, Math.max(1, Math.trunc(maxItems))),
-        items: itemSchema,
+        maxItems: Math.min(10, Math.max(1, Math.min(Math.trunc(maxItems), allowedRepairIds.length))),
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['repairId', 'action', 'items'],
+          properties: {
+            repairId: { type: 'string', enum: allowedRepairIds },
+            action: { type: 'string', enum: ['emit', 'drop'] },
+            items: {
+              type: 'array',
+              minItems: 0,
+              maxItems: 1,
+              items: itemSchema,
+            },
+          },
+        },
       },
     },
   };
@@ -808,6 +825,7 @@ function auditFromResponse(response: { meta?: MemoryLlmMeta; usage?: MemoryLlmUs
     ...(response.meta?.resourceId ? { resourceId: response.meta.resourceId } : {}),
     ...(response.meta?.model ? { model: response.meta.model } : {}),
     ...(Number.isFinite(response.meta?.latencyMs) ? { latencyMs: response.meta?.latencyMs } : {}),
+    ...(response.meta?.fallbackUsed === undefined ? {} : { fallbackUsed: response.meta.fallbackUsed }),
     usage: tokenUsage,
   };
 }
@@ -857,17 +875,23 @@ export class StructuredMemoryCaptureExtractor {
         input.repair.maxItems,
         input.repair.referenceDirectory,
         evidenceDirectory,
+        (input.repair.targets?.length ? input.repair.targets : [{ repairId: 'repair-item-1', issues: input.repair.issues }])
+          .map(target => target.repairId),
       )
       : buildStructuredCaptureSchema(sourceRefs, evidenceDirectory);
+    const repairTargets = input.repair
+      ? (input.repair.targets?.length ? input.repair.targets : [{ repairId: 'repair-item-1', issues: input.repair.issues }])
+      : [];
     const repairInstruction = input.repair ? [
       input.repair.mode === 'conservative'
-        ? '这是第二次且最后一次保守修复。只重新提取一个目标项目；可选字段没有直接证据时必须留空，引用数组只能保留 supportedReferences 中的成员。'
-        : '这是第一次定向重新提取。只依据本次 sourceBlocks 重新生成一个目标项目；不要复用、猜测或补写上一轮失败 JSON。',
+        ? '这是证据变化后的最后一次保守复核。可选字段没有直接证据时必须留空，引用数组只能保留 supportedReferences 中的成员。'
+        : '这是第一次定向复核。只依据本次 sourceBlocks 重新提取；不要复用、猜测或补写上一轮失败 JSON。',
       `目标集合：${input.repair.collection}`,
       `修复次数：${input.repair.attempt ?? 1}/${input.repair.maxAttempts ?? 2}`,
-      `安全校验问题：${safeJson(input.repair.issues.slice(0, 16))}`,
+      `复核目标：${safeJson(repairTargets.map(target => ({ repairId: target.repairId, issues: target.issues.slice(0, 16) })))}`,
       'supportedReferences 是当前字段唯一允许使用的闭集。必须逐字复制 ref；目录外实体不得引用或猜测，无法确认时字符串用空字符串、数组用空数组。',
-      '只返回 {"items":[...]}，items 中只允许出现目标集合对应的项目。',
+      '每个 repairId 必须且只能返回一次 decision。原文足以支持一条合法记录时返回 action="emit" 且 items 恰好一项；证据不足或不应形成记忆时返回 action="drop" 且 items 为空。',
+      '只返回 {"decisions":[{"repairId":"...","action":"emit|drop","items":[...]}]}，不要解释。',
     ].join('\n') : '';
     const response = await llm.runTask<unknown>({
       consumer: MEMORY_PLUGIN_ID,
@@ -882,12 +906,6 @@ export class StructuredMemoryCaptureExtractor {
       budget: { maxTokens: input.repair ? 2_048 : MEMORY_CAPTURE_MAX_TOKENS, maxLatencyMs: 180_000 },
       enqueue: { displayMode: 'compact' },
       ...(input.repair?.parentRequestId ? { parentRequestId: input.repair.parentRequestId } : {}),
-      ...(input.repair && (input.repair.resourceId || input.repair.model) ? {
-        route: {
-          ...(input.repair.resourceId ? { resourceId: input.repair.resourceId } : {}),
-          ...(input.repair.model ? { model: input.repair.model } : {}),
-        },
-      } : {}),
     });
     if (!response.ok) {
       throw createSSHelperError(
@@ -899,22 +917,72 @@ export class StructuredMemoryCaptureExtractor {
       );
     }
     const writable = new Set(sourceRefs);
-    const normalizedData = input.repair
-      ? {
-        actorCandidates: input.repair.collection === 'actorCandidates' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
-        locationCandidates: input.repair.collection === 'locationCandidates' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
-        itemCandidates: input.repair.collection === 'itemCandidates' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
-        episodes: input.repair.collection === 'episodes' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
-        claims: input.repair.collection === 'claims' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
-        inventoryOperations: input.repair.collection === 'inventoryOperations' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
+    const allowedRepairIds = new Set(repairTargets.map(target => target.repairId));
+    const seenRepairIds = new Set<string>();
+    const emittedLocalIds = new Set<string>();
+    const repairDecisions: NonNullable<StructuredCaptureResult['repairDecisions']> = [];
+    const emittedItems: unknown[] = [];
+    if (input.repair) {
+      const rows = Array.isArray((response.data as { decisions?: unknown[] })?.decisions)
+        ? (response.data as { decisions: unknown[] }).decisions
+        : [];
+      for (const value of rows) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+        const decision = value as { repairId?: unknown; action?: unknown; items?: unknown };
+        const repairId = typeof decision.repairId === 'string' ? decision.repairId : '';
+        const items = Array.isArray(decision.items) ? decision.items : [];
+        if (!allowedRepairIds.has(repairId) || seenRepairIds.has(repairId)) continue;
+        if (decision.action === 'drop' && items.length === 0) {
+          seenRepairIds.add(repairId);
+          repairDecisions.push({ repairId, action: 'drop' });
+          continue;
+        }
+        if (decision.action !== 'emit' || items.length !== 1) continue;
+        const localId = items[0] && typeof items[0] === 'object' && !Array.isArray(items[0])
+          ? String((items[0] as { localId?: unknown }).localId ?? '').trim()
+          : '';
+        if (!localId) continue;
+        seenRepairIds.add(repairId);
+        if (emittedLocalIds.has(localId)) {
+          repairDecisions.push({ repairId, action: 'drop' });
+          continue;
+        }
+        emittedLocalIds.add(localId);
+        emittedItems.push(items[0]);
+        repairDecisions.push({ repairId, action: 'emit', localId });
       }
-      : response.data;
+    }
+    const normalizedData = input.repair ? {
+      actorCandidates: input.repair.collection === 'actorCandidates' ? emittedItems : [],
+      locationCandidates: input.repair.collection === 'locationCandidates' ? emittedItems : [],
+      itemCandidates: input.repair.collection === 'itemCandidates' ? emittedItems : [],
+      episodes: input.repair.collection === 'episodes' ? emittedItems : [],
+      claims: input.repair.collection === 'claims' ? emittedItems : [],
+      inventoryOperations: input.repair.collection === 'inventoryOperations' ? emittedItems : [],
+    } : response.data;
     const capture = normalizeStructuredCapture(
       normalizedData,
       input.sources.filter(source => writable.has(source.id)),
       evidenceDirectory,
       response.meta,
     );
+    const emittedMetadata = new Map<string, { itemIndex: number; sourceRefs: readonly string[] }>([
+      ...capture.actorCandidates.map((item, itemIndex) => [item.localId, { itemIndex, sourceRefs: [item.sourceRef] }] as const),
+      ...capture.locationCandidates.map((item, itemIndex) => [item.localId, { itemIndex, sourceRefs: [item.sourceRef] }] as const),
+      ...(capture.itemCandidates ?? []).map((item, itemIndex) => [item.localId, { itemIndex, sourceRefs: [item.sourceRef] }] as const),
+      ...capture.episodes.map((item, itemIndex) => [item.localId, { itemIndex, sourceRefs: [...item.sourceRefs] }] as const),
+      ...capture.claims.map((item, itemIndex) => [item.localId, { itemIndex, sourceRefs: [item.sourceRef] }] as const),
+      ...(capture.inventoryOperations ?? []).map((item, itemIndex) => [item.localId, { itemIndex, sourceRefs: [item.sourceRef] }] as const),
+    ]);
+    const verifiedRepairDecisions = repairDecisions.map((decision) => {
+      if (decision.action !== 'emit') return decision;
+      const metadata = emittedMetadata.get(decision.localId ?? '');
+      return {
+        ...decision,
+        ...(metadata ? { itemIndex: metadata.itemIndex } : {}),
+        sourceRefs: [...(metadata?.sourceRefs ?? [])],
+      };
+    });
     const schemaRejections = (response.meta?.itemRejections ?? []).map((item, index) => ({
       id: `schema:${response.meta?.requestId ?? 'unknown'}:${item.collection}:${item.itemIndex}:${index}`,
       index: item.itemIndex,
@@ -943,6 +1011,7 @@ export class StructuredMemoryCaptureExtractor {
     }));
     return {
       ...capture,
+      ...(input.repair ? { repairDecisions: verifiedRepairDecisions } : {}),
       rejections: [...(capture.rejections ?? []), ...schemaRejections],
       diagnostics: {
         ...capture.diagnostics,

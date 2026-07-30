@@ -209,6 +209,7 @@ export interface MemoryCaptureProgress {
   pendingRepairCount?: number;
   retryableRepairCount?: number;
   exhaustedRepairCount?: number;
+  quarantinedCount?: number;
   reviewRequiredCount?: number;
   unresolvedRejectionCount?: number;
   repairedCount?: number;
@@ -243,9 +244,11 @@ export interface MemoryAuditRecord {
   accepted?: number;
   rejected?: unknown[];
   outcome?: 'complete' | 'partial';
+  requestId?: string;
   model?: string;
   resource?: string;
   resourceId?: string;
+  fallbackUsed?: boolean;
   kind?: string;
   routeSummary?: {
     requestCount?: number;
@@ -535,6 +538,7 @@ interface WorkbenchState {
   inventoryItems: Array<import('../domain').InventoryItem>;
   inventoryStates: Array<import('../domain').InventoryState>;
   inventoryEvents: Array<import('../domain').InventoryEvent>;
+  inventoryScope: 'current' | 'catalog';
   inventoryQuery: string;
   inventoryCategory: '' | import('../domain').InventoryItemCategory;
   selectedInventoryItemId: string;
@@ -613,6 +617,7 @@ interface WorkbenchState {
   audits: MemoryAuditRecord[];
   usages: unknown[];
   sqlite?: MemorySqliteStatus;
+  storageUsageStatus: 'loading' | 'ready' | 'error';
   integrityText: string;
   confirmBatchKey: string;
   selectedRejectionIds: string[];
@@ -674,6 +679,7 @@ export function renderMemoryWorkbench(
   let searchTimer: number | undefined;
   let graphSearchTimer: number | undefined;
   let progressTimer: number | undefined;
+  let storageUsageTimer: number | undefined;
   let removeOverviewChanged: (() => void) | undefined;
   let renderFrame: number | undefined;
   let graphMarqueeResizeFrame: number | undefined;
@@ -683,6 +689,7 @@ export function renderMemoryWorkbench(
   let progressRequestId = 0;
   let librarySearchRequestId = 0;
   let overviewRequestId = 0;
+  let storageUsageRequestId = 0;
   let pageRequestId = 0;
   let backgroundPageRequestId = 0;
   let liveRefreshRunning = false;
@@ -692,8 +699,8 @@ export function renderMemoryWorkbench(
   let sceneRendererToken = 0;
   const requestedGraphPage = initialActionId === 'open-relationship-graph' || initialActionId === 'rebuild-relationship-graph';
   const state: WorkbenchState = {
-    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', inventoryItems: [], inventoryStates: [], inventoryEvents: [], inventoryQuery: '', inventoryCategory: '', selectedInventoryItemId: '', inventoryNewName: '', inventoryCommandOperation: 'set', inventoryCommandMeasure: 'quantity', inventoryCommandAmount: '', inventoryCommandUnit: '个', inventoryConfirmInvalidId: '', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
-    selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeHiddenMessageFloors: true, reinitializeOpen: false, audits: [], usages: [], integrityText: '尚未执行完整性检查。', confirmBatchKey: '', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
+    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', inventoryItems: [], inventoryStates: [], inventoryEvents: [], inventoryScope: 'current', inventoryQuery: '', inventoryCategory: '', selectedInventoryItemId: '', inventoryNewName: '', inventoryCommandOperation: 'set', inventoryCommandMeasure: 'quantity', inventoryCommandAmount: '', inventoryCommandUnit: '个', inventoryConfirmInvalidId: '', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
+    selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeHiddenMessageFloors: true, reinitializeOpen: false, audits: [], usages: [], storageUsageStatus: 'loading', integrityText: '尚未执行完整性检查。', confirmBatchKey: '', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
   };
   const sceneEventsState = (): SceneEventsState => ({
     category: state.sceneCategory,
@@ -979,6 +986,55 @@ export function renderMemoryWorkbench(
     normalizeLibrarySelection();
     return true;
   };
+  const acceptOverview = (overview: MemoryUiOverview): void => {
+    const chatChanged = state.overview?.chatKey !== overview.chatKey;
+    if (chatChanged) {
+      storageUsageRequestId += 1;
+      state.sqlite = undefined;
+      state.storageUsageStatus = overview.bound ? 'loading' : 'ready';
+    }
+    state.overview = state.storageUsageStatus === 'ready' && state.sqlite
+      ? {
+          ...overview,
+          currentChatSizeBytes: state.sqlite.currentChatSizeBytes,
+          currentChatUsageRatio: state.sqlite.currentChatUsageRatio,
+        }
+      : overview;
+  };
+  const refreshStorageUsage = async (background: boolean): Promise<void> => {
+    const chatKey = state.overview?.chatKey;
+    if (!state.overview?.bound || !chatKey) {
+      state.storageUsageStatus = 'ready';
+      return;
+    }
+    const requestId = ++storageUsageRequestId;
+    state.storageUsageStatus = 'loading';
+    rerender('', background);
+    try {
+      const sqlite = await controller.getSqliteStatus({ detailed: true });
+      if (disposed || requestId !== storageUsageRequestId || state.overview?.chatKey !== chatKey) return;
+      state.sqlite = sqlite;
+      state.storageUsageStatus = 'ready';
+      state.overview = {
+        ...state.overview,
+        currentChatSizeBytes: sqlite.currentChatSizeBytes,
+        currentChatUsageRatio: sqlite.currentChatUsageRatio,
+      };
+      rerender('', background);
+    } catch (error) {
+      if (disposed || requestId !== storageUsageRequestId || state.overview?.chatKey !== chatKey) return;
+      state.storageUsageStatus = 'error';
+      rerender('', background);
+      if (!background) throw error;
+    }
+  };
+  const scheduleStorageUsageRefresh = (delay = 800): void => {
+    if (storageUsageTimer) window.clearTimeout(storageUsageTimer);
+    storageUsageTimer = window.setTimeout(() => {
+      storageUsageTimer = undefined;
+      void refreshStorageUsage(true);
+    }, delay);
+  };
   const loadOverview = async (): Promise<void> => {
     const requestId = ++overviewRequestId;
     const isCurrent = (): boolean => !disposed && requestId === overviewRequestId;
@@ -986,7 +1042,7 @@ export function renderMemoryWorkbench(
     try {
       const overview = await controller.getOverview();
       if (!isCurrent()) return;
-      state.overview = overview;
+      acceptOverview(overview);
       if (overview.bound === false) {
         state.facts = [];
         state.libraryResults = [];
@@ -998,6 +1054,7 @@ export function renderMemoryWorkbench(
       normalizeLibrarySelection();
       state.loading = false; state.errorDiagnostic = undefined; rerender();
       void updateProgress();
+      void refreshStorageUsage(true);
     } catch (error) {
       if (!isCurrent()) return;
       const diagnostic = describeMemoryError(error, 'INTERNAL_ERROR', 'workbench-load');
@@ -1017,7 +1074,9 @@ export function renderMemoryWorkbench(
           const requestId = ++overviewRequestId;
           const overview = await controller.getOverview();
           if (disposed || requestId !== overviewRequestId) continue;
-          state.overview = overview;
+          const previousChatKey = state.overview?.chatKey;
+          acceptOverview(overview);
+          if (previousChatKey !== overview.chatKey) scheduleStorageUsageRefresh(0);
           if (isChatUnbound(overview)) {
             clearActorState();
             state.facts = [];
@@ -1111,7 +1170,9 @@ export function renderMemoryWorkbench(
           if (!isCurrent()) return;
           state.inventoryItems = [...inventory.items];
           state.inventoryStates = [...inventory.states];
-          const visibleItems = state.inventoryItems.filter(item => item.status !== 'invalid');
+          const currentItemIds = new Set(state.inventoryStates.map(entry => entry.itemId));
+          const visibleItems = state.inventoryItems.filter(item => item.status !== 'invalid'
+            && (state.inventoryScope === 'catalog' || currentItemIds.has(item.id)));
           if (!visibleItems.some(item => item.id === state.selectedInventoryItemId)) state.selectedInventoryItemId = visibleItems[0]?.id ?? '';
           state.inventoryEvents = state.selectedInventoryItemId && controller.getInventoryHistory
             ? [...await controller.getInventoryHistory(state.selectedInventoryItemId)]
@@ -1275,6 +1336,7 @@ export function renderMemoryWorkbench(
         const sqlite = await controller.getSqliteStatus({ detailed: true });
         if (!isCurrent()) return;
         state.sqlite = sqlite;
+        state.storageUsageStatus = 'ready';
         if (state.overview) state.overview = {
           ...state.overview,
           currentChatSizeBytes: sqlite.currentChatSizeBytes,
@@ -1301,9 +1363,8 @@ export function renderMemoryWorkbench(
   const refreshAll = async (): Promise<void> => {
     state.busyAction = 'refresh'; rerender();
     try {
-      const [sqlite, overview] = await Promise.all([controller.getSqliteStatus(), controller.getOverview()]);
-      state.sqlite = sqlite;
-      state.overview = overview;
+      acceptOverview(await controller.getOverview());
+      await refreshStorageUsage(false);
       await loadPage(state.page);
       if (state.pageError) state.actionError = state.pageError;
       else {
@@ -1358,7 +1419,7 @@ export function renderMemoryWorkbench(
       controller.listFacts(),
       controller.getSqliteStatus().catch(() => undefined),
     ]);
-    state.overview = overview;
+    acceptOverview(overview);
     state.initialization = initialization;
     state.sources = sources;
     state.progress = progress;
@@ -1385,8 +1446,8 @@ export function renderMemoryWorkbench(
       : '选择聊天并完成初始化后，即可建立和召回记忆。';
     const statusIcon = ready ? 'circle-check' : working ? 'clock' : overview.status === 'error' ? 'triangle-exclamation' : 'circle-info';
     const statusTone = ready ? 'success' : overview.status === 'error' ? 'error' : working ? 'warning' : 'neutral';
-    const storage = overview.bound ? formatBytes(overview.currentChatSizeBytes ?? 0) : '—';
-    const storageRatio = overview.bound ? formatPercent(overview.currentChatUsageRatio ?? 0) : '—';
+    const storage = !overview.bound ? '—' : state.storageUsageStatus === 'loading' ? '计算中' : state.storageUsageStatus === 'error' ? '暂不可用' : formatBytes(overview.currentChatSizeBytes ?? 0);
+    const storageRatio = !overview.bound ? '—' : state.storageUsageStatus === 'loading' ? '计算中' : state.storageUsageStatus === 'error' ? '暂不可用' : formatPercent(overview.currentChatUsageRatio ?? 0);
     const lastOrganized = overview.lastOrganizedAt ? formatTime(overview.lastOrganizedAt) : '尚未整理';
     const routeRow = (label: string, icon: string, available: boolean | undefined, detail: string): string => {
       const status = available === undefined ? '读取中' : available ? '可用' : '未配置';
@@ -1624,33 +1685,82 @@ export function renderMemoryWorkbench(
     const categoryLabels = INVENTORY_CATEGORY_LABELS;
     const operationLabels: Readonly<Record<import('../domain').InventoryOperation, string>> = { set: '设置数量', increase: '增加', decrease: '减少', remove: '标记移除' };
     const reasonLabels: Readonly<Record<import('../domain').InventoryReason, string>> = { acquire: '获得', consume: '消耗', discard: '丢弃', lose: '损失', recount: '盘点', manual_correction: '人工修正', other: '其他' };
+    const measureLabels: Readonly<Record<import('../domain').InventoryMeasureKind, string>> = { quantity: '数量', coverage_days: '可维持天数' };
     const formatState = (item: import('../domain').InventoryState): string => {
       if (item.availability === 'absent') return '已移除';
-      if (item.amount === undefined || item.precision === 'unknown') return `数量未知${item.stateNote ? ` · ${item.stateNote}` : ''}`;
+      if (item.amount === undefined || item.precision === 'unknown') return `清单中已确认存在，原文未注明数量${item.stateNote ? ` · ${item.stateNote}` : ''}`;
       return `${item.precision === 'approximate' ? '约 ' : ''}${item.amount}${item.unit || ''}${item.stateNote ? ` · ${item.stateNote}` : ''}`;
     };
+    const isUnknownConfirmation = (event: import('../domain').InventoryEvent): boolean => event.operation === 'set'
+      && event.precision === 'unknown'
+      && event.beforeAmount === undefined
+      && event.afterAmount === undefined;
+    const formatEventChange = (event: import('../domain').InventoryEvent, firstUnknownConfirmation: boolean): string => {
+      if (isUnknownConfirmation(event)) return firstUnknownConfirmation
+        ? '确认物品存在，原文未注明数量'
+        : '再次确认物品仍存在，原文仍未注明数量';
+      if (event.operation === 'remove') return event.beforeAmount === undefined
+        ? '标记为不再持有'
+        : `从 ${event.beforeAmount}${event.unit} 标记为不再持有`;
+      if (event.afterAmount === undefined) return '当前数量未注明';
+      const after = `${event.precision === 'approximate' ? '约 ' : ''}${event.afterAmount}${event.unit}`;
+      if (event.beforeAmount === undefined) return `首次记录：${after}`;
+      if (event.beforeAmount === event.afterAmount) return `再次盘点：数量仍为 ${after}`;
+      const action = event.operation === 'increase' ? '增加' : event.operation === 'decrease' ? '减少' : '盘点更新';
+      return `${action}：${event.beforeAmount}${event.unit} → ${after}`;
+    };
+    const statesByItem = new Map<string, import('../domain').InventoryState[]>();
+    for (const inventoryState of state.inventoryStates) {
+      const group = statesByItem.get(inventoryState.itemId) ?? [];
+      group.push(inventoryState);
+      statesByItem.set(inventoryState.itemId, group);
+    }
+    const newestState = (itemId: string): import('../domain').InventoryState | undefined => [...(statesByItem.get(itemId) ?? [])]
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    const renderStateSource = (inventoryState: import('../domain').InventoryState | undefined, emptyLabel = '暂无来源证据'): string => {
+      if (!inventoryState) return `<span class="stx-memory-inventory-source is-muted">${escapeHtml(emptyLabel)}</span>`;
+      const sourceRef = inventoryState.sourceRefs[inventoryState.sourceRefs.length - 1];
+      if (!sourceRef) return `<span class="stx-memory-inventory-source is-muted">${escapeHtml(emptyLabel)}</span>`;
+      const target = parseMessageSourceReference(sourceRef);
+      const floor = inventoryState.updatedAtFloor ?? target?.index;
+      const label = floor === undefined ? `来源：${formatSourceReference(sourceRef)}` : `来源：第 ${floor} 层`;
+      if (!target || !navigateToMessage) return `<span class="stx-memory-inventory-source">${escapeHtml(label)}</span>`;
+      const messageId = target.messageId === undefined ? '' : ` data-message-id="${escapeHtml(target.messageId)}"`;
+      const index = target.index === undefined ? '' : ` data-message-index="${target.index}"`;
+      return `<button class="stx-memory-inventory-source" ${uiButton('neutral', 'xs')} type="button" data-action="jump-to-message"${messageId}${index} aria-label="跳转到${escapeHtml(label)}" title="点击跳转并高亮对应聊天楼层"><ss-helper-icon name="link" decorative></ss-helper-icon>${escapeHtml(label)}</button>`;
+    };
     const needle = state.inventoryQuery.trim().toLocaleLowerCase();
+    const currentItemIds = new Set(state.inventoryStates.map(item => item.itemId));
     const filtered = state.inventoryItems.filter(item => item.status !== 'invalid'
+      && (state.inventoryScope === 'catalog' || currentItemIds.has(item.id))
       && (!state.inventoryCategory || item.category === state.inventoryCategory)
-      && (!needle || [item.canonicalName, ...item.aliases].some(name => name.toLocaleLowerCase().includes(needle))));
+      && (!needle || [item.canonicalName, ...item.aliases].some(name => name.toLocaleLowerCase().includes(needle))))
+      .sort((left, right) => state.inventoryScope === 'current'
+        ? (newestState(right.id)?.updatedAtFloor ?? -1) - (newestState(left.id)?.updatedAtFloor ?? -1) || left.canonicalName.localeCompare(right.canonicalName)
+        : right.updatedAt - left.updatedAt || left.canonicalName.localeCompare(right.canonicalName));
     const selected = state.inventoryItems.find(item => item.id === state.selectedInventoryItemId && item.status !== 'invalid');
-    const selectedStates = selected ? state.inventoryStates.filter(item => item.itemId === selected.id) : [];
+    const selectedStates = selected ? [...(statesByItem.get(selected.id) ?? [])].sort((left, right) => right.updatedAt - left.updatedAt) : [];
     const itemRows = filtered.length === 0 ? renderEmpty('没有匹配的物品', '可调整搜索条件，或在右侧新增物品。') : filtered.map((item) => {
-      const states = state.inventoryStates.filter(entry => entry.itemId === item.id);
+      const states = statesByItem.get(item.id) ?? [];
       const summary = states.length ? states.map(formatState).join(' / ') : '尚无数量记录';
-      return `<button type="button" class="stx-memory-inventory-row" data-action="inventory-select" data-item-id="${escapeHtml(item.id)}" aria-pressed="${item.id === state.selectedInventoryItemId}"><span><strong>${escapeHtml(item.canonicalName)}</strong><small>${escapeHtml(categoryLabels[item.category])}</small></span><span>${escapeHtml(summary)}</span></button>`;
+      return `<article class="stx-memory-inventory-row" data-selected="${item.id === state.selectedInventoryItemId}"><button type="button" class="stx-memory-inventory-row-main" data-action="inventory-select" data-item-id="${escapeHtml(item.id)}" aria-pressed="${item.id === state.selectedInventoryItemId}"><span><strong>${escapeHtml(item.canonicalName)}</strong><small>${escapeHtml(categoryLabels[item.category])}</small></span><span>${escapeHtml(summary)}</span></button><footer>${states.length ? renderStateSource(newestState(item.id)) : `<span class="stx-memory-inventory-source is-muted">当前聊天无状态</span>`}</footer></article>`;
     }).join('');
     const history = [...state.inventoryEvents].sort((left, right) => right.recordedAt - left.recordedAt);
-    const historyRows = history.length === 0 ? renderEmpty('暂无变动记录', '设置、增加、减少和移除都会写入追加式账本。') : history.map(event => `<article class="stx-memory-inventory-event"><header><strong>${escapeHtml(operationLabels[event.operation])}</strong><time>${escapeHtml(formatTime(event.recordedAt))}</time></header><p>${event.beforeAmount === undefined ? '未知' : escapeHtml(event.beforeAmount)} → ${event.afterAmount === undefined ? event.availability === 'absent' ? '已移除' : '未知' : escapeHtml(event.afterAmount)} ${escapeHtml(event.unit)}</p><footer><span>${escapeHtml(reasonLabels[event.reason])} · ${event.origin === 'automatic' ? '自动提取' : event.origin === 'manual' ? '人工操作' : '导入'}</span>${event.sourceRef ? renderLibrarySourceReference(event.sourceRef, 'evidence') : ''}</footer>${event.evidenceExcerpt ? `<blockquote>${escapeHtml(event.evidenceExcerpt)}</blockquote>` : ''}</article>`).join('');
+    const firstUnknownConfirmationId = history.filter(isUnknownConfirmation).at(-1)?.id;
+    const historyRows = history.length === 0 ? renderEmpty('暂无变动记录', '设置、增加、减少和移除都会写入追加式账本。') : history.map(event => `<article class="stx-memory-inventory-event"><header><strong>${escapeHtml(operationLabels[event.operation])}</strong><time>${escapeHtml(formatTime(event.recordedAt))}</time></header><p>${escapeHtml(formatEventChange(event, event.id === firstUnknownConfirmationId))}</p><footer><span>${escapeHtml(reasonLabels[event.reason])} · ${event.origin === 'automatic' ? '自动提取' : event.origin === 'manual' ? '人工操作' : '导入'}</span>${event.sourceRef ? renderLibrarySourceReference(event.sourceRef, 'evidence') : ''}</footer>${event.evidenceExcerpt ? `<blockquote>${escapeHtml(event.evidenceExcerpt)}</blockquote>` : ''}</article>`).join('');
+    const currentStates = selectedStates.length === 0
+      ? `<p class="stx-memory-inventory-no-state">当前聊天无状态</p>`
+      : `<div class="stx-memory-inventory-current-states">${selectedStates.map(inventoryState => `<article><span><small>${escapeHtml(measureLabels[inventoryState.measureKind])}</small><strong>${escapeHtml(formatState(inventoryState))}</strong></span>${renderStateSource(inventoryState)}</article>`).join('')}</div>`;
     const categories = Object.entries(categoryLabels).map(([value, label]) => `<option value="${value}" ${state.inventoryCategory === value ? 'selected' : ''}>${label}</option>`).join('');
     return `<div class="stx-memory-inventory-shell">
-      <section class="stx-memory-inventory-list" aria-label="当前库存">
+      <section class="stx-memory-inventory-list" aria-label="${state.inventoryScope === 'current' ? '当前聊天库存' : '全部物品目录'}">
+        <div class="stx-memory-inventory-scope" ${uiControl('segmented')} role="group" aria-label="物品显示范围"><button type="button" data-action="inventory-set-scope" data-scope="current" aria-pressed="${state.inventoryScope === 'current'}">当前聊天 (${currentItemIds.size})</button><button type="button" data-action="inventory-set-scope" data-scope="catalog" aria-pressed="${state.inventoryScope === 'catalog'}">全部目录 (${state.inventoryItems.filter(item => item.status !== 'invalid').length})</button></div>
         <div class="stx-memory-inventory-toolbar"><label><span class="stx-memory-sr-only">搜索物品</span><input ${uiControl('input')} data-inventory-input="query" value="${escapeHtml(state.inventoryQuery)}" placeholder="搜索名称或别名"></label><label><span class="stx-memory-sr-only">按分类筛选</span><select ${uiControl('select')} data-inventory-select="category"><option value="">全部分类</option>${categories}</select></label></div>
-        <div class="stx-memory-inventory-rows">${itemRows}</div>
+        <div class="stx-memory-inventory-rows" aria-label="${state.inventoryScope === 'current' ? '当前聊天物品与资源列表' : '全部物品目录列表'}">${itemRows}</div>
       </section>
       <section class="stx-memory-inventory-detail" aria-label="物品详情">
         <form class="stx-memory-inventory-create" data-inventory-form="create"><label><span>新增物品</span><input ${uiControl('input')} data-inventory-input="new-name" value="${escapeHtml(state.inventoryNewName)}" maxlength="120" placeholder="规范名称"></label><button ${uiButton('primary', 'sm')} type="button" data-action="inventory-create" ${!controller.createInventoryItem || !state.inventoryNewName.trim() ? 'disabled' : ''}>新增</button></form>
-        ${selected ? `<header class="stx-memory-inventory-detail-heading"><div><span class="stx-memory-kicker">${escapeHtml(categoryLabels[selected.category])}</span><h3>${escapeHtml(selected.canonicalName)}</h3><p>${selectedStates.length ? selectedStates.map(formatState).map(escapeHtml).join(' / ') : '尚无当前数量'}</p></div>${state.inventoryConfirmInvalidId === selected.id ? `<span class="stx-memory-inline-confirm">确认作废？<button ${uiButton('danger', 'xs')} type="button" data-action="inventory-invalidate-confirm">确认</button><button ${uiButton('neutral', 'xs')} type="button" data-action="inventory-invalidate-cancel">取消</button></span>` : `<button ${uiButton('danger', 'xs')} type="button" data-action="inventory-invalidate" ${!controller.invalidateInventoryItem ? 'disabled' : ''}>作废错误物品</button>`}</header>
+        ${selected ? `<header class="stx-memory-inventory-detail-heading"><div><span class="stx-memory-kicker">${escapeHtml(categoryLabels[selected.category])}</span><h3>${escapeHtml(selected.canonicalName)}</h3></div>${state.inventoryConfirmInvalidId === selected.id ? `<span class="stx-memory-inline-confirm">确认作废？<button ${uiButton('danger', 'xs')} type="button" data-action="inventory-invalidate-confirm">确认</button><button ${uiButton('neutral', 'xs')} type="button" data-action="inventory-invalidate-cancel">取消</button></span>` : `<button ${uiButton('danger', 'xs')} type="button" data-action="inventory-invalidate" ${!controller.invalidateInventoryItem ? 'disabled' : ''}>作废错误物品</button>`}</header>${currentStates}
           <div class="stx-memory-inventory-command"><label><span>操作</span><select ${uiControl('select')} data-inventory-select="operation">${Object.entries(operationLabels).map(([value, label]) => `<option value="${value}" ${state.inventoryCommandOperation === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label><span>计量</span><select ${uiControl('select')} data-inventory-select="measure"><option value="quantity" ${state.inventoryCommandMeasure === 'quantity' ? 'selected' : ''}>数量</option><option value="coverage_days" ${state.inventoryCommandMeasure === 'coverage_days' ? 'selected' : ''}>可维持天数</option></select></label><label><span>数值</span><input ${uiControl('input')} data-inventory-input="amount" type="number" min="0" step="any" value="${escapeHtml(state.inventoryCommandAmount)}" ${state.inventoryCommandOperation === 'remove' ? 'disabled' : ''}></label><label><span>单位</span><input ${uiControl('input')} data-inventory-input="unit" value="${escapeHtml(state.inventoryCommandUnit)}" maxlength="20"></label><button ${uiButton('primary', 'sm')} type="button" data-action="inventory-command" ${!controller.applyInventoryCommand ? 'disabled' : ''}>写入账本</button></div>
           <section class="stx-memory-inventory-history"><h4>完整变动历史</h4>${historyRows}</section>` : renderEmpty('选择一个物品', '左侧选择后可查看当前数量、变动历史与来源证据。')}
       </section>
@@ -1960,12 +2070,14 @@ export function renderMemoryWorkbench(
       const batchNumber = Number.isInteger(record.batchIndex) ? Math.max(1, record.batchIndex!) : index + 1;
       const resource = formatAuditResource(record.resourceId ?? record.resource);
       const model = String(record.model ?? '未记录');
+      const route = record.fallbackUsed === true ? '使用回退' : record.fallbackUsed === false ? '主路由' : '未记录';
       const metrics = [
         ['来源', `${formatNumber(sourceCount)} 项`],
         ['事实', `${formatNumber(acceptedCount)} 条`],
         ['拒绝', `${formatNumber(rejectedCount)} 项`],
         ['资源', resource],
         ['模型', model],
+        ['路由', route],
       ];
       const rollback = !canRollback ? '' : confirming
         ? `<div class="stx-memory-confirm-inline"><span>${isActorCapture ? '确认回滚本次多主体 Capture？' : '确认回滚此批及后续批次？'}</span><button ${uiControl('button', 'danger')} type="button" data-action="confirm-rollback" data-job-id="${escapeHtml(record.jobId ?? '')}" data-batch-index="${Number(record.batchIndex ?? 0)}" data-audit-id="${escapeHtml(record.id ?? '')}">确认回滚</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-rollback">取消</button></div>`
@@ -1975,13 +2087,16 @@ export function renderMemoryWorkbench(
       const rejections = (Array.isArray(record.rejected) ? record.rejected : [])
         .filter((item): item is import('../domain').AutomaticIngestRejection => Boolean(item && typeof item === 'object' && ('code' in item || 'id' in item)));
       const unresolved = rejections.filter(item => (item.status ?? 'unresolved') === 'unresolved' && Boolean(item.id));
-      const unresolvedIds = new Set(unresolved.map(item => item.id!));
+      const actionable = unresolved.filter(item => item.waitingForEvidenceChange !== true);
+      const quarantined = unresolved.filter(item => item.waitingForEvidenceChange === true);
+      const unresolvedIds = new Set(actionable.map(item => item.id!));
       const selectedIds = state.selectedRejectionIds.filter(id => unresolvedIds.has(id));
-      const rejectionDetails = rejections.length === 0 ? '' : `<details class="stx-memory-capture-rejections" ${unresolved.length ? 'open' : ''}><summary>失败项 ${unresolved.length} 条待处理 / ${rejections.length} 条总计</summary><div class="stx-memory-rejection-list">${rejections.map((rejection) => {
+      const rejectionDetails = rejections.length === 0 ? '' : `<details class="stx-memory-capture-rejections" ${actionable.length ? 'open' : ''}><summary>失败项 ${quarantined.length} 条隔离 / ${rejections.length} 条总计</summary><div class="stx-memory-rejection-list">${rejections.map((rejection) => {
         const rejectionId = rejection.id ?? '';
-        const pending = (rejection.status ?? 'unresolved') === 'unresolved';
+        const isolated = (rejection.status ?? 'unresolved') === 'unresolved' && rejection.waitingForEvidenceChange === true;
+        const pending = (rejection.status ?? 'unresolved') === 'unresolved' && !isolated;
         const sourceRefs = rejection.sourceRefs ?? [];
-        const statusLabel = pending ? '待处理' : rejection.status === 'repaired' ? '已修复' : rejection.status === 'ignored' ? '已忽略' : '处理中';
+        const statusLabel = isolated ? '已隔离，等待新证据' : pending ? '自动处理中' : rejection.status === 'repaired' ? '已修复' : rejection.status === 'ignored' ? '已忽略' : '处理中';
         const diagnostics = [
           `reasonCode=${String(rejection.code ?? 'MEMORY_CAPTURE_REJECTED')}`,
           rejection.requestId ? `requestId=${rejection.requestId}` : '',
@@ -1989,8 +2104,8 @@ export function renderMemoryWorkbench(
           rejection.recordType ? `collection=${rejection.recordType}` : '',
           rejection.fieldPath ? `path=${rejection.fieldPath}` : '',
         ].filter(Boolean).join(' · ');
-        return `<article class="stx-memory-rejection-item" data-rejection-status="${escapeHtml(rejection.status ?? 'unresolved')}"><label><input ${uiControl('checkbox')} type="checkbox" data-capture-rejection-id="${escapeHtml(rejectionId)}" ${selectedIds.includes(rejectionId) ? 'checked' : ''} ${!pending || !rejectionId || state.busyAction ? 'disabled' : ''}><span><strong>${escapeHtml(String(rejection.recordType ?? '记录'))} · ${escapeHtml(rejection.fieldPath ?? '结构')}</strong><small>${escapeHtml(rejection.message)}</small><code>${escapeHtml(diagnostics)}</code></span>${renderStatusChip(statusLabel, pending ? 'warning' : rejection.status === 'repaired' ? 'success' : 'neutral')}</label>${sourceRefs.length ? `<div class="stx-memory-rejection-sources">${sourceRefs.map(ref => renderSourceReference(ref)).join('')}</div>` : ''}</article>`;
-      }).join('')}</div>${unresolved.length ? `<div class="stx-memory-rejection-actions"><span>已选 ${selectedIds.length} 项</span><button ${uiControl('button', 'neutral')} type="button" data-action="ignore-capture-rejections" data-audit-id="${escapeHtml(record.id ?? '')}" ${!selectedIds.length || !controller.ignoreCaptureRejections || state.busyAction ? 'disabled' : ''}>忽略所选</button></div>` : ''}</details>`;
+        return `<article class="stx-memory-rejection-item" data-rejection-status="${escapeHtml(isolated ? 'quarantined' : rejection.status ?? 'unresolved')}"><label><input ${uiControl('checkbox')} type="checkbox" data-capture-rejection-id="${escapeHtml(rejectionId)}" ${selectedIds.includes(rejectionId) ? 'checked' : ''} ${!pending || !rejectionId || state.busyAction ? 'disabled' : ''}><span><strong>${escapeHtml(String(rejection.recordType ?? '记录'))} · ${escapeHtml(rejection.fieldPath ?? '结构')}</strong><small>${escapeHtml(rejection.message)}</small><code>${escapeHtml(diagnostics)}</code></span>${renderStatusChip(statusLabel, pending ? 'warning' : rejection.status === 'repaired' ? 'success' : 'neutral')}</label>${sourceRefs.length ? `<div class="stx-memory-rejection-sources">${sourceRefs.map(ref => renderSourceReference(ref)).join('')}</div>` : ''}</article>`;
+      }).join('')}</div>${actionable.length ? `<div class="stx-memory-rejection-actions"><span>已选 ${selectedIds.length} 项</span><button ${uiControl('button', 'neutral')} type="button" data-action="ignore-capture-rejections" data-audit-id="${escapeHtml(record.id ?? '')}" ${!selectedIds.length || !controller.ignoreCaptureRejections || state.busyAction ? 'disabled' : ''}>忽略所选</button></div>` : ''}</details>`;
       const safeTechnicalDetails = {
         id: record.id,
         jobId: record.jobId,
@@ -2003,13 +2118,14 @@ export function renderMemoryWorkbench(
         sourceCount,
         resource,
         model,
+        fallbackUsed: record.fallbackUsed,
       };
       return `<article class="stx-memory-audit-item"><div class="stx-memory-audit-heading"><div><span class="stx-memory-kicker">${kicker}</span><h3>${escapeHtml(heading)}</h3></div>${renderStatusChip(`${formatNumber(acceptedCount)} 条事实 · 已接受`, record.outcome === 'partial' ? 'warning' : 'neutral')}</div><dl class="stx-memory-audit-metrics">${metrics.map(([label, value]) => `<div title="${escapeHtml(value)}"><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>${rejectionDetails}<details class="stx-memory-audit-details"><summary>查看技术明细</summary><pre class="stx-memory-code">${escapeHtml(formatJson(safeTechnicalDetails))}</pre></details>${rollback ? `<div class="stx-memory-audit-actions">${rollback}</div>` : ''}</article>`;
   };
   const renderAudit = (): string => {
     const records = state.audits.length ? state.audits.map(renderAuditRecord).join('') : renderEmpty('暂无捕获审计', '新 Capture 完成后会在这里出现。');
     const cold = Boolean(popupUi && controller.loadMemoryPage);
-    return `<div class="stx-memory-page-actions"><p class="stx-memory-muted">合法项已经提交；失败项可在对应 Capture 中选择修复或忽略。</p></div><div class="stx-memory-audit-list" data-memory-page-list="audit">${cold ? '' : records}</div><details class="stx-memory-panel stx-memory-usage"><summary>主聊天 Token / usage（${state.usages.length} 条）</summary>${cold ? '<div class="stx-memory-usage-list" data-memory-page-list="usage"></div>' : `<pre class="stx-memory-code">${escapeHtml(formatJson(state.usages))}</pre>`}</details>`;
+    return `<div class="stx-memory-page-actions"><p class="stx-memory-muted">合法项自动提交；失败项由 AI 复核，证据不足时隔离且不会进入召回。</p></div><div class="stx-memory-audit-list" data-memory-page-list="audit">${cold ? '' : records}</div><details class="stx-memory-panel stx-memory-usage"><summary>主聊天 Token / usage（${state.usages.length} 条）</summary>${cold ? '<div class="stx-memory-usage-list" data-memory-page-list="usage"></div>' : `<pre class="stx-memory-code">${escapeHtml(formatJson(state.usages))}</pre>`}</details>`;
   };
   const renderData = (): string => {
     const sqlite = state.sqlite;
@@ -2056,8 +2172,8 @@ export function renderMemoryWorkbench(
         : undefined;
     const alertMarkup = runtimeDiagnostic ? `<div class="stx-memory-alert">${renderErrorDetails(runtimeDiagnostic, 'refresh-health')}</div>` : '';
     const chatIdentity = formatChatIdentity(overview);
-    const chatStorageLabel = overview?.bound ? formatBytes(overview.currentChatSizeBytes ?? 0) : '—';
-    const chatStorageRatio = overview?.bound ? formatPercent(overview.currentChatUsageRatio ?? 0) : '—';
+    const chatStorageLabel = !overview?.bound ? '—' : state.storageUsageStatus === 'loading' ? '计算中' : state.storageUsageStatus === 'error' ? '暂不可用' : formatBytes(overview.currentChatSizeBytes ?? 0);
+    const chatStorageRatio = !overview?.bound ? '—' : state.storageUsageStatus === 'loading' ? '计算中' : state.storageUsageStatus === 'error' ? '暂不可用' : formatPercent(overview.currentChatUsageRatio ?? 0);
     const sceneHeader = state.page === 'scenes' ? getSceneEventsHeader(sceneEventsState()) : undefined;
     const pageDescription = sceneHeader?.description ?? currentPage.description;
     const pageTitle = state.page === 'initialize' ? '初始化记忆' : currentPage.label;
@@ -2246,50 +2362,6 @@ export function renderMemoryWorkbench(
           },
         });
       }
-    }
-    if (popupUi && controller.loadMemoryPage && state.page === 'inventory') {
-      const host = root.querySelector<HTMLElement>('.stx-memory-inventory-rows');
-      if (host) popupUi.mountList<import('../domain').InventoryItem>(host, {
-        id: `memory-inventory:${state.overview?.chatKey ?? 'unbound'}`,
-        ariaLabel: '当前物品与资源列表',
-        queryKey: JSON.stringify([state.overview?.chatKey ?? '', state.inventoryQuery.trim(), state.inventoryCategory]),
-        pageSize: 20,
-        overscan: 6,
-        maxCachedPages: 6,
-        itemHeight: 62,
-        itemGap: 7,
-        selectable: true,
-        selectedKey: state.selectedInventoryItemId,
-        getKey: item => item.id,
-        loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!('inventory-items', {
-          ...(cursor === undefined ? {} : { cursor }),
-          limit,
-          signal,
-          query: state.inventoryQuery.trim(),
-          filter: state.inventoryCategory ? { category: state.inventoryCategory } : {},
-          where: [{ field: 'status', op: 'in', value: ['confirmed', 'pending'] }],
-          orderBy: { field: 'updatedAt', direction: 'desc' },
-          includeTotal: true,
-        }),
-        renderItem: (item, context) => {
-          const states = state.inventoryStates.filter(entry => entry.itemId === item.id);
-          const summary = states.length === 0 ? '尚无数量记录' : states.map(entry => entry.availability === 'absent'
-            ? '已移除'
-            : entry.amount === undefined ? '数量未知' : `${entry.precision === 'approximate' ? '约 ' : ''}${entry.amount}${entry.unit}`).join(' / ');
-          return elementFromMarkup(`<button type="button" class="stx-memory-inventory-row" data-action="inventory-select" data-item-id="${escapeHtml(item.id)}" aria-pressed="${context.selected}"><span><strong>${escapeHtml(item.canonicalName)}</strong><small>${escapeHtml(INVENTORY_CATEGORY_LABELS[item.category])}</small></span><span>${escapeHtml(summary)}</span></button>`);
-        },
-        onSelect: (item) => {
-          state.selectedInventoryItemId = item.id;
-          if (!state.inventoryItems.some(value => value.id === item.id)) state.inventoryItems = [...state.inventoryItems, item];
-          state.inventoryEvents = [];
-          rerender();
-          if (controller.getInventoryHistory) void controller.getInventoryHistory(item.id).then(events => {
-            if (disposed || state.selectedInventoryItemId !== item.id) return;
-            state.inventoryEvents = [...events];
-            rerender();
-          }).catch(error => toast('error', '账本读取失败', '无法读取该物品的变动历史。', safeErrorCode(error, 'INTERNAL_ERROR')));
-        },
-      });
     }
     if (popupUi && controller.loadMemoryPage && state.page === 'scenes') {
       const host = root.querySelector<HTMLElement>('.stx-memory-scene-record-list');
@@ -2578,6 +2650,15 @@ export function renderMemoryWorkbench(
     if (action === 'toggle-filter-menu') { const filter = actionNode.dataset.filterMenu as 'kind' | 'status'; state.openFilter = state.openFilter === filter ? '' : filter; rerender(`#stx-memory-${filter}-filter-trigger`); return; }
     if (action === 'navigate') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (PAGES.some((item) => item.id === page)) void loadPage(page); return; }
     if (action === 'navigate-internal') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (INTERNAL_PAGES.some((item) => item.id === page)) void loadPage(page); return; }
+    if (action === 'inventory-set-scope') {
+      const scope = actionNode.dataset.scope;
+      if (scope !== 'current' && scope !== 'catalog') return;
+      state.inventoryScope = scope;
+      state.selectedInventoryItemId = '';
+      state.inventoryEvents = [];
+      void loadPage('inventory');
+      return;
+    }
     if (action === 'inventory-select') {
       const itemId = actionNode.dataset.itemId ?? '';
       if (!itemId) return;
@@ -2597,6 +2678,7 @@ export function renderMemoryWorkbench(
       if (!canonicalName || !controller.createInventoryItem) return;
       void runAction('inventory-create', async () => {
         const item = await controller.createInventoryItem!({ canonicalName });
+        state.inventoryScope = 'catalog';
         state.selectedInventoryItemId = item.id;
         state.inventoryNewName = '';
       }, '物品已新增', '物品目录已保存，可继续设置数量。', 'MEMORY_INVENTORY_ITEM_CREATED', () => loadPage('inventory'));
@@ -2634,7 +2716,10 @@ export function renderMemoryWorkbench(
       }, {
         expectedRevision: current?.revision ?? 0,
         idempotencyKey: crypto.randomUUID(),
-      }).then(() => undefined), '库存已更新', '变动已写入账本并同步当前状态。', 'MEMORY_INVENTORY_UPDATED', () => loadPage('inventory'));
+      }).then(() => undefined), '库存已更新', '变动已写入账本并同步当前状态。', 'MEMORY_INVENTORY_UPDATED', async () => {
+        state.inventoryScope = 'current';
+        await loadPage('inventory');
+      });
       return;
     }
     if (action === 'inventory-invalidate') { state.inventoryConfirmInvalidId = state.selectedInventoryItemId; rerender(); return; }
@@ -3077,7 +3162,9 @@ export function renderMemoryWorkbench(
         ...(messageId ? { messageId } : {}),
         ...(index !== undefined && Number.isSafeInteger(index) && index >= 0 ? { index } : {}),
       };
-      void navigateToMessage(target).catch(() => toast('warning', '无法跳转聊天楼层', '对应消息可能尚未加载或已被删除。', 'MEMORY_MESSAGE_NAVIGATION_UNAVAILABLE'));
+      void navigateToMessage(target)
+        .then(() => popupUi?.close())
+        .catch(() => toast('warning', '无法跳转聊天楼层', '对应消息可能尚未加载或已被删除。', 'MEMORY_MESSAGE_NAVIGATION_UNAVAILABLE'));
       return;
     }
     if (action === 'show-source-info') {
@@ -3433,7 +3520,10 @@ export function renderMemoryWorkbench(
     rerender();
   }, { signal: abortController.signal });
 
-  removeOverviewChanged = controller.onOverviewChanged?.(() => { void refreshLiveSnapshot(); });
+  removeOverviewChanged = controller.onOverviewChanged?.(() => {
+    scheduleStorageUsageRefresh();
+    void refreshLiveSnapshot();
+  });
   render();
   void document.fonts?.ready.then(() => refreshGraphMarquees(root));
   traceMemoryStartup('workbench:initial-rendered');
@@ -3454,10 +3544,11 @@ export function renderMemoryWorkbench(
     }
   });
   return () => {
-    disposed = true; pageRequestId += 1; backgroundPageRequestId += 1; progressRequestId += 1; librarySearchRequestId += 1; overviewRequestId += 1; abortController.abort();
+    disposed = true; pageRequestId += 1; backgroundPageRequestId += 1; progressRequestId += 1; librarySearchRequestId += 1; overviewRequestId += 1; storageUsageRequestId += 1; abortController.abort();
     if (searchTimer) window.clearTimeout(searchTimer);
     if (graphSearchTimer) window.clearTimeout(graphSearchTimer);
     if (progressTimer) window.clearTimeout(progressTimer);
+    if (storageUsageTimer) window.clearTimeout(storageUsageTimer);
     if (renderFrame !== undefined) window.cancelAnimationFrame(renderFrame);
     if (graphMarqueeResizeFrame !== undefined) window.cancelAnimationFrame(graphMarqueeResizeFrame);
     if (graphListModeFrame !== undefined) window.cancelAnimationFrame(graphListModeFrame);

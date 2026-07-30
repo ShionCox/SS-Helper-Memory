@@ -1920,26 +1920,40 @@
 .stx-memory-workbench .stx-memory-inventory-toolbar label,
 .stx-memory-workbench .stx-memory-inventory-command label,
 .stx-memory-workbench .stx-memory-inventory-create label { min-width: 0; display: grid; gap: 4px; color: var(--ss-theme-muted); font-size: .62rem; }
+.stx-memory-workbench .stx-memory-inventory-scope { justify-self: start; }
 .stx-memory-workbench .stx-memory-inventory-rows,
 .stx-memory-workbench .stx-memory-inventory-history { min-height: 0; display: grid; gap: 7px; overflow: auto; }
 .stx-memory-workbench .stx-memory-inventory-rows { max-height: 62vh; }
 .stx-memory-workbench .stx-memory-inventory-row {
   min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px;
+  display: grid;
+  gap: 6px;
+  padding: 9px 10px;
   border: 1px solid transparent;
   border-radius: 7px;
   color: var(--ss-theme-text);
   background: color-mix(in srgb, var(--ss-theme-bg) 72%, transparent);
   text-align: left;
 }
-.stx-memory-workbench .stx-memory-inventory-row[aria-pressed="true"] { border-color: var(--ss-theme-accent); background: color-mix(in srgb, var(--ss-theme-accent) 12%, var(--ss-theme-bg)); }
-.stx-memory-workbench .stx-memory-inventory-row > span:first-child { min-width: 0; display: grid; gap: 2px; }
+.stx-memory-workbench .stx-memory-inventory-row[data-selected="true"] { border-color: var(--ss-theme-accent); background: color-mix(in srgb, var(--ss-theme-accent) 12%, var(--ss-theme-bg)); }
+.stx-memory-workbench .stx-memory-inventory-row-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+.stx-memory-workbench .stx-memory-inventory-row-main > span:first-child { min-width: 0; display: grid; gap: 2px; }
 .stx-memory-workbench .stx-memory-inventory-row small,
-.stx-memory-workbench .stx-memory-inventory-row > span:last-child { color: var(--ss-theme-muted); font-size: .6rem; }
+.stx-memory-workbench .stx-memory-inventory-row-main > span:last-child { color: var(--ss-theme-muted); font-size: .6rem; }
+.stx-memory-workbench .stx-memory-inventory-row footer { display: flex; justify-content: flex-end; }
+.stx-memory-workbench .stx-memory-inventory-source { min-height: 24px; color: var(--ss-theme-muted); font-size: .58rem; }
+.stx-memory-workbench .stx-memory-inventory-source.is-muted { display: inline-flex; align-items: center; }
 .stx-memory-workbench .stx-memory-inventory-detail-heading,
 .stx-memory-workbench .stx-memory-inventory-create,
 .stx-memory-workbench .stx-memory-inventory-event header,
@@ -1950,13 +1964,18 @@
 .stx-memory-workbench .stx-memory-inventory-event p,
 .stx-memory-workbench .stx-memory-inventory-event blockquote { margin: 0; }
 .stx-memory-workbench .stx-memory-inventory-create label { flex: 1; }
+.stx-memory-workbench .stx-memory-inventory-current-states { display: grid; gap: 7px; }
+.stx-memory-workbench .stx-memory-inventory-current-states > article { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 10px; border: 1px solid var(--ss-theme-border); border-radius: 7px; }
+.stx-memory-workbench .stx-memory-inventory-current-states > article > span { display: grid; gap: 2px; }
+.stx-memory-workbench .stx-memory-inventory-current-states small,
+.stx-memory-workbench .stx-memory-inventory-no-state { color: var(--ss-theme-muted); font-size: .62rem; }
 .stx-memory-workbench .stx-memory-inventory-command { grid-template-columns: repeat(4, minmax(0, 1fr)) auto; align-items: end; padding: 10px; border: 1px solid var(--ss-theme-border); border-radius: 7px; }
 .stx-memory-workbench .stx-memory-inventory-history > h4 { margin: 4px 0; }
 .stx-memory-workbench .stx-memory-inventory-event { display: grid; gap: 6px; padding: 10px; border-left: 2px solid var(--ss-theme-accent); background: color-mix(in srgb, var(--ss-theme-bg) 75%, transparent); }
 .stx-memory-workbench .stx-memory-inventory-event time,
 .stx-memory-workbench .stx-memory-inventory-event footer { color: var(--ss-theme-muted); font-size: .58rem; }
 .stx-memory-workbench .stx-memory-inventory-event blockquote { padding: 7px 9px; border-radius: 5px; background: color-mix(in srgb, var(--ss-theme-bg) 88%, transparent); font-size: .62rem; }
-.stx-memory-workbench .stx-memory-inventory-row:focus-visible { outline: 2px solid var(--ss-theme-accent); outline-offset: 2px; }
+.stx-memory-workbench .stx-memory-inventory-row-main:focus-visible { outline: 2px solid var(--ss-theme-accent); outline-offset: 2px; }
 @media (max-width: 900px) {
   .stx-memory-workbench .stx-memory-inventory-shell { grid-template-columns: 1fr; }
   .stx-memory-workbench .stx-memory-inventory-command { grid-template-columns: repeat(2, minmax(0, 1fr)); }

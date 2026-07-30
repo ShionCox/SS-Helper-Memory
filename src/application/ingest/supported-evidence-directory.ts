@@ -90,6 +90,22 @@ export function buildSupportedEvidenceDirectory(
   };
 }
 
+/** Hashes writable evidence plus read-only neighbouring context used by AI review. */
+export function buildEvidenceWindowHash(
+  sources: readonly SourceBlock[],
+  writableSourceRefs: readonly string[],
+): string {
+  const evidenceSetHash = buildSupportedEvidenceDirectory(sources, writableSourceRefs).evidenceSetHash;
+  const context = sources.map(source => [
+    source.id,
+    source.floor ?? '',
+    source.kind,
+    source.role,
+    source.content,
+  ].join('\0')).join('\u0001');
+  return stableHash(`${evidenceSetHash}\0${context}`);
+}
+
 export function evidenceSpanById(
   directory: SupportedEvidenceDirectory,
   evidenceSpanId: string,

@@ -182,6 +182,7 @@ export interface MemoryJobCheckpoint {
   pendingRepairCount?: number;
   retryableRepairCount?: number;
   exhaustedRepairCount?: number;
+  quarantinedCount?: number;
   reviewRequiredCount?: number;
   unresolvedRejectionCount?: number;
   repairedCount?: number;
@@ -224,6 +225,10 @@ export interface CaptureRepairQueueRecord {
   maxAttempts?: number;
   candidateSetHash?: string;
   evidenceSetHash?: string;
+  /** First semantic review failed; do not retry until the source window changes. */
+  waitingForEvidenceChange?: boolean;
+  /** The one evidence-change retry has already been released. */
+  evidenceRetryUsed?: boolean;
   repairPolicyVersion?: number;
   resolutionMode?: RepairResolutionMode;
   fieldActions?: RepairFieldAction[];
@@ -392,6 +397,8 @@ export interface AutomaticIngestRejection {
   lastAttemptAt?: number;
   repairedAt?: number;
   ignoredAt?: number;
+  /** Non-blocking quarantine: the record is retried only after evidence changes. */
+  waitingForEvidenceChange?: boolean;
 }
 
 export interface AutomaticIngestResult {
@@ -422,6 +429,40 @@ export type AutomaticProposalErrorCode =
   | 'non_chinese_key'
   | 'duplicate_proposal'
   | 'quality_below_threshold';
+
+/** Source-locatable validation failures that an independent AI review may re-extract. */
+export const AI_REPAIRABLE_PROPOSAL_CODES = Object.freeze([
+  'invalid_shape',
+  'invalid_enum',
+  'invalid_reference',
+  'entity_ref_unsupported',
+  'schema_validation_failed',
+  'dependency_invalid',
+  'unknown_field',
+  'content_length',
+  'invalid_confidence',
+  'missing_evidence',
+  'empty_excerpt',
+  'excerpt_mismatch',
+  'non_chinese_key',
+] satisfies readonly AutomaticProposalErrorCode[]);
+
+/** Fail-closed outcomes that must never block Capture or spend an AI review call. */
+export const AUTO_IGNORED_PROPOSAL_CODES = Object.freeze([
+  'batch_invalid_json',
+  'missing_source',
+  'cross_chat_source',
+  'duplicate_proposal',
+  'quality_below_threshold',
+] satisfies readonly AutomaticProposalErrorCode[]);
+
+export function isAiRepairableProposalCode(code: AutomaticProposalErrorCode): boolean {
+  return (AI_REPAIRABLE_PROPOSAL_CODES as readonly AutomaticProposalErrorCode[]).includes(code);
+}
+
+export function isAutoIgnoredProposalCode(code: AutomaticProposalErrorCode): boolean {
+  return (AUTO_IGNORED_PROPOSAL_CODES as readonly AutomaticProposalErrorCode[]).includes(code);
+}
 
 export type AutomaticProposalValidation =
   | { ok: true; value: ValidatedAutomaticFact }

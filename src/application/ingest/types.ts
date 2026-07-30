@@ -130,6 +130,7 @@ export interface MemoryExtractionAudit {
   resourceId?: string;
   model?: string;
   latencyMs?: number;
+  fallbackUsed?: boolean;
   usage?: MemoryTokenUsage | null;
 }
 
@@ -239,6 +240,8 @@ export interface StructuredCaptureResult {
   claims: StructuredClaim[];
   /** Required and normalized to [] at the LLM boundary. */
   inventoryOperations?: StructuredInventoryOperation[];
+  /** AI review decisions. `emit` candidates still pass the normal hard validators. */
+  repairDecisions?: StructuredRepairDecision[];
   rejections?: AutomaticIngestRejection[];
   diagnostics?: {
     parser?: string;
@@ -280,6 +283,22 @@ export interface KnownActorContextItem {
   canonicalName: string;
   aliases: string[];
   status: 'confirmed' | 'pending';
+}
+
+export interface StructuredRepairDecision {
+  repairId: string;
+  action: 'emit' | 'drop';
+  /** Present only for emit; used to match the accepted candidate after validation. */
+  localId?: string;
+  /** Server-derived index in the normalized target collection. */
+  itemIndex?: number;
+  /** Server-derived sources of the emitted candidate; never trusted from model output. */
+  sourceRefs?: string[];
+}
+
+export interface StructuredRepairTarget {
+  repairId: string;
+  issues: Array<{ path: string; keyword: string; expected: string }>;
 }
 
 export interface KnownInventoryContextItem {
@@ -346,6 +365,8 @@ export interface MemoryExtractionInput {
   repair?: RepairAttemptContext & {
     collection: 'actorCandidates' | 'locationCandidates' | 'itemCandidates' | 'episodes' | 'claims' | 'inventoryOperations';
     issues: Array<{ path: string; keyword: string; expected: string }>;
+    /** One to four source-overlapping records reviewed in the same request. */
+    targets?: StructuredRepairTarget[];
     parentRequestId?: string;
     resourceId?: string;
     model?: string;

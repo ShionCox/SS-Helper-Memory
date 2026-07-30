@@ -224,6 +224,7 @@ describe('Memory UI 展示适配', () => {
         jobId: 'job:audit', batchIndex: 1, status: 'completed', accepted: 0,
         sourceRefs: Array.from({ length: 6 }, (_, index) => `message:${index}`),
         rejected: Array.from({ length: 12 }, () => ({})), resource: '__builtin_tavern__',
+        requestId: 'repair-request', model: 'repair-model', fallbackUsed: true,
       }],
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -231,12 +232,15 @@ describe('Memory UI 展示适配', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const metrics = container.querySelector('.stx-memory-audit-metrics');
-    expect(metrics?.children).toHaveLength(5);
+    expect(metrics?.children).toHaveLength(6);
     expect(metrics?.querySelectorAll('dd')[0]?.textContent).toBe('6 项');
     expect(metrics?.querySelectorAll('dd')[1]?.textContent).toBe('0 条');
     expect(metrics?.querySelectorAll('dd')[2]?.textContent).toBe('12 项');
     expect(metrics?.querySelectorAll('dd')[3]?.textContent).toBe('酒馆内置');
+    expect(metrics?.querySelectorAll('dd')[4]?.textContent).toBe('repair-model');
+    expect(metrics?.querySelectorAll('dd')[5]?.textContent).toBe('使用回退');
     expect(container.textContent).toContain('查看技术明细');
+    expect(container.textContent).toContain('repair-request');
     dispose();
   });
 
@@ -258,7 +262,7 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).toContain('33 条事实');
     expect(container.textContent).toContain('酒馆内置');
     expect(container.textContent).not.toContain('初始化最终写入');
-    expect(container.querySelector('.stx-memory-audit-metrics')?.children).toHaveLength(5);
+    expect(container.querySelector('.stx-memory-audit-metrics')?.children).toHaveLength(6);
     dispose();
   });
 
@@ -342,6 +346,7 @@ describe('Memory UI 展示适配', () => {
     const controller = workbenchController({ updateFact: async (_id, content) => { updates.push(content); } });
     const dispose = renderMemoryWorkbench(container, controller);
     await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(container.querySelector('.stx-memory-status-storage')?.textContent).toContain('2.00 KB'));
 
     expect(container.querySelectorAll('[data-action="navigate"]')).toHaveLength(11);
     expect([...container.querySelectorAll('[data-action="navigate"]')].slice(0, 3).map((node) => node.getAttribute('data-page'))).toEqual(['overview', 'initialize', 'actors']);
@@ -354,7 +359,6 @@ describe('Memory UI 展示适配', () => {
     expect(container.querySelectorAll('[data-action="toggle-filter-menu"]')).toHaveLength(2);
     expect(container.querySelector('[data-filter="query"]')?.getAttribute('data-ss-helper-control')).toBe('input');
     expect(container.querySelector('.stx-memory-page-heading .stx-memory-kicker')).toBeNull();
-    expect(container.querySelector('.stx-memory-status-storage')?.textContent).toContain('2.00 KB');
     expect(container.querySelector('.stx-memory-status-storage')?.textContent).toContain('25%');
     expect(container.querySelector('.stx-memory-library-content-card')).not.toBeNull();
     expect(container.querySelectorAll('.stx-memory-library-metric')).toHaveLength(4);
@@ -395,7 +399,7 @@ describe('Memory UI 展示适配', () => {
     expect(container.querySelector('.stx-memory-inventory-shell')).not.toBeNull();
     expect(container.textContent).toContain('瓶装水');
     expect(container.textContent).toContain('20瓶');
-    expect(container.textContent).toContain('22 → 20');
+    expect(container.textContent).toContain('盘点更新：22瓶 → 20瓶');
     const amount = container.querySelector<HTMLInputElement>('[data-inventory-input="amount"]')!;
     amount.value = '18';
     amount.dispatchEvent(new Event('input', { bubbles: true }));
@@ -405,6 +409,126 @@ describe('Memory UI 展示适配', () => {
     (container.querySelector('[data-action="inventory-command"]') as HTMLButtonElement).click();
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(applyInventoryCommand).toHaveBeenCalledWith(expect.objectContaining({ itemId: item.id, operation: 'set', amount: 18, unit: '瓶', origin: 'manual' }), expect.objectContaining({ expectedRevision: 2 }));
+    dispose();
+  });
+
+  it('把未注明数量的重复快照表达为存在确认而不是未知数值变化', async () => {
+    const item = { id: 'item:kit', workspaceId: 'w', canonicalName: '缝合包', aliases: [], category: 'medicine' as const, status: 'confirmed' as const, confidence: 1, sourceRefs: ['message:2'], createdAt: 1, updatedAt: 2 };
+    const inventoryState = { id: 'state:kit', workspaceId: 'w', chatKey: 'chat:1', itemId: item.id, measureKind: 'quantity' as const, unit: '', unitKey: 'unitless', precision: 'unknown' as const, availability: 'unknown' as const, lastEventId: 'event:kit:4', sourceRefs: ['message:2', 'message:4'], updatedAtFloor: 4, revision: 2, createdAt: 1, updatedAt: 4 };
+    const events = [2, 4].map(floor => ({ id: `event:kit:${floor}`, workspaceId: 'w', chatKey: 'chat:1', itemId: item.id, operation: 'set' as const, measureKind: 'quantity' as const, unit: '', unitKey: 'unitless', precision: 'unknown' as const, reason: 'recount' as const, availability: 'unknown' as const, sourceRef: `message:${floor}`, evidenceExcerpt: '缝合包', floor, occurredAt: floor, recordedAt: floor, origin: 'automatic' as const, confidence: 1 }));
+    const container = document.createElement('div');
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listInventoryStates: async () => ({ items: [item], states: [inventoryState] }),
+      getInventoryHistory: async () => events,
+    }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="inventory"]') as HTMLButtonElement).click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(container.textContent).toContain('清单中已确认存在，原文未注明数量');
+    expect(container.textContent).toContain('确认物品存在，原文未注明数量');
+    expect(container.textContent).toContain('再次确认物品仍存在，原文仍未注明数量');
+    expect(container.textContent).not.toContain('未知 → 未知');
+    dispose();
+  });
+
+  it('物品页一次展示当前聊天全部状态，目录隔离旧物品并让来源跳转后关闭工作台', async () => {
+    const items = Array.from({ length: 24 }, (_, index) => ({
+      id: `item:${index}`,
+      workspaceId: 'w',
+      canonicalName: index === 0 ? '瓶装水' : `物品${index}`,
+      aliases: [],
+      category: 'food' as const,
+      status: 'confirmed' as const,
+      confidence: 1,
+      sourceRefs: [`message:${index}`],
+      createdAt: index,
+      updatedAt: index,
+    }));
+    const catalogOnly = { ...items[0]!, id: 'item:catalog', canonicalName: '其他聊天旧物品', sourceRefs: ['message:99'], updatedAt: 99 };
+    const states = items.map((item, index) => ({
+      id: `state:${index}`,
+      workspaceId: 'w',
+      chatKey: 'chat:1',
+      itemId: item.id,
+      measureKind: 'quantity' as const,
+      ...(index === 0 ? { amount: 20 } : {}),
+      unit: index === 0 ? '个' : '',
+      unitKey: index === 0 ? '个' : 'unitless',
+      precision: index === 0 ? 'exact' as const : 'unknown' as const,
+      availability: index === 0 ? 'active' as const : 'unknown' as const,
+      lastEventId: `event:${index}`,
+      sourceRefs: index === 0 ? ['message:2', 'message:8'] : [`message:${index}`],
+      updatedAtFloor: index === 0 ? 8 : index,
+      revision: 1,
+      createdAt: index,
+      updatedAt: index,
+    }));
+    const mountList = vi.fn();
+    const close = vi.fn();
+    const navigateToMessage = vi.fn(async () => undefined);
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(
+      container,
+      workbenchController({
+        listInventoryStates: async () => ({ items: [...items, catalogOnly], states }),
+        getInventoryHistory: async () => [],
+        loadMemoryPage: vi.fn(async () => ({ items: [], total: 0 })) as never,
+      }),
+      vi.fn(),
+      { refreshControls: vi.fn(), mountList, close } as never,
+      undefined,
+      navigateToMessage,
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="inventory"]') as HTMLButtonElement).click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(container.querySelectorAll('.stx-memory-inventory-row')).toHaveLength(24);
+    expect(container.textContent).not.toContain('其他聊天旧物品');
+    expect(container.textContent).toContain('清单中已确认存在，原文未注明数量');
+    expect(container.textContent).toContain('来源：第 8 层');
+    expect(mountList).not.toHaveBeenCalled();
+
+    (container.querySelector('[data-action="inventory-set-scope"][data-scope="catalog"]') as HTMLButtonElement).click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(container.querySelectorAll('.stx-memory-inventory-row')).toHaveLength(25);
+    expect(container.textContent).toContain('其他聊天旧物品');
+    expect(container.textContent).toContain('当前聊天无状态');
+
+    const countBeforeSelection = container.querySelectorAll('.stx-memory-inventory-row').length;
+    (container.querySelector('[data-action="inventory-select"][data-item-id="item:0"]') as HTMLButtonElement).click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(container.querySelectorAll('.stx-memory-inventory-row')).toHaveLength(countBeforeSelection);
+
+    (container.querySelector('[data-action="jump-to-message"][data-message-id="8"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(navigateToMessage).toHaveBeenCalledWith({ messageId: '8', index: 8 }));
+    expect(close).toHaveBeenCalledTimes(1);
+    dispose();
+  });
+
+  it('库存来源跳转失败时保留工作台并显示中文诊断', async () => {
+    const item = { id: 'item:water-failed', workspaceId: 'w', canonicalName: '瓶装水', aliases: [], category: 'food' as const, status: 'confirmed' as const, confidence: 1, sourceRefs: ['message:8'], createdAt: 1, updatedAt: 2 };
+    const inventoryState = { id: 'state:water-failed', workspaceId: 'w', chatKey: 'chat:1', itemId: item.id, measureKind: 'quantity' as const, amount: 20, unit: '个', unitKey: '个', precision: 'exact' as const, availability: 'active' as const, lastEventId: 'event:water-failed', sourceRefs: ['message:8'], updatedAtFloor: 8, revision: 1, createdAt: 1, updatedAt: 2 };
+    const close = vi.fn();
+    const notify = vi.fn();
+    const container = document.createElement('div');
+    const dispose = renderMemoryWorkbench(
+      container,
+      workbenchController({ listInventoryStates: async () => ({ items: [item], states: [inventoryState] }), getInventoryHistory: async () => [] }),
+      notify,
+      { refreshControls: vi.fn(), close } as never,
+      undefined,
+      vi.fn(async () => Promise.reject(new Error('message unavailable'))),
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="inventory"]') as HTMLButtonElement).click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    (container.querySelector('[data-action="jump-to-message"][data-message-id="8"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledWith(expect.objectContaining({ code: 'MEMORY_MESSAGE_NAVIGATION_UNAVAILABLE' })));
+    expect(close).not.toHaveBeenCalled();
     dispose();
   });
 
@@ -522,6 +646,90 @@ describe('Memory UI 展示适配', () => {
     (overview?.querySelector('[data-action="navigate"][data-page="scenes"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(container.querySelector('.stx-memory-page-heading h2')?.textContent).toBe('场景与事件');
+    dispose();
+  });
+
+  it('详细占用统计完成前显示计算中，完成后显示真实字节和占比', async () => {
+    const resolvedStatus = {
+      ...await workbenchController().getSqliteStatus(),
+      workspaceSizeBytes: 16_384,
+      currentChatSizeBytes: 4_096,
+      currentChatUsageRatio: 0.25,
+    };
+    let resolveStatus!: (value: typeof resolvedStatus) => void;
+    const getSqliteStatus = vi.fn(() => new Promise<typeof resolvedStatus>(resolve => { resolveStatus = resolve; }));
+    const container = document.createElement('div');
+    const dispose = renderMemoryWorkbench(container, workbenchController({ getSqliteStatus }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(container.querySelector('.stx-memory-status-storage')?.textContent).toContain('计算中');
+    expect(getSqliteStatus).toHaveBeenCalledWith({ detailed: true });
+    resolveStatus(resolvedStatus);
+    await vi.waitFor(() => expect(container.querySelector('.stx-memory-status-storage')?.textContent).toContain('4.00 KB'));
+    expect(container.querySelector('.stx-memory-status-storage')?.textContent).toContain('25%');
+    dispose();
+  });
+
+  it('详细占用统计失败时显示暂不可用，并把连续通知防抖成一次重新统计', async () => {
+    let overviewChanged: (() => void) | undefined;
+    const status = await workbenchController().getSqliteStatus();
+    const getSqliteStatus = vi.fn(async () => status);
+    const container = document.createElement('div');
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getSqliteStatus,
+      onOverviewChanged: (listener) => { overviewChanged = listener; return () => undefined; },
+    }));
+    await vi.waitFor(() => expect(container.querySelector('.stx-memory-status-storage')?.textContent).toContain('2.00 KB'));
+    getSqliteStatus.mockClear();
+
+    overviewChanged?.();
+    overviewChanged?.();
+    overviewChanged?.();
+    await new Promise(resolve => setTimeout(resolve, 750));
+    expect(getSqliteStatus).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(getSqliteStatus).toHaveBeenCalledTimes(1), { timeout: 400 });
+    dispose();
+
+    const failedContainer = document.createElement('div');
+    const failedDispose = renderMemoryWorkbench(failedContainer, workbenchController({
+      getSqliteStatus: async () => Promise.reject(new Error('offline')),
+    }));
+    await vi.waitFor(() => expect(failedContainer.querySelector('.stx-memory-status-storage')?.textContent).toContain('暂不可用'));
+    failedDispose();
+  });
+
+  it('聊天切换发生在占用扫描期间时，会为新聊天重新统计并结束计算中状态', async () => {
+    let overviewChanged: (() => void) | undefined;
+    let currentOverview = await workbenchController().getOverview();
+    let delayNextOverview = false;
+    let resolveOverview!: () => void;
+    const getOverview = vi.fn(async () => {
+      if (delayNextOverview) {
+        delayNextOverview = false;
+        await new Promise<void>(resolve => { resolveOverview = resolve; });
+      }
+      return currentOverview;
+    });
+    const status = await workbenchController().getSqliteStatus();
+    const getSqliteStatus = vi.fn(async () => status);
+    const container = document.createElement('div');
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getOverview,
+      getSqliteStatus,
+      onOverviewChanged: (listener) => { overviewChanged = listener; return () => undefined; },
+    }));
+    await vi.waitFor(() => expect(container.querySelector('.stx-memory-status-storage')?.textContent).toContain('2.00 KB'));
+    getSqliteStatus.mockClear();
+
+    delayNextOverview = true;
+    overviewChanged?.();
+    await new Promise(resolve => setTimeout(resolve, 850));
+    expect(getSqliteStatus).toHaveBeenCalledTimes(1);
+
+    currentOverview = { ...currentOverview, chatKey: 'chat:2', chatName: '新聊天' };
+    resolveOverview();
+    await vi.waitFor(() => expect(getSqliteStatus).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(container.querySelector('.stx-memory-status-storage')?.textContent).not.toContain('计算中'));
     dispose();
   });
 

@@ -22,7 +22,7 @@ const REMOVED = /(?:已丢弃|已耗尽|已失去|已销毁|已用完|不再持�
 const UNKNOWN = /若干/u;
 const APPROXIMATE = /(?:约|大约|大概|近)/u;
 const COVERAGE = /(?:可维持|维持|天份|日份)/u;
-const NUMBER_WITH_UNIT = /(?<raw>(?:[x×]\s*)?(?:约|大约|大概|近)?\s*(?<amount>\d+(?:\.\d+)?)\s*(?<unit>天份|日份|天|日|小时|瓶|包|盒|枚|份|块|支|套|罐|袋|个|件|把|克|千克|公斤|毫克|毫升|升|g|kg|mg|ml|l))(?=$|[（(）)\s，,、；;])/iu;
+const NUMBER_WITH_UNIT = /(?<raw>(?:[x×]\s*)?(?:约|大约|大概|近)?\s*(?<amount>\d+(?:\.\d+)?)\s*(?<unit>天份|日份|天|日|小时|瓶|包|盒|枚|粒|株|份|块|支|套|罐|袋|个|件|把|克|千克|公斤|毫克|毫升|升|g|kg|mg|ml|l))(?=$|[（(）)\s，,、；;])/iu;
 const MULTIPLIER = /(?<raw>[x×]\s*(?<amount>\d+(?:\.\d+)?))(?=$|[（(）)\s，,、；;])/iu;
 
 export interface DeterministicInventoryProposal {
@@ -79,12 +79,17 @@ function nestedQuantifiedItems(value: string): string[] {
 
 function stripStateSuffix(value: string): string {
   return value
-    .replace(/[（(](?:约|大约|大概|近)?\s*\d+(?:\.\d+)?\s*(?:天份|日份|天|日|小时|瓶|包|盒|枚|份|块|支|套|罐|袋|个|件|把|克|千克|公斤|毫克|毫升|升|g|kg|mg|ml|l)[）)]\s*$/iu, '')
+    .replace(/[（(][^（）()]*(?:已使用|已安装|已丢弃|已耗尽|已失去|已销毁|已用完|不再持有|已接种|已播种|剩余|新建|运行中)[^（）()]*[）)]\s*$/u, '')
+    .replace(/[（(](?:约|大约|大概|近)?\s*\d+(?:\.\d+)?\s*(?:天份|日份|天|日|小时|瓶|包|盒|枚|粒|株|份|块|支|套|罐|袋|个|件|把|克|千克|公斤|毫克|毫升|升|g|kg|mg|ml|l)[）)]\s*$/iu, '')
     .replace(/[x×]\s*\d+(?:\.\d+)?\s*$/iu, '')
-    .replace(/[x×]?\s*(?:约|大约|大概|近)?\s*\d+(?:\.\d+)?\s*(?:天份|日份|天|日|小时|瓶|包|盒|枚|份|块|支|套|罐|袋|个|件|把|克|千克|公斤|毫克|毫升|升|g|kg|mg|ml|l)\s*$/iu, '')
+    .replace(/[x×]?\s*(?:约|大约|大概|近)?\s*\d+(?:\.\d+)?\s*(?:天份|日份|天|日|小时|瓶|包|盒|枚|粒|株|份|块|支|套|罐|袋|个|件|把|克|千克|公斤|毫克|毫升|升|g|kg|mg|ml|l)\s*$/iu, '')
     .replace(/若干(?:[（(].*?[）)])?\s*$/u, '')
-    .replace(/[（(](?:已丢弃|已耗尽|已失去|已销毁|已用完|不再持有|已使用)[^）)]*[）)]\s*$/u, '')
     .trim();
+}
+
+/** Comparison key for model candidates covered by an explicit snapshot. */
+export function canonicalInventoryName(value: string): string {
+  return normalizeInventoryName(stripStateSuffix(value));
 }
 
 function quantityOf(value: string): {
