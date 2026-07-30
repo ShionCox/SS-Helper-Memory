@@ -62,7 +62,8 @@ describe('Memory 总结策略', () => {
     ]);
     const charBatches = buildSummaryBatches(messages, { batchMode: 'chars', batchChars: 2_000, overlapFloors: 1 });
     expect(charBatches).toHaveLength(4);
-    expect(charBatches[1]?.map((source) => source.floor)).toEqual([2, 3, 4]);
+    expect(charBatches[1]?.map((source) => source.floor)).toEqual([3, 4]);
+    expect(charBatches.every(batch => batch.reduce((total, source) => total + source.content.length, 0) <= 2_000)).toBe(true);
   });
 
   it('marks overlap as read-only while keeping current sources writable', () => {
@@ -93,16 +94,14 @@ describe('Memory 总结策略', () => {
       { writableSourceRefs: ['message:2'] },
     );
 
-    expect(plans[0]?.sources.map((source) => source.id)).toEqual([
-      'message:1:summary-part:1',
-      'message:1:summary-part:2',
-      'message:2:summary-part:1',
-      'message:2:summary-part:2',
+    expect(plans.map(plan => plan.sources.map(source => source.id))).toEqual([
+      ['message:2:summary-part:1'],
+      ['message:2:summary-part:2'],
     ]);
-    expect(plans[0]?.writableSourceRefs).toEqual([
-      'message:2:summary-part:1',
-      'message:2:summary-part:2',
+    expect(plans.map(plan => plan.writableSourceRefs).flat()).toEqual([
+      'message:2:summary-part:1', 'message:2:summary-part:2',
     ]);
+    expect(plans.every(plan => plan.sources.reduce((total, source) => total + source.content.length, 0) <= 2_000)).toBe(true);
     expect(plans[0]?.messageCount).toBe(1);
   });
 

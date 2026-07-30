@@ -67,6 +67,7 @@ export interface GenerationMemoryCoordinatorDependencies {
   readonly listTraces: () => Promise<readonly ActorMemoryTrace[]>;
   readonly resolveOwnerName: (name: string) => string | undefined;
   readonly listKnownOwners?: () => readonly { readonly ownerId: string; readonly names: readonly string[] }[];
+  readonly buildInventoryPrompt?: (userMessage: string, maxChars: number) => Promise<string>;
   readonly recall: (input: {
     readonly query: string;
     readonly scene: SceneCast;
@@ -250,7 +251,21 @@ export class GenerationMemoryCoordinator {
       expanded: verified.expanded,
       createdAt: now,
     };
-    const prompt = this.dependencies.buildPrompt(verified.results, castPlan, input.maxChars, intent.intentKind);
+    const inventoryPrompt = this.dependencies.buildInventoryPrompt
+      ? await generationStage('inventory_prompt', () => this.dependencies.buildInventoryPrompt!(input.userMessage, input.maxChars))
+      : '';
+    assertCurrent();
+    const inventoryBudget = inventoryPrompt ? inventoryPrompt.length + 1 : 0;
+    const basePrompt = this.dependencies.buildPrompt(verified.results, castPlan, Math.max(0, input.maxChars - inventoryBudget), intent.intentKind);
+    const prompt: ActorMemoryPromptResult = inventoryPrompt ? {
+      ...basePrompt,
+      prompt: [basePrompt.prompt, inventoryPrompt].filter(Boolean).join('\n'),
+      diagnostics: {
+        ...basePrompt.diagnostics,
+        maxChars: input.maxChars,
+        usedChars: [basePrompt.prompt, inventoryPrompt].filter(Boolean).join('\n').length,
+      },
+    } : basePrompt;
     assertCurrent();
     await generationStage('commit_prepared', () => this.dependencies.commitPrepared({
       state: sceneResolution.state,

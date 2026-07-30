@@ -1893,6 +1893,81 @@
   overflow: hidden;
 }
 
+/* Inventory ledger */
+.stx-memory-workbench .stx-memory-inventory-shell {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(240px, .75fr) minmax(0, 1.25fr);
+  gap: 12px;
+}
+.stx-memory-workbench .stx-memory-inventory-list,
+.stx-memory-workbench .stx-memory-inventory-detail {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--ss-theme-border);
+  border-radius: 8px;
+  background: var(--stx-memory-card-surface);
+}
+.stx-memory-workbench .stx-memory-inventory-toolbar,
+.stx-memory-workbench .stx-memory-inventory-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(130px, .45fr);
+  gap: 8px;
+}
+.stx-memory-workbench .stx-memory-inventory-toolbar label,
+.stx-memory-workbench .stx-memory-inventory-command label,
+.stx-memory-workbench .stx-memory-inventory-create label { min-width: 0; display: grid; gap: 4px; color: var(--ss-theme-muted); font-size: .62rem; }
+.stx-memory-workbench .stx-memory-inventory-rows,
+.stx-memory-workbench .stx-memory-inventory-history { min-height: 0; display: grid; gap: 7px; overflow: auto; }
+.stx-memory-workbench .stx-memory-inventory-rows { max-height: 62vh; }
+.stx-memory-workbench .stx-memory-inventory-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--ss-theme-text);
+  background: color-mix(in srgb, var(--ss-theme-bg) 72%, transparent);
+  text-align: left;
+}
+.stx-memory-workbench .stx-memory-inventory-row[aria-pressed="true"] { border-color: var(--ss-theme-accent); background: color-mix(in srgb, var(--ss-theme-accent) 12%, var(--ss-theme-bg)); }
+.stx-memory-workbench .stx-memory-inventory-row > span:first-child { min-width: 0; display: grid; gap: 2px; }
+.stx-memory-workbench .stx-memory-inventory-row small,
+.stx-memory-workbench .stx-memory-inventory-row > span:last-child { color: var(--ss-theme-muted); font-size: .6rem; }
+.stx-memory-workbench .stx-memory-inventory-detail-heading,
+.stx-memory-workbench .stx-memory-inventory-create,
+.stx-memory-workbench .stx-memory-inventory-event header,
+.stx-memory-workbench .stx-memory-inventory-event footer,
+.stx-memory-workbench .stx-memory-inline-confirm { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.stx-memory-workbench .stx-memory-inventory-detail-heading h3,
+.stx-memory-workbench .stx-memory-inventory-detail-heading p,
+.stx-memory-workbench .stx-memory-inventory-event p,
+.stx-memory-workbench .stx-memory-inventory-event blockquote { margin: 0; }
+.stx-memory-workbench .stx-memory-inventory-create label { flex: 1; }
+.stx-memory-workbench .stx-memory-inventory-command { grid-template-columns: repeat(4, minmax(0, 1fr)) auto; align-items: end; padding: 10px; border: 1px solid var(--ss-theme-border); border-radius: 7px; }
+.stx-memory-workbench .stx-memory-inventory-history > h4 { margin: 4px 0; }
+.stx-memory-workbench .stx-memory-inventory-event { display: grid; gap: 6px; padding: 10px; border-left: 2px solid var(--ss-theme-accent); background: color-mix(in srgb, var(--ss-theme-bg) 75%, transparent); }
+.stx-memory-workbench .stx-memory-inventory-event time,
+.stx-memory-workbench .stx-memory-inventory-event footer { color: var(--ss-theme-muted); font-size: .58rem; }
+.stx-memory-workbench .stx-memory-inventory-event blockquote { padding: 7px 9px; border-radius: 5px; background: color-mix(in srgb, var(--ss-theme-bg) 88%, transparent); font-size: .62rem; }
+.stx-memory-workbench .stx-memory-inventory-row:focus-visible { outline: 2px solid var(--ss-theme-accent); outline-offset: 2px; }
+@media (max-width: 900px) {
+  .stx-memory-workbench .stx-memory-inventory-shell { grid-template-columns: 1fr; }
+  .stx-memory-workbench .stx-memory-inventory-command { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px) {
+  .stx-memory-workbench .stx-memory-inventory-toolbar,
+  .stx-memory-workbench .stx-memory-inventory-command { grid-template-columns: 1fr; }
+  .stx-memory-workbench .stx-memory-inventory-detail-heading,
+  .stx-memory-workbench .stx-memory-inventory-create { align-items: stretch; flex-direction: column; }
+}
+
 .stx-memory-workbench .stx-memory-scene-controls {
   min-width: 0;
   display: grid;

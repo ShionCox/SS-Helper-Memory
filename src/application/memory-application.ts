@@ -61,6 +61,7 @@ import {
 } from './ingest/summary-strategy';
 import type { SourceBlock } from './ingest/types';
 import { buildSupportedEvidenceDirectory } from './ingest/supported-evidence-directory';
+import { buildMatchedInventoryPrompt } from './inventory';
 import { selectSourceGroups, summarizeSourceGroups } from '../host/source-adapter';
 import type { MemoryPluginApi, MemorySqliteStatus } from '../index';
 import type {
@@ -459,6 +460,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           ownerId: owner.id,
           names: [...new Set([owner.displayName, owner.canonicalName ?? '', ...owner.aliases].map(value => value.trim()).filter(Boolean))],
         })),
+        buildInventoryPrompt: async (userMessage, maxChars) => {
+          const [items, states] = await Promise.all([repository.listInventoryItems(), repository.listInventoryStates()]);
+          return buildMatchedInventoryPrompt(userMessage, items, states, Math.min(2_000, maxChars));
+        },
         recall: async ({ query, scene, castPlan, intentPlan, maxItems, now, minimumRetrievalLevel, coverageExpansion, excludedFactIds }) => {
           if (!isCurrent()) throw staleScopeError();
           const result = await this.performActorRecall({
@@ -835,7 +840,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     linkedRejectionIds: Set<string>;
   } {
     const rank = (collection: CaptureRepairQueueRecord['collection']): number =>
-      ({ actorCandidates: 0, locationCandidates: 1, episodes: 2, claims: 3, batch: 4 })[collection];
+      ({ actorCandidates: 0, locationCandidates: 1, itemCandidates: 2, episodes: 3, claims: 4, inventoryOperations: 5, batch: 6 })[collection];
     const blocker = (record: CaptureRepairQueueRecord): CaptureRepairQueueRecord | undefined => {
       const sources = new Set([...record.sourceRefs, ...record.fallbackSourceRefs]);
       return queue.find(candidate =>
@@ -947,7 +952,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     }
     await repository.reconcileCaptureRepairQueue?.(jobId);
     const rank = (collection: CaptureRepairQueueRecord['collection']): number =>
-      ({ actorCandidates: 0, locationCandidates: 1, episodes: 2, claims: 3, batch: 4 })[collection];
+      ({ actorCandidates: 0, locationCandidates: 1, itemCandidates: 2, episodes: 3, claims: 4, inventoryOperations: 5, batch: 6 })[collection];
     const eligibleQueue = async (): Promise<CaptureRepairQueueRecord[]> =>
       (await repository.listCaptureRepairQueue(jobId))
         .filter(record => record.collection !== 'batch')
@@ -1088,8 +1093,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       results.push(result);
       const recordType = record.collection === 'actorCandidates' ? 'actor'
         : record.collection === 'locationCandidates' ? 'location'
-          : record.collection === 'episodes' ? 'episode'
-            : 'claim';
+          : record.collection === 'itemCandidates' ? 'item'
+            : record.collection === 'episodes' ? 'episode'
+              : record.collection === 'inventoryOperations' ? 'inventory'
+                : 'claim';
       const succeeded = result.acceptedLocalIds[recordType].length > 0
         && !result.rejections.some(rejection => (rejection.status ?? 'unresolved') === 'unresolved');
       const latestIssues = result.rejections.flatMap(rejection =>
@@ -1484,6 +1491,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       locations: locationRegistry?.listLocations() ?? [],
       locationAliases: locationRegistry?.listAliases() ?? [],
       pendingLocationCandidates: locationRegistry?.listPending() ?? [],
+      inventoryItems: [],
+      inventoryStates: [],
+      inventoryEvents: [],
       episodes: [],
       observations: [],
       facts,
@@ -1491,7 +1501,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       sceneCast,
       outcome: 'complete',
       rejections: [],
-      acceptedLocalIds: { actor: [], location: [], episode: [], claim: [] },
+      acceptedLocalIds: { actor: [], location: [], item: [], episode: [], claim: [], inventory: [] },
       ...(latestParent ? { changeAudit: latestParent } : {}),
     };
     await this.persistCaptureDerivations(rebuilt, chatKey, repository, registry);
@@ -1810,6 +1820,50 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   async listActors(): Promise<readonly import('../domain').MemoryOwner[]> {
     return this.multiActorRepository ? this.multiActorRepository.listOwners() : [];
+  }
+
+  async listInventoryStates(): Promise<{
+    readonly items: readonly import('../domain').InventoryItem[];
+    readonly states: readonly import('../domain').InventoryState[];
+  }> {
+    if (!this.multiActorRepository) return { items: [], states: [] };
+    const [items, states] = await Promise.all([
+      this.multiActorRepository.listInventoryItems(),
+      this.multiActorRepository.listInventoryStates(),
+    ]);
+    return { items, states };
+  }
+
+  async getInventoryHistory(itemId: string): Promise<readonly import('../domain').InventoryEvent[]> {
+    return this.multiActorRepository ? this.multiActorRepository.listInventoryEvents(itemId) : [];
+  }
+
+  async createInventoryItem(input: {
+    readonly canonicalName: string;
+    readonly aliases?: readonly string[];
+    readonly category?: import('../domain').InventoryItemCategory;
+  }): Promise<import('../domain').InventoryItem> {
+    if (!this.multiActorRepository) throw createSSHelperError('MEMORY_CAPTURE_NOT_BOUND', { stage: 'memory.inventory.item.create' });
+    const item = await this.multiActorRepository.createInventoryItem(input);
+    this.emitOverviewChanged();
+    return item;
+  }
+
+  async applyInventoryCommand(
+    command: import('../domain').InventoryCommand,
+    options?: { readonly expectedRevision?: number; readonly idempotencyKey?: string },
+  ): Promise<{ readonly state: import('../domain').InventoryState; readonly event: import('../domain').InventoryEvent }> {
+    if (!this.multiActorRepository) throw createSSHelperError('MEMORY_CAPTURE_NOT_BOUND', { stage: 'memory.inventory.command.apply' });
+    const result = await this.multiActorRepository.applyInventoryCommand(command, options);
+    this.emitOverviewChanged();
+    return result;
+  }
+
+  async invalidateInventoryItem(itemId: string): Promise<import('../domain').InventoryItem> {
+    if (!this.multiActorRepository) throw createSSHelperError('MEMORY_CAPTURE_NOT_BOUND', { stage: 'memory.inventory.item.invalidate' });
+    const item = await this.multiActorRepository.invalidateInventoryItem(itemId);
+    this.emitOverviewChanged();
+    return item;
   }
 
   async listActorAliases(): Promise<readonly import('../domain').ActorAlias[]> {
@@ -3083,7 +3137,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     if (resource === 'facts') return this.listFactsPage(request) as Promise<MemoryPage<T>>;
     const chatKey = this.requireChatKey();
     const workspaceId = this.multiActorRepository?.boundWorkspaceId;
-    const workspaceOnly = resource === 'actors' || resource === 'actor-aliases' || resource === 'profiles' || resource === 'profile-claims';
+    const workspaceOnly = resource === 'actors' || resource === 'actor-aliases' || resource === 'inventory-items' || resource === 'profiles' || resource === 'profile-claims';
     const scope: Record<string, string> = resource === 'usage'
       ? { chatKey }
       : {

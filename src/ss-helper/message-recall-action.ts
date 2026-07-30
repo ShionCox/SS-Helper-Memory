@@ -130,12 +130,17 @@ function injectedOwners(rows: readonly InjectedRow[]): readonly GenerationRecall
 function candidateCount(detail: GenerationRecallDetail): number { return detail.uniqueCandidateCount ?? candidateRows(detail).length; }
 function sourceLabel(row: CandidateRow | InjectedRow): string {
   const candidate = 'candidate' in row ? row.candidate : undefined;
-  if ((candidate?.rerankScore ?? 0) > 0) return '重排';
+  if (candidate?.rerankScore !== undefined) return '重排';
   if ((candidate?.graphScore ?? 0) > 0) return '图谱';
   if ((candidate?.vectorScore ?? 0) > 0) return '向量';
   return '基础';
 }
 function score(value: number | undefined): string { return value === undefined ? '—' : value.toFixed(3); }
+function scoreSummary(candidate: GenerationRecallCandidateDetail | undefined): string {
+  if (!candidate) return '排序分 —';
+  if (candidate.rerankScore === undefined) return `排序分 ${score(candidate.score)}`;
+  return `模型主导 ${score(candidate.score)} · 模型原始 ${score(candidate.rerankScore)}`;
+}
 
 function memoryFormLabel(owner: GenerationRecallOwnerDetail, strength: number): string {
   if (owner.role === 'world' || owner.role === 'narrator') return '系统完整记忆';
@@ -256,14 +261,14 @@ function renderRecallDetail(
           );
           heading.append(title, badges);
           const gist = element(document, 'p', 'stx-recall-preview-gist', row.packet.gist);
-          const compact = element(document, 'div', 'stx-recall-preview-compact', `强度 ${row.packet.effectiveStrength.toFixed(1)} · 清晰度 ${row.packet.clarity.toFixed(2)} · 最终 ${score(row.candidate?.score)}`);
+          const compact = element(document, 'div', 'stx-recall-preview-compact', `强度 ${row.packet.effectiveStrength.toFixed(1)} · 清晰度 ${row.packet.clarity.toFixed(2)} · ${scoreSummary(row.candidate)}`);
           const expanded = element(document, 'div', 'stx-recall-preview-expanded');
           if (row.packet.details.length > 0) {
             const list = element(document, 'ul'); row.packet.details.forEach(item => list.append(element(document, 'li', '', item.text))); expanded.append(list);
           }
           expanded.append(element(document, 'p', '', `权限 ${row.owner.permission ?? '默认'} · 层级 ${row.owner.retrievalLevel ?? '—'} · 路径 ${(row.owner.retrievalStages ?? [sourceLabel(row)]).join(' → ')}`));
           const scores = element(document, 'div', 'stx-recall-preview-score-grid');
-          for (const [label, value] of [['基础', row.candidate?.lexicalScore], ['向量', row.candidate?.vectorScore], ['图谱', row.candidate?.graphScore], ['融合', row.candidate?.fusionScore], ['重排', row.candidate?.rerankScore], ['最终', row.candidate?.score]] as const) {
+          for (const [label, value] of [['基础', row.candidate?.lexicalScore], ['向量', row.candidate?.vectorScore], ['图谱', row.candidate?.graphScore], ['融合', row.candidate?.fusionScore], ['模型原始', row.candidate?.rerankScore], [row.candidate?.rerankScore === undefined ? '排序分' : '模型主导', row.candidate?.score]] as const) {
             const cell = element(document, 'div'); cell.append(element(document, 'span', '', label), element(document, 'strong', '', score(value))); scores.append(cell);
           }
           expanded.append(scores);
@@ -328,7 +333,7 @@ function renderRecallDetail(
           if (formLabel) badges.append(element(document, 'span', '', formLabel));
           badges.append(element(document, 'span', '', sourceLabel(row)));
           heading.append(title, badges);
-          card.append(heading, element(document, 'p', 'stx-recall-preview-gist', candidate.summary || '没有可显示的摘要。'), element(document, 'div', 'stx-recall-preview-compact', `${row.attemptLabels.join('、')} · 最终 ${score(candidate.score)} · ${[...candidate.reasonCodes, candidate.omittedReason].filter(Boolean).join(' · ') || '无附加原因'}`));
+          card.append(heading, element(document, 'p', 'stx-recall-preview-gist', candidate.summary || '没有可显示的摘要。'), element(document, 'div', 'stx-recall-preview-compact', `${row.attemptLabels.join('、')} · ${scoreSummary(candidate)} · ${[...candidate.reasonCodes, candidate.omittedReason].filter(Boolean).join(' · ') || '无附加原因'}`));
           const actions = element(document, 'div', 'stx-recall-preview-actions'); addFloorButtons(document, actions, candidate.sourceFloors, ui, navigate); card.append(actions);
           const rowHost = element(document, 'div', 'stx-recall-preview-row');
           rowHost.append(card);

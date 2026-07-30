@@ -208,7 +208,7 @@ export interface CaptureRepairQueueRecord {
   chatKey: string;
   jobId: string;
   batchIndex: number;
-  collection: 'actorCandidates' | 'locationCandidates' | 'episodes' | 'claims' | 'batch';
+  collection: 'actorCandidates' | 'locationCandidates' | 'itemCandidates' | 'episodes' | 'claims' | 'inventoryOperations' | 'batch';
   itemIndex: number;
   issues: Array<{ path: string; keyword: string; expected: string }>;
   sourceRefs: string[];
@@ -372,7 +372,7 @@ export interface AutomaticIngestRejection {
   index: number;
   code: AutomaticProposalErrorCode;
   message: string;
-  recordType?: 'batch' | 'actor' | 'location' | 'episode' | 'claim' | 'observation' | 'fact';
+  recordType?: 'batch' | 'actor' | 'location' | 'item' | 'episode' | 'claim' | 'inventory' | 'observation' | 'fact';
   fieldPath?: string;
   issues?: Array<{
     path: string;

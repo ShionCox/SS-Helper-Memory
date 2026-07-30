@@ -117,6 +117,7 @@ function selectRerankItems(items: readonly RecallItem[], query: string, temporal
 // candidates. Keep enough headroom for route inspection and provider jitter.
 const RERANK_TIMEOUT_MS = 30_000;
 const TOTAL_EXTRA_RECALL_BUDGET_MS = 40_000;
+const RERANK_MODEL_WEIGHT = 0.85;
 const HISTORICAL_QUERY_PATTERN = /(?:曾经|当时|之前|历史|过程|最早|最初|一开始|中段|先后|一路|变化|如何发展|起初|后来)/u;
 const CURRENT_STATE_QUERY_PATTERN = /(?:最新状态|最后确认|当前|现在|目前|还剩|剩余|还能|现有|最终确认)/u;
 const STATE_HISTORY_TOPIC_PATTERN = /(?:状态|数量|多少|几次|次数|弹药|剩余|还剩|变化|一路|先后)/u;
@@ -167,6 +168,12 @@ function adaptiveRerankRequired(items: readonly RecallItem[]): boolean {
   const secondScore = items[1]?.score ?? 0;
   const normalizedGap = firstScore > 0 ? Math.abs(firstScore - secondScore) / firstScore : 1;
   return normalizedGap <= 0.08;
+}
+
+function normalizedRerankScore(item: RecallItem, modelScore: number): number {
+  // Do not use batch min-max: an entirely irrelevant batch must not manufacture a 1.0 winner.
+  const support = Math.min(1, Math.max(0, item.lexicalScore ?? 0, item.vectorScore ?? 0, item.graphScore ?? 0));
+  return modelScore * (RERANK_MODEL_WEIGHT + (1 - RERANK_MODEL_WEIGHT) * support);
 }
 
 function updateCandidate(
@@ -369,6 +376,8 @@ export class SemanticRecallService {
                     || item.index < 0
                     || item.index >= rerankItems.length
                     || !Number.isFinite(item.score)
+                    || item.score < 0
+                    || item.score > 1
                     || seen.has(item.index)) return false;
                   seen.add(item.index);
                   return true;
@@ -377,7 +386,7 @@ export class SemanticRecallService {
               const rankedIndexes = new Set(valid.map(item => item.index));
               const reranked = valid.map(result => ({
                 ...rerankItems[result.index]!,
-                score: result.score,
+                score: normalizedRerankScore(rerankItems[result.index]!, result.score),
                 rerankScore: result.score,
               }));
               const rerankIds = new Set(rerankItems.map(item => item.fact.id));
@@ -470,4 +479,5 @@ export class SemanticRecallService {
 export const semanticRecallLimits = Object.freeze({
   rerankTimeoutMs: RERANK_TIMEOUT_MS,
   totalExtraBudgetMs: TOTAL_EXTRA_RECALL_BUDGET_MS,
+  rerankModelWeight: RERANK_MODEL_WEIGHT,
 });

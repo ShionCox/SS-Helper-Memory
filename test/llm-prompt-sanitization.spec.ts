@@ -6,7 +6,7 @@ describe('memory Capture prompt sanitization', () => {
   it('never exposes persistence owner/location IDs to the model', async () => {
     const runTask = vi.fn(async (_input: Parameters<MemoryLlmClient['runTask']>[0]) => ({
       ok: true as const,
-      data: { actorCandidates: [], locationCandidates: [], episodes: [], claims: [] },
+      data: { actorCandidates: [], locationCandidates: [], itemCandidates: [], episodes: [], claims: [], inventoryOperations: [] },
       meta: { resourceId: 'generation', model: 'test', latencyMs: 1 },
       usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
     }));

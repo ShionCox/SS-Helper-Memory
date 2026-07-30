@@ -1401,4 +1401,67 @@ describe('multi-actor repository transaction semantics', () => {
     expect(transaction).toHaveBeenCalledTimes(1);
     expect(transaction.mock.calls[0]?.[0].operations).toHaveLength(501);
   });
+
+  it('applies manual inventory commands atomically, rejects stale revisions and keeps chat branches isolated', async () => {
+    const repository = new MultiActorMemoryRepository(port());
+    repository.bind('w', 'chat-a');
+    await repository.open();
+    const item = await repository.createInventoryItem({ canonicalName: '瓶装水', category: 'food' });
+    const first = await repository.applyInventoryCommand({
+      itemId: item.id, operation: 'set', measureKind: 'quantity', amount: 22, rawAmount: '22', unit: '瓶', precision: 'exact', reason: 'manual_correction', origin: 'manual', confidence: 1,
+    }, { expectedRevision: 0, idempotencyKey: 'inventory-water-set-22' });
+    expect(first.state).toMatchObject({ amount: 22, revision: 1, availability: 'active' });
+    const second = await repository.applyInventoryCommand({
+      itemId: item.id, operation: 'decrease', measureKind: 'quantity', amount: 2, rawAmount: '2', unit: '瓶', precision: 'exact', reason: 'consume', origin: 'manual', confidence: 1,
+    }, { expectedRevision: 1, idempotencyKey: 'inventory-water-drink-2' });
+    expect(second.state).toMatchObject({ amount: 20, revision: 2 });
+    await expect(repository.applyInventoryCommand({
+      itemId: item.id, operation: 'increase', measureKind: 'quantity', amount: 1, rawAmount: '1', unit: '瓶', precision: 'exact', reason: 'acquire', origin: 'manual', confidence: 1,
+    }, { expectedRevision: 1, idempotencyKey: 'inventory-water-stale' })).rejects.toMatchObject({ details: { reasonCode: 'WORKSPACE_CONFLICT' } });
+    const replay = await repository.applyInventoryCommand({
+      itemId: item.id, operation: 'decrease', measureKind: 'quantity', amount: 2, rawAmount: '2', unit: '瓶', precision: 'exact', reason: 'consume', origin: 'manual', confidence: 1,
+    }, { expectedRevision: 2, idempotencyKey: 'inventory-water-drink-2' });
+    expect(replay.event.id).toBe(second.event.id);
+    expect(await repository.listInventoryEvents(item.id)).toHaveLength(2);
+    const removed = await repository.applyInventoryCommand({
+      itemId: item.id, operation: 'remove', measureKind: 'quantity', unit: '瓶', precision: 'exact', reason: 'discard', origin: 'manual', confidence: 1,
+    }, { expectedRevision: 2, idempotencyKey: 'inventory-water-remove' });
+    expect(removed.state).toMatchObject({ availability: 'absent', revision: 3 });
+    const restored = await repository.applyInventoryCommand({
+      itemId: item.id, operation: 'set', measureKind: 'quantity', amount: 5, rawAmount: '5', unit: '瓶', precision: 'exact', reason: 'acquire', origin: 'manual', confidence: 1,
+    }, { expectedRevision: 3, idempotencyKey: 'inventory-water-restore' });
+    expect(restored.state).toMatchObject({ amount: 5, availability: 'active', revision: 4 });
+
+    repository.bind('w', 'chat-b');
+    expect(await repository.listInventoryItems()).toHaveLength(1);
+    expect(await repository.listInventoryStates()).toEqual([]);
+  });
+
+  it('clears current-chat inventory state and events while preserving the workspace item directory', async () => {
+    const repository = new MultiActorMemoryRepository(port());
+    repository.bind('w', 'chat');
+    await repository.open();
+    const item = await repository.createInventoryItem({ canonicalName: '隔离箱', category: 'special' });
+    await repository.applyInventoryCommand({
+      itemId: item.id, operation: 'set', measureKind: 'quantity', unit: '', precision: 'unknown', reason: 'recount', origin: 'manual', confidence: 1,
+    }, { expectedRevision: 0, idempotencyKey: 'inventory-isolation-box' });
+    await repository.clearCurrentChatData();
+    expect(await repository.listInventoryItems()).toEqual([expect.objectContaining({ canonicalName: '隔离箱' })]);
+    expect(await repository.listInventoryStates()).toEqual([]);
+    expect(await repository.listInventoryEvents()).toEqual([]);
+  });
+
+  it('treats a retried inventory Capture as idempotent after its stable event is already present', async () => {
+    const repository = new MultiActorMemoryRepository(port());
+    repository.bind('w', 'chat');
+    await repository.open();
+    const item = await repository.createInventoryItem({ canonicalName: '瓶装水', category: 'food' });
+    const event = { id: 'inventory-event:retry', workspaceId: 'w', chatKey: 'chat', itemId: item.id, operation: 'decrease' as const, measureKind: 'quantity' as const, amount: 2, rawAmount: '2瓶', unit: '瓶', unitKey: '瓶', precision: 'exact' as const, reason: 'consume' as const, beforeAmount: 22, afterAmount: 20, availability: 'active' as const, sourceRef: 'source:s', evidenceExcerpt: '喝掉2瓶瓶装水', floor: 1, occurredAt: 1, recordedAt: 1, origin: 'automatic' as const, confidence: 1 };
+    const state = { id: 'inventory-state:retry', workspaceId: 'w', chatKey: 'chat', itemId: item.id, measureKind: 'quantity' as const, amount: 20, unit: '瓶', unitKey: '瓶', precision: 'exact' as const, availability: 'active' as const, lastEventId: event.id, sourceRefs: ['source:s'], revision: 2, createdAt: 1, updatedAt: 1 };
+    const first = await repository.commitCapture({ ...commit(40, 0), inventoryItems: [item], inventoryStates: [state], inventoryEvents: [event], idempotencyKey: 'capture:inventory-retry' });
+    const replay = await repository.commitCapture({ ...commit(40, 0), inventoryItems: [], inventoryStates: [], inventoryEvents: [], idempotencyKey: 'capture:inventory-retry' });
+    expect(replay.id).toBe(first.id);
+    expect(await repository.listInventoryEvents(item.id)).toHaveLength(1);
+    expect(await repository.listInventoryStates()).toEqual([expect.objectContaining({ amount: 20, revision: 2 })]);
+  });
 });

@@ -38,7 +38,7 @@ function claim(index: number): Record<string, unknown> {
 describe('structured Capture strict decode boundaries', () => {
   it('does not silently truncate an oversized array', () => {
     const result = normalizeStructuredCapture({
-      actorCandidates: [], locationCandidates: [], episodes: [],
+      actorCandidates: [], locationCandidates: [], itemCandidates: [], episodes: [], inventoryOperations: [],
       claims: Array.from({ length: 33 }, (_, index) => claim(index)),
     }, [source], evidenceDirectory);
 
@@ -48,7 +48,7 @@ describe('structured Capture strict decode boundaries', () => {
 
   it('does not invent defaults for missing critical fields', () => {
     const result = normalizeStructuredCapture({
-      actorCandidates: [], locationCandidates: [], episodes: [],
+      actorCandidates: [], locationCandidates: [], itemCandidates: [], episodes: [], inventoryOperations: [],
       claims: [{
         ...claim(1),
         confidence: undefined,
@@ -68,7 +68,7 @@ describe('structured Capture strict decode boundaries', () => {
         localId: 'actor-long', displayName: longName, aliases: [],
         evidenceSpanId, confidence: 0.9,
       }],
-      locationCandidates: [], episodes: [], claims: [],
+      locationCandidates: [], itemCandidates: [], episodes: [], claims: [], inventoryOperations: [],
     }, [source], evidenceDirectory);
 
     const decoded = result.actorCandidates[0]?.displayName ?? '';

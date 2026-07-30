@@ -48,7 +48,7 @@ function service(
 
 describe('语义、混合召回与 LLM rerank', () => {
   it('为真实 rerank 保留 15 秒窗口及完整额外召回预算', () => {
-    expect(semanticRecallLimits).toEqual({ rerankTimeoutMs: 30_000, totalExtraBudgetMs: 40_000 });
+    expect(semanticRecallLimits).toEqual({ rerankTimeoutMs: 30_000, totalExtraBudgetMs: 40_000, rerankModelWeight: 0.85 });
   });
 
   it('纯向量能召回没有关键词重叠的同义改写', async () => {
@@ -196,7 +196,34 @@ describe('语义、混合召回与 LLM rerank', () => {
 
     expect(rerank).toHaveBeenCalledTimes(1);
     expect(result.items[0]?.fact.id).toBe('second');
+    expect(result.items[0]).toMatchObject({ rerankScore: 0.97 });
+    expect(result.items[0]?.score).toBeGreaterThan(0.97 * semanticRecallLimits.rerankModelWeight);
+    expect(result.items[0]?.score).toBeLessThanOrEqual(0.97);
+    expect(result.items[0]?.score).not.toBe(0.97);
     expect(result.diagnostics.rerank).toMatchObject({ requested: true, success: true, resourceId: 'Rerank', usage: null });
+  });
+
+  it('低尺度 rerank 以模型分主导归一且零相关保持为零', async () => {
+    const rerank = vi.fn(async () => ({
+      ok: true as const,
+      results: [{ index: 1, score: 0.0323486328125 }, { index: 0, score: 0 }],
+      meta: { resourceId: 'Rerank', model: 'Qwen3-Reranker-4B', latencyMs: 45 },
+    }));
+    const result = await service(
+      [fact('first', '晶尘环境需要避免直接暴露。'), fact('second', '蛋白质复合物可降低晶尘穿透效率。')],
+      [['first', 0.9], ['second', 0.88]],
+      rerank,
+    ).recall({ chatKey: 'chat-a', query: '进入晶尘环境的防护原则', now: NOW }, 'hybrid', 'always');
+
+    expect(result.items.map(item => item.fact.id)).toEqual(['second', 'first']);
+    expect(result.items.map(item => item.rerankScore)).toEqual([0.0323486328125, 0]);
+    expect(result.items[0]?.score).toBeGreaterThan(0.0323486328125 * semanticRecallLimits.rerankModelWeight);
+    expect(result.items[0]?.score).toBeLessThanOrEqual(0.0323486328125);
+    expect(result.items[1]?.score).toBe(0);
+    expect(result.candidates.find(candidate => candidate.factId === 'second')).toMatchObject({
+      score: result.items[0]?.score,
+      rerankScore: 0.0323486328125,
+    });
   });
 
   it('从宽融合池中意图补齐八条重排候选并保留未重排尾部', async () => {
@@ -346,7 +373,7 @@ describe('语义、混合召回与 LLM rerank', () => {
   it('rerank 非法索引和 NaN 不会破坏原融合顺序', async () => {
     const rerank = vi.fn(async () => ({
       ok: true as const,
-      results: [{ index: 99, score: 1 }, { index: 0, score: Number.NaN }],
+      results: [{ index: 99, score: 1 }, { index: 0, score: Number.NaN }, { index: 1, score: 1.1 }, { index: 0, score: -0.1 }],
       meta: { resourceId: 'Rerank', model: 'test' },
     }));
     const result = await service(

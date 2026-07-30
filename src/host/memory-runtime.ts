@@ -114,7 +114,7 @@ export class MemoryRuntime {
             repairOn: ['INVALID_JSON', 'SCHEMA_VALIDATION_FAILED'],
             itemFailure: 'return_partial',
             envelopeFailure: 'repair_once',
-            itemCollections: ['actorCandidates', 'locationCandidates', 'episodes', 'claims'],
+            itemCollections: ['actorCandidates', 'locationCandidates', 'itemCandidates', 'episodes', 'claims', 'inventoryOperations'],
           },
         },
         {

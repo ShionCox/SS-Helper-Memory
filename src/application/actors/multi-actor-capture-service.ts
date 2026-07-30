@@ -13,6 +13,9 @@ import {
   type CaptureEnvelope,
   type LocationAlias,
   type LocationCandidate,
+  type InventoryEvent,
+  type InventoryItem,
+  type InventoryState,
   type MemoryEpisode,
   type MemoryFact,
   type MemoryKnowledgeMode,
@@ -25,12 +28,15 @@ import type {
   ExistingMemoryContextItem,
   KnownActorContextItem,
   KnownLocationContextItem,
+  KnownInventoryContextItem,
   SourceBlock,
   StructuredActorCandidate,
   StructuredCaptureResult,
   StructuredClaim,
   StructuredEpisode,
   StructuredLocationCandidate,
+  StructuredInventoryOperation,
+  StructuredItemCandidate,
   RepairFieldAction,
 } from '../ingest/types';
 import { filterSourceBlocks } from '../ingest/source-blocks';
@@ -44,6 +50,15 @@ import {
   buildSupportedReferenceDirectory,
   referenceDirectoryAllows,
 } from './supported-reference-directory';
+import {
+  inventoryItemId,
+  inventoryStateId,
+  normalizeInventoryName,
+  normalizeInventoryUnit,
+  parseInventorySnapshots,
+  selectKnownInventoryContext,
+  type DeterministicInventoryProposal,
+} from '../inventory';
 
 function hash(value: string): string {
   const normalized = value.normalize('NFKC');
@@ -86,8 +101,8 @@ function record(value: unknown): Record<string, unknown> {
 }
 function finite(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value); }
 function validConfidence(value: unknown): value is number { return finite(value) && value >= 0 && value <= 1; }
-function localPromptRef(prefix: 'actor' | 'location', index: number): string {
-  const marker = prefix === 'actor' ? 'A' : 'L';
+function localPromptRef(prefix: 'actor' | 'location' | 'item', index: number): string {
+  const marker = prefix === 'actor' ? 'A' : prefix === 'location' ? 'L' : 'I';
   return `${marker}${String(index + 1).padStart(2, '0')}`;
 }
 
@@ -99,8 +114,10 @@ const FACT_KINDS = new Set<MemoryFact['kind']>([
 interface PreparedCapture {
   actorCandidates: StructuredActorCandidate[];
   locationCandidates: StructuredLocationCandidate[];
+  itemCandidates: StructuredItemCandidate[];
   episodes: StructuredEpisode[];
   claims: StructuredClaim[];
+  inventoryOperations: StructuredInventoryOperation[];
   rejections: AutomaticIngestRejection[];
   deterministicRepairs: number;
   fieldActions: RepairFieldAction[];
@@ -125,6 +142,9 @@ export interface MultiActorCaptureResult {
   readonly locations: readonly MemoryLocation[];
   readonly locationAliases: readonly LocationAlias[];
   readonly pendingLocationCandidates: readonly LocationCandidate[];
+  readonly inventoryItems: readonly InventoryItem[];
+  readonly inventoryStates: readonly InventoryState[];
+  readonly inventoryEvents: readonly InventoryEvent[];
   readonly episodes: readonly MemoryEpisode[];
   readonly observations: readonly MemoryObservation[];
   readonly facts: readonly MemoryFact[];
@@ -134,7 +154,7 @@ export interface MultiActorCaptureResult {
   readonly audit?: import('../ingest/types').MemoryExtractionAudit;
   readonly outcome: 'complete' | 'partial';
   readonly rejections: readonly AutomaticIngestRejection[];
-  readonly acceptedLocalIds: Readonly<Record<'actor' | 'location' | 'episode' | 'claim', readonly string[]>>;
+  readonly acceptedLocalIds: Readonly<Record<'actor' | 'location' | 'item' | 'episode' | 'claim' | 'inventory', readonly string[]>>;
   readonly candidateSetHash?: string;
   readonly resolutionMode?: import('../../domain').RepairResolutionMode;
   readonly fieldActions?: readonly RepairFieldAction[];
@@ -159,7 +179,7 @@ export interface MultiActorCaptureInput {
 
 function rejection(
   input: MultiActorCaptureInput,
-  recordType: 'actor' | 'location' | 'episode' | 'claim',
+  recordType: 'actor' | 'location' | 'item' | 'episode' | 'claim' | 'inventory' | 'batch',
   index: number,
   code: AutomaticProposalErrorCode,
   message: string,
@@ -357,6 +377,58 @@ function claimQuality(claim: StructuredClaim, subjectResolved: boolean): number 
       + numericBonus * 0.05,
   ));
 }
+
+function numericTokens(value: string): string[] {
+  return unique([...value.matchAll(/\d+(?:\.\d+)?/gu)].map(match => match[0]!));
+}
+
+function numericClaimSupported(claim: StructuredClaim): boolean {
+  const expected = numericTokens(`${claim.content}\n${claim.objectText ?? ''}`);
+  if (expected.length === 0) return true;
+  const subject = claim.subjectText?.trim();
+  if (!subject || !claim.evidenceExcerpt.includes(subject)) {
+    return expected.every(token => numericTokens(claim.evidenceExcerpt).includes(token));
+  }
+  const fragments = claim.evidenceExcerpt.split(/[\n、，,；;]/u).filter(fragment => fragment.includes(subject));
+  return fragments.some(fragment => expected.every(token => numericTokens(fragment).includes(token)));
+}
+
+function numericSummarySupported(summary: string, sources: readonly SourceBlock[], evidenceExcerpts?: readonly string[]): boolean {
+  const expected = numericTokens(summary);
+  if (expected.length === 0) return true;
+  const sourceNumbers = numericTokens((evidenceExcerpts?.length ? evidenceExcerpts : sources.map(source => source.content)).join('\n'));
+  return expected.every(token => sourceNumbers.includes(token));
+}
+
+function inventoryOperationSupported(operation: StructuredInventoryOperation, names: readonly string[]): boolean {
+  if (!names.some(name => name.length >= 2 && operation.evidenceExcerpt.includes(name))) return false;
+  if (!validConfidence(operation.confidence)) return false;
+  if (operation.measureKind === 'coverage_days' && !['set', 'remove'].includes(operation.operation)) return false;
+  if (operation.precision !== 'exact' && !['set', 'remove'].includes(operation.operation)) return false;
+  if (operation.operation === 'remove') return REMOVAL_CUE.test(operation.evidenceExcerpt);
+  if (operation.operation === 'set' && operation.precision === 'unknown') {
+    return operation.amount === undefined && !operation.rawAmount?.trim();
+  }
+  if (!finite(operation.amount) || operation.amount < 0 || (operation.operation !== 'set' && operation.amount === 0)) return false;
+  const rawAmount = operation.rawAmount?.trim() ?? '';
+  if (!rawAmount || !operation.evidenceExcerpt.includes(rawAmount)) return false;
+  const parsed = Number(rawAmount.match(/\d+(?:\.\d+)?/u)?.[0]);
+  if (!Number.isFinite(parsed) || parsed !== operation.amount) return false;
+  const expectedUnit = normalizeInventoryUnit(operation.unit);
+  if (expectedUnit && expectedUnit !== '个') {
+    const rawIndex = operation.evidenceExcerpt.indexOf(rawAmount);
+    const unitWindow = rawIndex < 0 ? '' : operation.evidenceExcerpt.slice(rawIndex, rawIndex + rawAmount.length + 12);
+    const supportedUnit = unitWindow.match(/天份|日份|天|日|小时|瓶|包|盒|枚|份|块|支|套|罐|袋|个|件|把|克|千克|公斤|毫克|毫升|升|kg|mg|ml|g|l/iu)?.[0] ?? '';
+    if (normalizeInventoryUnit(supportedUnit) !== expectedUnit) return false;
+  }
+  if (operation.operation === 'increase' && !INCREASE_CUE.test(operation.evidenceExcerpt)) return false;
+  if (operation.operation === 'decrease' && !DECREASE_CUE.test(operation.evidenceExcerpt)) return false;
+  return true;
+}
+
+const INCREASE_CUE = /(?:获得|增加|补充|收到|拾取|找到|购入|新增)/u;
+const DECREASE_CUE = /(?:消耗|喝掉|吃掉|用掉|减少|失去|丢失|损坏)/u;
+const REMOVAL_CUE = /(?:丢弃|耗尽|失去|销毁|用完|不再持有)/u;
 
 function observationChannel(claim: StructuredClaim, source: SourceBlock): MemoryObservation['channel'] {
   if (source.kind === 'worldbook' || source.kind === 'host_card') return 'worldbook';
@@ -557,6 +629,69 @@ function extractExplicitDirectiveClaims(
   return claims;
 }
 
+function mergeDeterministicInventory(
+  extracted: StructuredCaptureResult,
+  proposals: readonly DeterministicInventoryProposal[],
+  knownInventory: readonly KnownInventoryContextItem[],
+): StructuredCaptureResult {
+  if (proposals.length === 0) return extracted;
+  const itemCandidates: StructuredItemCandidate[] = [];
+  const itemRefByName = new Map<string, string>();
+  for (const item of knownInventory) {
+    for (const name of unique([item.canonicalName, ...item.aliases])) itemRefByName.set(normalizeInventoryName(name), item.referenceId);
+  }
+  for (const proposal of proposals) {
+    const normalized = normalizeInventoryName(proposal.itemName);
+    if (itemRefByName.has(normalized)) continue;
+    const localId = `snapshot-item-${hash(normalized)}`;
+    itemRefByName.set(normalized, localId);
+    itemCandidates.push({
+      localId,
+      displayName: proposal.itemName,
+      aliases: [],
+      category: proposal.category,
+      sourceRef: proposal.source.id,
+      evidenceExcerpt: proposal.command.evidenceExcerpt ?? proposal.itemName,
+      confidence: 1,
+    });
+  }
+  const inventoryOperations: StructuredInventoryOperation[] = proposals.map(proposal => ({
+    localId: `snapshot-operation-${hash(`${proposal.source.id}\0${proposal.itemName}\0${proposal.command.measureKind}\0${proposal.command.rawAmount ?? proposal.command.operation}`)}`,
+    itemRef: itemRefByName.get(normalizeInventoryName(proposal.itemName))!,
+    operation: proposal.command.operation,
+    measureKind: proposal.command.measureKind,
+    ...(proposal.command.amount === undefined ? {} : { amount: proposal.command.amount }),
+    ...(proposal.command.rawAmount === undefined ? {} : { rawAmount: proposal.command.rawAmount }),
+    unit: proposal.command.unit,
+    precision: proposal.command.precision,
+    reason: proposal.command.reason,
+    ...(proposal.command.stateNote ? { stateNote: proposal.command.stateNote } : {}),
+    sourceRef: proposal.source.id,
+    evidenceExcerpt: proposal.command.evidenceExcerpt ?? proposal.itemName,
+    confidence: 1,
+  }));
+  const deterministicKeys = new Set(proposals.map(proposal => `${proposal.source.id}\0${normalizeInventoryName(proposal.itemName)}`));
+  const extractedItems = extracted.itemCandidates ?? [];
+  const extractedOperations = extracted.inventoryOperations ?? [];
+  const extractedNames = new Map(extractedItems.map(item => [item.localId, item.displayName]));
+  for (const item of knownInventory) extractedNames.set(item.referenceId, item.canonicalName);
+  return {
+    ...extracted,
+    itemCandidates: [...extractedItems, ...itemCandidates],
+    inventoryOperations: [
+      ...inventoryOperations,
+      ...extractedOperations.filter(operation => {
+        const name = extractedNames.get(operation.itemRef);
+        return !name || !deterministicKeys.has(`${operation.sourceRef}\0${normalizeInventoryName(name)}`);
+      }),
+    ],
+    diagnostics: {
+      ...extracted.diagnostics,
+      deterministicRepairs: (extracted.diagnostics?.deterministicRepairs ?? 0) + itemCandidates.length + inventoryOperations.length,
+    },
+  };
+}
+
 /**
  * New v1 Capture coordinator. The model emits small Claims only. Server code
  * owns time, persistence identity, observations, evidence, traces and fact
@@ -717,6 +852,7 @@ export class MultiActorCaptureService {
     writableSourceRefs: ReadonlySet<string>,
     knownActors: readonly KnownActorContextItem[],
     knownLocations: readonly KnownLocationContextItem[],
+    knownInventory: readonly KnownInventoryContextItem[],
   ): PreparedCapture {
     const rejections: AutomaticIngestRejection[] = structuredClone(structured.rejections ?? []);
     let deterministicRepairs = 0;
@@ -726,11 +862,13 @@ export class MultiActorCaptureService {
     const sourceById = new Map(sources.map(source => [source.id, source]));
     const actorRefs = new Set(knownActors.map(actor => actor.referenceId));
     const locationRefs = new Set(knownLocations.map(location => location.referenceId));
+    const itemRefs = new Set(knownInventory.map(item => item.referenceId));
     const entityLocalIds = new Set<string>([...actorRefs, ...locationRefs, 'world', 'narrator', 'player']);
     const episodeLocalIds = new Set<string>();
     const claimLocalIds = new Set<string>();
     const actorCandidates: StructuredActorCandidate[] = [];
     const locationCandidates: StructuredLocationCandidate[] = [];
+    const itemCandidates: StructuredItemCandidate[] = [];
 
     for (const [index, originalCandidate] of structured.actorCandidates.entries()) {
       let candidate = originalCandidate;
@@ -863,6 +1001,44 @@ export class MultiActorCaptureService {
       } : candidate);
     }
 
+    const inventoryNamesByRef = new Map<string, readonly string[]>();
+    for (const item of knownInventory) inventoryNamesByRef.set(item.referenceId, unique([item.canonicalName, ...item.aliases]));
+    for (const [index, candidate] of (structured.itemCandidates ?? []).entries()) {
+      const source = sourceById.get(candidate.sourceRef);
+      if (!candidate.localId || !candidate.displayName.trim()) {
+        rejections.push(rejection(input, 'item', index, 'invalid_shape', '物品缺少有效 localId/displayName。', 'displayName', candidate));
+        continue;
+      }
+      if (entityLocalIds.has(candidate.localId) || itemRefs.has(candidate.localId)) {
+        rejections.push(rejection(input, 'item', index, 'duplicate_proposal', '物品 localId 与已有引用重复。', 'localId', candidate));
+        continue;
+      }
+      if (!source || !writableSourceRefs.has(candidate.sourceRef)) {
+        rejections.push(rejection(input, 'item', index, 'invalid_reference', '物品引用了不存在或不可写的来源。', 'sourceRef', candidate, [...writableSourceRefs]));
+        continue;
+      }
+      const exactEvidence = locateExactEvidenceExcerpt(source.content, candidate.evidenceExcerpt);
+      if (!exactEvidence || !exactEvidence.includes(candidate.displayName)) {
+        rejections.push(rejection(input, 'item', index, 'excerpt_mismatch', '物品名称必须逐字出现在来源证据中。', 'evidenceExcerpt', candidate));
+        continue;
+      }
+      if (!validConfidence(candidate.confidence)) {
+        rejections.push(rejection(input, 'item', index, 'invalid_confidence', '物品 confidence 必须是 0 到 1。', 'confidence', candidate));
+        continue;
+      }
+      const known = knownInventory.find(item => unique([item.canonicalName, ...item.aliases])
+        .some(name => normalizeInventoryName(name) === normalizeInventoryName(candidate.displayName)));
+      const accepted = {
+        ...candidate,
+        displayName: known?.canonicalName ?? candidate.displayName.trim(),
+        aliases: unique([...candidate.aliases.filter(alias => exactEvidence.includes(alias)), candidate.displayName]),
+        evidenceExcerpt: exactEvidence,
+      };
+      itemRefs.add(candidate.localId);
+      inventoryNamesByRef.set(candidate.localId, unique([accepted.displayName, ...accepted.aliases]));
+      itemCandidates.push(accepted);
+    }
+
     const episodeEntityNamesByRef = new Map<string, readonly string[]>();
     for (const actor of knownActors) {
       episodeEntityNamesByRef.set(actor.referenceId, unique([actor.canonicalName, ...actor.aliases]).filter(Boolean));
@@ -911,6 +1087,10 @@ export class MultiActorCaptureService {
       const episodeSources = validSources
         .map(ref => sourceById.get(ref))
         .filter((source): source is SourceBlock => Boolean(source));
+      if (!numericSummarySupported(episode.summary, episodeSources, episode.evidenceExcerpts)) {
+        rejections.push(rejection(input, 'episode', index, 'excerpt_mismatch', '事件摘要中的数字没有得到所选证据片段支持。', 'summary', episode));
+        continue;
+      }
       if (conservative && referenceDirectory) {
         const filterActorField = (
           field: 'participantRefs' | 'presentRefs' | 'mentionedRefs',
@@ -1040,6 +1220,10 @@ export class MultiActorCaptureService {
       if (exactEvidence !== claim.evidenceExcerpt) {
         claim = { ...claim, evidenceExcerpt: exactEvidence };
         deterministicRepairs += 1;
+      }
+      if (!numericClaimSupported(claim)) {
+        rejections.push(rejection(input, 'claim', index, 'excerpt_mismatch', 'Claim 中的数字没有得到同一主体证据片段支持。', 'content', claim));
+        continue;
       }
       if (!FACT_KINDS.has(claim.kind)) {
         rejections.push(rejection(input, 'claim', index, 'invalid_enum', 'Claim kind 不在允许范围。', 'kind', claim, [...FACT_KINDS]));
@@ -1215,11 +1399,55 @@ export class MultiActorCaptureService {
       });
     }
 
+    const inventoryOperations: StructuredInventoryOperation[] = [];
+    const operationLocalIds = new Set<string>();
+    for (const [index, originalOperation] of (structured.inventoryOperations ?? []).entries()) {
+      let operation = originalOperation;
+      const source = sourceById.get(operation.sourceRef);
+      const names = inventoryNamesByRef.get(operation.itemRef) ?? [];
+      if (!operation.localId || !source || !writableSourceRefs.has(operation.sourceRef)) {
+        rejections.push(rejection(input, 'inventory', index, !operation.localId ? 'invalid_shape' : 'invalid_reference', !operation.localId ? '库存操作缺少 localId。' : '库存操作引用了不存在或不可写的来源。', !operation.localId ? 'localId' : 'sourceRef', operation, [...writableSourceRefs]));
+        continue;
+      }
+      if (!itemRefs.has(operation.itemRef) || names.length === 0) {
+        rejections.push(rejection(input, 'inventory', index, 'invalid_reference', '库存操作 itemRef 不属于当前物品目录或本次候选。', 'itemRef', operation, [...itemRefs]));
+        continue;
+      }
+      const exactEvidence = locateExactEvidenceExcerpt(source.content, operation.evidenceExcerpt);
+      if (!exactEvidence) {
+        rejections.push(rejection(input, 'inventory', index, 'excerpt_mismatch', '库存操作证据必须逐字出现在来源中。', 'evidenceExcerpt', operation));
+        continue;
+      }
+      if (exactEvidence !== operation.evidenceExcerpt) operation = { ...operation, evidenceExcerpt: exactEvidence };
+      if (!inventoryOperationSupported(operation, names)) {
+        rejections.push(rejection(input, 'inventory', index, 'excerpt_mismatch', '库存操作的物品、数字、单位或方向没有得到同一证据支持。', 'rawAmount', operation));
+        continue;
+      }
+      if (operationLocalIds.has(operation.localId)) {
+        rejections.push(rejection(input, 'inventory', index, 'duplicate_proposal', '库存操作 localId 在同一 Capture 中重复。', 'localId', operation));
+        continue;
+      }
+      operationLocalIds.add(operation.localId);
+      inventoryOperations.push({ ...operation, unit: normalizeInventoryUnit(operation.unit) });
+    }
+
+    const inventoryClaimKeys = new Set(inventoryOperations.flatMap(operation =>
+      (inventoryNamesByRef.get(operation.itemRef) ?? []).map(name => `${operation.sourceRef}\0${normalizeInventoryName(name)}`)));
+    const nonInventoryClaims = claims.filter((claim, index) => {
+      if (claim.kind !== 'state' || numericTokens(`${claim.content}${claim.objectText ?? ''}`).length === 0) return true;
+      const subject = claim.subjectText?.trim();
+      if (!subject || !inventoryClaimKeys.has(`${claim.sourceRef}\0${normalizeInventoryName(subject)}`)) return true;
+      rejections.push(rejection(input, 'claim', index, 'duplicate_proposal', '库存数量已由物品账本接管，未重复写入普通状态事实。', 'kind', claim, undefined, 'ignored'));
+      return false;
+    });
+
     return {
       actorCandidates,
       locationCandidates,
+      itemCandidates,
       episodes,
-      claims,
+      claims: nonInventoryClaims,
+      inventoryOperations,
       rejections,
       deterministicRepairs,
       fieldActions,
@@ -1233,6 +1461,8 @@ export class MultiActorCaptureService {
     writableSourceRefs: ReadonlySet<string>,
     knownActors: readonly KnownActorContextItem[],
     knownLocations: readonly KnownLocationContextItem[],
+    knownInventory: readonly KnownInventoryContextItem[],
+    deterministicInventory: readonly DeterministicInventoryProposal[],
   ): Promise<{ prepared: PreparedCapture; structured: StructuredCaptureResult }> {
     const repair = input.repair ? {
       ...input.repair,
@@ -1250,11 +1480,12 @@ export class MultiActorCaptureService {
       writableSourceRefs: [...writableSourceRefs],
       knownActorContext: knownActors,
       knownLocationContext: knownLocations,
+      knownInventoryContext: knownInventory,
       ...(input.existingMemoryContext ? { existingMemoryContext: input.existingMemoryContext } : {}),
       ...(input.graphLlmRelationEnabled === undefined ? {} : { graphLlmRelationEnabled: input.graphLlmRelationEnabled }),
       ...(repair === undefined ? {} : { repair }),
     };
-    const extracted = await this.extractor.extract(extractionInput);
+    const extracted = mergeDeterministicInventory(await this.extractor.extract(extractionInput), deterministicInventory, knownInventory);
     const deterministicClaims = extractExplicitDirectiveClaims(
       sources,
       writableSourceRefs,
@@ -1270,7 +1501,7 @@ export class MultiActorCaptureService {
       },
     };
     return {
-      prepared: this.prepare(scopedInput, first, sources, writableSourceRefs, knownActors, knownLocations),
+      prepared: this.prepare(scopedInput, first, sources, writableSourceRefs, knownActors, knownLocations, knownInventory),
       structured: first,
     };
   }
@@ -1290,6 +1521,21 @@ export class MultiActorCaptureService {
     this.discoverTrustedDirectories(sources.filter(source => writableSourceRefs.has(source.id)));
     const knownActors = this.actorDirectory(sources);
     const knownLocations = this.locationDirectory(sources);
+    const inventoryRepository = this.repository as (MultiActorMemoryRepository & {
+      listInventoryItems?: MultiActorMemoryRepository['listInventoryItems'];
+      listInventoryStates?: MultiActorMemoryRepository['listInventoryStates'];
+      listInventoryEvents?: MultiActorMemoryRepository['listInventoryEvents'];
+    }) | undefined;
+    const [existingInventoryItems, existingInventoryStates, existingInventoryEvents] = inventoryRepository
+      ? await Promise.all([
+        inventoryRepository.listInventoryItems?.() ?? Promise.resolve([]),
+        inventoryRepository.listInventoryStates?.() ?? Promise.resolve([]),
+        inventoryRepository.listInventoryEvents?.() ?? Promise.resolve([]),
+      ])
+      : [[], [], []] as const;
+    const matchedInventory = selectKnownInventoryContext(sources, existingInventoryItems, existingInventoryStates, Math.max(50, existingInventoryItems.length));
+    const knownInventory = matchedInventory.slice(0, 50);
+    const deterministicInventory = parseInventorySnapshots(sources, writableSourceRefs);
     const actorIdByPromptRef = new Map(knownActors.filter(item => item.ownerId).map(item => [item.referenceId, item.ownerId!]));
     const locationIdByPromptRef = new Map(knownLocations.filter(item => item.locationId).map(item => [item.referenceId, item.locationId!]));
 
@@ -1299,10 +1545,25 @@ export class MultiActorCaptureService {
       writableSourceRefs,
       knownActors,
       knownLocations,
+      knownInventory,
+      deterministicInventory,
     );
+    if (matchedInventory.length > knownInventory.length) {
+      prepared.rejections.push(rejection(
+        input,
+        'batch',
+        0,
+        'invalid_shape',
+        `本批精确命中 ${matchedInventory.length} 个物品，仅向模型提供前 ${knownInventory.length} 个，已记录截断审计。`,
+        'knownInventoryContext',
+        { matched: matchedInventory.length, provided: knownInventory.length },
+        undefined,
+        'ignored',
+      ));
+    }
 
-    const acceptedLocalIds: Record<'actor' | 'location' | 'episode' | 'claim', string[]> = {
-      actor: [], location: [], episode: [], claim: [],
+    const acceptedLocalIds: Record<'actor' | 'location' | 'item' | 'episode' | 'claim' | 'inventory', string[]> = {
+      actor: [], location: [], item: [], episode: [], claim: [], inventory: [],
     };
     const ownerIdByRef = new Map(actorIdByPromptRef);
     const locationIdByRef = new Map(locationIdByPromptRef);
@@ -1370,6 +1631,38 @@ export class MultiActorCaptureService {
           locationRef: resolution.location.id,
         });
       }
+    }
+
+    const itemIdByRef = new Map(knownInventory.filter(item => item.itemId).map(item => [item.referenceId, item.itemId!]));
+    const inventoryItemsById = new Map(existingInventoryItems.map(item => [item.id, item]));
+    const inventoryItemsToCommit = new Map<string, InventoryItem>();
+    for (const [index, candidate] of prepared.itemCandidates.entries()) {
+      const existingKnown = knownInventory.find(item => unique([item.canonicalName, ...item.aliases])
+        .some(name => normalizeInventoryName(name) === normalizeInventoryName(candidate.displayName)));
+      const id = existingKnown?.itemId ?? inventoryItemId(input.workspaceId, candidate.displayName);
+      const previous = inventoryItemsById.get(id);
+      if (previous?.status === 'invalid') {
+        prepared.rejections.push(rejection(input, 'item', index, 'dependency_invalid', '该物品已被人工作废，自动提取不会恢复它。', 'displayName', candidate, undefined, 'ignored'));
+        continue;
+      }
+      const now = Date.now();
+      const item: InventoryItem = {
+        id,
+        workspaceId: input.workspaceId,
+        canonicalName: previous?.canonicalName ?? candidate.displayName.trim(),
+        aliases: unique([...(previous?.aliases ?? []), ...candidate.aliases, candidate.displayName])
+          .filter(alias => normalizeInventoryName(alias) !== normalizeInventoryName(previous?.canonicalName ?? candidate.displayName)),
+        category: previous?.category ?? candidate.category,
+        status: candidate.confidence >= 0.9 ? 'confirmed' : 'pending',
+        confidence: Math.max(previous?.confidence ?? 0, candidate.confidence),
+        sourceRefs: unique([...(previous?.sourceRefs ?? []), candidate.sourceRef]),
+        createdAt: previous?.createdAt ?? now,
+        updatedAt: now,
+      };
+      inventoryItemsById.set(id, item);
+      inventoryItemsToCommit.set(id, item);
+      itemIdByRef.set(candidate.localId, id);
+      acceptedLocalIds.item.push(candidate.localId);
     }
 
     const resolveOwner = (ref: string | undefined): string | undefined => {
@@ -1644,6 +1937,100 @@ export class MultiActorCaptureService {
     }
 
     const facts = [...new Map(reconciledFacts.map(fact => [fact.id, fact])).values()];
+    const inventoryStatesById = new Map(existingInventoryStates.map(state => [state.id, state]));
+    const existingInventoryEventIds = new Set(existingInventoryEvents.map(event => event.id));
+    const inventoryStatesToCommit = new Map<string, InventoryState>();
+    const inventoryEventsToCommit: InventoryEvent[] = [];
+    const orderedInventoryOperations = [...prepared.inventoryOperations].sort((left, right) => {
+      const leftSource = sources.find(source => source.id === left.sourceRef);
+      const rightSource = sources.find(source => source.id === right.sourceRef);
+      return (leftSource?.floor ?? Number.MAX_SAFE_INTEGER) - (rightSource?.floor ?? Number.MAX_SAFE_INTEGER)
+        || (leftSource?.content.indexOf(left.evidenceExcerpt) ?? 0) - (rightSource?.content.indexOf(right.evidenceExcerpt) ?? 0)
+        || left.localId.localeCompare(right.localId);
+    });
+    for (const [index, operation] of orderedInventoryOperations.entries()) {
+      const itemId = itemIdByRef.get(operation.itemRef);
+      const source = sources.find(row => row.id === operation.sourceRef);
+      if (!itemId || !source) {
+        prepared.rejections.push(rejection(input, 'inventory', index, 'dependency_invalid', '库存操作没有可用的物品目录项，未更新当前快照。', 'itemRef', operation, undefined, 'ignored'));
+        continue;
+      }
+      const fallbackState = [...inventoryStatesById.values()].find(state => state.itemId === itemId && state.measureKind === operation.measureKind);
+      const unit = operation.unit || fallbackState?.unit || '';
+      const unitKey = normalizeInventoryUnit(unit) || 'unitless';
+      const stateId = inventoryStateId(input.chatKey, itemId, operation.measureKind, unitKey);
+      const previous = inventoryStatesById.get(stateId);
+      let afterAmount: number | undefined;
+      if (operation.operation === 'increase' || operation.operation === 'decrease') {
+        if (!previous || previous.precision !== 'exact' || previous.amount === undefined || operation.amount === undefined || previous.unitKey !== unitKey) {
+          prepared.rejections.push(rejection(input, 'inventory', index, 'dependency_invalid', '库存增减缺少同单位的精确当前数量，已转入审核。', 'amount', operation));
+          continue;
+        }
+        afterAmount = previous.amount + (operation.operation === 'increase' ? operation.amount : -operation.amount);
+        if (afterAmount < 0) {
+          prepared.rejections.push(rejection(input, 'inventory', index, 'invalid_shape', '库存减少后不能小于 0。', 'amount', operation));
+          continue;
+        }
+      } else if (operation.operation === 'set') {
+        afterAmount = operation.precision === 'unknown' ? undefined : operation.amount;
+      }
+      const eventId = `inventory-event:${hash(`${input.chatKey}\0${itemId}\0${operation.sourceRef}\0${operation.evidenceExcerpt}\0${operation.operation}\0${operation.rawAmount ?? ''}`)}`;
+      if (existingInventoryEventIds.has(eventId)) continue;
+      const availability = operation.operation === 'remove'
+        ? 'absent' as const
+        : operation.precision === 'unknown' ? 'unknown' as const : 'active' as const;
+      const now = Date.now();
+      const event: InventoryEvent = {
+        id: eventId,
+        workspaceId: input.workspaceId,
+        chatKey: input.chatKey,
+        itemId,
+        operation: operation.operation,
+        measureKind: operation.measureKind,
+        ...(operation.amount === undefined ? {} : { amount: operation.amount }),
+        ...(operation.rawAmount === undefined ? {} : { rawAmount: operation.rawAmount }),
+        unit,
+        unitKey,
+        precision: operation.precision,
+        reason: operation.reason,
+        ...(previous?.amount === undefined ? {} : { beforeAmount: previous.amount }),
+        ...(afterAmount === undefined ? {} : { afterAmount }),
+        availability,
+        sourceRef: operation.sourceRef,
+        evidenceExcerpt: operation.evidenceExcerpt,
+        ...(source.floor === undefined ? {} : { floor: source.floor }),
+        occurredAt: source.createdAt,
+        recordedAt: now,
+        origin: 'automatic',
+        confidence: operation.confidence,
+        ...(input.captureJobId ? { jobId: input.captureJobId } : {}),
+        ...(structured.audit?.requestId ? { requestId: structured.audit.requestId } : {}),
+      };
+      const state: InventoryState = {
+        id: stateId,
+        workspaceId: input.workspaceId,
+        chatKey: input.chatKey,
+        itemId,
+        measureKind: operation.measureKind,
+        ...(afterAmount === undefined ? {} : { amount: afterAmount }),
+        unit,
+        unitKey,
+        precision: operation.precision,
+        availability,
+        ...(operation.stateNote ? { stateNote: operation.stateNote } : {}),
+        lastEventId: eventId,
+        sourceRefs: unique([...(previous?.sourceRefs ?? []), operation.sourceRef]),
+        ...(source.floor === undefined ? {} : { updatedAtFloor: source.floor }),
+        revision: (previous?.revision ?? 0) + 1,
+        createdAt: previous?.createdAt ?? now,
+        updatedAt: now,
+      };
+      existingInventoryEventIds.add(eventId);
+      inventoryEventsToCommit.push(event);
+      inventoryStatesById.set(stateId, state);
+      inventoryStatesToCommit.set(stateId, state);
+      acceptedLocalIds.inventory.push(operation.localId);
+    }
     // A predecessor can be created and superseded inside the same Capture
     // window. Keep its observation so the actor receives a historical trace;
     // an older persisted predecessor submitted only for a status update has no
@@ -1708,6 +2095,9 @@ export class MultiActorCaptureService {
         locations: this.locationRegistry.listLocations(),
         locationAliases: this.locationRegistry.listAliases(),
         pendingLocationCandidates: this.locationRegistry.listPending(),
+        inventoryItems: [...inventoryItemsToCommit.values()],
+        inventoryStates: [...inventoryStatesToCommit.values()],
+        inventoryEvents: inventoryEventsToCommit,
         episodes,
         observations,
         facts,
@@ -1723,6 +2113,9 @@ export class MultiActorCaptureService {
       locations: this.locationRegistry.listLocations(),
       locationAliases: this.locationRegistry.listAliases(),
       pendingLocationCandidates: this.locationRegistry.listPending(),
+      inventoryItems: [...inventoryItemsToCommit.values()],
+      inventoryStates: [...inventoryStatesToCommit.values()],
+      inventoryEvents: inventoryEventsToCommit,
       episodes,
       observations,
       facts,

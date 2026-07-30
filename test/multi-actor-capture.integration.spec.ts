@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ActorRegistry, MultiActorCaptureService } from '../src/application/actors';
 import { LocationRegistry } from '../src/application/locations';
+import { inventoryStateId } from '../src/application/inventory';
 import type { SourceBlock, StructuredCaptureResult } from '../src/application/ingest/types';
 
 function service(workspace: string, extractor: { extract(input: any): Promise<StructuredCaptureResult> }, repository?: any) {
@@ -961,5 +962,93 @@ describe('Claim-based multi actor capture', () => {
     expect(blocked.outcome).toBe('partial');
     expect(blocked.facts).toEqual([]);
     expect(blocked.fieldActions).toBeUndefined();
+  });
+
+  it('rebuilds the golden inventory snapshots from floors 4 and 6 without binding later numbers to earlier evidence', async () => {
+    const inventoryItems: any[] = [];
+    const inventoryStates: any[] = [];
+    const inventoryEvents: any[] = [];
+    const repository = {
+      listInventoryItems: async () => inventoryItems,
+      listInventoryStates: async () => inventoryStates,
+      listInventoryEvents: async () => inventoryEvents,
+      listFacts: async () => [],
+      commitCapture: async (commit: any) => {
+        for (const item of commit.inventoryItems ?? []) {
+          const index = inventoryItems.findIndex(current => current.id === item.id);
+          if (index >= 0) inventoryItems[index] = item; else inventoryItems.push(item);
+        }
+        for (const state of commit.inventoryStates ?? []) {
+          const index = inventoryStates.findIndex(current => current.id === state.id);
+          if (index >= 0) inventoryStates[index] = state; else inventoryStates.push(state);
+        }
+        for (const event of commit.inventoryEvents ?? []) {
+          if (!inventoryEvents.some(current => current.id === event.id)) inventoryEvents.push(event);
+        }
+        return { id: `audit:${commit.envelope.sourceRefs.join(':')}`, entries: [] };
+      },
+    };
+    const captureService = service('inventory-golden-w', { extract: async () => empty() }, repository);
+    const snapshot = (id: string, floor: number, ration: number, water: number) => source({
+      id, floor, createdAt: floor * 1_000, kind: 'state', role: 'metadata', semanticSection: 'state_snapshot', actorRefs: [], locationRefs: [],
+      content: `【当前物资快照】\n食物: 高热量压缩口粮（约${ration}天份）、瓶装水x${water}\n【角色状态】\n小时：健康`,
+    });
+
+    await captureService.capture({ workspaceId: 'inventory-golden-w', chatKey: 'chat', sources: [snapshot('message:4', 4, 29, 22)] });
+    await captureService.capture({ workspaceId: 'inventory-golden-w', chatKey: 'chat', sources: [snapshot('message:6', 6, 28, 20)] });
+
+    const itemsById = new Map(inventoryItems.map(item => [item.id, item]));
+    const rationState = inventoryStates.find(state => itemsById.get(state.itemId)?.canonicalName === '高热量压缩口粮');
+    const waterState = inventoryStates.find(state => itemsById.get(state.itemId)?.canonicalName === '瓶装水');
+    expect(rationState).toMatchObject({ amount: 28, measureKind: 'coverage_days', updatedAtFloor: 6, revision: 2 });
+    expect(waterState).toMatchObject({ amount: 20, measureKind: 'quantity', updatedAtFloor: 6, revision: 2 });
+    expect(inventoryEvents.filter(event => event.itemId === rationState.itemId).map(event => ({ after: event.afterAmount, floor: event.floor, sourceRef: event.sourceRef }))).toEqual([
+      { after: 29, floor: 4, sourceRef: 'message:4' },
+      { after: 28, floor: 6, sourceRef: 'message:6' },
+    ]);
+    expect(inventoryEvents.filter(event => event.itemId === waterState.itemId).map(event => ({ after: event.afterAmount, floor: event.floor, sourceRef: event.sourceRef }))).toEqual([
+      { after: 22, floor: 4, sourceRef: 'message:4' },
+      { after: 20, floor: 6, sourceRef: 'message:6' },
+    ]);
+  });
+
+  it('applies an evidence-backed decrease but refuses a vague water-consumption guess', async () => {
+    const item = { id: 'inventory-item:water', workspaceId: 'inventory-narrative-w', canonicalName: '瓶装水', aliases: [], category: 'food', status: 'confirmed', confidence: 1, sourceRefs: ['message:4'], createdAt: 1, updatedAt: 1 };
+    let currentState: any = { id: inventoryStateId('chat', item.id, 'quantity', '瓶'), workspaceId: 'inventory-narrative-w', chatKey: 'chat', itemId: item.id, measureKind: 'quantity', amount: 22, unit: '瓶', unitKey: '瓶', precision: 'exact', availability: 'active', lastEventId: 'event:initial', sourceRefs: ['message:4'], revision: 1, createdAt: 1, updatedAt: 1 };
+    const events: any[] = [];
+    const repository = {
+      listInventoryItems: async () => [item],
+      listInventoryStates: async () => [currentState],
+      listInventoryEvents: async () => events,
+      listFacts: async () => [],
+      commitCapture: async (commit: any) => {
+        if (commit.inventoryStates?.[0]) currentState = commit.inventoryStates[0];
+        events.push(...(commit.inventoryEvents ?? []));
+        return { id: 'audit:inventory-narrative', entries: [] };
+      },
+    };
+    const extractor = { extract: async (input: any): Promise<StructuredCaptureResult> => ({
+      ...empty(),
+      inventoryOperations: [{
+        localId: 'drink-water', itemRef: input.knownInventoryContext[0].referenceId, operation: 'decrease', measureKind: 'quantity', amount: 2, rawAmount: '2瓶', unit: '瓶', precision: 'exact', reason: 'consume', sourceRef: input.sources[0].id, evidenceExcerpt: input.sources[0].content, confidence: 0.99,
+      }],
+    }) };
+    const explicit = source({ id: 'message:8', floor: 8, createdAt: 8_000, content: '小时喝掉2瓶瓶装水。', actorRefs: [], locationRefs: [] });
+    const accepted = await service('inventory-narrative-w', extractor, repository).capture({ workspaceId: 'inventory-narrative-w', chatKey: 'chat', sources: [explicit] });
+    expect(accepted.inventoryStates[0]).toMatchObject({ amount: 20, revision: 2 });
+
+    currentState = { ...currentState, amount: 22, revision: 1 };
+    events.length = 0;
+    const vague = source({ id: 'message:9', floor: 9, createdAt: 9_000, content: '小时喝了一些瓶装水。', actorRefs: [], locationRefs: [] });
+    const rejected = await service('inventory-narrative-w', extractor, repository).capture({ workspaceId: 'inventory-narrative-w', chatKey: 'chat', sources: [vague] });
+    expect(rejected.inventoryStates).toEqual([]);
+    expect(rejected.inventoryEvents).toEqual([]);
+    expect(rejected.rejections).toContainEqual(expect.objectContaining({ recordType: 'inventory', code: 'excerpt_mismatch' }));
+
+    currentState = { ...currentState, amount: undefined, precision: 'unknown', availability: 'unknown', revision: 1 };
+    events.length = 0;
+    const unknownBase = await service('inventory-narrative-w', extractor, repository).capture({ workspaceId: 'inventory-narrative-w', chatKey: 'chat', sources: [explicit] });
+    expect(unknownBase.inventoryStates).toEqual([]);
+    expect(unknownBase.rejections).toContainEqual(expect.objectContaining({ recordType: 'inventory', code: 'dependency_invalid' }));
   });
 });

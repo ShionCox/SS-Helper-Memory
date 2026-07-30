@@ -156,9 +156,40 @@ export interface StructuredLocationCandidate {
   confidence: number;
 }
 
+export interface StructuredItemCandidate {
+  localId: string;
+  displayName: string;
+  aliases: string[];
+  category: import('../../domain').InventoryItemCategory;
+  sourceRef: string;
+  evidenceExcerpt: string;
+  confidence: number;
+}
+
+export interface StructuredInventoryOperation {
+  localId: string;
+  itemRef: string;
+  operation: import('../../domain').InventoryOperation;
+  measureKind: import('../../domain').InventoryMeasureKind;
+  amount?: number;
+  rawAmount?: string;
+  unit: string;
+  precision: import('../../domain').InventoryPrecision;
+  reason: import('../../domain').InventoryReason;
+  /** Deterministic snapshot-only condition text, for example “已使用”. */
+  stateNote?: string;
+  sourceRef: string;
+  evidenceExcerpt: string;
+  confidence: number;
+}
+
 export interface StructuredEpisode {
   localId: string;
   sourceRefs: string[];
+  /** Required by the AI schema; optional only for trusted in-process producers/tests. */
+  evidenceSpanIds?: string[];
+  /** Server-owned exact excerpts resolved from evidenceSpanIds. */
+  evidenceExcerpts?: string[];
   participantRefs: string[];
   presentRefs: string[];
   mentionedRefs: string[];
@@ -202,8 +233,12 @@ export interface StructuredClaim {
 export interface StructuredCaptureResult {
   actorCandidates: StructuredActorCandidate[];
   locationCandidates: StructuredLocationCandidate[];
+  /** Required and normalized to [] at the LLM boundary. */
+  itemCandidates?: StructuredItemCandidate[];
   episodes: StructuredEpisode[];
   claims: StructuredClaim[];
+  /** Required and normalized to [] at the LLM boundary. */
+  inventoryOperations?: StructuredInventoryOperation[];
   rejections?: AutomaticIngestRejection[];
   diagnostics?: {
     parser?: string;
@@ -245,6 +280,16 @@ export interface KnownActorContextItem {
   canonicalName: string;
   aliases: string[];
   status: 'confirmed' | 'pending';
+}
+
+export interface KnownInventoryContextItem {
+  referenceId: string;
+  /** Internal deterministic mapping; never serialized to the model. */
+  itemId?: string;
+  canonicalName: string;
+  aliases: string[];
+  category: import('../../domain').InventoryItemCategory;
+  states: Array<Pick<import('../../domain').InventoryState, 'measureKind' | 'amount' | 'unit' | 'precision' | 'availability' | 'updatedAtFloor'>>;
 }
 
 export interface SupportedReferenceItem {
@@ -294,10 +339,12 @@ export interface MemoryExtractionInput {
   knownActorContext?: readonly KnownActorContextItem[];
   /** Stable location names/aliases already known by LocationRegistry. */
   knownLocationContext?: readonly KnownLocationContextItem[];
+  /** Exact-name matched current inventory. Context only; never evidence. */
+  knownInventoryContext?: readonly KnownInventoryContextItem[];
   /** Enables source-grounded relation-fact guidance in the existing single call. */
   graphLlmRelationEnabled?: boolean;
   repair?: RepairAttemptContext & {
-    collection: 'actorCandidates' | 'locationCandidates' | 'episodes' | 'claims';
+    collection: 'actorCandidates' | 'locationCandidates' | 'itemCandidates' | 'episodes' | 'claims' | 'inventoryOperations';
     issues: Array<{ path: string; keyword: string; expected: string }>;
     parentRequestId?: string;
     resourceId?: string;

@@ -136,6 +136,47 @@ export function buildSummaryBatches(blocks: readonly SourceBlock[], strategyInpu
   return buildSummaryBatchPlans(blocks, strategyInput, options).map((plan) => plan.sources);
 }
 
+function hardCapSummaryPlans(plans: readonly SummaryBatchPlan[], limit: number): SummaryBatchPlan[] {
+  const capped: SummaryBatchPlan[] = [];
+  for (const plan of plans) {
+    const expanded = plan.sources.flatMap(source => splitForCharLimit(source, limit));
+    const writable = new Set(plan.writableSourceRefs);
+    const writableParts = expanded.filter(source => writable.has(source.id) || writable.has(messageSourceId(source)));
+    const contextParts = expanded.filter(source => !writableParts.includes(source));
+    let offset = 0;
+    let first = true;
+    while (offset < writableParts.length) {
+      const body: SourceBlock[] = [];
+      let chars = 0;
+      while (offset < writableParts.length) {
+        const source = writableParts[offset]!;
+        if (body.length > 0 && chars + source.content.length > limit) break;
+        body.push(source);
+        chars += source.content.length;
+        offset += 1;
+        if (chars >= limit) break;
+      }
+      const context: SourceBlock[] = [];
+      if (first && chars < limit) {
+        let remaining = limit - chars;
+        for (let index = contextParts.length - 1; index >= 0; index -= 1) {
+          const source = contextParts[index]!;
+          if (source.content.length > remaining) continue;
+          context.unshift(source);
+          remaining -= source.content.length;
+        }
+      }
+      capped.push({
+        sources: [...context, ...body],
+        writableSourceRefs: body.map(source => source.id),
+        messageCount: new Set(body.filter(source => source.kind === 'message').map(messageSourceId)).size,
+      });
+      first = false;
+    }
+  }
+  return capped;
+}
+
 /**
  * 在稳定批次之外同时标明本批写入边界。重叠楼层会继续进入 sources，
  * 但不会进入 writableSourceRefs，避免重复 Capture 抬高修订和审计计数。
@@ -160,17 +201,25 @@ export function buildSummaryBatchPlans(blocks: readonly SourceBlock[], strategyI
       writableSourceRefs: metadata.filter(isTaskWritable).map((source) => source.id),
       messageCount: 0,
     };
-    return taskWritableRefs && plan.writableSourceRefs.length === 0 ? [] : [plan];
+    return taskWritableRefs && plan.writableSourceRefs.length === 0 ? [] : hardCapSummaryPlans([plan], strategy.batchChars);
   }
 
   const groups: Array<{ start: number; end: number; blocks: SourceBlock[] }> = [];
   if (strategy.batchMode === 'floors') {
-    for (let index = 0; index < floorGroups.length; index += strategy.batchFloors) {
-      groups.push({
-        start: index,
-        end: Math.min(floorGroups.length, index + strategy.batchFloors),
-        blocks: flattenedGroups(floorGroups.slice(index, index + strategy.batchFloors)).flatMap((message) => splitForCharLimit(message, strategy.batchChars)),
-      });
+    for (let index = 0; index < floorGroups.length;) {
+      const start = index;
+      const blocks: SourceBlock[] = [];
+      let chars = 0;
+      while (index < floorGroups.length && index - start < strategy.batchFloors) {
+        const parts = flattenedGroups([floorGroups[index]!]).flatMap((message) => splitForCharLimit(message, strategy.batchChars));
+        const length = parts.reduce((total, part) => total + part.content.length, 0);
+        if (blocks.length > 0 && chars + length > strategy.batchChars) break;
+        blocks.push(...parts);
+        chars += length;
+        index += 1;
+        if (chars >= strategy.batchChars) break;
+      }
+      groups.push({ start, end: index, blocks });
     }
   } else {
     let current: SourceBlock[] = [];
@@ -213,7 +262,7 @@ export function buildSummaryBatchPlans(blocks: readonly SourceBlock[], strategyI
       messageCount: new Set(writableSources.filter((source) => source.kind === 'message').map(messageSourceId)).size,
     };
   });
-  if (!taskWritableRefs) return plans;
+  if (!taskWritableRefs) return hardCapSummaryPlans(plans, strategy.batchChars);
   const writablePlans: SummaryBatchPlan[] = [];
   let leadingContext: SourceBlock[] = [];
   for (const plan of plans) {
@@ -231,7 +280,7 @@ export function buildSummaryBatchPlans(blocks: readonly SourceBlock[], strategyI
       writablePlans.push(plan);
     }
   }
-  return writablePlans;
+  return hardCapSummaryPlans(writablePlans, strategy.batchChars);
 }
 
 /** 根据当前总结策略的实际批次估算 LLM 输入成本。 */

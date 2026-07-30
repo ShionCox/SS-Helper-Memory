@@ -20,6 +20,11 @@ import {
   type CaptureEnvelope,
   type LocationAlias,
   type LocationCandidate,
+  type InventoryCommand,
+  type InventoryEvent,
+  type InventoryItem,
+  type InventoryItemCategory,
+  type InventoryState,
   type MemoryLocation,
   type FactListOptions,
   type ManualFactInput,
@@ -58,13 +63,15 @@ function isRepairCaptureAudit(metadata: Record<string, unknown>, captureJobId: s
 function repairCollection(item: AutomaticIngestRejection): CaptureRepairQueueRecord['collection'] {
   return item.recordType === 'actor' ? 'actorCandidates'
     : item.recordType === 'location' ? 'locationCandidates'
-      : item.recordType === 'episode' ? 'episodes'
-        : item.recordType === 'claim' ? 'claims'
-          : 'batch';
+      : item.recordType === 'item' ? 'itemCandidates'
+        : item.recordType === 'episode' ? 'episodes'
+          : item.recordType === 'claim' ? 'claims'
+            : item.recordType === 'inventory' ? 'inventoryOperations'
+              : 'batch';
 }
 
 function repairCollectionRank(collection: CaptureRepairQueueRecord['collection']): number {
-  return ({ actorCandidates: 0, locationCandidates: 1, episodes: 2, claims: 3, batch: 4 })[collection];
+  return ({ actorCandidates: 0, locationCandidates: 1, itemCandidates: 2, episodes: 3, claims: 4, inventoryOperations: 5, batch: 6 })[collection];
 }
 
 function repairDependencyBlocker(
@@ -135,7 +142,7 @@ function locationCandidateRecordId(candidate: Pick<LocationCandidate, 'localId' 
   return `location-candidate:${stableRecordHash(`${candidate.locationRef ?? candidate.displayName}\0${candidate.localId}\0${candidate.sourceRef}`)}`;
 }
 
-type Persistable = MemoryOwner | ActorAlias | MemoryLocation | LocationAlias | MemoryEpisode | MemoryObservation | MemoryFact | ActorMemoryTrace | SceneCast | SceneState | SceneTransition | GenerationCastPlan | CastPlanAudit | RecallCoverageLog | MemoryUsageLog | Record<string, unknown>;
+type Persistable = MemoryOwner | ActorAlias | MemoryLocation | LocationAlias | InventoryItem | InventoryState | InventoryEvent | MemoryEpisode | MemoryObservation | MemoryFact | ActorMemoryTrace | SceneCast | SceneState | SceneTransition | GenerationCastPlan | CastPlanAudit | RecallCoverageLog | MemoryUsageLog | Record<string, unknown>;
 interface CaptureCommit {
   readonly envelope: CaptureEnvelope;
   /** Distinguishes original extraction audits from field-level repair audits. */
@@ -153,6 +160,9 @@ interface CaptureCommit {
   readonly locations: readonly MemoryLocation[];
   readonly locationAliases: readonly LocationAlias[];
   readonly pendingLocationCandidates?: readonly LocationCandidate[];
+  readonly inventoryItems?: readonly InventoryItem[];
+  readonly inventoryStates?: readonly InventoryState[];
+  readonly inventoryEvents?: readonly InventoryEvent[];
   readonly episodes: readonly MemoryEpisode[];
   readonly observations: readonly MemoryObservation[];
   readonly facts: readonly MemoryFact[];
@@ -296,6 +306,19 @@ function stableKey(value: string): string {
   return stableRecordHash(value);
 }
 
+function normalizedInventoryText(value: string): string {
+  return value.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase();
+}
+
+function inventoryUnitKey(value: string): string {
+  const normalized = normalizedInventoryText(value);
+  return ({ 公斤: 'kg', 千克: 'kg', 克: 'g', 毫克: 'mg', 毫升: 'ml', 升: 'l', 日份: '天份', 日: '天' } as Record<string, string>)[normalized] ?? normalized;
+}
+
+function repositoryInventoryStateId(chatKey: string, itemId: string, measureKind: InventoryState['measureKind'], unitKey: string): string {
+  return `inventory-state:${stableRecordHash(`${chatKey}\0${itemId}\0${measureKind}\0${unitKey}`)}`;
+}
+
 const KNOWLEDGE_MODE_RANK: Readonly<Record<ActorMemoryTrace['knowledgeMode'], number>> = Object.freeze({ unknown: 0, suspected: 1, believed: 2, inferred: 3, heard: 4, experienced: 5, self_reported: 6, asserted: 7 });
 const PRIVACY_RANK: Readonly<Record<ActorMemoryTrace['privacy'], number>> = Object.freeze({ public: 0, limited: 1, private: 2, secret: 3 });
 const QUERY_PAGE_SIZE = 500;
@@ -376,6 +399,177 @@ export class MultiActorMemoryRepository {
   async listLocationAliases(): Promise<LocationAlias[]> {
     return (await this.list('location-aliases', { workspaceId: this.workspaceId }))
       .map(record => record.value as unknown as LocationAlias);
+  }
+  async listInventoryItems(): Promise<InventoryItem[]> {
+    return (await this.list('inventory-items', { workspaceId: this.workspaceId }))
+      .map(record => record.value as unknown as InventoryItem);
+  }
+  async listInventoryStates(): Promise<InventoryState[]> {
+    return (await this.list('inventory-states', { workspaceId: this.workspaceId, chatKey: this.chatKey }))
+      .map(record => record.value as unknown as InventoryState);
+  }
+  async listInventoryEvents(itemId?: string): Promise<InventoryEvent[]> {
+    return (await this.list('inventory-events', {
+      workspaceId: this.workspaceId,
+      chatKey: this.chatKey,
+      ...(itemId ? { itemId } : {}),
+    })).map(record => record.value as unknown as InventoryEvent);
+  }
+  async createInventoryItem(input: {
+    readonly canonicalName: string;
+    readonly aliases?: readonly string[];
+    readonly category?: InventoryItemCategory;
+  }): Promise<InventoryItem> {
+    const canonicalName = input.canonicalName.normalize('NFKC').trim();
+    if (!canonicalName || canonicalName.length > 120) {
+      throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.inventory.item.validate' });
+    }
+    const existing = (await this.listInventoryItems()).find(item =>
+      normalizedInventoryText(item.canonicalName) === normalizedInventoryText(canonicalName));
+    if (existing) return existing;
+    const now = Date.now();
+    const id = `inventory-item:${stableRecordHash(`${this.workspaceId}\0${normalizedInventoryText(canonicalName)}`)}`;
+    const item: InventoryItem = {
+      id,
+      workspaceId: this.workspaceId,
+      canonicalName,
+      aliases: [...new Set((input.aliases ?? []).map(alias => alias.normalize('NFKC').trim()).filter(alias => alias && normalizedInventoryText(alias) !== normalizedInventoryText(canonicalName)))],
+      category: input.category ?? 'other',
+      status: 'confirmed',
+      confidence: 1,
+      sourceRefs: ['manual'],
+      createdAt: now,
+      updatedAt: now,
+    };
+    await this.store.apply({
+      workspaceId: this.workspaceId,
+      idempotencyKey: `inventory-item-create:${stableRecordHash(id)}`,
+      operations: [{ action: 'upsert', collection: 'inventory-items', recordId: id, value: asPlain(item), expectedVersion: 0 }],
+    });
+    return item;
+  }
+
+  async applyInventoryCommand(
+    command: InventoryCommand,
+    options: { readonly expectedRevision?: number; readonly idempotencyKey?: string } = {},
+  ): Promise<{ readonly state: InventoryState; readonly event: InventoryEvent }> {
+    const itemRecord = await this.store.read({ workspaceId: this.workspaceId, collection: 'inventory-items', recordId: command.itemId });
+    const item = itemRecord?.value as unknown as InventoryItem | undefined;
+    if (!item || item.workspaceId !== this.workspaceId || item.status === 'invalid') {
+      throw createSSHelperError('WORKSPACE_NOT_FOUND', { stage: 'memory.inventory.command.item' });
+    }
+    const unit = command.unit.normalize('NFKC').trim();
+    const unitKey = inventoryUnitKey(unit);
+    if (command.measureKind === 'coverage_days' && !['set', 'remove'].includes(command.operation)) {
+      throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.inventory.command.coverage' });
+    }
+    if (!['set', 'remove'].includes(command.operation) && command.precision !== 'exact') {
+      throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.inventory.command.precision' });
+    }
+    if (command.operation !== 'remove' && command.precision !== 'unknown'
+      && (!Number.isFinite(command.amount) || Number(command.amount) < 0)) {
+      throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.inventory.command.amount' });
+    }
+    const stateId = repositoryInventoryStateId(this.chatKey, command.itemId, command.measureKind, unitKey);
+    const stateRecord = await this.store.read({ workspaceId: this.workspaceId, collection: 'inventory-states', recordId: stateId });
+    const before = stateRecord?.value as unknown as InventoryState | undefined;
+    if (before && (before.workspaceId !== this.workspaceId || before.chatKey !== this.chatKey)) {
+      throw createSSHelperError('WORKSPACE_ACCESS_DENIED', { stage: 'memory.inventory.command.scope' });
+    }
+    if (options.expectedRevision !== undefined && options.expectedRevision !== (before?.revision ?? 0)) {
+      throw createSSHelperError('WORKSPACE_CONFLICT', { stage: 'memory.inventory.command.revision' });
+    }
+    let afterAmount: number | undefined;
+    if (command.operation === 'set') afterAmount = command.precision === 'unknown' ? undefined : command.amount;
+    else if (command.operation === 'remove') afterAmount = undefined;
+    else {
+      if (before?.availability !== 'active' || before.precision !== 'exact' || !Number.isFinite(before.amount)) {
+        throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.inventory.command.base-state' });
+      }
+      afterAmount = command.operation === 'increase'
+        ? before.amount! + Number(command.amount)
+        : before.amount! - Number(command.amount);
+      if (afterAmount < 0) throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.inventory.command.negative' });
+    }
+    const now = Date.now();
+    const transactionSeed = options.idempotencyKey?.trim() || crypto.randomUUID();
+    const eventId = `inventory-event:${stableRecordHash(`${this.chatKey}\0${stateId}\0${transactionSeed}`)}`;
+    const existingEvent = await this.store.read({ workspaceId: this.workspaceId, collection: 'inventory-events', recordId: eventId });
+    if (existingEvent?.value) {
+      const persistedEvent = existingEvent.value as unknown as InventoryEvent;
+      const persistedState = await this.store.read({ workspaceId: this.workspaceId, collection: 'inventory-states', recordId: stateId });
+      if (!persistedState?.value) throw createSSHelperError('MEMORY_CAPTURE_INTEGRITY_FAILED', { stage: 'memory.inventory.command.idempotency' });
+      return { state: persistedState.value as unknown as InventoryState, event: persistedEvent };
+    }
+    const availability: InventoryState['availability'] = command.operation === 'remove'
+      ? 'absent'
+      : command.precision === 'unknown' ? 'unknown' : 'active';
+    const state: InventoryState = {
+      id: stateId,
+      workspaceId: this.workspaceId,
+      chatKey: this.chatKey,
+      itemId: command.itemId,
+      measureKind: command.measureKind,
+      ...(afterAmount === undefined ? {} : { amount: afterAmount }),
+      unit,
+      unitKey,
+      precision: command.operation === 'remove' ? before?.precision ?? command.precision : command.precision,
+      availability,
+      ...(command.stateNote?.trim() ? { stateNote: command.stateNote.trim() } : {}),
+      lastEventId: eventId,
+      sourceRefs: command.sourceRef ? [command.sourceRef] : ['manual'],
+      ...(command.floor === undefined ? {} : { updatedAtFloor: command.floor }),
+      revision: (before?.revision ?? 0) + 1,
+      createdAt: before?.createdAt ?? now,
+      updatedAt: now,
+    };
+    const event: InventoryEvent = {
+      id: eventId,
+      workspaceId: this.workspaceId,
+      chatKey: this.chatKey,
+      itemId: command.itemId,
+      operation: command.operation,
+      measureKind: command.measureKind,
+      ...(command.amount === undefined ? {} : { amount: command.amount }),
+      ...(command.rawAmount?.trim() ? { rawAmount: command.rawAmount.trim() } : {}),
+      unit,
+      unitKey,
+      precision: command.precision,
+      reason: command.reason,
+      ...(before?.amount === undefined ? {} : { beforeAmount: before.amount }),
+      ...(afterAmount === undefined ? {} : { afterAmount }),
+      availability,
+      ...(command.sourceRef ? { sourceRef: command.sourceRef } : {}),
+      ...(command.evidenceExcerpt?.trim() ? { evidenceExcerpt: command.evidenceExcerpt.trim() } : {}),
+      ...(command.floor === undefined ? {} : { floor: command.floor }),
+      occurredAt: command.occurredAt ?? now,
+      recordedAt: now,
+      origin: command.origin,
+      confidence: command.confidence,
+    };
+    await this.store.apply({
+      workspaceId: this.workspaceId,
+      idempotencyKey: `inventory-command:${stableRecordHash(transactionSeed)}`,
+      operations: [
+        { action: 'upsert', collection: 'inventory-events', recordId: eventId, value: asPlain(event), expectedVersion: 0 },
+        { action: 'upsert', collection: 'inventory-states', recordId: stateId, value: asPlain(state), expectedVersion: stateRecord?.version ?? 0 },
+      ],
+    });
+    return { state, event };
+  }
+
+  async invalidateInventoryItem(itemId: string): Promise<InventoryItem> {
+    const current = await this.store.read({ workspaceId: this.workspaceId, collection: 'inventory-items', recordId: itemId });
+    const item = current?.value as unknown as InventoryItem | undefined;
+    if (!item || item.workspaceId !== this.workspaceId) throw createSSHelperError('WORKSPACE_NOT_FOUND', { stage: 'memory.inventory.item.invalidate' });
+    if (item.status === 'invalid') return item;
+    const invalid: InventoryItem = { ...item, status: 'invalid', updatedAt: Date.now() };
+    await this.store.apply({
+      workspaceId: this.workspaceId,
+      idempotencyKey: `inventory-item-invalidate:${stableRecordHash(`${itemId}\0${current!.version}`)}`,
+      operations: [{ action: 'upsert', collection: 'inventory-items', recordId: itemId, value: asPlain(invalid), expectedVersion: current!.version }],
+    });
+    return invalid;
   }
   async listPendingLocationCandidates(): Promise<LocationCandidate[]> {
     return (await this.list('location-candidates', { workspaceId: this.workspaceId, chatKey: this.chatKey, status: 'pending' }))
@@ -1301,6 +1495,10 @@ export class MultiActorMemoryRepository {
       return await this.commitCaptureOnce(commit);
     } catch (error) {
       if (!isWorkspaceConflict(error)) throw error;
+      // Inventory deltas and snapshots were computed from a concrete prior
+      // revision. Re-reading only the storage revision would overwrite a
+      // concurrent manual correction with stale semantic before/after values.
+      if ((commit.inventoryStates?.length ?? 0) > 0) throw error;
       // The validated Capture result is immutable at this point. Rebuild the
       // transaction once from fresh revisions without repeating any LLM work.
       return this.commitCaptureOnce(commit);
@@ -1320,6 +1518,9 @@ export class MultiActorMemoryRepository {
       locations: commit.locations,
       locationAliases: commit.locationAliases,
       pendingLocationCandidates: commit.pendingLocationCandidates ?? [],
+      inventoryItems: commit.inventoryItems ?? [],
+      inventoryStates: commit.inventoryStates ?? [],
+      inventoryEvents: commit.inventoryEvents ?? [],
       episodes: commit.episodes,
       observations: commit.observations,
       facts: commit.facts,
@@ -1368,6 +1569,16 @@ export class MultiActorMemoryRepository {
             });
           }
           if (persistedDigest !== requestDigest) {
+            const persistedInventoryEventIds = Array.isArray(metadata.inventoryEventIds)
+              ? metadata.inventoryEventIds.map(String)
+              : [];
+            const persistedSourceRefs = Array.isArray(metadata.sourceRefs) ? metadata.sourceRefs.map(String) : [];
+            const sameSourceWindow = JSON.stringify(persistedSourceRefs) === JSON.stringify(commit.envelope.sourceRefs);
+            const inventoryReplayAfterApply = persistedInventoryEventIds.length > 0
+              && (commit.inventoryEvents?.length ?? 0) === 0
+              && (commit.inventoryStates?.length ?? 0) === 0
+              && sameSourceWindow;
+            if (inventoryReplayAfterApply) return structuredClone(existingAudit);
             throw createSSHelperError('WORKSPACE_CONFLICT', {
               stage: 'memory.repository.capture.idempotency',
             });
@@ -1513,6 +1724,9 @@ export class MultiActorMemoryRepository {
     }
     // Candidates absent from this turn remain pending; only candidates whose
     // bound owner/location is now confirmed are removed automatically.
+    for (const value of commit.inventoryItems ?? []) await add('inventory-items', value);
+    for (const value of commit.inventoryStates ?? []) await add('inventory-states', value);
+    for (const value of commit.inventoryEvents ?? []) await add('inventory-events', value);
     for (const value of commit.episodes) await add('episodes', value);
     for (const value of commit.observations) await add('observations', value);
     for (const value of commit.facts) await add('facts', value);
@@ -1715,6 +1929,7 @@ export class MultiActorMemoryRepository {
         requestDigest,
         ...(retryAttempt > 0 ? { retryAttempt, retriedTransactionKey: baseTransactionKey } : {}),
         sourceRefs: [...commit.envelope.sourceRefs],
+        inventoryEventIds: (commit.inventoryEvents ?? []).map(event => event.id),
         batchIndex: Math.max(0, Number((commit.captureJob?.checkpoint as Record<string, unknown> | undefined)?.lastScannedBatch
           ?? (commit.captureJob?.checkpoint as Record<string, unknown> | undefined)?.batchIndex
           ?? 1) - 1),
@@ -1726,6 +1941,9 @@ export class MultiActorMemoryRepository {
           episodes: commit.episodes.length,
           observations: commit.observations.length,
           facts: commit.facts.length,
+          inventoryItems: commit.inventoryItems?.length ?? 0,
+          inventoryStates: commit.inventoryStates?.length ?? 0,
+          inventoryEvents: commit.inventoryEvents?.length ?? 0,
         },
         registrySnapshot: {
           owners: commit.owners.length,
@@ -2127,7 +2345,7 @@ export class MultiActorMemoryRepository {
   }
 
   async clearCurrentChatData(): Promise<void> {
-    const chatScopedCollections = ['actor-candidates', 'location-candidates', 'episodes', 'observations', 'facts', 'evidence', 'fact-heads', 'memory-traces', 'scene-casts', 'scene-states', 'scene-transitions', 'generation-cast-plans', 'cast-plan-audits', 'recall-coverage-logs', 'memory-usage-logs', 'capture-jobs', 'capture-repair-queue', 'change-audits', 'memory-details', 'memory-links', 'vector-index', 'graph-nodes', 'graph-edges', 'recall-exposures', 'dream-jobs', 'dream-audits', 'dream-narratives', 'usage', 'recall-logs', 'generation-recall-details', 'generation-prompt-snapshots', 'generation-prompt-snapshot-chunks'] as const;
+    const chatScopedCollections = ['actor-candidates', 'location-candidates', 'inventory-states', 'inventory-events', 'episodes', 'observations', 'facts', 'evidence', 'fact-heads', 'memory-traces', 'scene-casts', 'scene-states', 'scene-transitions', 'generation-cast-plans', 'cast-plan-audits', 'recall-coverage-logs', 'memory-usage-logs', 'capture-jobs', 'capture-repair-queue', 'change-audits', 'memory-details', 'memory-links', 'vector-index', 'graph-nodes', 'graph-edges', 'recall-exposures', 'dream-jobs', 'dream-audits', 'dream-narratives', 'usage', 'recall-logs', 'generation-recall-details', 'generation-prompt-snapshots', 'generation-prompt-snapshot-chunks'] as const;
     const operations: StoreOperation[] = [];
     // Observations intentionally point at an Episode instead of duplicating
     // chat metadata. Resolve the current chat's episode ids before deleting so

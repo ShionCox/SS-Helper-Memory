@@ -4,6 +4,7 @@ import {
   type ChatIndicatorTarget,
   type PluginSession,
 } from '@ss-helper/sdk';
+import { MEMORY_WORKSPACE_COLLECTIONS } from '../infrastructure/memory-workspace-schema';
 
 const QUERY_CONCURRENCY = 4;
 
@@ -39,7 +40,7 @@ export function registerMemoryChatIndicator(
       try {
         const workspace = await session.workspace.open({
           id: target.workspaceId,
-          schema: { collections: [{ name: 'facts', indexes: ['chatKey'] }] },
+          schema: { collections: [{ name: 'facts', indexes: [...MEMORY_WORKSPACE_COLLECTIONS.facts] }] },
           metadata: { kind: 'memory-chat-indicator' },
         });
         const page = await workspace.query('facts', { filter: { chatKey: target.chatKey }, limit: 1 });

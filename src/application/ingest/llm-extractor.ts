@@ -8,6 +8,8 @@ import type {
   StructuredClaim,
   StructuredClaimKnowledge,
   StructuredEpisode,
+  StructuredInventoryOperation,
+  StructuredItemCandidate,
   StructuredLocationCandidate,
 } from './types';
 import {
@@ -248,6 +250,13 @@ function serializeExtractionInput(input: MemoryExtractionInput, evidenceDirector
       aliases: location.aliases,
       status: location.status,
     })),
+    knownInventory: (input.knownInventoryContext ?? []).map(item => ({
+      ref: item.referenceId,
+      canonicalName: item.canonicalName,
+      aliases: item.aliases,
+      category: item.category,
+      states: item.states,
+    })),
     ...(input.repair?.referenceDirectory ? {
       repairAttempt: {
         attempt: input.repair.attempt ?? 1,
@@ -388,12 +397,24 @@ export function buildStructuredCaptureSchema(
       confidence: { type: 'number', minimum: 0, maximum: 1 },
     },
   };
-  const episode = {
+  const itemCandidate = {
     type: 'object', additionalProperties: false,
-    required: ['localId', 'sourceRefs', 'participantRefs', 'presentRefs', 'mentionedRefs', 'locationRef', 'storyTimeText', 'summary'],
+    required: ['localId', 'displayName', 'aliases', 'category', 'evidenceSpanId', 'confidence'],
     properties: {
       localId,
-      sourceRefs: { type: 'array', minItems: 1, maxItems: 12, uniqueItems: true, items: sourceRef },
+      displayName: requiredString(120),
+      aliases: stringArray(12, 120),
+      category: { type: 'string', enum: ['weapon', 'medicine', 'food', 'armor', 'special', 'core', 'material', 'other'] },
+      evidenceSpanId,
+      confidence: { type: 'number', minimum: 0, maximum: 1 },
+    },
+  };
+  const episode = {
+    type: 'object', additionalProperties: false,
+    required: ['localId', 'evidenceSpanIds', 'participantRefs', 'presentRefs', 'mentionedRefs', 'locationRef', 'storyTimeText', 'summary'],
+    properties: {
+      localId,
+      evidenceSpanIds: { type: 'array', minItems: 1, maxItems: 12, uniqueItems: true, items: evidenceSpanId },
       participantRefs: stringArray(24, 80),
       presentRefs: stringArray(24, 80),
       mentionedRefs: stringArray(24, 80),
@@ -438,15 +459,34 @@ export function buildStructuredCaptureSchema(
       stableAnchor: { type: 'boolean' },
     },
   };
+  const inventoryOperation = {
+    type: 'object', additionalProperties: false,
+    required: ['localId', 'itemRef', 'operation', 'measureKind', 'amount', 'rawAmount', 'unit', 'precision', 'reason', 'evidenceSpanId', 'confidence'],
+    properties: {
+      localId,
+      itemRef: requiredString(120),
+      operation: { type: 'string', enum: ['set', 'increase', 'decrease', 'remove'] },
+      measureKind: { type: 'string', enum: ['quantity', 'coverage_days'] },
+      amount: { type: 'number', minimum: 0 },
+      rawAmount: fixedString(40),
+      unit: fixedString(20),
+      precision: { type: 'string', enum: ['exact', 'approximate', 'unknown'] },
+      reason: { type: 'string', enum: ['acquire', 'consume', 'discard', 'lose', 'recount', 'manual_correction', 'other'] },
+      evidenceSpanId,
+      confidence: { type: 'number', minimum: 0, maximum: 1 },
+    },
+  };
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['actorCandidates', 'locationCandidates', 'episodes', 'claims'],
+    required: ['actorCandidates', 'locationCandidates', 'itemCandidates', 'episodes', 'claims', 'inventoryOperations'],
     properties: {
       actorCandidates: { type: 'array', maxItems: 24, items: actorCandidate },
       locationCandidates: { type: 'array', maxItems: 24, items: locationCandidate },
+      itemCandidates: { type: 'array', maxItems: 40, items: itemCandidate },
       episodes: { type: 'array', maxItems: 16, items: episode },
       claims: { type: 'array', maxItems: 32, items: claim },
+      inventoryOperations: { type: 'array', maxItems: 48, items: inventoryOperation },
     },
   };
 }
@@ -471,7 +511,7 @@ function copyKnowledge(value: StructuredClaimKnowledge & {
 
 export function buildStructuredRepairSchema(
   sourceRefs: readonly string[],
-  collection: 'actorCandidates' | 'locationCandidates' | 'episodes' | 'claims',
+  collection: 'actorCandidates' | 'locationCandidates' | 'itemCandidates' | 'episodes' | 'claims' | 'inventoryOperations',
   maxItems: number,
   referenceDirectory?: import('./types').SupportedReferenceDirectory,
   evidenceDirectory?: SupportedEvidenceDirectory,
@@ -573,7 +613,8 @@ export function normalizeStructuredCapture(
   const row = value as {
     actorCandidates: Array<Omit<StructuredActorCandidate, 'evidenceExcerpt' | 'sourceRef'> & { evidenceSpanId: string }>;
     locationCandidates: Array<Omit<StructuredLocationCandidate, 'evidenceExcerpt' | 'sourceRef'> & { evidenceSpanId: string }>;
-    episodes: Array<StructuredEpisode & { locationRef: string; storyTimeText: string }>;
+    itemCandidates: Array<Omit<StructuredItemCandidate, 'evidenceExcerpt' | 'sourceRef'> & { evidenceSpanId: string }>;
+    episodes: Array<Omit<StructuredEpisode, 'sourceRefs'> & { locationRef: string; storyTimeText: string }>;
     claims: Array<Omit<StructuredClaim, 'evidenceExcerpt' | 'sourceRef'> & {
       evidenceSpanId: string;
       episodeLocalId: string;
@@ -583,20 +624,25 @@ export function normalizeStructuredCapture(
       objectText: string;
       knowledge: StructuredClaimKnowledge & { speakerRef: string; viewpointRef: string };
     }>;
+    inventoryOperations: Array<Omit<StructuredInventoryOperation, 'evidenceExcerpt' | 'sourceRef' | 'amount' | 'rawAmount'> & {
+      evidenceSpanId: string;
+      amount: number;
+      rawAmount: string;
+    }>;
   };
-  if (![row.actorCandidates, row.locationCandidates, row.episodes, row.claims].every(Array.isArray)) {
+  if (![row.actorCandidates, row.locationCandidates, row.itemCandidates, row.episodes, row.claims, row.inventoryOperations].every(Array.isArray)) {
     throw createSSHelperError('SCHEMA_VALIDATION_FAILED', {
       stage: 'memory.capture.map',
       path: '$',
       keyword: 'required',
-      expected: 'actorCandidates, locationCandidates, episodes, claims',
+      expected: 'actorCandidates, locationCandidates, itemCandidates, episodes, claims, inventoryOperations',
       ...responseContext,
     });
   }
   const evidenceRejections: AutomaticIngestRejection[] = [];
   const rejectEvidence = (
-    collection: 'actorCandidates' | 'locationCandidates' | 'claims',
-    recordType: 'actor' | 'location' | 'claim',
+    collection: 'actorCandidates' | 'locationCandidates' | 'itemCandidates' | 'episodes' | 'claims' | 'inventoryOperations',
+    recordType: 'actor' | 'location' | 'item' | 'episode' | 'claim' | 'inventory',
     index: number,
   ): void => {
     const path = `$.${collection}[${index}].evidenceSpanId`;
@@ -648,6 +694,23 @@ export function normalizeStructuredCapture(
       confidence: item.confidence,
     });
   }
+  const itemCandidates: StructuredItemCandidate[] = [];
+  for (const [index, item] of row.itemCandidates.entries()) {
+    const span = evidenceDirectory && evidenceSpanById(evidenceDirectory, item.evidenceSpanId);
+    if (!span) {
+      rejectEvidence('itemCandidates', 'item', index);
+      continue;
+    }
+    itemCandidates.push({
+      localId: item.localId,
+      displayName: item.displayName,
+      aliases: [...item.aliases],
+      category: item.category,
+      sourceRef: span.sourceRef,
+      evidenceExcerpt: span.text,
+      confidence: item.confidence,
+    });
+  }
   const claims: StructuredClaim[] = [];
   for (const [index, item] of row.claims.entries()) {
     const span = evidenceDirectory && evidenceSpanById(evidenceDirectory, item.evidenceSpanId);
@@ -672,20 +735,56 @@ export function normalizeStructuredCapture(
       stableAnchor: item.stableAnchor,
     });
   }
-  return {
-    actorCandidates,
-    locationCandidates,
-    episodes: row.episodes.map(item => ({
+  const inventoryOperations: StructuredInventoryOperation[] = [];
+  for (const [index, item] of row.inventoryOperations.entries()) {
+    const span = evidenceDirectory && evidenceSpanById(evidenceDirectory, item.evidenceSpanId);
+    if (!span) {
+      rejectEvidence('inventoryOperations', 'inventory', index);
+      continue;
+    }
+    inventoryOperations.push({
       localId: item.localId,
-      sourceRefs: [...item.sourceRefs],
+      itemRef: item.itemRef,
+      operation: item.operation,
+      measureKind: item.measureKind,
+      ...(item.operation === 'remove' || item.precision === 'unknown' ? {} : { amount: item.amount }),
+      ...(item.rawAmount === '' ? {} : { rawAmount: item.rawAmount }),
+      unit: item.unit,
+      precision: item.precision,
+      reason: item.reason,
+      sourceRef: span.sourceRef,
+      evidenceExcerpt: span.text,
+      confidence: item.confidence,
+    });
+  }
+  const episodes: StructuredEpisode[] = [];
+  for (const [index, item] of row.episodes.entries()) {
+    const evidenceSpanIds = item.evidenceSpanIds ?? [];
+    const spans = evidenceSpanIds.map(id => evidenceDirectory && evidenceSpanById(evidenceDirectory, id));
+    if (spans.some(span => !span)) {
+      rejectEvidence('episodes', 'episode', index);
+      continue;
+    }
+    episodes.push({
+      localId: item.localId,
+      sourceRefs: [...new Set(spans.map(span => span!.sourceRef))],
+      evidenceSpanIds: [...evidenceSpanIds],
+      evidenceExcerpts: spans.map(span => span!.text),
       participantRefs: [...item.participantRefs],
       presentRefs: [...item.presentRefs],
       mentionedRefs: [...item.mentionedRefs],
       locationRef: optionalString(item.locationRef),
       storyTimeText: optionalString(item.storyTimeText),
       summary: item.summary,
-    })),
+    });
+  }
+  return {
+    actorCandidates,
+    locationCandidates,
+    itemCandidates,
+    episodes,
     claims,
+    inventoryOperations,
     ...(evidenceRejections.length > 0 ? { rejections: evidenceRejections } : {}),
     diagnostics: {
       parser: 'claim-json',
@@ -716,11 +815,15 @@ function auditFromResponse(response: { meta?: MemoryLlmMeta; usage?: MemoryLlmUs
 function systemPrompt(input: MemoryExtractionInput): string {
   return [
     '你是 SS-Helper 的多角色长期记忆 Claim 捕获器。只提取已经发生或已经明确成立、且对未来剧情有检索价值的内容。',
-    '最终只返回一个 JSON 对象，固定包含 actorCandidates、locationCandidates、episodes、claims 四个数组。不要 Markdown，不要解释。',
+    '最终只返回一个 JSON 对象，固定包含 actorCandidates、locationCandidates、itemCandidates、episodes、claims、inventoryOperations 六个数组。不要 Markdown，不要解释。',
     '只有 allowedSourceRefs 可以成为新记录证据；contextOnlySourceRefs 与 existingMemoryContext 只用于理解和去重。',
     'knownActors 与 knownLocations 是系统目录。所有人物和地点引用必须优先使用其中的 ref；简称、昵称、繁简写法不得创建重复候选。',
     '新人物必须具有持续身份、能独立行动、说话、思考或知情；“重构体”“表情的话”、物品、材料、食物、地点、状态和抽象概念都不是人物。',
     '新地点必须是可持续定位的场所，普通方位词“这里、外面、前方”不是地点。',
+    'knownInventory 是只读的当前物品目录，只用于识别与去重，绝不能作为新数量证据。只有来源明确命名的物品才能输出操作。',
+    '物品获得、消耗、盘点和移除写入 inventoryOperations，不要再输出重复的库存数量 Claim。新物品先输出 itemCandidates，并由 inventoryOperations.itemRef 引用其 localId。',
+    'inventoryOperations.rawAmount 必须逐字出现在 evidenceSpanId 对应片段中；set 是绝对快照，increase/decrease 只用于明确增减，remove 只用于明确丢弃、耗尽或不再持有。',
+    'coverage_days 只用于“可维持/天份”等资源覆盖期；剧情日期、经过天数和未来收获预测仍是普通事件或 Claim。约数和未知数只允许 set，不得做加减。',
     '剧情选项、控制文本、状态栏标题、未来可能性和 OOC 指令不得作为已发生事件。cast_manifest 只用于人物目录；state_snapshot 只可产生当前状态 Claim。',
     '模型不得输出 Unix 时间、occurredAt、validFrom、validUntil、数据库 ID、Observation、Evidence、Trace，actorCandidate/locationCandidate/claim 也不得输出 sourceRef；这些全部由服务器根据 evidenceSpanId 确定性生成。',
     'episode 只描述事件容器；机器时间和楼层由服务器计算。storyTimeText 只保存“灾变第十八日黄昏”等剧情内时间。',
@@ -800,8 +903,10 @@ export class StructuredMemoryCaptureExtractor {
       ? {
         actorCandidates: input.repair.collection === 'actorCandidates' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
         locationCandidates: input.repair.collection === 'locationCandidates' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
+        itemCandidates: input.repair.collection === 'itemCandidates' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
         episodes: input.repair.collection === 'episodes' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
         claims: input.repair.collection === 'claims' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
+        inventoryOperations: input.repair.collection === 'inventoryOperations' ? (response.data as { items?: unknown[] })?.items ?? [] : [],
       }
       : response.data;
     const capture = normalizeStructuredCapture(
@@ -817,9 +922,11 @@ export class StructuredMemoryCaptureExtractor {
       message: `结构化项目未通过 Schema：${item.issues.map(issue => `${issue.path} ${issue.keyword} expected ${issue.expected}`).join('; ')}`,
       recordType: item.collection === 'actorCandidates' ? 'actor' as const
         : item.collection === 'locationCandidates' ? 'location' as const
-          : item.collection === 'episodes' ? 'episode' as const
-            : item.collection === 'claims' ? 'claim' as const
-              : 'batch' as const,
+          : item.collection === 'itemCandidates' ? 'item' as const
+            : item.collection === 'episodes' ? 'episode' as const
+              : item.collection === 'claims' ? 'claim' as const
+                : item.collection === 'inventoryOperations' ? 'inventory' as const
+                  : 'batch' as const,
       ...(item.issues[0]?.path ? { fieldPath: item.issues[0].path } : {}),
       issues: item.issues.map(issue => ({
         path: issue.path,

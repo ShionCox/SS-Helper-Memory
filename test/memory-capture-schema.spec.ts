@@ -60,9 +60,9 @@ describe('Claim capture schema', () => {
     expect(schema).toMatchObject({
       type: 'object',
       additionalProperties: false,
-      required: ['actorCandidates', 'locationCandidates', 'episodes', 'claims'],
+      required: ['actorCandidates', 'locationCandidates', 'itemCandidates', 'episodes', 'claims', 'inventoryOperations'],
     });
-    expect(Object.keys(schema.properties)).toEqual(['actorCandidates', 'locationCandidates', 'episodes', 'claims']);
+    expect(Object.keys(schema.properties)).toEqual(['actorCandidates', 'locationCandidates', 'itemCandidates', 'episodes', 'claims', 'inventoryOperations']);
     const episodeProperties = schema.properties.episodes.items.properties;
     const claimProperties = schema.properties.claims.items.properties;
     expect(episodeProperties).not.toHaveProperty('occurredAt');
@@ -96,9 +96,10 @@ describe('Claim capture schema', () => {
           data: {
             actorCandidates: [],
             locationCandidates: [],
+            itemCandidates: [],
             episodes: [{
               localId: 'episode-1',
-              sourceRefs: [source.id],
+              evidenceSpanIds: [evidenceSpanId],
               participantRefs: ['actor:kotono'],
               presentRefs: ['actor:kotono'],
               mentionedRefs: [],
@@ -124,6 +125,7 @@ describe('Claim capture schema', () => {
               confidence: 0.98,
               stableAnchor: false,
             }],
+            inventoryOperations: [],
           } as T,
           meta: { resourceId: 'test', model: 'model' },
         };
@@ -154,7 +156,7 @@ describe('Claim capture schema', () => {
       async runTask<T>(input: Parameters<MemoryLlmClient['runTask']>[0]) {
         schema = input.schema as Record<string, any>;
         payload = JSON.parse(input.input.messages[1]?.content ?? '{}');
-        return { ok: true as const, data: { actorCandidates: [], locationCandidates: [], episodes: [], claims: [] } as T };
+        return { ok: true as const, data: { actorCandidates: [], locationCandidates: [], itemCandidates: [], episodes: [], claims: [], inventoryOperations: [] } as T };
       },
     };
     await new StructuredMemoryCaptureExtractor(() => llm).extract({
@@ -163,7 +165,8 @@ describe('Claim capture schema', () => {
       writableSourceRefs: [source.id],
     });
     expect(payload).toMatchObject({ allowedSourceRefs: [source.id], contextOnlySourceRefs: [overlap.id] });
-    expect(schema?.properties.episodes.items.properties.sourceRefs.items.enum).toEqual([source.id]);
+    expect(schema?.properties.episodes.items.properties.evidenceSpanIds.items.enum).toEqual(expect.any(Array));
+    expect(schema?.properties.episodes.items.properties).not.toHaveProperty('sourceRefs');
     expect(schema?.properties.claims.items.properties).not.toHaveProperty('sourceRef');
   });
 
@@ -175,6 +178,7 @@ describe('Claim capture schema', () => {
           data: {
             actorCandidates: [],
             locationCandidates: [],
+            itemCandidates: [],
             episodes: [],
             claims: [{
               localId: 'claim-1', episodeLocalId: '', kind: 'action',
@@ -187,6 +191,7 @@ describe('Claim capture schema', () => {
               },
               confidence: '90%', stable: false,
             }],
+            inventoryOperations: [],
           } as T,
         };
       },

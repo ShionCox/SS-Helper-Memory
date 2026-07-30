@@ -17,7 +17,7 @@ const source: SourceBlock = {
   content: '紫罗能够净化空气。', createdAt: 1,
 };
 
-const emptyCapture = { actorCandidates: [], locationCandidates: [], episodes: [], claims: [] };
+const emptyCapture = { actorCandidates: [], locationCandidates: [], itemCandidates: [], episodes: [], claims: [], inventoryOperations: [] };
 
 describe('StructuredMemoryCaptureExtractor', () => {
   it('uses the Claim task budget and returns safe audit metadata', async () => {
@@ -200,13 +200,13 @@ describe('StructuredMemoryCaptureExtractor', () => {
     };
     const directory = buildSupportedEvidenceDirectory([row]);
     const result = normalizeStructuredCapture({
-      actorCandidates: [], locationCandidates: [], episodes: [], claims: [{
+      actorCandidates: [], locationCandidates: [], itemCandidates: [], episodes: [], claims: [{
         localId: 'hallucinated', episodeLocalId: '', kind: 'event',
         subjectRef: '', subjectText: '白夕小时', predicateKey: '杀死', objectText: '白夕叶',
         content: '白夕小时杀死白夕叶。', evidenceSpanId: 'outside-closed-set',
         knowledge: { mode: 'asserted', privacy: 'public', ownerRefs: [], speakerRef: '', viewpointRef: '', observerRefs: [], presentRefs: [], mentionedRefs: [] },
         confidence: 0.9, stableAnchor: false,
-      }],
+      }], inventoryOperations: [],
     }, [row], directory, { requestId: 'capture-evidence', resourceId: 'resource', model: 'model' });
     expect(result.claims).toEqual([]);
     expect(result.rejections).toEqual([expect.objectContaining({
@@ -241,8 +241,10 @@ describe('StructuredMemoryCaptureExtractor', () => {
         confidence: 0.95,
       }],
       locationCandidates: [],
+      itemCandidates: [],
       episodes: [],
       claims: [],
+      inventoryOperations: [],
     }, [source, second], directory, { requestId: 'capture-cross-source' });
     expect(result.actorCandidates).toEqual([expect.objectContaining({
       sourceRef: second.id,

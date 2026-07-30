@@ -304,6 +304,11 @@ export interface MemoryUiController {
   /** Optional multi-actor workbench read models. */
   listActors?(): Promise<readonly import('../domain').MemoryOwner[]>;
   listActorAliases?(): Promise<readonly import('../domain').ActorAlias[]>;
+  listInventoryStates?(): Promise<{ readonly items: readonly import('../domain').InventoryItem[]; readonly states: readonly import('../domain').InventoryState[] }>;
+  getInventoryHistory?(itemId: string): Promise<readonly import('../domain').InventoryEvent[]>;
+  createInventoryItem?(input: { readonly canonicalName: string; readonly aliases?: readonly string[]; readonly category?: import('../domain').InventoryItemCategory }): Promise<import('../domain').InventoryItem>;
+  applyInventoryCommand?(command: import('../domain').InventoryCommand, options?: { readonly expectedRevision?: number; readonly idempotencyKey?: string }): Promise<{ readonly state: import('../domain').InventoryState; readonly event: import('../domain').InventoryEvent }>;
+  invalidateInventoryItem?(itemId: string): Promise<import('../domain').InventoryItem>;
   listSceneCasts?(): Promise<readonly import('../domain').SceneCast[]>;
   getCurrentSceneState?(): Promise<import('../domain').SceneState | null>;
   listSceneTransitions?(): Promise<readonly import('../domain').SceneTransition[]>;
@@ -352,6 +357,7 @@ const FACT_KIND_LABELS: Readonly<Record<string, string>> = Object.freeze({
   goal: '目标', commitment: '承诺', event: '事件', preference: '偏好', capability: '能力', other: '其他',
 });
 const FACT_STATUS_LABELS: Readonly<Record<string, string>> = Object.freeze({ active: '有效', pending: '待确认', superseded: '已替代', invalid: '无效' });
+const INVENTORY_CATEGORY_LABELS: Readonly<Record<import('../domain').InventoryItemCategory, string>> = Object.freeze({ weapon: '武器', medicine: '药品', food: '食物', armor: '防具', special: '特殊道具', core: '核心', material: '材料', other: '其他' });
 const RECORD_STATUS_LABELS: Readonly<Record<string, string>> = Object.freeze({
   idle: '空闲', queued: '已排队', running: '进行中', paused: '已暂停', completed: '已完成', failed: '失败', cancelled: '已取消',
 });
@@ -482,11 +488,12 @@ function safeInlineError(value: unknown, _fallback: string): string {
   return isSSHelperReasonCode(value) ? value : 'INTERNAL_ERROR';
 }
 
-export type MemoryWorkbenchPage = 'overview' | 'actors' | 'scenes' | 'library' | 'actor-memory' | 'profiles' | 'dreams' | 'recall' | 'audit' | 'initialize' | 'graph' | 'data';
+export type MemoryWorkbenchPage = 'overview' | 'actors' | 'inventory' | 'scenes' | 'library' | 'actor-memory' | 'profiles' | 'dreams' | 'recall' | 'audit' | 'initialize' | 'graph' | 'data';
 const PAGES: ReadonlyArray<{ id: MemoryWorkbenchPage; label: string; description: string; icon: string }> = [
   { id: 'overview', label: '概览', description: '当前工作区与场景状态', icon: 'gauge-high' },
   { id: 'initialize', label: '初始化', description: '选择来源并捕获当前聊天记忆', icon: 'wand-magic-sparkles' },
   { id: 'actors', label: '人物与别名', description: '主体发现与待确认归属', icon: 'users' },
+  { id: 'inventory', label: '物品与资源', description: '当前数量与完整变动账本', icon: 'boxes-stacked' },
   { id: 'scenes', label: '场景与事件', description: '在场、提及与事件来源', icon: 'timeline' },
   { id: 'library', label: '记忆块', description: '浏览、审阅与编辑事实', icon: 'book-open' },
   { id: 'actor-memory', label: '角色记忆', description: '按主体查看记忆痕迹', icon: 'brain' },
@@ -525,6 +532,18 @@ interface WorkbenchState {
   actorOperationAliasId: string;
   actorOperationTargetId: string;
   actorOperationName: string;
+  inventoryItems: Array<import('../domain').InventoryItem>;
+  inventoryStates: Array<import('../domain').InventoryState>;
+  inventoryEvents: Array<import('../domain').InventoryEvent>;
+  inventoryQuery: string;
+  inventoryCategory: '' | import('../domain').InventoryItemCategory;
+  selectedInventoryItemId: string;
+  inventoryNewName: string;
+  inventoryCommandOperation: import('../domain').InventoryOperation;
+  inventoryCommandMeasure: import('../domain').InventoryMeasureKind;
+  inventoryCommandAmount: string;
+  inventoryCommandUnit: string;
+  inventoryConfirmInvalidId: string;
   candidateResolutionMode: 'existing' | 'new';
   candidateTargetOwnerId: string;
   candidateCanonicalName: string;
@@ -673,7 +692,7 @@ export function renderMemoryWorkbench(
   let sceneRendererToken = 0;
   const requestedGraphPage = initialActionId === 'open-relationship-graph' || initialActionId === 'rebuild-relationship-graph';
   const state: WorkbenchState = {
-    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
+    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', inventoryItems: [], inventoryStates: [], inventoryEvents: [], inventoryQuery: '', inventoryCategory: '', selectedInventoryItemId: '', inventoryNewName: '', inventoryCommandOperation: 'set', inventoryCommandMeasure: 'quantity', inventoryCommandAmount: '', inventoryCommandUnit: '个', inventoryConfirmInvalidId: '', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
     selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeHiddenMessageFloors: true, reinitializeOpen: false, audits: [], usages: [], integrityText: '尚未执行完整性检查。', confirmBatchKey: '', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
   };
   const sceneEventsState = (): SceneEventsState => ({
@@ -1075,6 +1094,29 @@ export function renderMemoryWorkbench(
           if (!state.actors.some(actor => actor.id === state.selectedActorId)) state.selectedActorId = userActors[0]?.id ?? state.actors[0]?.id ?? '';
           if (!state.pendingActors.some(candidate => candidate.localId === state.selectedCandidateId)) state.selectedCandidateId = state.pendingActors[0]?.localId ?? '';
           if (state.pendingActors.length === 0 && state.actorView === 'pending') state.actorView = 'people';
+        }
+      } else if (page === 'inventory') {
+        if (isChatUnbound()) {
+          state.inventoryItems = [];
+          state.inventoryStates = [];
+          state.inventoryEvents = [];
+          state.selectedInventoryItemId = '';
+        } else {
+          const inventory = controller.listInventoryStates
+            ? await controller.listInventoryStates()
+            : {
+                items: await firstMemoryPage<import('../domain').InventoryItem>('inventory-items', () => Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } }),
+                states: await firstMemoryPage<import('../domain').InventoryState>('inventory-states', () => Promise.resolve([]), { orderBy: { field: 'updatedAt', direction: 'desc' } }),
+              };
+          if (!isCurrent()) return;
+          state.inventoryItems = [...inventory.items];
+          state.inventoryStates = [...inventory.states];
+          const visibleItems = state.inventoryItems.filter(item => item.status !== 'invalid');
+          if (!visibleItems.some(item => item.id === state.selectedInventoryItemId)) state.selectedInventoryItemId = visibleItems[0]?.id ?? '';
+          state.inventoryEvents = state.selectedInventoryItemId && controller.getInventoryHistory
+            ? [...await controller.getInventoryHistory(state.selectedInventoryItemId)]
+            : [];
+          if (!isCurrent()) return;
         }
       } else if (page === 'scenes') {
         const [scenes, episodes, observations, actors, aliases, currentSceneState, transitions, plans, planAudits] = await Promise.all([
@@ -1578,6 +1620,43 @@ export function renderMemoryWorkbench(
     ? renderEmpty('暂无 Dream 任务', 'Dream 默认按主体自动排队；也可以从后续操作入口手动 dry-run。')
     : `<section class="stx-memory-panel stx-memory-cold-page-panel"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Dream Audit</span><h3>巩固任务</h3></div><span>${formatNumber(state.dreams.length)} 个任务</span></div><div class="stx-memory-reference-list" data-memory-page-list="dreams">${state.dreams.map(job => `<article class="stx-memory-evidence"><strong>${escapeHtml(String(job.ownerId ?? '主体'))}</strong>${renderStatusChip(String(job.status ?? 'queued'), job.status === 'applied' ? 'success' : job.status === 'failed' ? 'error' : 'neutral')}<p>阶段：${escapeHtml(String(job.phase ?? 'gather'))}</p><small>任务：${escapeHtml(String(job.id ?? ''))}</small>${controller.runActorDream && job.id ? `<button ${uiControl('button', 'neutral')} type="button" data-action="dream-dry-run" data-job-id="${escapeHtml(String(job.id))}">dry-run 预览</button>` : ''}</article>`).join('')}</div></section>`;
 
+  const renderInventory = (): string => {
+    const categoryLabels = INVENTORY_CATEGORY_LABELS;
+    const operationLabels: Readonly<Record<import('../domain').InventoryOperation, string>> = { set: '设置数量', increase: '增加', decrease: '减少', remove: '标记移除' };
+    const reasonLabels: Readonly<Record<import('../domain').InventoryReason, string>> = { acquire: '获得', consume: '消耗', discard: '丢弃', lose: '损失', recount: '盘点', manual_correction: '人工修正', other: '其他' };
+    const formatState = (item: import('../domain').InventoryState): string => {
+      if (item.availability === 'absent') return '已移除';
+      if (item.amount === undefined || item.precision === 'unknown') return `数量未知${item.stateNote ? ` · ${item.stateNote}` : ''}`;
+      return `${item.precision === 'approximate' ? '约 ' : ''}${item.amount}${item.unit || ''}${item.stateNote ? ` · ${item.stateNote}` : ''}`;
+    };
+    const needle = state.inventoryQuery.trim().toLocaleLowerCase();
+    const filtered = state.inventoryItems.filter(item => item.status !== 'invalid'
+      && (!state.inventoryCategory || item.category === state.inventoryCategory)
+      && (!needle || [item.canonicalName, ...item.aliases].some(name => name.toLocaleLowerCase().includes(needle))));
+    const selected = state.inventoryItems.find(item => item.id === state.selectedInventoryItemId && item.status !== 'invalid');
+    const selectedStates = selected ? state.inventoryStates.filter(item => item.itemId === selected.id) : [];
+    const itemRows = filtered.length === 0 ? renderEmpty('没有匹配的物品', '可调整搜索条件，或在右侧新增物品。') : filtered.map((item) => {
+      const states = state.inventoryStates.filter(entry => entry.itemId === item.id);
+      const summary = states.length ? states.map(formatState).join(' / ') : '尚无数量记录';
+      return `<button type="button" class="stx-memory-inventory-row" data-action="inventory-select" data-item-id="${escapeHtml(item.id)}" aria-pressed="${item.id === state.selectedInventoryItemId}"><span><strong>${escapeHtml(item.canonicalName)}</strong><small>${escapeHtml(categoryLabels[item.category])}</small></span><span>${escapeHtml(summary)}</span></button>`;
+    }).join('');
+    const history = [...state.inventoryEvents].sort((left, right) => right.recordedAt - left.recordedAt);
+    const historyRows = history.length === 0 ? renderEmpty('暂无变动记录', '设置、增加、减少和移除都会写入追加式账本。') : history.map(event => `<article class="stx-memory-inventory-event"><header><strong>${escapeHtml(operationLabels[event.operation])}</strong><time>${escapeHtml(formatTime(event.recordedAt))}</time></header><p>${event.beforeAmount === undefined ? '未知' : escapeHtml(event.beforeAmount)} → ${event.afterAmount === undefined ? event.availability === 'absent' ? '已移除' : '未知' : escapeHtml(event.afterAmount)} ${escapeHtml(event.unit)}</p><footer><span>${escapeHtml(reasonLabels[event.reason])} · ${event.origin === 'automatic' ? '自动提取' : event.origin === 'manual' ? '人工操作' : '导入'}</span>${event.sourceRef ? renderLibrarySourceReference(event.sourceRef, 'evidence') : ''}</footer>${event.evidenceExcerpt ? `<blockquote>${escapeHtml(event.evidenceExcerpt)}</blockquote>` : ''}</article>`).join('');
+    const categories = Object.entries(categoryLabels).map(([value, label]) => `<option value="${value}" ${state.inventoryCategory === value ? 'selected' : ''}>${label}</option>`).join('');
+    return `<div class="stx-memory-inventory-shell">
+      <section class="stx-memory-inventory-list" aria-label="当前库存">
+        <div class="stx-memory-inventory-toolbar"><label><span class="stx-memory-sr-only">搜索物品</span><input ${uiControl('input')} data-inventory-input="query" value="${escapeHtml(state.inventoryQuery)}" placeholder="搜索名称或别名"></label><label><span class="stx-memory-sr-only">按分类筛选</span><select ${uiControl('select')} data-inventory-select="category"><option value="">全部分类</option>${categories}</select></label></div>
+        <div class="stx-memory-inventory-rows">${itemRows}</div>
+      </section>
+      <section class="stx-memory-inventory-detail" aria-label="物品详情">
+        <form class="stx-memory-inventory-create" data-inventory-form="create"><label><span>新增物品</span><input ${uiControl('input')} data-inventory-input="new-name" value="${escapeHtml(state.inventoryNewName)}" maxlength="120" placeholder="规范名称"></label><button ${uiButton('primary', 'sm')} type="button" data-action="inventory-create" ${!controller.createInventoryItem || !state.inventoryNewName.trim() ? 'disabled' : ''}>新增</button></form>
+        ${selected ? `<header class="stx-memory-inventory-detail-heading"><div><span class="stx-memory-kicker">${escapeHtml(categoryLabels[selected.category])}</span><h3>${escapeHtml(selected.canonicalName)}</h3><p>${selectedStates.length ? selectedStates.map(formatState).map(escapeHtml).join(' / ') : '尚无当前数量'}</p></div>${state.inventoryConfirmInvalidId === selected.id ? `<span class="stx-memory-inline-confirm">确认作废？<button ${uiButton('danger', 'xs')} type="button" data-action="inventory-invalidate-confirm">确认</button><button ${uiButton('neutral', 'xs')} type="button" data-action="inventory-invalidate-cancel">取消</button></span>` : `<button ${uiButton('danger', 'xs')} type="button" data-action="inventory-invalidate" ${!controller.invalidateInventoryItem ? 'disabled' : ''}>作废错误物品</button>`}</header>
+          <div class="stx-memory-inventory-command"><label><span>操作</span><select ${uiControl('select')} data-inventory-select="operation">${Object.entries(operationLabels).map(([value, label]) => `<option value="${value}" ${state.inventoryCommandOperation === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label><span>计量</span><select ${uiControl('select')} data-inventory-select="measure"><option value="quantity" ${state.inventoryCommandMeasure === 'quantity' ? 'selected' : ''}>数量</option><option value="coverage_days" ${state.inventoryCommandMeasure === 'coverage_days' ? 'selected' : ''}>可维持天数</option></select></label><label><span>数值</span><input ${uiControl('input')} data-inventory-input="amount" type="number" min="0" step="any" value="${escapeHtml(state.inventoryCommandAmount)}" ${state.inventoryCommandOperation === 'remove' ? 'disabled' : ''}></label><label><span>单位</span><input ${uiControl('input')} data-inventory-input="unit" value="${escapeHtml(state.inventoryCommandUnit)}" maxlength="20"></label><button ${uiButton('primary', 'sm')} type="button" data-action="inventory-command" ${!controller.applyInventoryCommand ? 'disabled' : ''}>写入账本</button></div>
+          <section class="stx-memory-inventory-history"><h4>完整变动历史</h4>${historyRows}</section>` : renderEmpty('选择一个物品', '左侧选择后可查看当前数量、变动历史与来源证据。')}
+      </section>
+    </div>`;
+  };
+
   const renderLibrary = (): string => renderMemoryLibraryView({
     allFacts: state.facts,
     queryFacts: state.libraryResults,
@@ -1949,15 +2028,16 @@ export function renderMemoryWorkbench(
     const actionError = state.actionError ? renderErrorDetails(state.actionError, 'dismiss-error') : '';
     const content = state.page === 'overview' ? renderOverview()
       : state.page === 'actors' ? renderActors()
-        : state.page === 'scenes' ? renderScenes()
-          : state.page === 'library' ? renderLibrary()
-            : state.page === 'actor-memory' ? renderActorMemory()
-              : state.page === 'profiles' ? renderProfiles()
-                : state.page === 'dreams' ? renderDreams()
-                  : state.page === 'initialize' ? renderInitialize()
-                    : state.page === 'recall' ? `${renderRecall()}<section class="stx-memory-panel stx-memory-graph-inline"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">关系图谱</span><h3>已验证事实关系</h3></div></div>${renderGraph()}</section>`
-                      : state.page === 'graph' ? renderGraph()
-                        : state.page === 'audit' ? `${renderAudit()}${renderData()}` : renderData();
+        : state.page === 'inventory' ? renderInventory()
+          : state.page === 'scenes' ? renderScenes()
+            : state.page === 'library' ? renderLibrary()
+              : state.page === 'actor-memory' ? renderActorMemory()
+                : state.page === 'profiles' ? renderProfiles()
+                  : state.page === 'dreams' ? renderDreams()
+                    : state.page === 'initialize' ? renderInitialize()
+                      : state.page === 'recall' ? `${renderRecall()}<section class="stx-memory-panel stx-memory-graph-inline"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">关系图谱</span><h3>已验证事实关系</h3></div></div>${renderGraph()}</section>`
+                        : state.page === 'graph' ? renderGraph()
+                          : state.page === 'audit' ? `${renderAudit()}${renderData()}` : renderData();
     return `${actionError}${content}`;
   };
   const render = (): void => {
@@ -2166,6 +2246,50 @@ export function renderMemoryWorkbench(
           },
         });
       }
+    }
+    if (popupUi && controller.loadMemoryPage && state.page === 'inventory') {
+      const host = root.querySelector<HTMLElement>('.stx-memory-inventory-rows');
+      if (host) popupUi.mountList<import('../domain').InventoryItem>(host, {
+        id: `memory-inventory:${state.overview?.chatKey ?? 'unbound'}`,
+        ariaLabel: '当前物品与资源列表',
+        queryKey: JSON.stringify([state.overview?.chatKey ?? '', state.inventoryQuery.trim(), state.inventoryCategory]),
+        pageSize: 20,
+        overscan: 6,
+        maxCachedPages: 6,
+        itemHeight: 62,
+        itemGap: 7,
+        selectable: true,
+        selectedKey: state.selectedInventoryItemId,
+        getKey: item => item.id,
+        loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!('inventory-items', {
+          ...(cursor === undefined ? {} : { cursor }),
+          limit,
+          signal,
+          query: state.inventoryQuery.trim(),
+          filter: state.inventoryCategory ? { category: state.inventoryCategory } : {},
+          where: [{ field: 'status', op: 'in', value: ['confirmed', 'pending'] }],
+          orderBy: { field: 'updatedAt', direction: 'desc' },
+          includeTotal: true,
+        }),
+        renderItem: (item, context) => {
+          const states = state.inventoryStates.filter(entry => entry.itemId === item.id);
+          const summary = states.length === 0 ? '尚无数量记录' : states.map(entry => entry.availability === 'absent'
+            ? '已移除'
+            : entry.amount === undefined ? '数量未知' : `${entry.precision === 'approximate' ? '约 ' : ''}${entry.amount}${entry.unit}`).join(' / ');
+          return elementFromMarkup(`<button type="button" class="stx-memory-inventory-row" data-action="inventory-select" data-item-id="${escapeHtml(item.id)}" aria-pressed="${context.selected}"><span><strong>${escapeHtml(item.canonicalName)}</strong><small>${escapeHtml(INVENTORY_CATEGORY_LABELS[item.category])}</small></span><span>${escapeHtml(summary)}</span></button>`);
+        },
+        onSelect: (item) => {
+          state.selectedInventoryItemId = item.id;
+          if (!state.inventoryItems.some(value => value.id === item.id)) state.inventoryItems = [...state.inventoryItems, item];
+          state.inventoryEvents = [];
+          rerender();
+          if (controller.getInventoryHistory) void controller.getInventoryHistory(item.id).then(events => {
+            if (disposed || state.selectedInventoryItemId !== item.id) return;
+            state.inventoryEvents = [...events];
+            rerender();
+          }).catch(error => toast('error', '账本读取失败', '无法读取该物品的变动历史。', safeErrorCode(error, 'INTERNAL_ERROR')));
+        },
+      });
     }
     if (popupUi && controller.loadMemoryPage && state.page === 'scenes') {
       const host = root.querySelector<HTMLElement>('.stx-memory-scene-record-list');
@@ -2454,6 +2578,77 @@ export function renderMemoryWorkbench(
     if (action === 'toggle-filter-menu') { const filter = actionNode.dataset.filterMenu as 'kind' | 'status'; state.openFilter = state.openFilter === filter ? '' : filter; rerender(`#stx-memory-${filter}-filter-trigger`); return; }
     if (action === 'navigate') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (PAGES.some((item) => item.id === page)) void loadPage(page); return; }
     if (action === 'navigate-internal') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (INTERNAL_PAGES.some((item) => item.id === page)) void loadPage(page); return; }
+    if (action === 'inventory-select') {
+      const itemId = actionNode.dataset.itemId ?? '';
+      if (!itemId) return;
+      state.selectedInventoryItemId = itemId;
+      state.inventoryConfirmInvalidId = '';
+      state.inventoryEvents = [];
+      rerender();
+      if (controller.getInventoryHistory) void controller.getInventoryHistory(itemId).then((events) => {
+        if (disposed || state.selectedInventoryItemId !== itemId) return;
+        state.inventoryEvents = [...events];
+        rerender();
+      }).catch(error => toast('error', '账本读取失败', '无法读取该物品的变动历史。', safeErrorCode(error, 'INTERNAL_ERROR')));
+      return;
+    }
+    if (action === 'inventory-create') {
+      const canonicalName = state.inventoryNewName.trim();
+      if (!canonicalName || !controller.createInventoryItem) return;
+      void runAction('inventory-create', async () => {
+        const item = await controller.createInventoryItem!({ canonicalName });
+        state.selectedInventoryItemId = item.id;
+        state.inventoryNewName = '';
+      }, '物品已新增', '物品目录已保存，可继续设置数量。', 'MEMORY_INVENTORY_ITEM_CREATED', () => loadPage('inventory'));
+      return;
+    }
+    if (action === 'inventory-command') {
+      const item = state.inventoryItems.find(entry => entry.id === state.selectedInventoryItemId && entry.status !== 'invalid');
+      if (!item || !controller.applyInventoryCommand) return;
+      const amount = state.inventoryCommandAmount.trim() === '' ? undefined : Number(state.inventoryCommandAmount);
+      if (state.inventoryCommandOperation !== 'remove' && (!Number.isFinite(amount) || Number(amount) < 0)) {
+        toast('warning', '数值无效', '请输入大于或等于 0 的数值。', 'INVALID_PAYLOAD');
+        return;
+      }
+      if (state.inventoryCommandMeasure === 'coverage_days' && !['set', 'remove'].includes(state.inventoryCommandOperation)) {
+        toast('warning', '操作不适用', '可维持天数只允许设置或移除，不能自动增减。', 'INVALID_PAYLOAD');
+        return;
+      }
+      const unit = state.inventoryCommandUnit.trim();
+      const current = state.inventoryStates.find(entry => entry.itemId === item.id
+        && entry.measureKind === state.inventoryCommandMeasure
+        && entry.unit.normalize('NFKC').trim().toLocaleLowerCase() === unit.normalize('NFKC').trim().toLocaleLowerCase());
+      const reason: import('../domain').InventoryReason = state.inventoryCommandOperation === 'increase' ? 'acquire'
+        : state.inventoryCommandOperation === 'decrease' ? 'consume'
+          : state.inventoryCommandOperation === 'remove' ? 'discard' : 'manual_correction';
+      void runAction('inventory-command', () => controller.applyInventoryCommand!({
+        itemId: item.id,
+        operation: state.inventoryCommandOperation,
+        measureKind: state.inventoryCommandMeasure,
+        ...(amount === undefined ? {} : { amount, rawAmount: state.inventoryCommandAmount.trim() }),
+        unit,
+        precision: 'exact',
+        reason,
+        origin: 'manual',
+        confidence: 1,
+      }, {
+        expectedRevision: current?.revision ?? 0,
+        idempotencyKey: crypto.randomUUID(),
+      }).then(() => undefined), '库存已更新', '变动已写入账本并同步当前状态。', 'MEMORY_INVENTORY_UPDATED', () => loadPage('inventory'));
+      return;
+    }
+    if (action === 'inventory-invalidate') { state.inventoryConfirmInvalidId = state.selectedInventoryItemId; rerender(); return; }
+    if (action === 'inventory-invalidate-cancel') { state.inventoryConfirmInvalidId = ''; rerender(); return; }
+    if (action === 'inventory-invalidate-confirm') {
+      const itemId = state.inventoryConfirmInvalidId;
+      if (!itemId || !controller.invalidateInventoryItem) return;
+      void runAction('inventory-invalidate', () => controller.invalidateInventoryItem!(itemId).then(() => undefined), '错误物品已作废', '历史账本仍然保留，该物品不再参与当前库存。', 'MEMORY_INVENTORY_ITEM_INVALIDATED', async () => {
+        state.inventoryConfirmInvalidId = '';
+        state.selectedInventoryItemId = '';
+        await loadPage('inventory');
+      });
+      return;
+    }
     if (action === 'scene-set-category') {
       const category = actionNode.dataset.category;
       if (category !== 'scene' && category !== 'event' && category !== 'observation') return;
@@ -3014,6 +3209,10 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('input', (event) => {
     const input = event.target as HTMLInputElement;
+    if (input.dataset.inventoryInput === 'query') { state.inventoryQuery = input.value; rerender('', true); return; }
+    if (input.dataset.inventoryInput === 'new-name') { state.inventoryNewName = input.value; rerender(); return; }
+    if (input.dataset.inventoryInput === 'amount') { state.inventoryCommandAmount = input.value; return; }
+    if (input.dataset.inventoryInput === 'unit') { state.inventoryCommandUnit = input.value; return; }
     if (input.dataset.actorMemoryInput === 'query') {
       state.actorMemoryQuery = input.value;
       rerender('', true);
@@ -3061,6 +3260,15 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('change', (event) => {
     const input = event.target as HTMLInputElement | HTMLSelectElement;
+    if (input.dataset.inventorySelect === 'category') { state.inventoryCategory = input.value as WorkbenchState['inventoryCategory']; state.selectedInventoryItemId = ''; rerender(); return; }
+    if (input.dataset.inventorySelect === 'operation') { state.inventoryCommandOperation = input.value as import('../domain').InventoryOperation; rerender(); return; }
+    if (input.dataset.inventorySelect === 'measure') {
+      state.inventoryCommandMeasure = input.value as import('../domain').InventoryMeasureKind;
+      if (state.inventoryCommandMeasure === 'coverage_days' && !['set', 'remove'].includes(state.inventoryCommandOperation)) state.inventoryCommandOperation = 'set';
+      if (state.inventoryCommandMeasure === 'coverage_days' && state.inventoryCommandUnit === '个') state.inventoryCommandUnit = '天';
+      rerender();
+      return;
+    }
     if (input.dataset.actorMemorySelect === 'knowledge') {
       state.actorMemoryKnowledgeMode = input.value as WorkbenchState['actorMemoryKnowledgeMode'];
       state.actorMemorySelectedTraceId = '';

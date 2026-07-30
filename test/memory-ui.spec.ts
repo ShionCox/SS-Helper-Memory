@@ -343,7 +343,7 @@ describe('Memory UI 展示适配', () => {
     const dispose = renderMemoryWorkbench(container, controller);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(container.querySelectorAll('[data-action="navigate"]')).toHaveLength(10);
+    expect(container.querySelectorAll('[data-action="navigate"]')).toHaveLength(11);
     expect([...container.querySelectorAll('[data-action="navigate"]')].slice(0, 3).map((node) => node.getAttribute('data-page'))).toEqual(['overview', 'initialize', 'actors']);
     expect(container.querySelector('[data-action="select-fact"]')).not.toBeNull();
     expect(container.querySelector('[data-action="select-fact"]')?.getAttribute('data-ss-helper-control')).toBe('button');
@@ -372,6 +372,40 @@ describe('Memory UI 展示适配', () => {
     expect(updates).toEqual(['更新后的事实']);
     dispose();
     expect(container.textContent).toBe('');
+  });
+
+  it('物品与资源页展示当前快照和账本，并把人工修正交给统一控制器', async () => {
+    const item = { id: 'item:water', workspaceId: 'w', canonicalName: '瓶装水', aliases: ['饮用水'], category: 'food' as const, status: 'confirmed' as const, confidence: 1, sourceRefs: ['message:4'], createdAt: 1, updatedAt: 2 };
+    const inventoryState = { id: 'state:water', workspaceId: 'w', chatKey: 'chat:1', itemId: item.id, measureKind: 'quantity' as const, amount: 20, unit: '瓶', unitKey: '瓶', precision: 'exact' as const, availability: 'active' as const, lastEventId: 'event:water', sourceRefs: ['message:6'], updatedAtFloor: 6, revision: 2, createdAt: 1, updatedAt: 2 };
+    const inventoryEvent = { id: 'event:water', workspaceId: 'w', chatKey: 'chat:1', itemId: item.id, operation: 'set' as const, measureKind: 'quantity' as const, amount: 20, rawAmount: '20', unit: '瓶', unitKey: '瓶', precision: 'exact' as const, reason: 'recount' as const, beforeAmount: 22, afterAmount: 20, availability: 'active' as const, sourceRef: 'message:6', evidenceExcerpt: '瓶装水x20', floor: 6, occurredAt: 6, recordedAt: 7, origin: 'automatic' as const, confidence: 1 };
+    const applyInventoryCommand = vi.fn(async () => ({ state: inventoryState, event: inventoryEvent }));
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listInventoryStates: async () => ({ items: [item], states: [inventoryState] }),
+      getInventoryHistory: async () => [inventoryEvent],
+      createInventoryItem: async () => item,
+      applyInventoryCommand,
+      invalidateInventoryItem: async () => ({ ...item, status: 'invalid' as const }),
+    }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="inventory"]') as HTMLButtonElement).click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(container.querySelector('.stx-memory-inventory-shell')).not.toBeNull();
+    expect(container.textContent).toContain('瓶装水');
+    expect(container.textContent).toContain('20瓶');
+    expect(container.textContent).toContain('22 → 20');
+    const amount = container.querySelector<HTMLInputElement>('[data-inventory-input="amount"]')!;
+    amount.value = '18';
+    amount.dispatchEvent(new Event('input', { bubbles: true }));
+    const unit = container.querySelector<HTMLInputElement>('[data-inventory-input="unit"]')!;
+    unit.value = '瓶';
+    unit.dispatchEvent(new Event('input', { bubbles: true }));
+    (container.querySelector('[data-action="inventory-command"]') as HTMLButtonElement).click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(applyInventoryCommand).toHaveBeenCalledWith(expect.objectContaining({ itemId: item.id, operation: 'set', amount: 18, unit: '瓶', origin: 'manual' }), expect.objectContaining({ expectedRevision: 2 }));
+    dispose();
   });
 
   it('搜索只更新结果列表，不改变完整事实统计和快速范围计数', async () => {
@@ -548,7 +582,7 @@ describe('Memory UI 展示适配', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const navPages = [...container.querySelectorAll<HTMLElement>('.stx-memory-nav [data-page]')].map((item) => item.dataset.page);
-    expect(navPages.slice(0, 4)).toEqual(['overview', 'initialize', 'actors', 'scenes']);
+    expect(navPages.slice(0, 5)).toEqual(['overview', 'initialize', 'actors', 'inventory', 'scenes']);
     (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(container.querySelector('.stx-memory-initialize-shell')).not.toBeNull();

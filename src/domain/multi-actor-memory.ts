@@ -78,6 +78,95 @@ export interface LocationCandidate {
   readonly locationRef?: string;
 }
 
+export type InventoryItemCategory = 'weapon' | 'medicine' | 'food' | 'armor' | 'special' | 'core' | 'material' | 'other';
+export type InventoryMeasureKind = 'quantity' | 'coverage_days';
+export type InventoryPrecision = 'exact' | 'approximate' | 'unknown';
+export type InventoryAvailability = 'active' | 'absent' | 'unknown';
+export type InventoryOperation = 'set' | 'increase' | 'decrease' | 'remove';
+export type InventoryReason = 'acquire' | 'consume' | 'discard' | 'lose' | 'recount' | 'manual_correction' | 'other';
+
+/** Workspace-wide fungible item identity. Per-chat quantities live in InventoryState. */
+export interface InventoryItem {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly canonicalName: string;
+  readonly aliases: readonly string[];
+  readonly category: InventoryItemCategory;
+  readonly status: 'confirmed' | 'pending' | 'invalid';
+  readonly confidence: number;
+  readonly sourceRefs: readonly string[];
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+/** Current materialized measure for one item in one chat branch. */
+export interface InventoryState {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly chatKey: string;
+  readonly itemId: string;
+  readonly measureKind: InventoryMeasureKind;
+  readonly amount?: number;
+  readonly unit: string;
+  readonly unitKey: string;
+  readonly precision: InventoryPrecision;
+  readonly availability: InventoryAvailability;
+  readonly stateNote?: string;
+  readonly lastEventId: string;
+  readonly sourceRefs: readonly string[];
+  readonly updatedAtFloor?: number;
+  readonly revision: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+/** Append-only inventory ledger row. before/after are server-computed. */
+export interface InventoryEvent {
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly chatKey: string;
+  readonly itemId: string;
+  readonly operation: InventoryOperation;
+  readonly measureKind: InventoryMeasureKind;
+  readonly amount?: number;
+  readonly rawAmount?: string;
+  readonly unit: string;
+  readonly unitKey: string;
+  readonly precision: InventoryPrecision;
+  readonly reason: InventoryReason;
+  readonly beforeAmount?: number;
+  readonly afterAmount?: number;
+  readonly availability: InventoryAvailability;
+  readonly sourceRef?: string;
+  readonly evidenceExcerpt?: string;
+  readonly floor?: number;
+  readonly occurredAt: number;
+  readonly recordedAt: number;
+  readonly origin: 'automatic' | 'manual' | 'import';
+  readonly confidence: number;
+  readonly jobId?: string;
+  readonly requestId?: string;
+  readonly batchIndex?: number;
+}
+
+export interface InventoryCommand {
+  readonly itemId: string;
+  readonly operation: InventoryOperation;
+  readonly measureKind: InventoryMeasureKind;
+  readonly amount?: number;
+  readonly rawAmount?: string;
+  readonly unit: string;
+  readonly precision: InventoryPrecision;
+  readonly reason: InventoryReason;
+  readonly stateNote?: string;
+  readonly sourceRef?: string;
+  readonly evidenceExcerpt?: string;
+  readonly floor?: number;
+  readonly occurredAt?: number;
+  readonly origin: 'automatic' | 'manual' | 'import';
+  readonly confidence: number;
+}
+
 export const DEFAULT_MEMORY_TRAITS: Readonly<Required<MemoryTraits>> = Object.freeze({
   halfLifeMs: 1000 * 60 * 60 * 24 * 30,
   rehearsalGain: 0.04,

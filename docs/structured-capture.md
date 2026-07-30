@@ -7,12 +7,14 @@ Capture 把当前聊天、角色卡和世界书整理成人物候选、地点候
 输入分成三部分：
 
 - `allowedSourceRefs`：本次允许作为证据的来源 ID。
-- `existingMemoryContext`：只用于消歧和去重，不能成为新事实证据。
+- `existingMemoryContext` / `knownInventoryContext`：只用于消歧、去重和读取当前值，不能成为新事实或库存变动证据。
 - `sourceBlocks`：按段落/句子切分后的连续证据片段；每段不超过 800 字符并带稳定 `evidenceSpanId`。
 
-人物、地点和 Claim 只输出 `evidenceSpanId`。模型不复制证据正文；服务端核对 span 与 `sourceRef` 属于同一来源后，按原始偏移回填现有事实 DTO 的 `evidenceExcerpt`。
+人物、地点、物品、Claim 和库存操作只输出 `evidenceSpanId`，Episode 输出一个或多个 `evidenceSpanIds`。模型不复制证据正文；服务端核对 span 与 `sourceRef` 属于同一来源后，按原始偏移回填证据与来源。
 
-根对象必须包含 `actorCandidates`、`locationCandidates`、`episodes`、`claims` 四个数组。LLM 插件先校验根容器，再逐项校验四个数组；模型输出不是可信契约。
+根对象必须包含 `actorCandidates`、`locationCandidates`、`itemCandidates`、`episodes`、`claims`、`inventoryOperations` 六个数组。LLM 插件先校验根容器，再逐项校验六个数组；模型输出不是可信契约。
+
+库存操作还必须通过服务端数值门：物品名称、原始数字、单位和操作方向必须由同一证据片段支持；`rawAmount` 必须逐字存在且与标准数值一致。明确的物资快照由确定性解析器优先产生 `set/remove`，模型只处理自由叙事中的明确增减。未通过的操作进入修复队列，不更新当前快照。
 
 ## 逐项 Schema 校验
 

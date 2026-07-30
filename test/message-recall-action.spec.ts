@@ -81,7 +81,11 @@ function detail(): GenerationRecallDetail {
             traceIds: ['trace:1'],
             sourceFloors: [1],
             summary: '艾琳知道地下仓库的位置。',
-            score: .92,
+            score: .03,
+            lexicalScore: .61,
+            vectorScore: .35,
+            fusionScore: .012,
+            rerankScore: .032,
             selected: true,
             state: 'injected',
             reasonCodes: ['semantic_match'],
@@ -268,6 +272,8 @@ describe('Memory message recall action', () => {
     expect(container.textContent).toContain('艾琳记得地下仓库的位置');
     expect(container.textContent).toContain('入口位于旧礼堂后方');
     expect(container.textContent).toContain('角色摘要');
+    expect(container.textContent).toContain('模型主导 0.030 · 模型原始 0.032');
+    expect(container.textContent).not.toContain('最终 0.032');
     expect(container.textContent).toContain('评估 3 次 · 1 轮');
     expect(container.textContent).toContain('预算 240/4000');
     expect(container.textContent).toContain('涉及角色1 个');
@@ -276,6 +282,8 @@ describe('Memory message recall action', () => {
     const recallCard = container.querySelector<HTMLDetailsElement>('.stx-recall-preview-card.is-injected')!;
     recallCard.querySelector<HTMLElement>('.stx-recall-preview-gist')!.click();
     expect(recallCard.open).toBe(true);
+    expect(recallCard.textContent).toContain('模型原始0.032');
+    expect(recallCard.textContent).toContain('模型主导0.030');
     recallCard.querySelector<HTMLElement>('.stx-recall-preview-gist')!.click();
     expect(recallCard.open).toBe(false);
 
