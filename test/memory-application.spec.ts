@@ -227,6 +227,233 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     state.recallRouteRelease = null;
   });
 
+  it('把 Capture change audit 与 repair queue 合并为安全必填读模型', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    const queue: CaptureRepairQueueRecord = {
+      id: 'repair:1', workspaceId: 'character:c1', chatKey: 'chat-a', jobId: 'job:capture',
+      batchIndex: 2, collection: 'claims', itemIndex: 0,
+      issues: [{ path: '$.claims[0].kind', keyword: 'enum', expected: 'known fact kind' }],
+      sourceRefs: ['message:7'], fallbackSourceRefs: ['message:6'],
+      originalRequestId: 'request:safe', originalResourceId: 'memory_extract', originalModel: 'model-safe',
+      rejectionId: 'rejection:1', status: 'unresolved', attemptCount: 1, maxAttempts: 2,
+      waitingForEvidenceChange: true,
+      failure: { reasonCode: 'SCHEMA_VALIDATION_FAILED', stage: 'memory.capture.item', requestId: 'request:safe', batchIndex: 2, collection: 'claims', path: '$.claims[0].kind' },
+      createdAt: 10, updatedAt: 20,
+    };
+    (app as unknown as {
+      multiActorRepository: {
+        listChangeAudits(): Promise<Array<Record<string, unknown>>>;
+        listCaptureRepairQueue(): Promise<CaptureRepairQueueRecord[]>;
+      };
+    }).multiActorRepository = {
+      listChangeAudits: async () => [{
+        id: 'change-audit:1', workspaceId: 'character:c1', chatKey: 'chat-a', kind: 'capture-change-set-v0', createdAt: 30,
+        entries: [{ collection: 'facts', recordId: 'fact:secret', after: { content: '候选正文不得进入 UI' } }],
+        metadata: {
+          captureJobId: 'job:capture', batchIndex: 2, outcome: 'partial', requestId: 'request:safe', resourceId: 'memory_extract', model: 'model-safe', fallbackUsed: false,
+          sourceRefs: ['message:7'], accepted: { facts: 3, observations: 1 },
+          rejections: [{
+            id: 'rejection:1', index: 0, code: 'schema_validation_failed', message: '原始错误消息不得进入 UI', recordType: 'claim', fieldPath: '$.claims[0].kind',
+            sourceRefs: ['message:7'], requestId: 'request:safe', status: 'unresolved',
+            candidateSnapshot: { content: '候选正文不得进入 UI' },
+          }],
+        },
+      }],
+      listCaptureRepairQueue: async () => [queue],
+    };
+
+    const records = await app.listAuditRecords();
+
+    expect(records).toEqual([expect.objectContaining({
+      id: 'change-audit:1', jobId: 'job:capture', batchIndex: 2, status: 'partial', outcome: 'partial',
+      acceptedCount: 4, rejectedCount: 1, unresolvedCount: 1, repairedCount: 0, ignoredCount: 0,
+      requestId: 'request:safe', resourceId: 'memory_extract', model: 'model-safe', fallbackUsed: false,
+      issues: [expect.objectContaining({
+        id: 'rejection:1', collection: 'claims', path: '$.claims[0].kind', status: 'unresolved',
+        canIgnore: true, attemptCount: 1, waitingForEvidenceChange: true,
+        failure: expect.objectContaining({ reasonCode: 'SCHEMA_VALIDATION_FAILED', requestId: 'request:safe' }),
+      })],
+    })]);
+    const serialized = JSON.stringify(records);
+    expect(serialized).not.toContain('entries');
+    expect(serialized).not.toContain('metadata');
+    expect(serialized).not.toContain('candidateSnapshot');
+    expect(serialized).not.toContain('原始错误消息');
+    expect(serialized).not.toContain('候选正文');
+  });
+
+  it('按 Capture 批次隔离 repair queue，补齐安全上下文并展开全部字段问题', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    const repair = (overrides: Partial<CaptureRepairQueueRecord>): CaptureRepairQueueRecord => ({
+      id: 'repair:default', workspaceId: 'character:c1', chatKey: 'chat-a', jobId: 'job:shared',
+      batchIndex: 0, collection: 'claims', itemIndex: 0,
+      issues: [{ path: '$.default', keyword: 'type', expected: 'string' }],
+      sourceRefs: [], fallbackSourceRefs: [], rejectionId: 'rejection:default',
+      status: 'unresolved', attemptCount: 0, createdAt: 1, updatedAt: 1,
+      ...overrides,
+    });
+    const queue = [
+      repair({
+        id: 'repair:batch-0', batchIndex: 0, rejectionId: 'rejection:batch-0',
+        originalRequestId: 'request:batch-0', originalResourceId: 'resource:batch-0', originalModel: 'model:batch-0',
+        issues: [
+          { path: '$.claims[0].kind', keyword: 'enum', expected: 'known kind' },
+          { path: '$.claims[0].subjectRef', keyword: 'required', expected: 'owner ref' },
+        ],
+        failure: { reasonCode: 'SCHEMA_VALIDATION_FAILED', stage: 'memory.capture.schema' },
+      }),
+      repair({ id: 'repair:batch-1', batchIndex: 1, rejectionId: 'rejection:batch-1', issues: [{ path: '$.claims[1]', keyword: 'type', expected: 'claim' }] }),
+      repair({ id: 'repair:other-job', jobId: 'job:other', batchIndex: 0, rejectionId: 'rejection:other', issues: [{ path: '$.other', keyword: 'type', expected: 'never' }] }),
+    ];
+    (app as unknown as {
+      multiActorRepository: {
+        listChangeAudits(): Promise<Array<Record<string, unknown>>>;
+        listCaptureRepairQueue(): Promise<CaptureRepairQueueRecord[]>;
+      };
+    }).multiActorRepository = {
+      listChangeAudits: async () => [0, 1].map(batchIndex => ({
+        id: `change-audit:batch-${batchIndex}`,
+        workspaceId: 'character:c1',
+        chatKey: 'chat-a',
+        kind: 'capture-change-set-v0',
+        createdAt: 20 - batchIndex,
+        entries: [],
+        metadata: {
+          captureJobId: 'job:shared',
+          batchIndex,
+          outcome: 'partial',
+          accepted: { facts: 1 },
+          rejections: [{
+            id: `rejection:batch-${batchIndex}`,
+            index: batchIndex,
+            code: 'schema_validation_failed',
+            message: '原始错误不得展示',
+            recordType: 'claim',
+            status: 'unresolved',
+          }],
+        },
+      })),
+      listCaptureRepairQueue: async () => queue,
+    };
+
+    const records = await app.listAuditRecords();
+    const batch0 = records.find(record => record.batchIndex === 0)!;
+    const batch1 = records.find(record => record.batchIndex === 1)!;
+    expect(batch0.issues.map(issue => issue.path)).toEqual(['$.claims[0].kind', '$.claims[0].subjectRef']);
+    expect(batch0.issues.map(issue => issue.failure.path)).toEqual(['$.claims[0].kind', '$.claims[0].subjectRef']);
+    expect(batch0.issues.map(issue => issue.id)).toEqual(['rejection:batch-0:issue:0', 'rejection:batch-0:issue:1']);
+    expect(batch0.issues.map(issue => issue.canIgnore)).toEqual([true, false]);
+    expect(batch0.unresolvedCount).toBe(1);
+    expect(batch0.issues[0]?.failure).toEqual(expect.objectContaining({
+      reasonCode: 'SCHEMA_VALIDATION_FAILED',
+      stage: 'memory.capture.schema',
+      requestId: 'request:batch-0',
+      resourceId: 'resource:batch-0',
+      model: 'model:batch-0',
+    }));
+    expect(batch1.issues.map(issue => issue.path)).toEqual(['$.claims[1]']);
+    expect(batch1.issues.every(issue => issue.batchIndex === 1)).toBe(true);
+    expect(JSON.stringify(records)).not.toContain('$.other');
+    expect(JSON.stringify(records)).not.toContain('rejection:other');
+  });
+
+  it('审计投影把已回滚 Capture 标记为 rolled_back', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    (app as unknown as { multiActorRepository: { listChangeAudits(): Promise<Array<Record<string, unknown>>>; listCaptureRepairQueue(): Promise<CaptureRepairQueueRecord[]> } }).multiActorRepository = {
+      listChangeAudits: async () => [{
+        id: 'change-audit:rolled-back', workspaceId: 'character:c1', chatKey: 'chat-a', kind: 'capture-change-set-v0', createdAt: 30, rolledBackAt: 40, entries: [],
+        metadata: { captureJobId: 'job:rolled-back', batchIndex: 0, outcome: 'complete', accepted: { facts: 2 }, sourceRefs: [] },
+      }],
+      listCaptureRepairQueue: async () => [],
+    };
+
+    await expect(app.listAuditRecords()).resolves.toEqual([
+      expect.objectContaining({ id: 'change-audit:rolled-back', status: 'rolled_back', rolledBackAt: 40, acceptedCount: 2 }),
+    ]);
+  });
+
+  it('审计分页把后续 cursor 继续交给 SQLite，而不调用全量列表', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    const changeAudit = (id: string, createdAt: number) => ({
+      id, workspaceId: 'character:c1', chatKey: 'chat-a', kind: 'capture-change-set-v0' as const,
+      createdAt, entries: [], metadata: { captureJobId: id, batchIndex: 0, outcome: 'complete', accepted: {} },
+    });
+    const page = vi.fn(async (collection: string, request: { cursor?: string }) => {
+      if (collection === 'capture-repair-queue') return { items: [], nextCursor: null };
+      return request.cursor === 'cursor:next'
+        ? { items: [changeAudit('audit:second', 10)], nextCursor: null, total: 2 }
+        : { items: [changeAudit('audit:first', 20)], nextCursor: 'cursor:next', total: 2 };
+    });
+    const listChangeAudits = vi.fn(async () => { throw new Error('不应全量读取'); });
+    const listCaptureRepairQueue = vi.fn(async () => { throw new Error('不应全量读取'); });
+    (app as unknown as { multiActorRepository: unknown }).multiActorRepository = {
+      boundWorkspaceId: 'character:c1',
+      page,
+      listChangeAudits,
+      listCaptureRepairQueue,
+    };
+
+    const first = await app.listAuditRecordsPage({ limit: 1, includeTotal: true });
+    const second = await app.listAuditRecordsPage({ limit: 1, cursor: first.nextCursor ?? undefined, includeTotal: true });
+
+    expect(first.items.map(item => item.id)).toEqual(['audit:first']);
+    expect(first.nextCursor).toBe('cursor:next');
+    expect(second.items.map(item => item.id)).toEqual(['audit:second']);
+    expect(page.mock.calls.filter(([collection]) => collection === 'change-audits').map(([, request]) => request.cursor)).toEqual([undefined, 'cursor:next']);
+    expect(listChangeAudits).not.toHaveBeenCalled();
+    expect(listCaptureRepairQueue).not.toHaveBeenCalled();
+  });
+
+  it('Token 用量分页保留 null，并把后续 cursor 限定在当前聊天', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    const usage = (id: string, totalTokens: number | null) => ({
+      id, chatKey: 'chat-a', messageId: id, promptTokens: null, completionTokens: 1,
+      cacheReadTokens: null, cacheWriteTokens: null, totalTokens, capturedAt: id === 'usage:first' ? 20 : 10,
+    });
+    const pageCollection = vi.fn(async (_collection: string, request: { cursor?: string }, scope: { chatKey: string }) => ({
+      items: [request.cursor ? usage('usage:second', null) : usage('usage:first', 2)],
+      nextCursor: request.cursor ? null : 'usage:next',
+      total: 2,
+      scope,
+    }));
+    (repository as unknown as { pageCollection: typeof pageCollection }).pageCollection = pageCollection;
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+
+    const first = await app.getMainChatUsagePage({ limit: 1, includeTotal: true });
+    const second = await app.getMainChatUsagePage({ limit: 1, cursor: 'usage:next', includeTotal: true });
+
+    expect(first.items[0]?.totalTokens).toBe(2);
+    expect(second.items[0]?.totalTokens).toBeNull();
+    expect(pageCollection.mock.calls.map(([, request]) => request.cursor)).toEqual([undefined, 'usage:next']);
+    expect(pageCollection.mock.calls.every(([, , scope]) => scope.chatKey === 'chat-a')).toBe(true);
+  });
+
+  it('按当前 workspace 和 chatKey 读取指定召回详情', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    const getGenerationRecallDetail = vi.fn(async () => undefined);
+    (repository as unknown as { getGenerationRecallDetail: typeof getGenerationRecallDetail }).getGenerationRecallDetail = getGenerationRecallDetail;
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+
+    await expect(app.getGenerationRecallDetail('generation-recall:1')).resolves.toBeUndefined();
+    expect(getGenerationRecallDetail).toHaveBeenCalledWith('character:c1', 'chat-a', 'generation-recall:1');
+    await expect(app.getGenerationRecallDetail(' ')).rejects.toMatchObject({
+      code: 'INVALID_PAYLOAD',
+      details: { stage: 'memory.generation-recall.detail-scope' },
+    });
+  });
+
   it('场景工作台观察记录只返回当前聊天事件精确归属的数据', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const app = new MemoryApplication(new FakeRepository() as never);

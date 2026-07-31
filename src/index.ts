@@ -67,7 +67,7 @@ export interface MemoryPluginApi {
   getInitializationState(): Promise<import('./ui/memory-ui').MemoryInitializationState>;
   reinitialize(selectedKinds?: string[], options?: MemoryInitializationOptions): Promise<void>;
   cancelCapture(): Promise<void>;
-  listAuditRecords(): Promise<Array<Record<string, unknown>>>;
+  listAuditRecords(): Promise<import('./ui/memory-ui').MemoryAuditRecord[]>;
   getMainChatUsage(): Promise<MainChatUsage[]>;
   getSqliteStatus(): Promise<MemorySqliteStatus>;
   clearCurrentChatData(): Promise<void>;

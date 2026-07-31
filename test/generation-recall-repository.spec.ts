@@ -196,6 +196,12 @@ describe('generation recall persistence', () => {
 
     await repository.commitMainChatGeneration(usage, detail);
     expect(fixture.commits).toHaveLength(1);
+    await expect(repository.getGenerationRecallDetail('character:test', 'chat', detail.id)).resolves.toEqual(detail);
+    await expect(repository.getGenerationRecallDetail('character:test', 'chat', 'generation-recall:missing')).resolves.toBeUndefined();
+    await expect(repository.getGenerationRecallDetail('character:test', 'other-chat', detail.id)).rejects.toMatchObject({
+      code: 'INVALID_PAYLOAD',
+      details: { stage: 'memory.repository.generation-recall.detail-scope' },
+    });
     expect(fixture.commits[0]?.request.operations.map(operation => operation.collection))
       .toEqual(['usage', 'generation-recall-details']);
     expect(fixture.commits[0]?.request.idempotencyKey).toBe(`generation-recall:${detail.id}`);

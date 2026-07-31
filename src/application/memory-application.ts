@@ -1,4 +1,4 @@
-import { MemoryRepository } from '../infrastructure';
+import { MemoryRepository, MultiActorMemoryRepository, type ChangeAudit } from '../infrastructure';
 import {
   createSSHelperError,
   describeSSHelperFailure,
@@ -70,6 +70,9 @@ import type {
   MemoryInitializationOptions,
   MemoryInitializationState,
   MemoryInitializationSourceOption,
+  MemoryAuditIssue,
+  MemoryAuditRecord,
+  MemoryAuditSummary,
   MemoryUiController,
   MemoryUiFact,
   MemoryUiOverview,
@@ -91,7 +94,6 @@ import {
 } from './actors';
 import { ActorRecallService, RecallExposureTracker, auditKnowledgeLeakage, type KnowledgeLeakageAudit } from './recall';
 import { buildActorMemoryPromptResult, type ActorMemoryPromptResult } from './prompt';
-import { MultiActorMemoryRepository } from '../infrastructure';
 import type { ActorRecallRequest, ActorRecallResponse, SceneCast } from '../domain';
 import { StructuredMemoryCaptureExtractor } from './ingest/llm-extractor';
 import { LocationRegistry } from './locations';
@@ -2917,36 +2919,318 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     };
   }
 
-  async listAuditRecords(): Promise<Array<Record<string, unknown>>> {
-    const chatKey = this.requireChatKey();
-    const actorAudits = this.multiActorRepository
-      ? (await this.multiActorRepository.listChangeAudits())
-        .filter(record => String(record.kind ?? '') === 'capture-change-set-v0')
-        .map(record => {
+  private projectAuditRecords(
+    changeAudits: readonly ChangeAudit[],
+    repairQueue: readonly CaptureRepairQueueRecord[],
+    chatKey: string,
+  ): MemoryAuditRecord[] {
+    const cleanString = (value: unknown): string | undefined => {
+      const text = typeof value === 'string' ? value.trim() : '';
+      return text || undefined;
+    };
+    const cleanStrings = (value: unknown): string[] => Array.isArray(value)
+      ? [...new Set(value.map(cleanString).filter((item): item is string => item !== undefined))]
+      : [];
+    const repairKey = (jobId: string, batchIndex: number): string => `${jobId}\0${batchIndex}`;
+    const queueByAudit = new Map<string, CaptureRepairQueueRecord[]>();
+    for (const item of repairQueue) {
+      const key = repairKey(item.jobId, Number.isInteger(item.batchIndex) ? item.batchIndex : 0);
+      const bucket = queueByAudit.get(key) ?? [];
+      bucket.push(item);
+      queueByAudit.set(key, bucket);
+    }
+    const safeFailure = (
+      source: SSHelperFailureContext | undefined,
+      fallback: SSHelperFailureContext,
+    ): SSHelperFailureContext => {
+      const value: SSHelperFailureContext = {
+        reasonCode: source?.reasonCode ?? fallback.reasonCode,
+        stage: source?.stage ?? fallback.stage,
+        requestId: cleanString(source?.requestId) ?? cleanString(fallback.requestId),
+        attemptId: cleanString(source?.attemptId) ?? cleanString(fallback.attemptId),
+        batchIndex: Number.isInteger(source?.batchIndex) ? source?.batchIndex : fallback.batchIndex,
+        collection: cleanString(source?.collection) ?? cleanString(fallback.collection),
+        path: cleanString(source?.path) ?? cleanString(fallback.path),
+        keyword: cleanString(source?.keyword) ?? cleanString(fallback.keyword),
+        expected: cleanString(source?.expected) ?? cleanString(fallback.expected),
+        resourceId: cleanString(source?.resourceId) ?? cleanString(fallback.resourceId),
+        model: cleanString(source?.model) ?? cleanString(fallback.model),
+      };
+      return {
+        reasonCode: value.reasonCode,
+        stage: value.stage,
+        ...(cleanString(value.requestId) ? { requestId: cleanString(value.requestId) } : {}),
+        ...(cleanString(value.attemptId) ? { attemptId: cleanString(value.attemptId) } : {}),
+        ...(Number.isInteger(value.batchIndex) ? { batchIndex: value.batchIndex } : {}),
+        ...(cleanString(value.collection) ? { collection: cleanString(value.collection) } : {}),
+        ...(cleanString(value.path) ? { path: cleanString(value.path) } : {}),
+        ...(cleanString(value.keyword) ? { keyword: cleanString(value.keyword) } : {}),
+        ...(cleanString(value.expected) ? { expected: cleanString(value.expected) } : {}),
+        ...(cleanString(value.resourceId) ? { resourceId: cleanString(value.resourceId) } : {}),
+        ...(cleanString(value.model) ? { model: cleanString(value.model) } : {}),
+      };
+    };
+    const actorAudits = changeAudits
+      .filter(record => record.kind === 'capture-change-set-v0' && record.chatKey === chatKey)
+      .map((record): MemoryAuditRecord => {
         const metadata = record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
           ? record.metadata as Record<string, unknown>
           : {};
         const acceptedCounts = metadata.accepted && typeof metadata.accepted === 'object' && !Array.isArray(metadata.accepted)
           ? metadata.accepted as Record<string, unknown>
           : {};
-        const rejected = Array.isArray(metadata.rejections) ? metadata.rejections : [];
+        const rejections = Array.isArray(metadata.rejections)
+          ? metadata.rejections.filter((item): item is AutomaticIngestRejection => Boolean(item && typeof item === 'object'))
+          : [];
+        const jobId = cleanString(metadata.captureJobId) ?? record.id;
+        const batchIndex = Number.isInteger(metadata.batchIndex) ? Number(metadata.batchIndex) : 0;
+        const scopedRepairQueue = queueByAudit.get(repairKey(jobId, batchIndex)) ?? [];
+        const queueByRejectionId = new Map<string, CaptureRepairQueueRecord>();
+        for (const item of scopedRepairQueue) {
+          for (const rejectionId of item.rejectionIds?.length ? item.rejectionIds : item.rejectionId ? [item.rejectionId] : []) {
+            if (rejectionId.trim()) queueByRejectionId.set(rejectionId, item);
+          }
+        }
+        const recordRequestId = cleanString(metadata.requestId);
+        const recordResourceId = cleanString(metadata.resourceId);
+        const recordModel = cleanString(metadata.model);
+        const projectIssues = (
+          rejection: AutomaticIngestRejection | undefined,
+          repair: CaptureRepairQueueRecord | undefined,
+          fallbackIndex: number,
+        ): MemoryAuditIssue[] => {
+          const rejectionId = cleanString(rejection?.id);
+          const diagnosticId = rejectionId
+            ?? cleanString(repair?.rejectionId)
+            ?? cleanString(repair?.rejectionIds?.[0])
+            ?? cleanString(repair?.id)
+            ?? `${record.id}:item:${fallbackIndex}`;
+          const status = rejection?.status === 'ignored' || repair?.status === 'ignored'
+            ? 'ignored'
+            : rejection?.status === 'repaired' || repair?.status === 'resolved'
+              ? 'repaired'
+              : rejection?.status === 'repairing' || repair?.status === 'running'
+                ? 'running'
+                : repair?.status === 'queued' || repair?.status === 'unresolved'
+                  ? repair.status
+                : 'unresolved';
+          const collection = repair?.collection ?? rejection?.recordType ?? 'record';
+          const projectedBatchIndex = Number.isInteger(repair?.batchIndex)
+            ? repair!.batchIndex
+            : Number.isInteger(rejection?.batchIndex) ? rejection!.batchIndex! : batchIndex;
+          const requestId = cleanString(repair?.originalRequestId) ?? cleanString(rejection?.requestId) ?? recordRequestId;
+          const resourceId = cleanString(repair?.originalResourceId) ?? cleanString(rejection?.resourceId) ?? recordResourceId;
+          const model = cleanString(repair?.originalModel) ?? cleanString(rejection?.model) ?? recordModel;
+          const rawIssues = rejection?.issues?.length
+            ? rejection.issues
+            : repair?.issues?.length ? repair.issues : [undefined];
+          return rawIssues.map((issue, issueIndex): MemoryAuditIssue => {
+            const path = cleanString(issue?.path) ?? cleanString(rejection?.fieldPath) ?? '$';
+            const keyword = cleanString(issue?.keyword);
+            const expected = cleanString(issue?.expected);
+            const fallbackFailure: SSHelperFailureContext = {
+              reasonCode: rejection?.code === 'schema_validation_failed'
+                ? 'SCHEMA_VALIDATION_FAILED'
+                : rejection && isAiRepairableProposalCode(rejection.code)
+                  ? 'ENTITY_REF_UNSUPPORTED'
+                  : 'CAPTURE_ITEM_INVALID',
+              stage: 'memory.capture.item',
+              ...(requestId ? { requestId } : {}),
+              batchIndex: projectedBatchIndex,
+              collection,
+              path,
+              ...(keyword ? { keyword } : {}),
+              ...(expected ? { expected } : {}),
+              ...(resourceId ? { resourceId } : {}),
+              ...(model ? { model } : {}),
+            };
+            const failure = safeFailure(repair?.failure, fallbackFailure);
+            return {
+              id: rawIssues.length === 1 ? diagnosticId : `${diagnosticId}:issue:${issueIndex}`,
+              ...(rejectionId ? { rejectionId } : {}),
+              collection,
+              itemIndex: Number.isInteger(repair?.itemIndex) ? repair!.itemIndex : Number(rejection?.index ?? fallbackIndex),
+              batchIndex: projectedBatchIndex,
+              path,
+              ...(keyword ? { keyword } : {}),
+              ...(expected ? { expected } : {}),
+              sourceRefs: cleanStrings([
+                ...(repair?.sourceRefs ?? []),
+                ...(repair?.fallbackSourceRefs ?? []),
+                ...(rejection?.sourceRefs ?? []),
+              ]),
+              status,
+              canIgnore: status === 'unresolved' && rejectionId !== undefined && issueIndex === 0,
+              attemptCount: Math.max(0, Number(repair?.attemptCount ?? rejection?.repairAttempts ?? 0)),
+              ...(Number.isInteger(repair?.maxAttempts) ? { maxAttempts: repair!.maxAttempts } : {}),
+              waitingForEvidenceChange: repair?.waitingForEvidenceChange === true || rejection?.waitingForEvidenceChange === true,
+              ...(cleanString(repair?.resolutionMode) ? { resolutionMode: cleanString(repair?.resolutionMode) } : {}),
+              failure: {
+                ...failure,
+                batchIndex: projectedBatchIndex,
+                collection,
+                path,
+                ...(keyword ? { keyword } : {}),
+                ...(expected ? { expected } : {}),
+              },
+            };
+          });
+        };
+        const linkedQueueIds = new Set<string>();
+        const issues = rejections.flatMap((rejection, index) => {
+          const repair = rejection.id ? queueByRejectionId.get(rejection.id) : undefined;
+          if (repair) linkedQueueIds.add(repair.id);
+          return projectIssues(rejection, repair, index);
+        });
+        for (const repair of scopedRepairQueue.filter(item => !linkedQueueIds.has(item.id))) {
+          issues.push(...projectIssues(undefined, repair, issues.length));
+        }
+        const countItems = (matches: (issue: MemoryAuditIssue) => boolean): number => new Set(
+          issues.filter(matches).map(issue => issue.rejectionId ?? issue.id.replace(/:issue:\d+$/u, '')),
+        ).size;
+        const unresolvedCount = countItems(issue => issue.status === 'queued' || issue.status === 'running' || issue.status === 'unresolved');
+        const repairedCount = countItems(issue => issue.status === 'repaired');
+        const ignoredCount = countItems(issue => issue.status === 'ignored');
+        const acceptedCount = Object.values(acceptedCounts).reduce<number>((total, value) => {
+          const count = Number(value);
+          return total + (Number.isFinite(count) && count > 0 ? count : 0);
+        }, 0);
+        const outcome = metadata.outcome === 'partial' ? 'partial' : 'complete';
         return {
-          ...record,
-          type: 'actor-capture',
-          status: record.rolledBackAt ? '已回滚' : metadata.outcome === 'partial' ? '部分完成' : '已完成',
-          outcome: metadata.outcome ?? 'complete',
-          accepted: Object.values(acceptedCounts).reduce<number>((total, value) => total + Number(value ?? 0), 0),
-          rejected,
-          sourceRefs: Array.isArray(metadata.sourceRefs) ? metadata.sourceRefs : [],
-          ...(typeof metadata.requestId === 'string' ? { requestId: metadata.requestId } : {}),
-          ...(typeof metadata.resourceId === 'string' ? { resourceId: metadata.resourceId } : {}),
-          ...(typeof metadata.model === 'string' ? { model: metadata.model } : {}),
+          id: record.id,
+          jobId,
+          createdAt: record.createdAt,
+          ...(record.rolledBackAt === undefined ? {} : { rolledBackAt: record.rolledBackAt }),
+          status: record.rolledBackAt ? 'rolled_back' : outcome === 'partial' || unresolvedCount > 0 ? 'partial' : 'completed',
+          outcome,
+          batchIndex,
+          sourceRefs: cleanStrings(metadata.sourceRefs),
+          acceptedCount,
+          rejectedCount: rejections.length,
+          unresolvedCount,
+          repairedCount,
+          ignoredCount,
+          issues,
+          ...(recordRequestId ? { requestId: recordRequestId } : {}),
+          ...(recordResourceId ? { resourceId: recordResourceId } : {}),
+          ...(recordModel ? { model: recordModel } : {}),
+          ...(Number.isFinite(Number(metadata.latencyMs)) ? { latencyMs: Math.max(0, Number(metadata.latencyMs)) } : {}),
           ...(typeof metadata.fallbackUsed === 'boolean' ? { fallbackUsed: metadata.fallbackUsed } : {}),
         };
-      })
-      : [];
-    const auditTimestamp = (record: Record<string, unknown>): number => Number(record.createdAt ?? record.updatedAt ?? 0);
-    return actorAudits.sort((left, right) => auditTimestamp(right) - auditTimestamp(left));
+      });
+    return actorAudits.sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
+  }
+
+  private async listAuditRepairQueueForAudits(
+    changeAudits: readonly ChangeAudit[],
+    signal?: AbortSignal,
+  ): Promise<CaptureRepairQueueRecord[]> {
+    const repository = this.multiActorRepository;
+    if (!repository || changeAudits.length === 0) return [];
+    const chatKey = this.requireChatKey();
+    const pairKeys = new Set<string>();
+    const jobIds = new Set<string>();
+    for (const record of changeAudits) {
+      const metadata = record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
+        ? record.metadata as Record<string, unknown>
+        : {};
+      const jobId = typeof metadata.captureJobId === 'string' && metadata.captureJobId.trim()
+        ? metadata.captureJobId.trim()
+        : record.id;
+      const batchIndex = Number.isInteger(metadata.batchIndex) ? Number(metadata.batchIndex) : 0;
+      jobIds.add(jobId);
+      pairKeys.add(`${jobId}\0${batchIndex}`);
+    }
+    const items: CaptureRepairQueueRecord[] = [];
+    let cursor: string | undefined;
+    const seen = new Set<string>();
+    do {
+      if (signal?.aborted) throw signal.reason;
+      const page = await repository.page<CaptureRepairQueueRecord>('capture-repair-queue', {
+        limit: 500,
+        signal,
+        ...(cursor === undefined ? {} : { cursor }),
+        where: [{ field: 'jobId', op: 'in', value: [...jobIds] }],
+      }, {
+        workspaceId: repository.boundWorkspaceId,
+        chatKey,
+      });
+      items.push(...page.items.filter(item => pairKeys.has(`${item.jobId}\0${Number.isInteger(item.batchIndex) ? item.batchIndex : 0}`)));
+      if (page.nextCursor === null) break;
+      if (seen.has(page.nextCursor)) throw createSSHelperError('INTERNAL_ERROR', { stage: 'memory.ui.audit-repair-pagination' });
+      seen.add(page.nextCursor);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return items;
+  }
+
+  async listAuditRecords(): Promise<MemoryAuditRecord[]> {
+    const chatKey = this.requireChatKey();
+    const repository = this.multiActorRepository;
+    if (!repository) return [];
+    const [changeAudits, repairQueue] = await Promise.all([
+      repository.listChangeAudits(),
+      repository.listCaptureRepairQueue(),
+    ]);
+    return this.projectAuditRecords(changeAudits, repairQueue, chatKey);
+  }
+
+  async listAuditRecordsPage(request: MemoryPageRequest): Promise<MemoryPage<MemoryAuditRecord>> {
+    const chatKey = this.requireChatKey();
+    const repository = this.multiActorRepository;
+    if (!repository) return { items: [], nextCursor: null, total: 0 };
+    const limit = Math.max(1, Math.min(500, Math.trunc(request.limit)));
+    const query = request.query?.trim().toLocaleLowerCase() ?? '';
+    const requestedStatus = request.filter?.auditStatus;
+    const status = requestedStatus === 'completed' || requestedStatus === 'partial' || requestedStatus === 'rolled_back'
+      ? requestedStatus
+      : undefined;
+    const issuesOnly = request.filter?.auditIssuesOnly === true;
+    const scope = { workspaceId: repository.boundWorkspaceId, chatKey };
+    const loadRawPage = (cursor: string | undefined, pageLimit: number): Promise<MemoryPage<ChangeAudit>> => repository.page<ChangeAudit>('change-audits', {
+      limit: pageLimit,
+      signal: request.signal,
+      ...(cursor === undefined ? {} : { cursor }),
+      orderBy: { field: 'createdAt', direction: 'desc' },
+    }, scope);
+    const projectPage = async (page: MemoryPage<ChangeAudit>): Promise<MemoryAuditRecord[]> => {
+      const captureAudits = page.items.filter(record => record.kind === 'capture-change-set-v0' && record.chatKey === chatKey);
+      return this.projectAuditRecords(
+        captureAudits,
+        await this.listAuditRepairQueueForAudits(captureAudits, request.signal),
+        chatKey,
+      );
+    };
+    const matches = (record: MemoryAuditRecord): boolean => {
+      if (status && record.status !== status) return false;
+      if (issuesOnly && record.unresolvedCount === 0) return false;
+      if (!query) return true;
+      return [
+        record.id,
+        record.jobId,
+        record.requestId,
+        record.resourceId,
+        record.model,
+        ...record.sourceRefs,
+        ...record.issues.flatMap(issue => [issue.collection, issue.path, issue.failure.reasonCode, issue.failure.requestId]),
+      ].some(value => String(value ?? '').toLocaleLowerCase().includes(query));
+    };
+    const items: MemoryAuditRecord[] = [];
+    let cursor = request.cursor;
+    let nextCursor: string | null = cursor ?? null;
+    const seen = new Set<string>();
+    do {
+      if (request.signal?.aborted) throw request.signal.reason;
+      const page = await loadRawPage(cursor, Math.max(1, limit - items.length));
+      items.push(...(await projectPage(page)).filter(matches));
+      nextCursor = page.nextCursor;
+      if (items.length >= limit || nextCursor === null) break;
+      if (seen.has(nextCursor)) throw createSSHelperError('INTERNAL_ERROR', { stage: 'memory.ui.audit-page.search-pagination' });
+      seen.add(nextCursor);
+      cursor = nextCursor;
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    } while (cursor);
+    return { items, nextCursor };
   }
 
   private async readCaptureRejections(
@@ -2983,6 +3267,137 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   async getMainChatUsage(): Promise<MainChatUsage[]> {
     return this.repository.listMainChatUsage(this.requireChatKey());
+  }
+
+  private isMainChatUsageComplete(usage: MainChatUsage): boolean {
+    return [
+      usage.promptTokens,
+      usage.completionTokens,
+      usage.cacheReadTokens,
+      usage.cacheWriteTokens,
+      usage.totalTokens,
+    ].every(value => value !== null);
+  }
+
+  async getMainChatUsagePage(request: MemoryPageRequest): Promise<MemoryPage<MainChatUsage>> {
+    const chatKey = this.requireChatKey();
+    const limit = Math.max(1, Math.min(500, Math.trunc(request.limit)));
+    const query = request.query?.trim().toLocaleLowerCase() ?? '';
+    const requestedModel = request.filter?.usageModel;
+    const model = typeof requestedModel === 'string' && requestedModel.trim() ? requestedModel.trim() : undefined;
+    const requestedCompleteness = request.filter?.usageCompleteness;
+    const completeness = requestedCompleteness === 'complete' || requestedCompleteness === 'missing'
+      ? requestedCompleteness
+      : undefined;
+    const computedFilter = Boolean(query || model || completeness);
+    const loadRawPage = (cursor: string | undefined, pageLimit: number, includeTotal: boolean): Promise<MemoryPage<MainChatUsage>> => this.repository.pageCollection<MainChatUsage>('usage', {
+      limit: pageLimit,
+      signal: request.signal,
+      ...(cursor === undefined ? {} : { cursor }),
+      orderBy: { field: 'capturedAt', direction: 'desc' },
+      includeTotal,
+    }, { chatKey });
+    if (!computedFilter) return loadRawPage(request.cursor, limit, request.includeTotal === true);
+
+    const matches = (usage: MainChatUsage): boolean => {
+      if (model && usage.model !== model) return false;
+      const complete = this.isMainChatUsageComplete(usage);
+      if (completeness === 'complete' && !complete) return false;
+      if (completeness === 'missing' && complete) return false;
+      if (!query) return true;
+      return [usage.id, usage.messageId, usage.provider, usage.model]
+        .some(value => String(value ?? '').toLocaleLowerCase().includes(query));
+    };
+    const items: MainChatUsage[] = [];
+    let cursor = request.cursor;
+    let nextCursor: string | null = cursor ?? null;
+    const seen = new Set<string>();
+    do {
+      if (request.signal?.aborted) throw request.signal.reason;
+      const page = await loadRawPage(cursor, Math.max(1, limit - items.length), false);
+      items.push(...page.items.filter(matches));
+      nextCursor = page.nextCursor;
+      if (items.length >= limit || nextCursor === null) break;
+      if (seen.has(nextCursor)) throw createSSHelperError('INTERNAL_ERROR', { stage: 'memory.ui.usage-page.search-pagination' });
+      seen.add(nextCursor);
+      cursor = nextCursor;
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    } while (cursor);
+    return { items, nextCursor };
+  }
+
+  async getAuditSummary(): Promise<MemoryAuditSummary> {
+    const summary: MemoryAuditSummary = {
+      auditTotal: 0,
+      pendingIssueCount: 0,
+      rolledBackCount: 0,
+      usageTotal: 0,
+      promptTokens: { value: null, known: 0 },
+      completionTokens: { value: null, known: 0 },
+      totalTokens: { value: null, known: 0 },
+      incompleteUsageCount: 0,
+      models: [],
+    };
+    const models = new Set<string>();
+    const addKnown = (target: { value: number | null; known: number }, value: number | null): void => {
+      if (value === null) return;
+      target.value = (target.value ?? 0) + value;
+      target.known += 1;
+    };
+    let auditCursor: string | undefined;
+    const seenAuditCursors = new Set<string>();
+    do {
+      const page = await this.listAuditRecordsPage({
+        limit: 200,
+        ...(auditCursor === undefined ? {} : { cursor: auditCursor }),
+      });
+      summary.auditTotal += page.items.length;
+      for (const record of page.items) {
+        summary.pendingIssueCount += record.unresolvedCount;
+        if (record.status === 'rolled_back') summary.rolledBackCount += 1;
+      }
+      if (page.nextCursor === null) break;
+      if (seenAuditCursors.has(page.nextCursor)) throw createSSHelperError('INTERNAL_ERROR', { stage: 'memory.ui.audit-summary-pagination' });
+      seenAuditCursors.add(page.nextCursor);
+      auditCursor = page.nextCursor;
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    } while (auditCursor);
+
+    let usageCursor: string | undefined;
+    const seenUsageCursors = new Set<string>();
+    do {
+      const page = await this.getMainChatUsagePage({
+        limit: 500,
+        ...(usageCursor === undefined ? {} : { cursor: usageCursor }),
+      });
+      summary.usageTotal += page.items.length;
+      for (const usage of page.items) {
+        addKnown(summary.promptTokens, usage.promptTokens);
+        addKnown(summary.completionTokens, usage.completionTokens);
+        addKnown(summary.totalTokens, usage.totalTokens);
+        if (!this.isMainChatUsageComplete(usage)) summary.incompleteUsageCount += 1;
+        if (usage.model?.trim()) models.add(usage.model.trim());
+      }
+      if (page.nextCursor === null) break;
+      if (seenUsageCursors.has(page.nextCursor)) throw createSSHelperError('INTERNAL_ERROR', { stage: 'memory.ui.usage-summary-pagination' });
+      seenUsageCursors.add(page.nextCursor);
+      usageCursor = page.nextCursor;
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+    } while (usageCursor);
+    summary.models = [...models].sort((left, right) => left.localeCompare(right, 'zh-CN'));
+    return summary;
+  }
+
+  async getGenerationRecallDetail(detailId: string): Promise<GenerationRecallDetail | undefined> {
+    const workspaceId = this.hostContext?.getWorkspaceId().trim() ?? '';
+    const chatKey = this.requireChatKey();
+    detailId = detailId.trim();
+    if (!workspaceId || !detailId) {
+      throw createSSHelperError('INVALID_PAYLOAD', {
+        stage: 'memory.generation-recall.detail-scope',
+      });
+    }
+    return this.repository.getGenerationRecallDetail(workspaceId, chatKey, detailId);
   }
 
   captureGenerationCompletionScope(): GenerationCompletionScope {
@@ -3147,7 +3562,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       Promise.resolve([] as import('../domain').MemoryJobBatchAudit[]),
       this.multiActorRepository
         ? this.multiActorRepository.listChangeAudits().then(records => records.filter(record => String(record.kind ?? '') === 'capture-change-set-v0'))
-        : Promise.resolve([] as Array<Record<string, unknown>>),
+        : Promise.resolve([] as import('../infrastructure').ChangeAudit[]),
     ]);
     const result = await Promise.all(facts.map(async (fact) => {
       const auditBatches = [
@@ -3165,8 +3580,12 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         ...actorAudits
           .filter((audit) => {
             const entries = Array.isArray(audit.entries) ? audit.entries : [];
+            const metadata = audit.metadata && typeof audit.metadata === 'object' && !Array.isArray(audit.metadata)
+              ? audit.metadata as Record<string, unknown>
+              : {};
+            const sourceRefs = Array.isArray(metadata.sourceRefs) ? metadata.sourceRefs : [];
             return entries.some(entry => entry && typeof entry === 'object' && String((entry as Record<string, unknown>).collection ?? '') === 'facts' && String((entry as Record<string, unknown>).recordId ?? '') === fact.id)
-              || (Array.isArray(audit.sourceRefs) && audit.sourceRefs.some(sourceRef => fact.sourceRefs.includes(String(sourceRef))));
+              || sourceRefs.some(sourceRef => fact.sourceRefs.includes(String(sourceRef)));
           })
           .map(audit => ({
             jobId: String(audit.id ?? 'capture'),

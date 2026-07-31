@@ -1030,6 +1030,38 @@ export class MemoryRepository {
     });
   }
 
+  async getGenerationRecallDetail(
+    workspaceId: string,
+    chatKey: string,
+    detailId: string,
+    signal?: AbortSignal,
+  ): Promise<GenerationRecallDetail | undefined> {
+    workspaceId = workspaceId.trim();
+    chatKey = normalizedChatKey(chatKey);
+    detailId = detailId.trim();
+    if (!workspaceId || !chatKey || !detailId) {
+      throw createSSHelperError('INVALID_PAYLOAD', {
+        stage: 'memory.repository.generation-recall.detail-scope',
+      });
+    }
+    if (signal?.aborted) throw signal.reason;
+    if (!this.store.hasSession(workspaceId)) await this.ensureGenerationRecallDetailsCollection(workspaceId);
+    const record = await this.store.read({
+      workspaceId,
+      collection: 'generation-recall-details',
+      recordId: detailId,
+    });
+    if (signal?.aborted) throw signal.reason;
+    if (record === null) return undefined;
+    const detail = record.value as unknown as GenerationRecallDetail;
+    if (detail.id !== detailId || detail.workspaceId !== workspaceId || detail.chatKey !== chatKey) {
+      throw createSSHelperError('INVALID_PAYLOAD', {
+        stage: 'memory.repository.generation-recall.detail-scope',
+      });
+    }
+    return structuredClone(detail);
+  }
+
   async findGenerationRecallDetailsForTargets(
     workspaceId: string,
     chatKey: string,

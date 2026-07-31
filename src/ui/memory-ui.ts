@@ -18,10 +18,23 @@ import {
   type SSHelperFailureContext,
 } from '@ss-helper/sdk';
 import type { SummaryInitializationEstimate } from '../application/ingest/summary-strategy';
-import { DEFAULT_MEMORY_TRAITS, type CastPlanningSettings, type MemoryGraphPreview, type MemoryGraphStatus } from '../domain';
+import {
+  DEFAULT_MEMORY_TRAITS,
+  type CastPlanningSettings,
+  type GenerationRecallDetail,
+  type MainChatUsage,
+  type MemoryGraphPreview,
+  type MemoryGraphStatus,
+} from '../domain';
 import { describeMemoryError, type MemoryErrorDiagnostic } from '../diagnostics/memory-error';
 import { startMemoryPerformanceSpan, traceMemoryStartup } from '../host/runtime-feedback';
 import { mountRelationshipGraphThree, type RelationshipGraphCommand, type RelationshipGraphRenderer } from './relationship-graph-three';
+import {
+  mountInventoryCardThree,
+  type InventoryCardRenderer,
+  type InventoryCardViewModel,
+} from './inventory-card-three';
+import { latestInventoryState, selectInventoryWorkbenchModel } from './inventory-workbench-model';
 import { selectGraphView } from './relationship-graph-layout';
 import {
   getSceneEventsHeader,
@@ -234,32 +247,63 @@ export interface MemoryInitializationState {
   attempts: MemoryInitializationAttempt[];
 }
 
+export type MemoryAuditStatus = 'completed' | 'partial' | 'rolled_back';
+export type MemoryAuditIssueStatus = 'queued' | 'running' | 'unresolved' | 'repaired' | 'ignored';
+
+/** UI-safe Capture issue. Candidate bodies and provider payloads never cross this boundary. */
+export interface MemoryAuditIssue {
+  id: string;
+  /** Original Capture rejection id used by the real ignore operation. */
+  rejectionId?: string;
+  collection: string;
+  itemIndex: number;
+  batchIndex: number;
+  path: string;
+  keyword?: string;
+  expected?: string;
+  sourceRefs: string[];
+  status: MemoryAuditIssueStatus;
+  canIgnore: boolean;
+  attemptCount: number;
+  maxAttempts?: number;
+  waitingForEvidenceChange: boolean;
+  resolutionMode?: string;
+  failure: SSHelperFailureContext;
+}
+
+/** Required, allow-listed audit projection consumed by the workbench. */
 export interface MemoryAuditRecord {
-  id?: string;
-  jobId?: string;
-  type?: string;
-  status?: string;
-  batchIndex?: number;
-  sourceRefs?: string[];
-  accepted?: number;
-  rejected?: unknown[];
-  outcome?: 'complete' | 'partial';
+  id: string;
+  jobId: string;
+  createdAt: number;
+  rolledBackAt?: number;
+  status: MemoryAuditStatus;
+  outcome: 'complete' | 'partial';
+  batchIndex: number;
+  sourceRefs: string[];
+  acceptedCount: number;
+  rejectedCount: number;
+  unresolvedCount: number;
+  repairedCount: number;
+  ignoredCount: number;
+  issues: MemoryAuditIssue[];
   requestId?: string;
-  model?: string;
-  resource?: string;
   resourceId?: string;
+  model?: string;
+  latencyMs?: number;
   fallbackUsed?: boolean;
-  kind?: string;
-  routeSummary?: {
-    requestCount?: number;
-    resourceIds?: string[];
-    models?: string[];
-    latencyMs?: number | null;
-    usage?: unknown;
-  };
-  usage?: unknown;
-  createdAt?: number;
-  [key: string]: unknown;
+}
+
+export interface MemoryAuditSummary {
+  auditTotal: number;
+  pendingIssueCount: number;
+  rolledBackCount: number;
+  usageTotal: number;
+  promptTokens: { value: number | null; known: number };
+  completionTokens: { value: number | null; known: number };
+  totalTokens: { value: number | null; known: number };
+  incompleteUsageCount: number;
+  models: string[];
 }
 
 export interface ActorCorrectionReview { readonly id: string; readonly operation: 'correction' | 'merge' | 'split' | 'rename' | 'alias'; readonly status: 'pending' | 'applied' | 'undone'; readonly ownerIds: readonly string[]; readonly createdAt: number; readonly sourceRef?: string; }
@@ -293,8 +337,12 @@ export interface MemoryUiController {
   removeFact(id: string): Promise<void>;
   getLastRecall(): Promise<unknown>;
   listAuditRecords(): Promise<MemoryAuditRecord[]>;
+  listAuditRecordsPage?(request: MemoryPageRequest): Promise<MemoryPage<MemoryAuditRecord>>;
+  getAuditSummary?(): Promise<MemoryAuditSummary>;
   ignoreCaptureRejections?(auditId: string, rejectionIds: readonly string[]): Promise<void>;
-  getMainChatUsage(): Promise<unknown[]>;
+  getMainChatUsage(): Promise<MainChatUsage[]>;
+  getMainChatUsagePage?(request: MemoryPageRequest): Promise<MemoryPage<MainChatUsage>>;
+  getGenerationRecallDetail?(detailId: string): Promise<GenerationRecallDetail | undefined>;
   getRecallStatus(): Promise<MemoryRecallStatus>;
   rebuildVectorIndex(): Promise<void>;
   getGraphStatus(): MemoryGraphStatus;
@@ -478,11 +526,14 @@ function formatJson(value: unknown, fallback = '暂无记录'): string {
   if (value === null || value === undefined) return fallback;
   try { return JSON.stringify(value, null, 2) || fallback; } catch { return fallback; }
 }
-function downloadSqlite(content: Blob): void {
+function downloadBlob(content: Blob, filename: string): void {
   const anchor = document.createElement('a'); const objectUrl = URL.createObjectURL(content); anchor.href = objectUrl;
-  anchor.download = content instanceof File && content.name ? content.name : `ss-helper-memory-${new Date().toISOString().slice(0, 10)}.json`;
+  anchor.download = content instanceof File && content.name ? content.name : filename;
   anchor.click();
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+}
+function downloadSqlite(content: Blob): void {
+  downloadBlob(content, `ss-helper-memory-${new Date().toISOString().slice(0, 10)}.json`);
 }
 function safeErrorCode(error: unknown, _fallback: string): string {
   return describeSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.ui.action' }).reasonCode;
@@ -504,11 +555,23 @@ const PAGES: ReadonlyArray<{ id: MemoryWorkbenchPage; label: string; description
   { id: 'dreams', label: 'Dream', description: '逐主体巩固、审计与回滚', icon: 'moon' },
   { id: 'recall', label: '召回与索引', description: '检查检索链路', icon: 'magnifying-glass-chart' },
   { id: 'audit', label: '审计记录', description: '查看整理批次', icon: 'list-check' },
+  { id: 'data', label: '数据维护', description: '存储健康、归档与清理', icon: 'database' },
 ];
 const INTERNAL_PAGES: ReadonlyArray<{ id: MemoryWorkbenchPage; label: string; description: string; icon: string }> = [
   { id: 'graph', label: '关系图谱', description: '召回诊断中的只读图谱', icon: 'diagram-project' },
-  { id: 'data', label: '数据维护', description: '审计页内的存储健康状态', icon: 'database' },
 ];
+const INVENTORY_DETAIL_WIDTH_MIN = 300;
+const INVENTORY_DETAIL_WIDTH_MAX = 560;
+const INVENTORY_DETAIL_WIDTH_DEFAULT = 360;
+const INVENTORY_PREVIEW_HEIGHT_MIN = 220;
+const INVENTORY_PREVIEW_HEIGHT_MAX = 520;
+const INVENTORY_PREVIEW_HEIGHT_DEFAULT = 330;
+const INVENTORY_SPLITTER_KEYBOARD_STEP = 16;
+const INVENTORY_CARD_TRANSITION_MS = 300;
+const INVENTORY_CARD_ENTER_TRANSITION_MS = 380;
+type InventorySplitterKind = 'detail' | 'preview';
+
+const serializeInventoryCardModel = (model: InventoryCardViewModel): string => JSON.stringify(model);
 
 interface WorkbenchState {
   page: MemoryWorkbenchPage;
@@ -541,13 +604,20 @@ interface WorkbenchState {
   inventoryScope: 'current' | 'catalog';
   inventoryQuery: string;
   inventoryCategory: '' | import('../domain').InventoryItemCategory;
+  inventorySort: 'recent' | 'name' | 'amount' | 'confidence';
+  inventoryView: 'grid' | 'list';
   selectedInventoryItemId: string;
+  inventoryDetailWidth: number;
+  inventoryPreviewHeight: number;
+  inventoryCreateOpen: boolean;
   inventoryNewName: string;
+  inventoryNewAliases: string;
+  inventoryNewCategory: import('../domain').InventoryItemCategory;
   inventoryCommandOperation: import('../domain').InventoryOperation;
   inventoryCommandMeasure: import('../domain').InventoryMeasureKind;
   inventoryCommandAmount: string;
   inventoryCommandUnit: string;
-  inventoryConfirmInvalidId: string;
+  inventoryCommandPrecision: import('../domain').InventoryPrecision;
   candidateResolutionMode: 'existing' | 'new';
   candidateTargetOwnerId: string;
   candidateCanonicalName: string;
@@ -615,11 +685,26 @@ interface WorkbenchState {
   selectedGraphNodeId: string;
   graphNeighborFocus: boolean;
   audits: MemoryAuditRecord[];
-  usages: unknown[];
+  usages: MainChatUsage[];
+  auditSummary?: MemoryAuditSummary;
+  auditTotal: number;
+  usageTotal: number;
+  auditSummaryLoading: boolean;
+  auditTab: 'records' | 'usage';
+  auditQuery: string;
+  auditStatus: 'all' | MemoryAuditStatus;
+  auditIssuesOnly: boolean;
+  auditMobileView: 'list' | 'detail';
+  selectedAuditId: string;
+  selectedUsageId: string;
+  usageQuery: string;
+  usageModel: string;
+  usageCompleteness: 'all' | 'complete' | 'missing';
+  usageRecallDetail?: GenerationRecallDetail;
+  usageRecallLoading: boolean;
   sqlite?: MemorySqliteStatus;
   storageUsageStatus: 'loading' | 'ready' | 'error';
   integrityText: string;
-  confirmBatchKey: string;
   selectedRejectionIds: string[];
   dangerConfirm: '' | 'current' | 'all';
 }
@@ -677,9 +762,11 @@ export function renderMemoryWorkbench(
   const abortController = new AbortController();
   let disposed = false;
   let searchTimer: number | undefined;
+  let inventorySearchTimer: number | undefined;
   let graphSearchTimer: number | undefined;
   let progressTimer: number | undefined;
   let storageUsageTimer: number | undefined;
+  let auditFilterTimer: number | undefined;
   let removeOverviewChanged: (() => void) | undefined;
   let renderFrame: number | undefined;
   let graphMarqueeResizeFrame: number | undefined;
@@ -692,15 +779,32 @@ export function renderMemoryWorkbench(
   let storageUsageRequestId = 0;
   let pageRequestId = 0;
   let backgroundPageRequestId = 0;
+  let auditListRequestId = 0;
+  let auditSummaryRequestId = 0;
+  let usageRecallRequestId = 0;
   let liveRefreshRunning = false;
   let liveRefreshRequested = false;
   let graphRenderer: RelationshipGraphRenderer | undefined;
+  let inventoryCardRenderer: InventoryCardRenderer | undefined;
+  let inventoryCardRendererToken = 0;
+  let inventoryCardModel: InventoryCardViewModel | undefined;
+  let inventoryCardRendererItemId = '';
+  let inventoryCardRendererModelKey = '';
+  let inventoryCardMountingItemId = '';
+  let inventoryCardMountingModelKey = '';
+  let inventoryCardHostToRestore: HTMLElement | undefined;
+  let inventoryCardFlipped = false;
+  let inventorySelectionTimer: number | undefined;
+  let inventoryEnterTimer: number | undefined;
+  let pendingInventorySelectionId = '';
+  let inventoryEnteringItemId = '';
+  let inventoryResizeDrag: { kind: InventorySplitterKind; pointerId: number; splitter: HTMLElement } | undefined;
   let sceneRenderer: SceneCastPixiRenderer | undefined;
   let sceneRendererToken = 0;
   const requestedGraphPage = initialActionId === 'open-relationship-graph' || initialActionId === 'rebuild-relationship-graph';
   const state: WorkbenchState = {
-    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', inventoryItems: [], inventoryStates: [], inventoryEvents: [], inventoryScope: 'current', inventoryQuery: '', inventoryCategory: '', selectedInventoryItemId: '', inventoryNewName: '', inventoryCommandOperation: 'set', inventoryCommandMeasure: 'quantity', inventoryCommandAmount: '', inventoryCommandUnit: '个', inventoryConfirmInvalidId: '', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
-    selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeHiddenMessageFloors: true, reinitializeOpen: false, audits: [], usages: [], storageUsageStatus: 'loading', integrityText: '尚未执行完整性检查。', confirmBatchKey: '', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
+    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', inventoryItems: [], inventoryStates: [], inventoryEvents: [], inventoryScope: 'current', inventoryQuery: '', inventoryCategory: '', inventorySort: 'recent', inventoryView: 'grid', selectedInventoryItemId: '', inventoryDetailWidth: INVENTORY_DETAIL_WIDTH_DEFAULT, inventoryPreviewHeight: INVENTORY_PREVIEW_HEIGHT_DEFAULT, inventoryCreateOpen: false, inventoryNewName: '', inventoryNewAliases: '', inventoryNewCategory: 'other', inventoryCommandOperation: 'set', inventoryCommandMeasure: 'quantity', inventoryCommandAmount: '', inventoryCommandUnit: '个', inventoryCommandPrecision: 'exact', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
+    selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeHiddenMessageFloors: true, reinitializeOpen: false, audits: [], usages: [], auditTotal: 0, usageTotal: 0, auditSummaryLoading: false, auditTab: 'records', auditQuery: '', auditStatus: 'all', auditIssuesOnly: false, auditMobileView: 'list', selectedAuditId: '', selectedUsageId: '', usageQuery: '', usageModel: '', usageCompleteness: 'all', usageRecallLoading: false, storageUsageStatus: 'loading', integrityText: '尚未执行完整性检查。', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
   };
   const sceneEventsState = (): SceneEventsState => ({
     category: state.sceneCategory,
@@ -830,6 +934,17 @@ export function renderMemoryWorkbench(
       toast('warning', '无法跳转聊天楼层', '对应消息可能尚未加载或已被删除。', 'MEMORY_MESSAGE_NAVIGATION_UNAVAILABLE');
     });
   };
+  const disposeInventoryCardRenderer = (): void => {
+    inventoryCardRendererToken += 1;
+    inventoryCardRenderer?.dispose();
+    inventoryCardRenderer = undefined;
+    inventoryCardRendererItemId = '';
+    inventoryCardRendererModelKey = '';
+    inventoryCardMountingItemId = '';
+    inventoryCardMountingModelKey = '';
+    inventoryCardHostToRestore = undefined;
+    inventoryCardFlipped = false;
+  };
   const renderNow = (): void => {
     if (disposed) return;
     const focusSelector = pendingFocusSelector;
@@ -845,6 +960,13 @@ export function renderMemoryWorkbench(
     const selectionEnd = active?.selectionEnd;
     graphRenderer?.dispose();
     graphRenderer = undefined;
+    const currentInventoryCardHost = root.querySelector<HTMLElement>('[data-inventory-card-three-host]') ?? undefined;
+    const activeInventoryCardId = inventoryCardMountingItemId || inventoryCardRendererItemId;
+    const preserveInventoryCard = state.page === 'inventory'
+      && Boolean(currentInventoryCardHost)
+      && Boolean(activeInventoryCardId);
+    inventoryCardHostToRestore = preserveInventoryCard ? currentInventoryCardHost : undefined;
+    if (!preserveInventoryCard) disposeInventoryCardRenderer();
     sceneRenderer?.dispose();
     sceneRenderer = undefined;
     sceneRendererToken += 1;
@@ -899,6 +1021,146 @@ export function renderMemoryWorkbench(
     if (!window.matchMedia?.('(max-width: 760px)').matches) return;
     const target = state.actorView === 'pending' ? '#stx-memory-actor-candidate-inspector' : '#stx-memory-actor-inspector';
     window.setTimeout(() => root.querySelector<HTMLElement>(target)?.scrollIntoView?.({ block: 'start' }), 0);
+  };
+  const revealInventoryInspector = (): void => {
+    if (!window.matchMedia?.('(max-width: 900px)').matches) return;
+    window.setTimeout(() => {
+      const target = root.querySelector<HTMLElement>('#stx-memory-inventory-detail');
+      target?.scrollIntoView?.({ block: 'start' });
+      target?.focus();
+    }, 0);
+  };
+  const inventoryDetailWidthMax = (): number => {
+    const console = root.querySelector<HTMLElement>('.stx-memory-inventory-console');
+    const width = console?.clientWidth ?? 0;
+    if (width <= 0) return INVENTORY_DETAIL_WIDTH_MAX;
+    const compact = width <= 1180;
+    const reservedWidth = (compact ? 153 : 166) + (compact ? 330 : 360) + 12;
+    return Math.max(INVENTORY_DETAIL_WIDTH_MIN, Math.min(INVENTORY_DETAIL_WIDTH_MAX, width - reservedWidth));
+  };
+  const syncInventorySplitters = (): void => {
+    const console = root.querySelector<HTMLElement>('.stx-memory-inventory-console');
+    const preview = root.querySelector<HTMLElement>('.stx-memory-inventory-preview');
+    const detailSplitter = root.querySelector<HTMLElement>('[data-inventory-split="detail"]');
+    const previewSplitter = root.querySelector<HTMLElement>('[data-inventory-split="preview"]');
+    if (!console && !preview && !detailSplitter && !previewSplitter) return;
+    const disabled = window.matchMedia?.('(max-width: 900px)').matches ?? false;
+    const detailMax = inventoryDetailWidthMax();
+    if (!disabled) state.inventoryDetailWidth = Math.max(INVENTORY_DETAIL_WIDTH_MIN, Math.min(detailMax, state.inventoryDetailWidth));
+    state.inventoryPreviewHeight = Math.max(INVENTORY_PREVIEW_HEIGHT_MIN, Math.min(INVENTORY_PREVIEW_HEIGHT_MAX, state.inventoryPreviewHeight));
+    console?.style.setProperty('--stx-inventory-detail-width', `${state.inventoryDetailWidth}px`);
+    preview?.style.setProperty('--stx-inventory-preview-height', `${state.inventoryPreviewHeight}px`);
+    if (detailSplitter) {
+      detailSplitter.tabIndex = disabled ? -1 : 0;
+      detailSplitter.setAttribute('aria-disabled', String(disabled));
+      detailSplitter.setAttribute('aria-valuemax', String(detailMax));
+      detailSplitter.setAttribute('aria-valuenow', String(Math.round(state.inventoryDetailWidth)));
+      detailSplitter.setAttribute('aria-valuetext', `详情宽度 ${Math.round(state.inventoryDetailWidth)} 像素`);
+    }
+    if (previewSplitter) {
+      previewSplitter.tabIndex = disabled ? -1 : 0;
+      previewSplitter.setAttribute('aria-disabled', String(disabled));
+      previewSplitter.setAttribute('aria-valuenow', String(Math.round(state.inventoryPreviewHeight)));
+      previewSplitter.setAttribute('aria-valuetext', `卡片预览高度 ${Math.round(state.inventoryPreviewHeight)} 像素`);
+    }
+  };
+  const setInventorySplitValue = (kind: InventorySplitterKind, requestedValue: number): void => {
+    if (!Number.isFinite(requestedValue)) return;
+    if (kind === 'detail') {
+      state.inventoryDetailWidth = Math.max(INVENTORY_DETAIL_WIDTH_MIN, Math.min(inventoryDetailWidthMax(), requestedValue));
+    } else {
+      state.inventoryPreviewHeight = Math.max(INVENTORY_PREVIEW_HEIGHT_MIN, Math.min(INVENTORY_PREVIEW_HEIGHT_MAX, requestedValue));
+    }
+    syncInventorySplitters();
+  };
+  const updateInventoryResizeFromPointer = (event: PointerEvent): void => {
+    if (!inventoryResizeDrag || event.pointerId !== inventoryResizeDrag.pointerId) return;
+    if (inventoryResizeDrag.kind === 'detail') {
+      const console = root.querySelector<HTMLElement>('.stx-memory-inventory-console');
+      const rect = console?.getBoundingClientRect();
+      if (rect && rect.width > 0) setInventorySplitValue('detail', rect.right - event.clientX);
+    } else {
+      const preview = root.querySelector<HTMLElement>('.stx-memory-inventory-preview');
+      const rect = preview?.getBoundingClientRect();
+      if (rect && rect.height > 0) setInventorySplitValue('preview', event.clientY - rect.top);
+    }
+  };
+  const stopInventoryResize = (event?: PointerEvent): void => {
+    const drag = inventoryResizeDrag;
+    if (!drag) return;
+    drag.splitter.closest<HTMLElement>('.stx-memory-inventory-console, .stx-memory-inventory-detail-scroll')?.classList.remove('is-resizing');
+    const pointerId = event?.pointerId ?? drag.pointerId;
+    if (drag.splitter.hasPointerCapture?.(pointerId)) drag.splitter.releasePointerCapture?.(pointerId);
+    inventoryResizeDrag = undefined;
+  };
+  const cancelInventorySelectionTransition = (): void => {
+    if (inventorySelectionTimer !== undefined) window.clearTimeout(inventorySelectionTimer);
+    if (inventoryEnterTimer !== undefined) window.clearTimeout(inventoryEnterTimer);
+    inventorySelectionTimer = undefined;
+    inventoryEnterTimer = undefined;
+    pendingInventorySelectionId = '';
+    inventoryEnteringItemId = '';
+  };
+  const startInventoryCardEnterTransition = (itemId: string, stage: HTMLElement): void => {
+    if (inventoryEnterTimer !== undefined) window.clearTimeout(inventoryEnterTimer);
+    inventoryEnteringItemId = itemId;
+    stage.setAttribute('data-inventory-transition', 'entering');
+    inventoryCardRenderer?.enter();
+    inventoryEnterTimer = window.setTimeout(() => {
+      inventoryEnterTimer = undefined;
+      if (inventoryEnteringItemId === itemId) inventoryEnteringItemId = '';
+      if (stage.isConnected) stage.setAttribute('data-inventory-transition', 'idle');
+    }, INVENTORY_CARD_ENTER_TRANSITION_MS);
+  };
+  const commitInventorySelection = (itemId: string): void => {
+    if (disposed || state.page !== 'inventory' || !state.inventoryItems.some(item => item.id === itemId && item.status !== 'invalid')) return;
+    if (inventoryEnterTimer !== undefined) window.clearTimeout(inventoryEnterTimer);
+    inventoryEnterTimer = undefined;
+    inventoryEnteringItemId = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? '' : itemId;
+    state.selectedInventoryItemId = itemId;
+    state.inventoryEvents = [];
+    rerender();
+    revealInventoryInspector();
+    if (controller.getInventoryHistory) void controller.getInventoryHistory(itemId).then((events) => {
+      if (disposed || state.selectedInventoryItemId !== itemId) return;
+      state.inventoryEvents = [...events];
+      rerender();
+    }).catch((error) => {
+      if (!disposed && state.selectedInventoryItemId === itemId) {
+        toast('error', '账本读取失败', '无法读取该物品的变动历史。', safeErrorCode(error, 'INTERNAL_ERROR'));
+      }
+    });
+  };
+  const requestInventorySelection = (itemId: string): void => {
+    const stage = root.querySelector<HTMLElement>('[data-inventory-card-three-host]');
+    if (itemId === state.selectedInventoryItemId) {
+      if (inventorySelectionTimer !== undefined) {
+        window.clearTimeout(inventorySelectionTimer);
+        inventorySelectionTimer = undefined;
+        pendingInventorySelectionId = '';
+        if (stage && !(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false)) {
+          startInventoryCardEnterTransition(itemId, stage);
+        }
+      }
+      return;
+    }
+    pendingInventorySelectionId = itemId;
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+    const visualCard = stage?.querySelector('.stx-memory-inventory-card-canvas, .stx-memory-inventory-card-fallback-image');
+    if (reduceMotion || !stage || !visualCard) {
+      cancelInventorySelectionTransition();
+      commitInventorySelection(itemId);
+      return;
+    }
+    if (inventorySelectionTimer !== undefined) return;
+    stage.setAttribute('data-inventory-transition', 'leaving');
+    inventoryCardRenderer?.leave();
+    inventorySelectionTimer = window.setTimeout(() => {
+      inventorySelectionTimer = undefined;
+      const nextItemId = pendingInventorySelectionId;
+      pendingInventorySelectionId = '';
+      if (nextItemId) commitInventorySelection(nextItemId);
+    }, INVENTORY_CARD_TRANSITION_MS);
   };
   const scheduleProgress = (): void => {
     if (progressTimer) window.clearTimeout(progressTimer);
@@ -967,6 +1229,34 @@ export function renderMemoryWorkbench(
         ...request,
       })).items
     : fallback();
+  const auditPageRequest = (
+    limit: number,
+    options: { cursor?: string; signal?: AbortSignal; includeTotal?: boolean } = {},
+  ): MemoryPageRequest => ({
+    limit,
+    query: state.auditQuery.trim(),
+    filter: {
+      ...(state.auditStatus === 'all' ? {} : { auditStatus: state.auditStatus }),
+      ...(state.auditIssuesOnly ? { auditIssuesOnly: true } : {}),
+    },
+    ...(options.cursor === undefined ? {} : { cursor: options.cursor }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.includeTotal ? { includeTotal: true } : {}),
+  });
+  const usagePageRequest = (
+    limit: number,
+    options: { cursor?: string; signal?: AbortSignal; includeTotal?: boolean } = {},
+  ): MemoryPageRequest => ({
+    limit,
+    query: state.usageQuery.trim(),
+    filter: {
+      ...(state.usageModel ? { usageModel: state.usageModel } : {}),
+      ...(state.usageCompleteness === 'all' ? {} : { usageCompleteness: state.usageCompleteness }),
+    },
+    ...(options.cursor === undefined ? {} : { cursor: options.cursor }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.includeTotal ? { includeTotal: true } : {}),
+  });
   const refreshLibrarySearch = async (): Promise<boolean> => {
     const requestId = ++librarySearchRequestId;
     const query = state.query.trim();
@@ -990,8 +1280,18 @@ export function renderMemoryWorkbench(
     const chatChanged = state.overview?.chatKey !== overview.chatKey;
     if (chatChanged) {
       storageUsageRequestId += 1;
+      auditListRequestId += 1;
+      auditSummaryRequestId += 1;
+      usageRecallRequestId += 1;
       state.sqlite = undefined;
       state.storageUsageStatus = overview.bound ? 'loading' : 'ready';
+      state.audits = [];
+      state.usages = [];
+      state.auditTotal = 0;
+      state.usageTotal = 0;
+      state.auditSummaryLoading = false;
+      delete state.auditSummary;
+      delete state.usageRecallDetail;
     }
     state.overview = state.storageUsageStatus === 'ready' && state.sqlite
       ? {
@@ -1088,6 +1388,10 @@ export function renderMemoryWorkbench(
             state.dreams = [];
             state.audits = [];
             state.usages = [];
+            state.auditTotal = 0;
+            state.usageTotal = 0;
+            state.auditSummaryLoading = false;
+            delete state.auditSummary;
             state.graph = { nodes: [], edges: [] };
             state.loading = false;
             rerender('', true);
@@ -1109,9 +1413,76 @@ export function renderMemoryWorkbench(
       liveRefreshRunning = false;
     }
   };
+  const refreshAuditSummary = async (chatKey = state.overview?.chatKey): Promise<void> => {
+    if (!controller.getAuditSummary || !chatKey || state.overview?.bound === false) return;
+    const requestId = ++auditSummaryRequestId;
+    state.auditSummaryLoading = true;
+    try {
+      const summary = await controller.getAuditSummary();
+      if (disposed || requestId !== auditSummaryRequestId || state.overview?.chatKey !== chatKey) return;
+      state.auditSummary = summary;
+      state.auditTotal = summary.auditTotal;
+      state.usageTotal = summary.usageTotal;
+    } catch {
+      // The first safe pages stay usable when the non-blocking aggregate scan fails.
+    } finally {
+      if (!disposed && requestId === auditSummaryRequestId && state.overview?.chatKey === chatKey) {
+        state.auditSummaryLoading = false;
+        rerender('', true);
+      }
+    }
+  };
+  const loadAuditFirstPages = async (): Promise<{
+    audits: MemoryPage<MemoryAuditRecord>;
+    usages: MemoryPage<MainChatUsage>;
+  }> => {
+    const [audits, usages] = await Promise.all([
+      controller.listAuditRecordsPage
+        ? controller.listAuditRecordsPage(auditPageRequest(50, { includeTotal: true }))
+        : controller.listAuditRecords().then(items => ({ items, nextCursor: null, total: items.length })),
+      controller.getMainChatUsagePage
+        ? controller.getMainChatUsagePage(usagePageRequest(50, { includeTotal: true }))
+        : controller.getMainChatUsage().then(items => ({ items, nextCursor: null, total: items.length })),
+    ]);
+    return { audits, usages };
+  };
+  const refreshAuditList = async (tab: WorkbenchState['auditTab']): Promise<void> => {
+    const requestId = ++auditListRequestId;
+    if (tab === 'records' && controller.listAuditRecordsPage) {
+      const retained = state.audits.find(record => record.id === state.selectedAuditId);
+      const page = await controller.listAuditRecordsPage(auditPageRequest(50, { includeTotal: true }));
+      if (disposed || requestId !== auditListRequestId || state.page !== 'audit' || state.auditTab !== tab) return;
+      state.audits = [...page.items];
+      if (retained && !state.audits.some(record => record.id === retained.id)) state.audits.push(retained);
+      if (page.total !== undefined) state.auditTotal = page.total;
+    } else if (tab === 'usage' && controller.getMainChatUsagePage) {
+      const retained = state.usages.find(usage => usage.id === state.selectedUsageId);
+      const page = await controller.getMainChatUsagePage(usagePageRequest(50, { includeTotal: true }));
+      if (disposed || requestId !== auditListRequestId || state.page !== 'audit' || state.auditTab !== tab) return;
+      state.usages = [...page.items];
+      if (retained && !state.usages.some(usage => usage.id === retained.id)) state.usages.push(retained);
+      if (page.total !== undefined) state.usageTotal = page.total;
+    } else {
+      if (disposed || requestId !== auditListRequestId || state.page !== 'audit' || state.auditTab !== tab) return;
+    }
+    normalizeAuditSelection();
+    rerender('', true);
+  };
+  const scheduleAuditListRefresh = (tab: WorkbenchState['auditTab'], delay = 180): void => {
+    if (auditFilterTimer) window.clearTimeout(auditFilterTimer);
+    auditFilterTimer = window.setTimeout(() => {
+      auditFilterTimer = undefined;
+      void refreshAuditList(tab).catch((error) => {
+        if (disposed) return;
+        const diagnostic = describeMemoryError(error, 'INTERNAL_ERROR', 'workbench-page');
+        toast('error', diagnostic.title, diagnostic.reason, diagnostic.reasonCode);
+      });
+    }, delay);
+  };
   const loadPage = async (page: MemoryWorkbenchPage, options: { background?: boolean } = {}): Promise<void> => {
     if (disposed) return;
     const background = options.background === true;
+    if (!background) cancelInventorySelectionTransition();
     if (background && page !== state.page) return;
     if (!background) {
       backgroundPageRequestId += 1;
@@ -1317,21 +1688,24 @@ export function renderMemoryWorkbench(
         if (state.overview?.bound === false) {
           state.audits = [];
           state.usages = [];
+          state.auditTotal = 0;
+          state.usageTotal = 0;
+          state.auditSummaryLoading = false;
+          delete state.auditSummary;
         } else {
-          const audits = controller.loadMemoryPage
-            ? await controller.loadMemoryPage<MemoryAuditRecord>('change-audits', { limit: 50, includeTotal: true, orderBy: { field: 'createdAt', direction: 'desc' } }).then(page => page.items)
-            : await controller.listAuditRecords();
+          const { audits, usages } = await loadAuditFirstPages();
           if (!isCurrent()) return;
-          const usages = controller.loadMemoryPage
-            ? await controller.loadMemoryPage<unknown>('usage', { limit: 50, includeTotal: true, orderBy: { field: 'capturedAt', direction: 'desc' } }).then(page => page.items)
-            : await controller.getMainChatUsage();
-          if (!isCurrent()) return;
-          state.audits = [...audits];
-          state.usages = [...usages];
+          state.audits = [...audits.items].sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id));
+          state.usages = [...usages.items].sort((left, right) => right.capturedAt - left.capturedAt || right.id.localeCompare(left.id));
+          state.auditTotal = audits.total ?? state.audits.length;
+          state.usageTotal = usages.total ?? state.usages.length;
+          if (!state.audits.some(record => record.id === state.selectedAuditId)) state.selectedAuditId = state.audits[0]?.id ?? '';
+          if (!state.usages.some(usage => usage.id === state.selectedUsageId)) {
+            state.selectedUsageId = state.usages[0]?.id ?? '';
+            delete state.usageRecallDetail;
+          }
+          if (!background || !state.auditSummary) void refreshAuditSummary();
         }
-        const sqlite = await controller.getSqliteStatus();
-        if (!isCurrent()) return;
-        state.sqlite = sqlite;
       } else if (page === 'data') {
         const sqlite = await controller.getSqliteStatus({ detailed: true });
         if (!isCurrent()) return;
@@ -1683,13 +2057,23 @@ export function renderMemoryWorkbench(
 
   const renderInventory = (): string => {
     const categoryLabels = INVENTORY_CATEGORY_LABELS;
+    const categoryIcons: Readonly<Record<import('../domain').InventoryItemCategory | 'all', string>> = {
+      all: 'boxes-stacked', weapon: 'sword', medicine: 'kit-medical', food: 'burger', armor: 'shield', special: 'gem', core: 'atom', material: 'cubes-stacked', other: 'cube',
+    };
     const operationLabels: Readonly<Record<import('../domain').InventoryOperation, string>> = { set: '设置数量', increase: '增加', decrease: '减少', remove: '标记移除' };
     const reasonLabels: Readonly<Record<import('../domain').InventoryReason, string>> = { acquire: '获得', consume: '消耗', discard: '丢弃', lose: '损失', recount: '盘点', manual_correction: '人工修正', other: '其他' };
     const measureLabels: Readonly<Record<import('../domain').InventoryMeasureKind, string>> = { quantity: '数量', coverage_days: '可维持天数' };
+    const precisionLabels: Readonly<Record<import('../domain').InventoryPrecision, string>> = { exact: '精确记录', approximate: '近似记录', unknown: '数量未知' };
     const formatState = (item: import('../domain').InventoryState): string => {
       if (item.availability === 'absent') return '已移除';
       if (item.amount === undefined || item.precision === 'unknown') return `清单中已确认存在，原文未注明数量${item.stateNote ? ` · ${item.stateNote}` : ''}`;
       return `${item.precision === 'approximate' ? '约 ' : ''}${item.amount}${item.unit || ''}${item.stateNote ? ` · ${item.stateNote}` : ''}`;
+    };
+    const formatStateAmount = (item: import('../domain').InventoryState | undefined): string => {
+      if (!item) return '未记录';
+      if (item.availability === 'absent') return '已移除';
+      if (item.amount === undefined || item.precision === 'unknown') return '数量未知';
+      return `${item.precision === 'approximate' ? '约 ' : ''}${item.amount}${item.unit || ''}`;
     };
     const isUnknownConfirmation = (event: import('../domain').InventoryEvent): boolean => event.operation === 'set'
       && event.precision === 'unknown'
@@ -1709,62 +2093,92 @@ export function renderMemoryWorkbench(
       const action = event.operation === 'increase' ? '增加' : event.operation === 'decrease' ? '减少' : '盘点更新';
       return `${action}：${event.beforeAmount}${event.unit} → ${after}`;
     };
-    const statesByItem = new Map<string, import('../domain').InventoryState[]>();
-    for (const inventoryState of state.inventoryStates) {
-      const group = statesByItem.get(inventoryState.itemId) ?? [];
-      group.push(inventoryState);
-      statesByItem.set(inventoryState.itemId, group);
-    }
-    const newestState = (itemId: string): import('../domain').InventoryState | undefined => [...(statesByItem.get(itemId) ?? [])]
-      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
-    const renderStateSource = (inventoryState: import('../domain').InventoryState | undefined, emptyLabel = '暂无来源证据'): string => {
-      if (!inventoryState) return `<span class="stx-memory-inventory-source is-muted">${escapeHtml(emptyLabel)}</span>`;
+    const inventoryModel = selectInventoryWorkbenchModel({
+      items: state.inventoryItems,
+      states: state.inventoryStates,
+      scope: state.inventoryScope,
+      category: state.inventoryCategory,
+      query: state.inventoryQuery,
+      sort: state.inventorySort,
+      selectedId: state.selectedInventoryItemId,
+    });
+    const { statesByItem, heldItems: currentHeldItems, precisionCounts, maxCoverageDays: maxCoverage, scopeItems, categoryCounts, filteredItems: filtered } = inventoryModel;
+    state.selectedInventoryItemId = inventoryModel.selectedId;
+    const newestState = (itemId: string, measureKind?: import('../domain').InventoryMeasureKind): import('../domain').InventoryState | undefined => latestInventoryState(statesByItem, itemId, measureKind);
+    const renderStateSource = (inventoryState: import('../domain').InventoryState | undefined, emptyLabel = '暂无来源证据', compact = false): string => {
+      const compactEmptyLabel = compact ? '无来源' : emptyLabel;
+      if (!inventoryState) return `<span class="stx-memory-inventory-source is-muted">${escapeHtml(compactEmptyLabel)}</span>`;
       const sourceRef = inventoryState.sourceRefs[inventoryState.sourceRefs.length - 1];
-      if (!sourceRef) return `<span class="stx-memory-inventory-source is-muted">${escapeHtml(emptyLabel)}</span>`;
+      if (!sourceRef) return `<span class="stx-memory-inventory-source is-muted">${escapeHtml(compactEmptyLabel)}</span>`;
       const target = parseMessageSourceReference(sourceRef);
       const floor = inventoryState.updatedAtFloor ?? target?.index;
       const label = floor === undefined ? `来源：${formatSourceReference(sourceRef)}` : `来源：第 ${floor} 层`;
-      if (!target || !navigateToMessage) return `<span class="stx-memory-inventory-source">${escapeHtml(label)}</span>`;
+      const visibleLabel = compact && floor !== undefined ? `第 ${floor} 层` : label;
+      if (!target || !navigateToMessage) return `<span class="stx-memory-inventory-source">${escapeHtml(visibleLabel)}</span>`;
       const messageId = target.messageId === undefined ? '' : ` data-message-id="${escapeHtml(target.messageId)}"`;
       const index = target.index === undefined ? '' : ` data-message-index="${target.index}"`;
-      return `<button class="stx-memory-inventory-source" ${uiButton('neutral', 'xs')} type="button" data-action="jump-to-message"${messageId}${index} aria-label="跳转到${escapeHtml(label)}" title="点击跳转并高亮对应聊天楼层"><ss-helper-icon name="link" decorative></ss-helper-icon>${escapeHtml(label)}</button>`;
+      return `<button class="stx-memory-inventory-source" ${uiButton('neutral', 'xs')} type="button" data-action="jump-to-message"${messageId}${index} aria-label="跳转到${escapeHtml(label)}" title="点击跳转并高亮对应聊天楼层"><ss-helper-icon name="link" decorative></ss-helper-icon>${escapeHtml(visibleLabel)}</button>`;
     };
-    const needle = state.inventoryQuery.trim().toLocaleLowerCase();
-    const currentItemIds = new Set(state.inventoryStates.map(item => item.itemId));
-    const filtered = state.inventoryItems.filter(item => item.status !== 'invalid'
-      && (state.inventoryScope === 'catalog' || currentItemIds.has(item.id))
-      && (!state.inventoryCategory || item.category === state.inventoryCategory)
-      && (!needle || [item.canonicalName, ...item.aliases].some(name => name.toLocaleLowerCase().includes(needle))))
-      .sort((left, right) => state.inventoryScope === 'current'
-        ? (newestState(right.id)?.updatedAtFloor ?? -1) - (newestState(left.id)?.updatedAtFloor ?? -1) || left.canonicalName.localeCompare(right.canonicalName)
-        : right.updatedAt - left.updatedAt || left.canonicalName.localeCompare(right.canonicalName));
-    const selected = state.inventoryItems.find(item => item.id === state.selectedInventoryItemId && item.status !== 'invalid');
+    const selected = filtered.find(item => item.id === state.selectedInventoryItemId);
     const selectedStates = selected ? [...(statesByItem.get(selected.id) ?? [])].sort((left, right) => right.updatedAt - left.updatedAt) : [];
-    const itemRows = filtered.length === 0 ? renderEmpty('没有匹配的物品', '可调整搜索条件，或在右侧新增物品。') : filtered.map((item) => {
-      const states = statesByItem.get(item.id) ?? [];
-      const summary = states.length ? states.map(formatState).join(' / ') : '尚无数量记录';
-      return `<article class="stx-memory-inventory-row" data-selected="${item.id === state.selectedInventoryItemId}"><button type="button" class="stx-memory-inventory-row-main" data-action="inventory-select" data-item-id="${escapeHtml(item.id)}" aria-pressed="${item.id === state.selectedInventoryItemId}"><span><strong>${escapeHtml(item.canonicalName)}</strong><small>${escapeHtml(categoryLabels[item.category])}</small></span><span>${escapeHtml(summary)}</span></button><footer>${states.length ? renderStateSource(newestState(item.id)) : `<span class="stx-memory-inventory-source is-muted">当前聊天无状态</span>`}</footer></article>`;
+    const itemRows = filtered.length === 0 ? renderEmpty('没有匹配的物品', '可调整搜索、分类或显示范围。') : filtered.map((item) => {
+      const primary = newestState(item.id, 'quantity') ?? newestState(item.id);
+      const selectedItem = item.id === state.selectedInventoryItemId;
+      const statusLabel = primary?.availability === 'absent' ? '已移除' : primary?.precision === 'exact' ? '精确' : primary?.precision === 'approximate' ? '近似' : primary ? '未知' : '未记录';
+      return `<article class="stx-memory-inventory-item" data-category="${item.category}" data-selected="${selectedItem}" data-view="${state.inventoryView}"><button ${uiControl('button', 'neutral')} type="button" class="stx-memory-inventory-item-main" data-action="inventory-select" data-item-id="${escapeHtml(item.id)}" aria-pressed="${selectedItem}"><span class="stx-memory-inventory-item-top"><small>${escapeHtml(categoryLabels[item.category])}</small><span>${escapeHtml(statusLabel)}</span></span><span class="stx-memory-inventory-item-body"><span class="stx-memory-inventory-item-icon" aria-hidden="true"><ss-helper-icon name="${categoryIcons[item.category]}" decorative></ss-helper-icon></span><span><strong>${escapeHtml(item.canonicalName)}</strong><b>${escapeHtml(formatStateAmount(primary))}</b></span></span><span class="stx-memory-inventory-item-foot"><small>${escapeHtml(categoryLabels[item.category])}</small><span>${Math.round(item.confidence * 100)}%</span></span></button></article>`;
     }).join('');
     const history = [...state.inventoryEvents].sort((left, right) => right.recordedAt - left.recordedAt);
     const firstUnknownConfirmationId = history.filter(isUnknownConfirmation).at(-1)?.id;
     const historyRows = history.length === 0 ? renderEmpty('暂无变动记录', '设置、增加、减少和移除都会写入追加式账本。') : history.map(event => `<article class="stx-memory-inventory-event"><header><strong>${escapeHtml(operationLabels[event.operation])}</strong><time>${escapeHtml(formatTime(event.recordedAt))}</time></header><p>${escapeHtml(formatEventChange(event, event.id === firstUnknownConfirmationId))}</p><footer><span>${escapeHtml(reasonLabels[event.reason])} · ${event.origin === 'automatic' ? '自动提取' : event.origin === 'manual' ? '人工操作' : '导入'}</span>${event.sourceRef ? renderLibrarySourceReference(event.sourceRef, 'evidence') : ''}</footer>${event.evidenceExcerpt ? `<blockquote>${escapeHtml(event.evidenceExcerpt)}</blockquote>` : ''}</article>`).join('');
     const currentStates = selectedStates.length === 0
       ? `<p class="stx-memory-inventory-no-state">当前聊天无状态</p>`
-      : `<div class="stx-memory-inventory-current-states">${selectedStates.map(inventoryState => `<article><span><small>${escapeHtml(measureLabels[inventoryState.measureKind])}</small><strong>${escapeHtml(formatState(inventoryState))}</strong></span>${renderStateSource(inventoryState)}</article>`).join('')}</div>`;
-    const categories = Object.entries(categoryLabels).map(([value, label]) => `<option value="${value}" ${state.inventoryCategory === value ? 'selected' : ''}>${label}</option>`).join('');
-    return `<div class="stx-memory-inventory-shell">
-      <section class="stx-memory-inventory-list" aria-label="${state.inventoryScope === 'current' ? '当前聊天库存' : '全部物品目录'}">
-        <div class="stx-memory-inventory-scope" ${uiControl('segmented')} role="group" aria-label="物品显示范围"><button type="button" data-action="inventory-set-scope" data-scope="current" aria-pressed="${state.inventoryScope === 'current'}">当前聊天 (${currentItemIds.size})</button><button type="button" data-action="inventory-set-scope" data-scope="catalog" aria-pressed="${state.inventoryScope === 'catalog'}">全部目录 (${state.inventoryItems.filter(item => item.status !== 'invalid').length})</button></div>
-        <div class="stx-memory-inventory-toolbar"><label><span class="stx-memory-sr-only">搜索物品</span><input ${uiControl('input')} data-inventory-input="query" value="${escapeHtml(state.inventoryQuery)}" placeholder="搜索名称或别名"></label><label><span class="stx-memory-sr-only">按分类筛选</span><select ${uiControl('select')} data-inventory-select="category"><option value="">全部分类</option>${categories}</select></label></div>
-        <div class="stx-memory-inventory-rows" aria-label="${state.inventoryScope === 'current' ? '当前聊天物品与资源列表' : '全部物品目录列表'}">${itemRows}</div>
-      </section>
-      <section class="stx-memory-inventory-detail" aria-label="物品详情">
-        <form class="stx-memory-inventory-create" data-inventory-form="create"><label><span>新增物品</span><input ${uiControl('input')} data-inventory-input="new-name" value="${escapeHtml(state.inventoryNewName)}" maxlength="120" placeholder="规范名称"></label><button ${uiButton('primary', 'sm')} type="button" data-action="inventory-create" ${!controller.createInventoryItem || !state.inventoryNewName.trim() ? 'disabled' : ''}>新增</button></form>
-        ${selected ? `<header class="stx-memory-inventory-detail-heading"><div><span class="stx-memory-kicker">${escapeHtml(categoryLabels[selected.category])}</span><h3>${escapeHtml(selected.canonicalName)}</h3></div>${state.inventoryConfirmInvalidId === selected.id ? `<span class="stx-memory-inline-confirm">确认作废？<button ${uiButton('danger', 'xs')} type="button" data-action="inventory-invalidate-confirm">确认</button><button ${uiButton('neutral', 'xs')} type="button" data-action="inventory-invalidate-cancel">取消</button></span>` : `<button ${uiButton('danger', 'xs')} type="button" data-action="inventory-invalidate" ${!controller.invalidateInventoryItem ? 'disabled' : ''}>作废错误物品</button>`}</header>${currentStates}
-          <div class="stx-memory-inventory-command"><label><span>操作</span><select ${uiControl('select')} data-inventory-select="operation">${Object.entries(operationLabels).map(([value, label]) => `<option value="${value}" ${state.inventoryCommandOperation === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label><span>计量</span><select ${uiControl('select')} data-inventory-select="measure"><option value="quantity" ${state.inventoryCommandMeasure === 'quantity' ? 'selected' : ''}>数量</option><option value="coverage_days" ${state.inventoryCommandMeasure === 'coverage_days' ? 'selected' : ''}>可维持天数</option></select></label><label><span>数值</span><input ${uiControl('input')} data-inventory-input="amount" type="number" min="0" step="any" value="${escapeHtml(state.inventoryCommandAmount)}" ${state.inventoryCommandOperation === 'remove' ? 'disabled' : ''}></label><label><span>单位</span><input ${uiControl('input')} data-inventory-input="unit" value="${escapeHtml(state.inventoryCommandUnit)}" maxlength="20"></label><button ${uiButton('primary', 'sm')} type="button" data-action="inventory-command" ${!controller.applyInventoryCommand ? 'disabled' : ''}>写入账本</button></div>
-          <section class="stx-memory-inventory-history"><h4>完整变动历史</h4>${historyRows}</section>` : renderEmpty('选择一个物品', '左侧选择后可查看当前数量、变动历史与来源证据。')}
-      </section>
-    </div>`;
+      : `<div class="stx-memory-inventory-current-states">${selectedStates.map(inventoryState => `<article><small>${escapeHtml(measureLabels[inventoryState.measureKind])} · ${escapeHtml(precisionLabels[inventoryState.precision])}</small><strong>${escapeHtml(formatState(inventoryState))}</strong>${renderStateSource(inventoryState, '暂无来源证据', true)}</article>`).join('')}</div>`;
+    const selectedPrimary = selected ? newestState(selected.id, 'quantity') ?? newestState(selected.id) : undefined;
+    const selectedSourceRef = selectedPrimary?.sourceRefs[selectedPrimary.sourceRefs.length - 1];
+    const selectedFloor = selectedPrimary?.updatedAtFloor ?? (selectedSourceRef ? parseMessageSourceReference(selectedSourceRef)?.index : undefined);
+    inventoryCardModel = selected ? {
+      id: selected.id,
+      name: selected.canonicalName,
+      category: selected.category,
+      categoryLabel: categoryLabels[selected.category],
+      aliases: selected.aliases,
+      confidence: selected.confidence,
+      amountLabel: formatStateAmount(selectedPrimary),
+      precisionLabel: selectedPrimary ? precisionLabels[selectedPrimary.precision] : '尚未记录',
+      ...(selectedPrimary?.stateNote ? { stateNote: selectedPrimary.stateNote } : {}),
+      ...(selectedFloor === undefined ? {} : { sourceFloor: selectedFloor }),
+    } : undefined;
+    const inventorySplitDisabled = window.matchMedia?.('(max-width: 900px)').matches ?? false;
+    const inventorySplitTabIndex = inventorySplitDisabled ? -1 : 0;
+    const inventoryCardTransition = selected && inventoryEnteringItemId === selected.id ? 'entering' : 'idle';
+    const metricCards = [
+      ['当前持有', formatNumber(currentHeldItems.length), 'boxes-stacked'],
+      ['精确数量', formatNumber(precisionCounts.exact), 'circle-check'],
+      ['近似数量', formatNumber(precisionCounts.approximate), 'wave-square'],
+      ['数量未知', formatNumber(precisionCounts.unknown), 'circle-question'],
+      ['最长维持', maxCoverage === undefined ? '未记录' : `${maxCoverage.toLocaleString('zh-CN', { maximumFractionDigits: 2 })} 天`, 'calendar-range'],
+    ];
+    const categoryButtons = ([
+      ['', '全部物资', '按当前显示范围', scopeItems.length, 'all'],
+      ...Object.entries(categoryLabels).map(([value, label]) => [value, label, value === 'weapon' ? '攻击与防卫' : value === 'medicine' ? '医疗与恢复' : value === 'food' ? '食物与饮水' : value === 'armor' ? '防护装备' : value === 'special' ? '特殊物品' : value === 'core' ? '能源核心' : value === 'material' ? '制作材料' : '未分类', categoryCounts[value as import('../domain').InventoryItemCategory], value]),
+    ] as Array<[string, string, string, number, import('../domain').InventoryItemCategory | 'all']>)
+      .map(([value, label, description, count, iconKey]) => `<button ${uiControl('button', 'neutral')} type="button" class="stx-memory-inventory-category" data-action="inventory-set-category" data-category="${value}" aria-pressed="${state.inventoryCategory === value}"><span aria-hidden="true"><ss-helper-icon name="${categoryIcons[iconKey]}" decorative></ss-helper-icon></span><span><strong>${escapeHtml(label)}</strong><small>${escapeHtml(description)}</small></span><b>${formatNumber(count)}</b></button>`).join('');
+    const createPanel = state.inventoryCreateOpen ? `<section class="stx-memory-inventory-create-panel" role="region" aria-labelledby="stx-memory-inventory-create-title"><div><h3 id="stx-memory-inventory-create-title">新增物品</h3><p>创建工作区级物品身份，随后再写入当前聊天数量。</p></div><div class="stx-memory-inventory-create-fields"><label><span>规范名称</span><input id="stx-memory-inventory-new-name" ${uiControl('input')} data-inventory-input="new-name" value="${escapeHtml(state.inventoryNewName)}" maxlength="120" autocomplete="off" placeholder="例如：瓶装水"></label><label><span>别名</span><input ${uiControl('input')} data-inventory-input="new-aliases" value="${escapeHtml(state.inventoryNewAliases)}" maxlength="300" autocomplete="off" placeholder="使用逗号分隔"></label><label><span>分类</span><select ${uiControl('select')} data-inventory-select="new-category">${Object.entries(categoryLabels).map(([value, label]) => `<option value="${value}" ${state.inventoryNewCategory === value ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label></div><div class="stx-memory-inventory-create-actions"><button ${uiButton('primary', 'sm')} type="button" data-action="inventory-create" ${!controller.createInventoryItem || !state.inventoryNewName.trim() || Boolean(state.busyAction) ? 'disabled' : ''}>保存物品</button><button ${uiButton('neutral', 'sm')} type="button" data-action="inventory-create-cancel">取消</button></div></section>` : '';
+    const detail = selected ? `<div class="stx-memory-inventory-detail-scroll">
+      <section class="stx-memory-inventory-preview" data-category="${selected.category}" style="--stx-inventory-preview-height:${state.inventoryPreviewHeight}px" aria-label="三维物品卡牌预览"><div class="stx-memory-inventory-preview-stage" data-inventory-card-three-host data-inventory-transition="${inventoryCardTransition}" role="img" aria-label="${escapeHtml(selected.canonicalName)}三维卡牌预览"><div class="stx-memory-inventory-preview-loading" role="status">正在载入三维卡牌…</div></div><div class="stx-memory-inventory-preview-foot"><span>移动旋转 · 点击翻面</span><button ${uiButton('neutral', 'xs')} type="button" data-action="inventory-card-flip" aria-pressed="false" aria-label="显示卡牌背面" disabled><ss-helper-icon name="rotate" decorative></ss-helper-icon><span>翻面</span></button></div></section>
+      <div class="stx-memory-inventory-splitter is-horizontal" role="separator" tabindex="${inventorySplitTabIndex}" aria-label="调整卡片预览与属性区域高度" aria-orientation="horizontal" aria-disabled="${inventorySplitDisabled}" aria-valuemin="${INVENTORY_PREVIEW_HEIGHT_MIN}" aria-valuemax="${INVENTORY_PREVIEW_HEIGHT_MAX}" aria-valuenow="${Math.round(state.inventoryPreviewHeight)}" aria-valuetext="卡片预览高度 ${Math.round(state.inventoryPreviewHeight)} 像素" data-inventory-split="preview"></div>
+      <section class="stx-memory-inventory-hero" data-category="${selected.category}"><span class="stx-memory-inventory-hero-icon" aria-hidden="true"><ss-helper-icon name="${categoryIcons[selected.category]}" decorative></ss-helper-icon></span><span><small>分类 · ${escapeHtml(categoryLabels[selected.category])}</small><h3>${escapeHtml(selected.canonicalName)}</h3><span class="stx-memory-inventory-tags">${renderStatusChip(selected.status === 'confirmed' ? '已确认' : '待确认', selected.status === 'confirmed' ? 'success' : 'warning')}${selectedFloor === undefined ? renderStatusChip('暂无来源', 'neutral') : renderStatusChip(`来源 第 ${selectedFloor} 层`, 'neutral')}</span></span><button ${uiButton('danger', 'xs')} type="button" data-action="inventory-invalidate" ${!controller.invalidateInventoryItem || !popupUi || Boolean(state.busyAction) ? 'disabled' : ''}>作废错误物品</button></section>
+      <section class="stx-memory-inventory-section"><div class="stx-memory-inventory-section-title"><span><h4>别名与识别</h4><p>工作区级物品身份</p></span><small>${selected.aliases.length} 个别名</small></div><div class="stx-memory-inventory-aliases">${selected.aliases.length ? selected.aliases.map(alias => `<span>${escapeHtml(alias)}</span>`).join('') : '<span>暂无别名</span>'}</div><div class="stx-memory-inventory-confidence"><span>可信度</span><progress ${uiControl('progress')} max="1" value="${Math.max(0, Math.min(1, selected.confidence))}">${formatPercent(selected.confidence)}</progress><strong>${formatPercent(selected.confidence)}</strong></div></section>
+      <section class="stx-memory-inventory-section"><div class="stx-memory-inventory-section-title"><span><h4>当前状态</h4><p>属于当前聊天分支</p></span><small>${selectedStates.length} 条</small></div>${currentStates}</section>
+      <section class="stx-memory-inventory-section"><div class="stx-memory-inventory-section-title"><span><h4>写入账本</h4><p>服务端计算变更前后数量</p></span><small>REV ${Math.max(0, ...selectedStates.map(entry => entry.revision))}</small></div><div class="stx-memory-inventory-operations" ${uiControl('segmented')} role="group" aria-label="库存操作">${(Object.entries(operationLabels) as Array<[import('../domain').InventoryOperation, string]>).map(([value, label]) => `<button ${uiControl('button', 'neutral')} type="button" data-action="inventory-set-operation" data-operation="${value}" aria-pressed="${state.inventoryCommandOperation === value}" ${state.inventoryCommandMeasure === 'coverage_days' && (value === 'increase' || value === 'decrease') ? 'disabled' : ''}>${escapeHtml(label.replace('数量', ''))}</button>`).join('')}</div><div class="stx-memory-inventory-command"><label><span>计量类型</span><select ${uiControl('select')} data-inventory-select="measure"><option value="quantity" ${state.inventoryCommandMeasure === 'quantity' ? 'selected' : ''}>数量</option><option value="coverage_days" ${state.inventoryCommandMeasure === 'coverage_days' ? 'selected' : ''}>可维持天数</option></select></label><label><span>数值</span><input ${uiControl('input')} data-inventory-input="amount" type="number" min="0" step="any" value="${escapeHtml(state.inventoryCommandAmount)}" ${state.inventoryCommandOperation === 'remove' || state.inventoryCommandPrecision === 'unknown' ? 'disabled' : ''}></label><label><span>单位</span><input ${uiControl('input')} data-inventory-input="unit" value="${escapeHtml(state.inventoryCommandUnit)}" maxlength="20" ${state.inventoryCommandMeasure === 'coverage_days' ? 'disabled' : ''}></label><label><span>精确度</span><select ${uiControl('select')} data-inventory-select="precision"><option value="exact" ${state.inventoryCommandPrecision === 'exact' ? 'selected' : ''}>精确</option><option value="approximate" ${state.inventoryCommandPrecision === 'approximate' ? 'selected' : ''} ${state.inventoryCommandOperation === 'increase' || state.inventoryCommandOperation === 'decrease' ? 'disabled' : ''}>近似</option><option value="unknown" ${state.inventoryCommandPrecision === 'unknown' ? 'selected' : ''} ${state.inventoryCommandOperation !== 'set' ? 'disabled' : ''}>未知</option></select></label><button ${uiButton('primary', 'md')} type="button" data-action="inventory-command" ${!controller.applyInventoryCommand || Boolean(state.busyAction) ? 'disabled' : ''}>确认写入账本</button></div></section>
+      <section class="stx-memory-inventory-section stx-memory-inventory-history"><div class="stx-memory-inventory-section-title"><span><h4>完整变动历史</h4><p>追加式账本，不覆盖旧记录</p></span><small>${history.length} 条</small></div>${historyRows}</section>
+    </div>` : renderEmpty('选择一个物品', '从物品网格选择后，可查看三维卡牌、当前状态、来源和完整账本。');
+    return `<div class="stx-memory-inventory-shell">${createPanel}<section class="stx-memory-inventory-metrics" aria-label="当前聊天物品统计">${metricCards.map(([label, value, icon]) => `<article><span aria-hidden="true"><ss-helper-icon name="${icon}" decorative></ss-helper-icon></span><span><small>${label}</small><strong>${value}</strong></span></article>`).join('')}</section><div class="stx-memory-inventory-console" style="--stx-inventory-detail-width:${state.inventoryDetailWidth}px">
+      <aside class="stx-memory-inventory-categories" aria-label="物资分类"><header><div><h3>物资分类</h3><p>按当前显示范围</p></div><span>${formatNumber(scopeItems.length)} 项</span></header><div class="stx-memory-inventory-scope" ${uiControl('segmented')} role="group" aria-label="物品显示范围"><button ${uiControl('button', 'neutral')} type="button" data-action="inventory-set-scope" data-scope="current" aria-pressed="${state.inventoryScope === 'current'}">当前聊天</button><button ${uiControl('button', 'neutral')} type="button" data-action="inventory-set-scope" data-scope="catalog" aria-pressed="${state.inventoryScope === 'catalog'}">全部目录</button></div><div class="stx-memory-inventory-category-list">${categoryButtons}</div><footer>已移除项目保留在当前聊天范围中，便于追溯完整账本。</footer></aside>
+      <section class="stx-memory-inventory-browser" aria-label="${state.inventoryScope === 'current' ? '当前聊天物品' : '全部物品目录'}"><header><div><h3>${state.inventoryScope === 'current' ? '当前聊天物品' : '全部物品目录'}</h3><p>选择物品以查看详细状态与账本</p></div><span>${formatNumber(filtered.length)} 项</span></header><div class="stx-memory-inventory-toolbar"><label class="stx-memory-inventory-search"><span class="stx-memory-sr-only">搜索物品或别名</span><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><input id="stx-memory-inventory-query" ${uiControl('input')} type="search" data-inventory-input="query" value="${escapeHtml(state.inventoryQuery)}" placeholder="搜索名称或别名"></label><label><span class="stx-memory-sr-only">物品排序</span><select ${uiControl('select')} data-inventory-select="sort" aria-label="物品排序"><option value="recent" ${state.inventorySort === 'recent' ? 'selected' : ''}>最近更新</option><option value="name" ${state.inventorySort === 'name' ? 'selected' : ''}>名称</option><option value="amount" ${state.inventorySort === 'amount' ? 'selected' : ''}>数值</option><option value="confidence" ${state.inventorySort === 'confidence' ? 'selected' : ''}>置信度</option></select></label><div class="stx-memory-inventory-view-switch" ${uiControl('segmented')} role="group" aria-label="物品列表布局"><button ${uiButton('neutral', 'sm', true)} type="button" data-action="inventory-set-view" data-view="grid" aria-pressed="${state.inventoryView === 'grid'}" aria-label="网格视图"><ss-helper-icon name="table-cells-large" decorative></ss-helper-icon></button><button ${uiButton('neutral', 'sm', true)} type="button" data-action="inventory-set-view" data-view="list" aria-pressed="${state.inventoryView === 'list'}" aria-label="列表视图"><ss-helper-icon name="list" decorative></ss-helper-icon></button></div></div><div class="stx-memory-inventory-grid" data-inventory-view="${state.inventoryView}" aria-label="物品与资源列表">${itemRows}</div></section>
+      <div class="stx-memory-inventory-splitter is-vertical" role="separator" tabindex="${inventorySplitTabIndex}" aria-label="调整物品列表与详情区域宽度" aria-orientation="vertical" aria-disabled="${inventorySplitDisabled}" aria-valuemin="${INVENTORY_DETAIL_WIDTH_MIN}" aria-valuemax="${INVENTORY_DETAIL_WIDTH_MAX}" aria-valuenow="${Math.round(state.inventoryDetailWidth)}" aria-valuetext="详情宽度 ${Math.round(state.inventoryDetailWidth)} 像素" data-inventory-split="detail"></div>
+      <section class="stx-memory-inventory-detail" id="stx-memory-inventory-detail" aria-label="物品详情" tabindex="-1"><header><h3>物品详情</h3><span>${selected ? `${filtered.findIndex(item => item.id === selected.id) + 1} / ${filtered.length}` : `0 / ${filtered.length}`}</span></header>${detail}</section>
+    </div></div>`;
   };
 
   const renderLibrary = (): string => renderMemoryLibraryView({
@@ -2057,75 +2471,346 @@ export function renderMemoryWorkbench(
       });
     });
   };
-  const renderAuditRecord = (record: MemoryAuditRecord, index: number): string => {
-      const key = `${record.jobId ?? record.id ?? index}:${Number(record.batchIndex ?? index)}`;
-      const isActorCapture = record.kind === 'capture-change-set-v0';
-      const canRollback = isActorCapture
-        ? Boolean(record.id && controller.rollbackActorCapture)
-        : Boolean(record.jobId && Number.isInteger(record.batchIndex));
-      const confirming = state.confirmBatchKey === key;
-      const sourceCount = Array.isArray(record.sourceRefs) ? record.sourceRefs.length : 0;
-      const rejectedCount = Array.isArray(record.rejected) ? record.rejected.length : 0;
-      const acceptedCount = Number(record.accepted ?? record.factCount ?? 0);
-      const batchNumber = Number.isInteger(record.batchIndex) ? Math.max(1, record.batchIndex!) : index + 1;
-      const resource = formatAuditResource(record.resourceId ?? record.resource);
-      const model = String(record.model ?? '未记录');
-      const route = record.fallbackUsed === true ? '使用回退' : record.fallbackUsed === false ? '主路由' : '未记录';
-      const metrics = [
-        ['来源', `${formatNumber(sourceCount)} 项`],
-        ['事实', `${formatNumber(acceptedCount)} 条`],
-        ['拒绝', `${formatNumber(rejectedCount)} 项`],
-        ['资源', resource],
-        ['模型', model],
-        ['路由', route],
-      ];
-      const rollback = !canRollback ? '' : confirming
-        ? `<div class="stx-memory-confirm-inline"><span>${isActorCapture ? '确认回滚本次多主体 Capture？' : '确认回滚此批及后续批次？'}</span><button ${uiControl('button', 'danger')} type="button" data-action="confirm-rollback" data-job-id="${escapeHtml(record.jobId ?? '')}" data-batch-index="${Number(record.batchIndex ?? 0)}" data-audit-id="${escapeHtml(record.id ?? '')}">确认回滚</button><button ${uiControl('button', 'neutral')} type="button" data-action="cancel-rollback">取消</button></div>`
-        : `<button ${uiControl('button', 'danger')} type="button" data-action="rollback" data-rollback-key="${escapeHtml(key)}">${isActorCapture ? '回滚本次 Capture' : '回滚此批及后续批次'}</button>`;
-      const kicker = isActorCapture ? '多主体 Capture' : record.type === 'recall' ? '召回' : `捕获批次 ${batchNumber}`;
-      const heading = translateRecordStatus(String(record.status ?? '已记录'));
-      const rejections = (Array.isArray(record.rejected) ? record.rejected : [])
-        .filter((item): item is import('../domain').AutomaticIngestRejection => Boolean(item && typeof item === 'object' && ('code' in item || 'id' in item)));
-      const unresolved = rejections.filter(item => (item.status ?? 'unresolved') === 'unresolved' && Boolean(item.id));
-      const actionable = unresolved.filter(item => item.waitingForEvidenceChange !== true);
-      const quarantined = unresolved.filter(item => item.waitingForEvidenceChange === true);
-      const unresolvedIds = new Set(actionable.map(item => item.id!));
-      const selectedIds = state.selectedRejectionIds.filter(id => unresolvedIds.has(id));
-      const rejectionDetails = rejections.length === 0 ? '' : `<details class="stx-memory-capture-rejections" ${actionable.length ? 'open' : ''}><summary>失败项 ${quarantined.length} 条隔离 / ${rejections.length} 条总计</summary><div class="stx-memory-rejection-list">${rejections.map((rejection) => {
-        const rejectionId = rejection.id ?? '';
-        const isolated = (rejection.status ?? 'unresolved') === 'unresolved' && rejection.waitingForEvidenceChange === true;
-        const pending = (rejection.status ?? 'unresolved') === 'unresolved' && !isolated;
-        const sourceRefs = rejection.sourceRefs ?? [];
-        const statusLabel = isolated ? '已隔离，等待新证据' : pending ? '自动处理中' : rejection.status === 'repaired' ? '已修复' : rejection.status === 'ignored' ? '已忽略' : '处理中';
-        const diagnostics = [
-          `reasonCode=${String(rejection.code ?? 'MEMORY_CAPTURE_REJECTED')}`,
-          rejection.requestId ? `requestId=${rejection.requestId}` : '',
-          Number.isInteger(rejection.batchIndex) ? `batchIndex=${rejection.batchIndex}` : '',
-          rejection.recordType ? `collection=${rejection.recordType}` : '',
-          rejection.fieldPath ? `path=${rejection.fieldPath}` : '',
-        ].filter(Boolean).join(' · ');
-        return `<article class="stx-memory-rejection-item" data-rejection-status="${escapeHtml(isolated ? 'quarantined' : rejection.status ?? 'unresolved')}"><label><input ${uiControl('checkbox')} type="checkbox" data-capture-rejection-id="${escapeHtml(rejectionId)}" ${selectedIds.includes(rejectionId) ? 'checked' : ''} ${!pending || !rejectionId || state.busyAction ? 'disabled' : ''}><span><strong>${escapeHtml(String(rejection.recordType ?? '记录'))} · ${escapeHtml(rejection.fieldPath ?? '结构')}</strong><small>${escapeHtml(rejection.message)}</small><code>${escapeHtml(diagnostics)}</code></span>${renderStatusChip(statusLabel, pending ? 'warning' : rejection.status === 'repaired' ? 'success' : 'neutral')}</label>${sourceRefs.length ? `<div class="stx-memory-rejection-sources">${sourceRefs.map(ref => renderSourceReference(ref)).join('')}</div>` : ''}</article>`;
-      }).join('')}</div>${actionable.length ? `<div class="stx-memory-rejection-actions"><span>已选 ${selectedIds.length} 项</span><button ${uiControl('button', 'neutral')} type="button" data-action="ignore-capture-rejections" data-audit-id="${escapeHtml(record.id ?? '')}" ${!selectedIds.length || !controller.ignoreCaptureRejections || state.busyAction ? 'disabled' : ''}>忽略所选</button></div>` : ''}</details>`;
-      const safeTechnicalDetails = {
-        id: record.id,
-        jobId: record.jobId,
-        batchIndex: record.batchIndex,
-        requestId: record.requestId,
-        status: record.status,
-        outcome: record.outcome,
-        acceptedCount,
-        rejectedCount,
-        sourceCount,
-        resource,
-        model,
-        fallbackUsed: record.fallbackUsed,
-      };
-      return `<article class="stx-memory-audit-item"><div class="stx-memory-audit-heading"><div><span class="stx-memory-kicker">${kicker}</span><h3>${escapeHtml(heading)}</h3></div>${renderStatusChip(`${formatNumber(acceptedCount)} 条事实 · 已接受`, record.outcome === 'partial' ? 'warning' : 'neutral')}</div><dl class="stx-memory-audit-metrics">${metrics.map(([label, value]) => `<div title="${escapeHtml(value)}"><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>${rejectionDetails}<details class="stx-memory-audit-details"><summary>查看技术明细</summary><pre class="stx-memory-code">${escapeHtml(formatJson(safeTechnicalDetails))}</pre></details>${rollback ? `<div class="stx-memory-audit-actions">${rollback}</div>` : ''}</article>`;
+  const loadUsageRecallDetail = async (usage: MainChatUsage): Promise<void> => {
+    const detailId = usage.generationRecallDetailId?.trim();
+    if (detailId && state.usageRecallDetail?.id === detailId && !state.usageRecallLoading) return;
+    const requestId = ++usageRecallRequestId;
+    delete state.usageRecallDetail;
+    if (!detailId || !controller.getGenerationRecallDetail) {
+      state.usageRecallLoading = false;
+      rerender();
+      return;
+    }
+    state.usageRecallLoading = true;
+    rerender();
+    try {
+      const detail = await controller.getGenerationRecallDetail(detailId);
+      if (!disposed && requestId === usageRecallRequestId && state.selectedUsageId === usage.id && detail?.id === detailId) state.usageRecallDetail = detail;
+    } catch (error) {
+      if (!disposed && requestId === usageRecallRequestId && state.selectedUsageId === usage.id) {
+        const diagnostic = describeMemoryError(error, 'INTERNAL_ERROR', 'workbench-page');
+        toast('error', diagnostic.title, diagnostic.reason, diagnostic.reasonCode);
+      }
+    } finally {
+      if (!disposed && requestId === usageRecallRequestId) {
+        state.usageRecallLoading = false;
+        rerender();
+      }
+    }
+  };
+  const auditStatusLabel = (status: MemoryAuditStatus): string => status === 'rolled_back' ? '已回滚' : status === 'partial' ? '部分完成' : '已完成';
+  const auditStatusTone = (status: MemoryAuditStatus): 'success' | 'warning' | 'neutral' => status === 'completed' ? 'success' : status === 'partial' ? 'warning' : 'neutral';
+  const issueStatusLabel = (issue: MemoryAuditIssue): string => issue.status === 'repaired' ? '已修复'
+    : issue.status === 'ignored' ? '已忽略'
+      : issue.waitingForEvidenceChange ? '等待新证据'
+        : issue.status === 'running' ? '处理中'
+          : issue.status === 'queued' ? '已排队' : '待处理';
+  const usageComplete = (usage: MainChatUsage): boolean => [
+    usage.promptTokens,
+    usage.completionTokens,
+    usage.cacheReadTokens,
+    usage.cacheWriteTokens,
+    usage.totalTokens,
+  ].every(value => value !== null);
+  const formatTokenCount = (value: number | null): string => value === null ? '未返回' : formatNumber(value);
+  const visibleAudits = (): MemoryAuditRecord[] => {
+    const query = state.auditQuery.trim().toLocaleLowerCase();
+    return state.audits.filter((record) => {
+      if (state.auditStatus !== 'all' && record.status !== state.auditStatus) return false;
+      if (state.auditIssuesOnly && record.unresolvedCount === 0) return false;
+      if (!query) return true;
+      return [
+        record.id,
+        record.jobId,
+        record.requestId,
+        record.resourceId,
+        record.model,
+        ...record.sourceRefs,
+        ...record.issues.flatMap(issue => [issue.collection, issue.path, issue.failure.reasonCode, issue.failure.requestId]),
+      ].some(value => String(value ?? '').toLocaleLowerCase().includes(query));
+    });
+  };
+  const visibleUsages = (): MainChatUsage[] => {
+    const query = state.usageQuery.trim().toLocaleLowerCase();
+    return state.usages.filter((usage) => {
+      if (state.usageModel && (usage.model ?? '') !== state.usageModel) return false;
+      const complete = usageComplete(usage);
+      if (state.usageCompleteness === 'complete' && !complete) return false;
+      if (state.usageCompleteness === 'missing' && complete) return false;
+      if (!query) return true;
+      return [usage.id, usage.messageId, usage.provider, usage.model].some(value => String(value ?? '').toLocaleLowerCase().includes(query));
+    });
+  };
+  const collectPages = async <T,>(load: (cursor: string | undefined) => Promise<MemoryPage<T>>): Promise<T[]> => {
+    const items: T[] = [];
+    let cursor: string | undefined;
+    const seen = new Set<string>();
+    do {
+      const page = await load(cursor);
+      items.push(...page.items);
+      if (page.nextCursor === null) break;
+      if (seen.has(page.nextCursor)) throw new Error('分页游标重复。');
+      seen.add(page.nextCursor);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return items;
+  };
+  const collectAuditExportRecords = (): Promise<MemoryAuditRecord[]> => controller.listAuditRecordsPage
+    ? collectPages(cursor => controller.listAuditRecordsPage!(auditPageRequest(200, {
+        cursor,
+        signal: abortController.signal,
+      })))
+    : Promise.resolve(visibleAudits());
+  const collectUsageExportRecords = (): Promise<MainChatUsage[]> => controller.getMainChatUsagePage
+    ? collectPages(cursor => controller.getMainChatUsagePage!(usagePageRequest(500, {
+        cursor,
+        signal: abortController.signal,
+      })))
+    : Promise.resolve(visibleUsages());
+  const downloadAuditExport = (sourceRecords: readonly MemoryAuditRecord[]): number => {
+    const records = sourceRecords.map(record => ({
+      id: record.id,
+      jobId: record.jobId,
+      createdAt: record.createdAt,
+      ...(record.rolledBackAt === undefined ? {} : { rolledBackAt: record.rolledBackAt }),
+      status: record.status,
+      outcome: record.outcome,
+      batchIndex: record.batchIndex,
+      sourceRefs: [...record.sourceRefs],
+      acceptedCount: record.acceptedCount,
+      rejectedCount: record.rejectedCount,
+      unresolvedCount: record.unresolvedCount,
+      repairedCount: record.repairedCount,
+      ignoredCount: record.ignoredCount,
+      ...(record.requestId ? { requestId: record.requestId } : {}),
+      ...(record.resourceId ? { resourceId: record.resourceId } : {}),
+      ...(record.model ? { model: record.model } : {}),
+      ...(record.latencyMs === undefined ? {} : { latencyMs: record.latencyMs }),
+      ...(record.fallbackUsed === undefined ? {} : { fallbackUsed: record.fallbackUsed }),
+      issues: record.issues.map(issue => ({
+        id: issue.id,
+        ...(issue.rejectionId ? { rejectionId: issue.rejectionId } : {}),
+        collection: issue.collection,
+        itemIndex: issue.itemIndex,
+        batchIndex: issue.batchIndex,
+        path: issue.path,
+        ...(issue.keyword ? { keyword: issue.keyword } : {}),
+        ...(issue.expected ? { expected: issue.expected } : {}),
+        sourceRefs: [...issue.sourceRefs],
+        status: issue.status,
+        attemptCount: issue.attemptCount,
+        ...(issue.maxAttempts === undefined ? {} : { maxAttempts: issue.maxAttempts }),
+        waitingForEvidenceChange: issue.waitingForEvidenceChange,
+        ...(issue.resolutionMode ? { resolutionMode: issue.resolutionMode } : {}),
+        failure: {
+          reasonCode: issue.failure.reasonCode,
+          stage: issue.failure.stage,
+          ...(issue.failure.requestId ? { requestId: issue.failure.requestId } : {}),
+          ...(issue.failure.batchIndex === undefined ? {} : { batchIndex: issue.failure.batchIndex }),
+          ...(issue.failure.collection ? { collection: issue.failure.collection } : {}),
+          ...(issue.failure.path ? { path: issue.failure.path } : {}),
+          ...(issue.failure.keyword ? { keyword: issue.failure.keyword } : {}),
+          ...(issue.failure.expected ? { expected: issue.failure.expected } : {}),
+          ...(issue.failure.resourceId ? { resourceId: issue.failure.resourceId } : {}),
+          ...(issue.failure.model ? { model: issue.failure.model } : {}),
+        },
+      })),
+    }));
+    downloadBlob(new Blob([JSON.stringify({ schema: 'MEMORY_AUDIT_EXPORT_V0', exportedAt: new Date().toISOString(), records }, null, 2)], { type: 'application/json;charset=utf-8' }), `ss-helper-memory-audit-${new Date().toISOString().slice(0, 10)}.json`);
+    return records.length;
+  };
+  const downloadUsageExport = (usages: readonly MainChatUsage[]): number => {
+    const csvCell = (value: unknown): string => {
+      const raw = String(value ?? '');
+      const safe = typeof value === 'string' && /^[=+\-@]/u.test(raw) ? `'${raw}` : raw;
+      return `"${safe.replaceAll('"', '""')}"`;
+    };
+    const header = ['id', 'messageId', 'recallLogId', 'generationRecallDetailId', 'promptTokens', 'completionTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens', 'provider', 'model', 'capturedAt', 'completeness'];
+    const rows = usages.map(usage => [
+      usage.id,
+      usage.messageId,
+      usage.recallLogId ?? '',
+      usage.generationRecallDetailId ?? '',
+      usage.promptTokens ?? '',
+      usage.completionTokens ?? '',
+      usage.cacheReadTokens ?? '',
+      usage.cacheWriteTokens ?? '',
+      usage.totalTokens ?? '',
+      usage.provider ?? '',
+      usage.model ?? '',
+      new Date(usage.capturedAt).toISOString(),
+      usageComplete(usage) ? 'complete' : 'missing',
+    ]);
+    const csv = `\uFEFF${[header, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n')}`;
+    downloadBlob(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `ss-helper-memory-usage-${new Date().toISOString().slice(0, 10)}.csv`);
+    return rows.length;
+  };
+  const normalizeAuditSelection = (): void => {
+    const records = visibleAudits();
+    if (!records.some(record => record.id === state.selectedAuditId)) state.selectedAuditId = records[0]?.id ?? '';
+    const usages = visibleUsages();
+    if (!usages.some(usage => usage.id === state.selectedUsageId)) {
+      state.selectedUsageId = usages[0]?.id ?? '';
+      delete state.usageRecallDetail;
+    }
+    if (!(state.auditTab === 'records' ? state.selectedAuditId : state.selectedUsageId)) state.auditMobileView = 'list';
+  };
+  const renderAuditRecord = (record: MemoryAuditRecord): string => `<button class="stx-memory-audit-row" type="button" data-action="select-audit-record" data-audit-record-id="${escapeHtml(record.id)}" aria-pressed="${record.id === state.selectedAuditId}"><span class="stx-memory-audit-row-head"><strong>Capture #${formatNumber(record.batchIndex + 1)}</strong>${renderStatusChip(auditStatusLabel(record.status), auditStatusTone(record.status))}</span><span class="stx-memory-audit-row-meta"><span>${escapeHtml(formatTime(record.createdAt))}</span><span>${formatNumber(record.acceptedCount)} 接受</span><span>${formatNumber(record.rejectedCount)} 拒绝</span></span>${record.unresolvedCount ? `<span class="stx-memory-audit-row-alert"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon>${formatNumber(record.unresolvedCount)} 项待处理</span>` : '<span class="stx-memory-audit-row-ok"><ss-helper-icon name="circle-check" decorative></ss-helper-icon>无需处理</span>'}</button>`;
+  const renderAuditIssue = (issue: MemoryAuditIssue): string => {
+    const diagnostic = describeSSHelperFailure(issue.failure);
+    const actionableId = issue.rejectionId ?? issue.id;
+    const selected = state.selectedRejectionIds.includes(actionableId);
+    const selectable = issue.canIgnore && controller.ignoreCaptureRejections && !state.busyAction;
+    const technical = [
+      `reasonCode=${issue.failure.reasonCode}`,
+      issue.failure.requestId ? `requestId=${issue.failure.requestId}` : '',
+      `collection=${issue.collection}`,
+      `path=${issue.path}`,
+      `batchIndex=${issue.batchIndex}`,
+    ].filter(Boolean).join(' · ');
+    return `<article class="stx-memory-audit-issue" data-issue-status="${escapeHtml(issue.status)}"><div class="stx-memory-audit-issue-head">${selectable ? `<label class="stx-memory-audit-issue-check"><input ${uiControl('checkbox')} type="checkbox" data-capture-rejection-id="${escapeHtml(actionableId)}" ${selected ? 'checked' : ''}><span class="stx-memory-sr-only">选择 ${escapeHtml(diagnostic.title)}</span></label>` : '<span class="stx-memory-audit-issue-icon" aria-hidden="true"><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span>'}<div><strong>${escapeHtml(diagnostic.title)}</strong><small>${escapeHtml(issue.collection)} · ${escapeHtml(issue.path)}</small></div>${renderStatusChip(issueStatusLabel(issue), issue.status === 'repaired' ? 'success' : issue.status === 'ignored' ? 'neutral' : 'warning')}</div><div class="stx-memory-audit-diagnostic"><p><b>原因：</b>${escapeHtml(diagnostic.reason)}</p><p><b>处理建议：</b>${escapeHtml(diagnostic.action)}</p><code>${escapeHtml(technical)}</code></div>${issue.sourceRefs.length ? `<div class="stx-memory-audit-sources">${issue.sourceRefs.map(ref => renderSourceReference(ref)).join('')}</div>` : ''}</article>`;
+  };
+  const renderAuditDetail = (record: MemoryAuditRecord | undefined): string => {
+    if (!record) return `<section class="stx-memory-audit-detail" data-audit-detail>${renderEmpty('选择一条操作记录', '右侧会显示安全诊断、来源与真实可用操作。')}</section>`;
+    const selectedIds = state.selectedRejectionIds.filter(id => record.issues.some(issue => (issue.rejectionId ?? issue.id) === id && issue.canIgnore));
+    const issueMarkup = record.issues.length
+      ? `<div class="stx-memory-audit-issue-list">${record.issues.map(renderAuditIssue).join('')}</div>`
+      : renderEmpty('本次 Capture 没有失败项', '所有合法项目已按原事务提交。');
+    const rollback = record.status !== 'rolled_back' && controller.rollbackActorCapture && popupUi
+      ? `<button ${uiButton('danger', 'sm')} type="button" data-action="rollback-audit" data-audit-id="${escapeHtml(record.id)}"><ss-helper-icon name="rotate-left" decorative></ss-helper-icon>回滚 Capture</button>`
+      : '';
+    return `<section class="stx-memory-audit-detail" data-audit-detail><button class="stx-memory-audit-mobile-back" ${uiButton('neutral', 'sm')} type="button" data-action="audit-mobile-back"><ss-helper-icon name="arrow-left" decorative></ss-helper-icon>返回记录</button><header class="stx-memory-audit-detail-head"><div><span class="stx-memory-kicker">Capture #${formatNumber(record.batchIndex + 1)}</span><h3 id="stx-memory-audit-detail-heading" tabindex="-1">${escapeHtml(auditStatusLabel(record.status))}</h3><p>${escapeHtml(formatTime(record.createdAt))}</p></div><div class="stx-memory-audit-detail-actions">${rollback}</div></header><dl class="stx-memory-audit-summary"><div><dt>接受</dt><dd>${formatNumber(record.acceptedCount)}</dd></div><div><dt>拒绝</dt><dd>${formatNumber(record.rejectedCount)}</dd></div><div><dt>来源</dt><dd>${formatNumber(record.sourceRefs.length)}</dd></div><div><dt>耗时</dt><dd>${record.latencyMs === undefined ? '未记录' : `${formatNumber(record.latencyMs)} ms`}</dd></div></dl><div class="stx-memory-audit-route"><div><small>模型</small><strong>${escapeHtml(record.model ?? '未记录')}</strong></div><div><small>资源</small><strong>${escapeHtml(formatAuditResource(record.resourceId))}</strong></div><div><small>路由</small><strong>${record.fallbackUsed === true ? '使用回退' : record.fallbackUsed === false ? '主路由' : '未记录'}</strong></div>${record.requestId ? `<div><small>请求 ID</small><code>${escapeHtml(record.requestId)}</code></div>` : ''}</div>${record.sourceRefs.length ? `<section class="stx-memory-audit-source-block"><h4>来源消息</h4><div class="stx-memory-audit-sources">${record.sourceRefs.map(ref => renderSourceReference(ref)).join('')}</div></section>` : ''}<section class="stx-memory-audit-issues"><div class="stx-memory-audit-section-head"><div><h4>失败项</h4><p>${formatNumber(record.unresolvedCount)} 项待处理，${formatNumber(record.repairedCount)} 项已修复，${formatNumber(record.ignoredCount)} 项已忽略</p></div>${record.issues.some(issue => issue.canIgnore) ? `<button ${uiButton('neutral', 'sm')} type="button" data-action="ignore-capture-rejections" data-audit-id="${escapeHtml(record.id)}" ${selectedIds.length && controller.ignoreCaptureRejections && !state.busyAction ? '' : 'disabled'}><ss-helper-icon name="eye-slash" decorative></ss-helper-icon>忽略所选（${selectedIds.length}）</button>` : ''}</div>${issueMarkup}</section></section>`;
+  };
+  const renderUsageRecord = (usage: MainChatUsage): string => `<button class="stx-memory-usage-row" type="button" data-action="select-usage" data-usage-id="${escapeHtml(usage.id)}" aria-pressed="${usage.id === state.selectedUsageId}"><span><strong>${escapeHtml(usage.model ?? '模型未记录')}</strong><small>${escapeHtml(formatTime(usage.capturedAt))}</small></span><span>${formatTokenCount(usage.promptTokens)}</span><span>${formatTokenCount(usage.completionTokens)}</span><span class="stx-memory-usage-total">${formatTokenCount(usage.totalTokens)}</span><span>${renderStatusChip(usageComplete(usage) ? '完整' : '有缺失', usageComplete(usage) ? 'success' : 'warning')}</span></button>`;
+  const renderGenerationRecallDetail = (usage: MainChatUsage): string => {
+    if (!usage.generationRecallDetailId) return '<p class="stx-memory-muted">本条生成没有关联召回详情。</p>';
+    if (state.usageRecallLoading) return renderLoading('正在读取召回详情…');
+    const detail = state.usageRecallDetail?.id === usage.generationRecallDetailId ? state.usageRecallDetail : undefined;
+    if (!detail) return '<p class="stx-memory-muted">召回详情暂未读取或已经失效。</p>';
+    const finalAttempt = [...detail.attempts].reverse().find(attempt => attempt.final) ?? detail.attempts.at(-1);
+    const candidates = detail.uniqueCandidateCount ?? finalAttempt?.uniqueCandidateCount ?? detail.candidateOccurrenceCount ?? finalAttempt?.candidateCount;
+    const injected = detail.injectedUniqueCount ?? finalAttempt?.selectedCount ?? detail.prompt.includedCount;
+    const owners = new Set(finalAttempt?.owners.map(owner => owner.ownerId) ?? []).size;
+    return `<dl class="stx-memory-recall-detail-grid"><div><dt>候选数</dt><dd>${candidates === undefined ? '未返回' : formatNumber(candidates)}</dd></div><div><dt>注入数</dt><dd>${formatNumber(injected)}</dd></div><div><dt>主体数</dt><dd>${formatNumber(owners)}</dd></div><div><dt>Prompt 占用</dt><dd>${formatNumber(detail.prompt.usedChars)} / ${formatNumber(detail.prompt.maxChars)}</dd></div><div><dt>省略数</dt><dd>${formatNumber(detail.prompt.omittedCount)}</dd></div><div><dt>状态</dt><dd>${detail.previewState === 'invalidated' ? '已失效' : '有效'}</dd></div></dl>`;
+  };
+  const renderUsageDetail = (usage: MainChatUsage | undefined): string => {
+    if (!usage) return `<section class="stx-memory-audit-detail" data-audit-detail>${renderEmpty('选择一条用量记录', '右侧会显示 Token 返回情况和召回范围。')}</section>`;
+    const tokenFields: Array<[string, number | null]> = [
+      ['Prompt', usage.promptTokens],
+      ['Completion', usage.completionTokens],
+      ['Cache read', usage.cacheReadTokens],
+      ['Cache write', usage.cacheWriteTokens],
+      ['总计', usage.totalTokens],
+    ];
+    return `<section class="stx-memory-audit-detail" data-audit-detail><button class="stx-memory-audit-mobile-back" ${uiButton('neutral', 'sm')} type="button" data-action="audit-mobile-back"><ss-helper-icon name="arrow-left" decorative></ss-helper-icon>返回用量</button><header class="stx-memory-audit-detail-head"><div><span class="stx-memory-kicker">主聊天生成</span><h3 id="stx-memory-usage-detail-heading" tabindex="-1">${escapeHtml(usage.model ?? '模型未记录')}</h3><p>${escapeHtml(formatTime(usage.capturedAt))}</p></div>${renderStatusChip(usageComplete(usage) ? 'Token 完整' : 'Token 有缺失', usageComplete(usage) ? 'success' : 'warning')}</header><dl class="stx-memory-token-detail">${tokenFields.map(([label, value]) => `<div><dt>${label}</dt><dd>${formatTokenCount(value)}</dd></div>`).join('')}</dl><div class="stx-memory-audit-route"><div><small>Provider</small><strong>${escapeHtml(usage.provider ?? '未记录')}</strong></div><div><small>消息 ID</small><code>${escapeHtml(usage.messageId)}</code></div>${usage.recallLogId ? `<div><small>Recall log</small><code>${escapeHtml(usage.recallLogId)}</code></div>` : ''}</div>${navigateToMessage ? `<div class="stx-memory-audit-detail-actions"><button ${uiButton('neutral', 'sm')} type="button" data-action="jump-to-message" data-message-id="${escapeHtml(usage.messageId)}"><ss-helper-icon name="arrow-up-right-from-square" decorative></ss-helper-icon>跳转来源消息</button></div>` : ''}<section class="stx-memory-audit-issues"><div class="stx-memory-audit-section-head"><div><h4>召回详情</h4><p>仅展示计数、Prompt 占用与失效状态。</p></div></div>${renderGenerationRecallDetail(usage)}</section></section>`;
+  };
+  const renderUsageTrend = (usages: readonly MainChatUsage[]): string => {
+    const points = [...usages].sort((left, right) => left.capturedAt - right.capturedAt).slice(-30);
+    const known = points.filter((usage): usage is MainChatUsage & { totalTokens: number } => usage.totalTokens !== null);
+    const max = Math.max(1, ...known.map(usage => usage.totalTokens));
+    const overlays = known.map((usage) => {
+      const pointIndex = points.indexOf(usage);
+      const x = points.length <= 1 ? 50 : 5 + (pointIndex / (points.length - 1)) * 90;
+      const y = 88 - (usage.totalTokens / max) * 72;
+      return `<button type="button" data-action="select-usage" data-usage-id="${escapeHtml(usage.id)}" class="stx-memory-usage-chart-point" style="--point-x:${x.toFixed(2)}%;--point-y:${y.toFixed(2)}%" aria-label="${escapeHtml(`${formatTime(usage.capturedAt)}，总 Token ${formatNumber(usage.totalTokens)}`)}"></button>`;
+    }).join('');
+    return `<section class="stx-memory-usage-chart"><div class="stx-memory-audit-section-head"><div><h3>Token 趋势</h3><p>最近 ${formatNumber(points.length)} 次生成；缺失 Token 不绘制为 0。</p></div></div><div class="stx-memory-usage-chart-stage"><canvas data-memory-usage-chart role="img" aria-label="最近主聊天生成的总 Token 趋势"></canvas>${overlays}</div><details class="stx-memory-usage-chart-table"><summary>查看趋势数据表</summary><div class="stx-memory-table-scroll"><table><thead><tr><th>时间</th><th>模型</th><th>总 Token</th></tr></thead><tbody>${points.map(usage => `<tr><td>${escapeHtml(formatTime(usage.capturedAt))}</td><td>${escapeHtml(usage.model ?? '未记录')}</td><td>${formatTokenCount(usage.totalTokens)}</td></tr>`).join('')}</tbody></table></div></details></section>`;
+  };
+  const drawUsageTrendChart = (): void => {
+    if (navigator.userAgent.toLocaleLowerCase().includes('jsdom')) return;
+    const canvas = root.querySelector<HTMLCanvasElement>('[data-memory-usage-chart]');
+    if (!canvas) return;
+    let context: CanvasRenderingContext2D | null = null;
+    try { context = canvas.getContext('2d'); } catch { return; }
+    if (!context) return;
+    const points = [...visibleUsages()].sort((left, right) => left.capturedAt - right.capturedAt).slice(-30);
+    const values = points.map(usage => usage.totalTokens);
+    const known = values.filter((value): value is number => value !== null);
+    const width = Math.max(320, Math.round(canvas.getBoundingClientRect().width || 640));
+    const height = Math.max(180, Math.round(canvas.getBoundingClientRect().height || 220));
+    const ratio = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(height * ratio);
+    context.scale(ratio, ratio);
+    context.clearRect(0, 0, width, height);
+    const styles = getComputedStyle(root);
+    const lineColor = styles.getPropertyValue('--stx-memory-accent').trim() || '#d7b86e';
+    const gridColor = styles.getPropertyValue('--stx-memory-border').trim() || 'rgba(255,255,255,.12)';
+    const fillColor = styles.getPropertyValue('--stx-memory-accent-soft').trim() || 'rgba(215,184,110,.12)';
+    context.strokeStyle = gridColor;
+    context.lineWidth = 1;
+    for (let index = 0; index < 4; index += 1) {
+      const y = 20 + (index / 3) * (height - 42);
+      context.beginPath();
+      context.moveTo(28, y);
+      context.lineTo(width - 18, y);
+      context.stroke();
+    }
+    if (!known.length) return;
+    const max = Math.max(1, ...known);
+    const coordinates = points.flatMap((usage, index) => {
+      if (usage.totalTokens === null) return [];
+      const x = points.length <= 1 ? width / 2 : 28 + (index / (points.length - 1)) * (width - 46);
+      const y = height - 22 - (usage.totalTokens / max) * (height - 54);
+      return [{ x, y }];
+    });
+    if (!coordinates.length) return;
+    context.beginPath();
+    context.moveTo(coordinates[0]!.x, height - 22);
+    for (const point of coordinates) context.lineTo(point.x, point.y);
+    context.lineTo(coordinates.at(-1)!.x, height - 22);
+    context.closePath();
+    context.fillStyle = fillColor;
+    context.fill();
+    context.beginPath();
+    coordinates.forEach((point, index) => index === 0 ? context!.moveTo(point.x, point.y) : context!.lineTo(point.x, point.y));
+    context.strokeStyle = lineColor;
+    context.lineWidth = 2;
+    context.stroke();
   };
   const renderAudit = (): string => {
-    const records = state.audits.length ? state.audits.map(renderAuditRecord).join('') : renderEmpty('暂无捕获审计', '新 Capture 完成后会在这里出现。');
-    const cold = Boolean(popupUi && controller.loadMemoryPage);
-    return `<div class="stx-memory-page-actions"><p class="stx-memory-muted">合法项自动提交；失败项由 AI 复核，证据不足时隔离且不会进入召回。</p></div><div class="stx-memory-audit-list" data-memory-page-list="audit">${cold ? '' : records}</div><details class="stx-memory-panel stx-memory-usage"><summary>主聊天 Token / usage（${state.usages.length} 条）</summary>${cold ? '<div class="stx-memory-usage-list" data-memory-page-list="usage"></div>' : `<pre class="stx-memory-code">${escapeHtml(formatJson(state.usages))}</pre>`}</details>`;
+    normalizeAuditSelection();
+    const records = visibleAudits();
+    const usages = visibleUsages();
+    const selectedAudit = state.audits.find(record => record.id === state.selectedAuditId && records.some(item => item.id === record.id));
+    const selectedUsage = state.usages.find(usage => usage.id === state.selectedUsageId && usages.some(item => item.id === usage.id));
+    const aggregatePendingLabel = state.auditSummaryLoading ? '计算中' : '暂不可用';
+    const hasAggregateProvider = Boolean(controller.getAuditSummary);
+    const localPendingCount = state.audits.reduce((total, record) => total + record.unresolvedCount, 0);
+    const pendingCount = state.auditSummary?.pendingIssueCount ?? (hasAggregateProvider ? undefined : localPendingCount);
+    const currentFacts = state.overview?.factCount ?? state.libraryStats?.active ?? 0;
+    const localRolledBack = state.audits.filter(record => record.status === 'rolled_back').length;
+    const rolledBack = state.auditSummary?.rolledBackCount ?? (hasAggregateProvider ? undefined : localRolledBack);
+    const models = [...new Set([
+      ...(state.auditSummary?.models ?? []),
+      ...state.usages.map(usage => usage.model).filter((value): value is string => Boolean(value)),
+    ])].sort((left, right) => left.localeCompare(right, 'zh-CN'));
+    const sumKnown = (field: 'promptTokens' | 'completionTokens' | 'totalTokens'): { value: number | null; known: number } => {
+      const values = state.usages.map(usage => usage[field]).filter((value): value is number => value !== null);
+      return { value: values.length ? values.reduce((total, value) => total + value, 0) : null, known: values.length };
+    };
+    const prompt = state.auditSummary?.promptTokens ?? sumKnown('promptTokens');
+    const completion = state.auditSummary?.completionTokens ?? sumKnown('completionTokens');
+    const total = state.auditSummary?.totalTokens ?? sumKnown('totalTokens');
+    const incomplete = state.auditSummary?.incompleteUsageCount ?? (hasAggregateProvider ? undefined : state.usages.filter(usage => !usageComplete(usage)).length);
+    const auditTotal = state.auditSummary?.auditTotal ?? state.auditTotal;
+    const usageTotal = state.auditSummary?.usageTotal ?? state.usageTotal;
+    const recordList = records.length || (popupUi && controller.listAuditRecordsPage)
+      ? `<div class="stx-memory-audit-list" data-memory-page-list="audit">${popupUi ? '' : records.map(renderAuditRecord).join('')}</div>`
+      : renderEmpty('没有符合条件的审计记录', '调整搜索、状态或待处理筛选后重试。');
+    const usageList = usages.length || (popupUi && controller.getMainChatUsagePage)
+      ? `<div class="stx-memory-usage-table" role="region" aria-label="主聊天 Token 用量"><div class="stx-memory-usage-table-head" aria-hidden="true"><span>模型 / 时间</span><span>Prompt</span><span>Completion</span><span>总计</span><span>完整性</span></div><div class="stx-memory-usage-list" data-memory-page-list="usage">${popupUi ? '' : usages.map(renderUsageRecord).join('')}</div></div>`
+      : renderEmpty('没有符合条件的 Token 记录', '调整模型或完整性筛选后重试。');
+    const toolbar = state.auditTab === 'records'
+      ? `<div class="stx-memory-audit-toolbar"><label class="stx-memory-audit-search"><span class="stx-memory-sr-only">搜索审计记录</span><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><input id="stx-memory-audit-query" ${uiControl('input')} type="search" value="${escapeHtml(state.auditQuery)}" data-audit-input="query" placeholder="搜索批次、请求 ID、来源或错误码"></label><label><span class="stx-memory-sr-only">审计状态</span><select ${uiControl('select')} data-audit-select="status"><option value="all" ${state.auditStatus === 'all' ? 'selected' : ''}>全部状态</option><option value="partial" ${state.auditStatus === 'partial' ? 'selected' : ''}>部分完成</option><option value="completed" ${state.auditStatus === 'completed' ? 'selected' : ''}>已完成</option><option value="rolled_back" ${state.auditStatus === 'rolled_back' ? 'selected' : ''}>已回滚</option></select></label><button ${uiControl('toggle')} type="button" data-action="toggle-audit-issues" aria-pressed="${state.auditIssuesOnly}">只看待处理</button><button ${uiButton('neutral', 'sm')} type="button" data-action="export-audit"><ss-helper-icon name="download" decorative></ss-helper-icon>导出 JSON</button></div>`
+      : `<div class="stx-memory-audit-toolbar"><label class="stx-memory-audit-search"><span class="stx-memory-sr-only">搜索 Token 用量</span><ss-helper-icon name="magnifying-glass" decorative></ss-helper-icon><input id="stx-memory-usage-query" ${uiControl('input')} type="search" value="${escapeHtml(state.usageQuery)}" data-usage-input="query" placeholder="搜索模型、Provider 或消息 ID"></label><label><span class="stx-memory-sr-only">模型</span><select ${uiControl('select')} data-usage-select="model"><option value="">全部模型</option>${models.map(model => `<option value="${escapeHtml(model)}" ${state.usageModel === model ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('')}</select></label><label><span class="stx-memory-sr-only">Token 完整性</span><select ${uiControl('select')} data-usage-select="completeness"><option value="all" ${state.usageCompleteness === 'all' ? 'selected' : ''}>全部完整性</option><option value="complete" ${state.usageCompleteness === 'complete' ? 'selected' : ''}>完整</option><option value="missing" ${state.usageCompleteness === 'missing' ? 'selected' : ''}>有缺失</option></select></label><button ${uiButton('neutral', 'sm')} type="button" data-action="export-usage"><ss-helper-icon name="download" decorative></ss-helper-icon>导出 CSV</button></div>`;
+    const metrics = state.auditTab === 'records'
+      ? [['总记录', hasAggregateProvider && !state.auditSummary ? aggregatePendingLabel : formatNumber(auditTotal), 'list-check'], ['待处理', pendingCount === undefined ? aggregatePendingLabel : formatNumber(pendingCount), 'triangle-exclamation'], ['当前事实', formatNumber(currentFacts), 'database'], ['已回滚', rolledBack === undefined ? aggregatePendingLabel : formatNumber(rolledBack), 'rotate-left']]
+      : [['用量记录', formatNumber(usageTotal), 'list-check'], ['Prompt', hasAggregateProvider && !state.auditSummary ? aggregatePendingLabel : prompt.value === null ? '未返回' : formatNumber(prompt.value), 'arrow-up'], ['Completion', hasAggregateProvider && !state.auditSummary ? aggregatePendingLabel : completion.value === null ? '未返回' : formatNumber(completion.value), 'arrow-down'], ['缺失记录', incomplete === undefined ? aggregatePendingLabel : formatNumber(incomplete), 'triangle-exclamation']];
+    const usageSummaryNote = hasAggregateProvider && !state.auditSummary
+      ? state.auditSummaryLoading ? '正在后台计算完整 Token 汇总；列表与详情可继续使用。' : 'Token 汇总暂不可用；列表中的缺失值仍保留为“未返回”。'
+      : `已返回汇总：Prompt ${prompt.known}/${usageTotal}，Completion ${completion.known}/${usageTotal}，总计 ${total.known}/${usageTotal}。缺失值始终保留为“未返回”。`;
+    return `<div class="stx-memory-audit-shell" data-audit-tab="${state.auditTab}" data-audit-mobile-view="${state.auditMobileView}"><div class="stx-memory-audit-tabs" ${uiControl('segmented')} role="tablist" aria-label="审计视图"><button type="button" role="tab" data-action="audit-tab" data-audit-tab="records" aria-selected="${state.auditTab === 'records'}">操作记录</button><button type="button" role="tab" data-action="audit-tab" data-audit-tab="usage" aria-selected="${state.auditTab === 'usage'}">Token 用量</button></div><section class="stx-memory-audit-metric-grid" aria-label="${state.auditTab === 'records' ? '操作记录汇总' : 'Token 用量汇总'}">${metrics.map(([label, value, icon]) => `<article><span aria-hidden="true"><ss-helper-icon name="${icon}" decorative></ss-helper-icon></span><div><small>${label}</small><strong>${value}</strong></div></article>`).join('')}</section>${state.auditTab === 'usage' ? `<p class="stx-memory-usage-known-note">${usageSummaryNote}</p>` : ''}${toolbar}${state.auditTab === 'usage' ? renderUsageTrend(usages) : ''}<div class="stx-memory-audit-split"><section class="stx-memory-audit-master"><div class="stx-memory-audit-list-title"><h3>${state.auditTab === 'records' ? '操作记录' : '用量明细'}</h3><span>${formatNumber(state.auditTab === 'records' ? records.length : usages.length)} 条</span></div>${state.auditTab === 'records' ? recordList : usageList}</section>${state.auditTab === 'records' ? renderAuditDetail(selectedAudit) : renderUsageDetail(selectedUsage)}</div></div>`;
   };
   const renderData = (): string => {
     const sqlite = state.sqlite;
@@ -2153,11 +2838,12 @@ export function renderMemoryWorkbench(
                     : state.page === 'initialize' ? renderInitialize()
                       : state.page === 'recall' ? `${renderRecall()}<section class="stx-memory-panel stx-memory-graph-inline"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">关系图谱</span><h3>已验证事实关系</h3></div></div>${renderGraph()}</section>`
                         : state.page === 'graph' ? renderGraph()
-                          : state.page === 'audit' ? `${renderAudit()}${renderData()}` : renderData();
+                          : state.page === 'audit' ? renderAudit() : renderData();
     return `${actionError}${content}`;
   };
   const render = (): void => {
     traceMemoryStartup('workbench:render-begin');
+    inventoryCardModel = undefined;
     const overview = state.overview;
     const currentPage = PAGES.find((page) => page.id === state.page) ?? INTERNAL_PAGES.find((page) => page.id === state.page) ?? PAGES[0]!;
     const statusTone = overview?.status === 'error' ? 'error' : overview?.status === 'working' ? 'warning' : overview?.status === 'ready' ? 'success' : 'neutral';
@@ -2177,10 +2863,118 @@ export function renderMemoryWorkbench(
     const sceneHeader = state.page === 'scenes' ? getSceneEventsHeader(sceneEventsState()) : undefined;
     const pageDescription = sceneHeader?.description ?? currentPage.description;
     const pageTitle = state.page === 'initialize' ? '初始化记忆' : currentPage.label;
-    const pageHeadingAction = `<button class='stx-memory-page-refresh' ${uiButton('neutral', 'sm')} type='button' data-action='refresh' ${state.busyAction ? 'disabled' : ''} aria-label='刷新当前页面'><ss-helper-icon name='rotate' decorative></ss-helper-icon>刷新</button>`;
+    const pageHeadingAction = `<div class="stx-memory-heading-actions"><button class='stx-memory-page-refresh' ${uiButton('neutral', 'sm')} type='button' data-action='refresh' ${state.busyAction ? 'disabled' : ''} aria-label='刷新当前页面'><ss-helper-icon name='rotate' decorative></ss-helper-icon>刷新</button>${state.page === 'inventory' ? `<button ${uiButton('primary', 'sm')} type="button" data-action="inventory-create-open" ${!controller.createInventoryItem || state.busyAction ? 'disabled' : ''}><ss-helper-icon name="plus-large" decorative></ss-helper-icon>新增物品</button>` : ''}</div>`;
     root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${renderOverviewRouteStatus('向量模型', overview?.embedding)}${renderOverviewRouteStatus('重排序模型', overview?.rerank)}${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class='stx-memory-nav-meta'>记忆插件 v${escapeHtml(memoryPluginConfig.manifest.version)}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${pageTitle}</h2><p>${escapeHtml(pageDescription)}</p></div>${pageHeadingAction}</header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section><div class="stx-memory-internal-routes" hidden aria-hidden="true">${INTERNAL_PAGES.map((page) => `<button type="button" data-action="navigate-internal" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}">${page.label}</button>`).join('')}</div></main></div>`;
     traceMemoryStartup('workbench:dom-rendered');
     popupUi?.refreshControls(root);
+    syncInventorySplitters();
+    const inventoryCardPlaceholder = root.querySelector<HTMLElement>('[data-inventory-card-three-host]');
+    const cardModel = inventoryCardModel as InventoryCardViewModel | undefined;
+    const cardModelKey = cardModel ? serializeInventoryCardModel(cardModel) : '';
+    const activeInventoryCardId = inventoryCardMountingItemId || inventoryCardRendererItemId;
+    const activeInventoryCardModelKey = inventoryCardMountingModelKey || inventoryCardRendererModelKey;
+    const restoredInventoryCardHost = inventoryCardHostToRestore;
+    const canReuseInventoryCardHost = Boolean(
+      inventoryCardPlaceholder
+      && restoredInventoryCardHost
+      && cardModel
+      && state.page === 'inventory',
+    );
+    const inventoryCardAlreadyCurrent = Boolean(
+      cardModel
+      && activeInventoryCardId === cardModel.id
+      && activeInventoryCardModelKey === cardModelKey,
+    );
+    const inventoryRendererAlreadyCurrent = Boolean(
+      inventoryCardRenderer
+      && cardModel
+      && inventoryCardRendererItemId === cardModel.id
+      && inventoryCardRendererModelKey === cardModelKey,
+    );
+    inventoryCardHostToRestore = undefined;
+    let inventoryCardHost = inventoryCardPlaceholder;
+    if (canReuseInventoryCardHost && inventoryCardPlaceholder && restoredInventoryCardHost) {
+      if (inventoryCardPlaceholder.dataset.inventoryTransition === 'entering'
+        && restoredInventoryCardHost.dataset.inventoryTransition !== 'entering') {
+        restoredInventoryCardHost.dataset.inventoryTransition = 'entering';
+      }
+      inventoryCardPlaceholder.replaceWith(restoredInventoryCardHost);
+      inventoryCardHost = restoredInventoryCardHost;
+    } else if (restoredInventoryCardHost) {
+      disposeInventoryCardRenderer();
+    }
+    if (inventoryCardHost && cardModel) {
+      const cardHost = inventoryCardHost;
+      const token = inventoryCardRendererToken;
+      const syncFlipButton = (flipped: boolean, ready: boolean): void => {
+        inventoryCardFlipped = flipped;
+        const button = root.querySelector<HTMLButtonElement>('[data-action="inventory-card-flip"]');
+        if (!button) return;
+        button.disabled = !ready || cardHost.classList.contains('is-webgl-unavailable');
+        button.setAttribute('aria-pressed', String(flipped));
+        button.setAttribute('aria-label', flipped ? '显示卡牌正面' : '显示卡牌背面');
+        const label = button.querySelector('span');
+        if (label) label.textContent = flipped ? '正面' : '翻面';
+      };
+      if (inventoryCardAlreadyCurrent) {
+        syncFlipButton(inventoryCardFlipped, inventoryRendererAlreadyCurrent);
+      } else if (canReuseInventoryCardHost && inventoryCardRenderer) {
+        const updatingRenderer = inventoryCardRenderer;
+        inventoryCardMountingItemId = cardModel.id;
+        inventoryCardMountingModelKey = cardModelKey;
+        inventoryCardFlipped = false;
+        syncFlipButton(false, false);
+        void updatingRenderer.update(cardModel).then(() => {
+          if (disposed || token !== inventoryCardRendererToken || inventoryCardRenderer !== updatingRenderer
+            || state.page !== 'inventory' || state.selectedInventoryItemId !== cardModel.id) return;
+          inventoryCardRendererItemId = cardModel.id;
+          inventoryCardRendererModelKey = cardModelKey;
+          inventoryCardMountingItemId = '';
+          inventoryCardMountingModelKey = '';
+          if (inventoryEnteringItemId === cardModel.id) startInventoryCardEnterTransition(cardModel.id, cardHost);
+          syncFlipButton(false, true);
+        }).catch(() => {
+          if (disposed || token !== inventoryCardRendererToken || inventoryCardRenderer !== updatingRenderer) return;
+          inventoryCardMountingItemId = '';
+          inventoryCardMountingModelKey = '';
+          updatingRenderer.enter();
+          syncFlipButton(inventoryCardFlipped, true);
+        });
+      } else {
+        if (restoredInventoryCardHost) disposeInventoryCardRenderer();
+        inventoryCardMountingItemId = cardModel.id;
+        inventoryCardMountingModelKey = cardModelKey;
+        inventoryCardFlipped = false;
+        void mountInventoryCardThree(cardHost, cardModel, {
+          reduceMotion: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false,
+          entering: inventoryEnteringItemId === cardModel.id,
+          onFlipChange: (flipped) => {
+            if (disposed || token !== inventoryCardRendererToken || state.page !== 'inventory') return;
+            syncFlipButton(flipped, true);
+          },
+        }).then((renderer) => {
+          if (disposed || token !== inventoryCardRendererToken || state.page !== 'inventory' || state.selectedInventoryItemId !== cardModel.id) {
+            renderer.dispose();
+            return;
+          }
+          inventoryCardRenderer = renderer;
+          inventoryCardRendererItemId = cardModel.id;
+          inventoryCardRendererModelKey = cardModelKey;
+          inventoryCardMountingItemId = '';
+          inventoryCardMountingModelKey = '';
+          if (inventoryEnteringItemId === cardModel.id) startInventoryCardEnterTransition(cardModel.id, cardHost);
+          syncFlipButton(inventoryCardFlipped, true);
+        }).catch(() => {
+          if (disposed || token !== inventoryCardRendererToken) return;
+          inventoryCardMountingItemId = '';
+          inventoryCardMountingModelKey = '';
+          const loading = cardHost.querySelector<HTMLElement>('.stx-memory-inventory-preview-loading');
+          if (loading) loading.textContent = '三维预览暂不可用，物品详情和账本仍可使用。';
+        });
+      }
+    } else if (state.page !== 'inventory' || !cardModel) {
+      inventoryEnteringItemId = '';
+    }
     const libraryListHost = state.page === 'library' && controller.listFactsPage
       ? root.querySelector<HTMLElement>('.stx-memory-library-fact-list')
       : null;
@@ -2499,46 +3293,73 @@ export function renderMemoryWorkbench(
           : elementFromMarkup(`<article class="stx-memory-evidence"><strong>${escapeHtml(String(item.ownerId ?? '主体'))}</strong>${renderStatusChip(String(item.status ?? 'queued'), item.status === 'applied' ? 'success' : item.status === 'failed' ? 'error' : 'neutral')}<p>阶段：${escapeHtml(String(item.phase ?? 'gather'))}</p><small>任务：${escapeHtml(String(item.id ?? ''))}</small>${controller.runActorDream && item.id ? `<button ${uiControl('button', 'neutral')} type="button" data-action="dream-dry-run" data-job-id="${escapeHtml(String(item.id))}">dry-run 预览</button>` : ''}</article>`),
       });
     }
-    if (popupUi && controller.loadMemoryPage && state.page === 'audit') {
-      const auditHost = root.querySelector<HTMLElement>('[data-memory-page-list="audit"]');
-      if (auditHost) popupUi.mountList<MemoryAuditRecord>(auditHost, {
-        id: `memory-audits:${state.overview?.chatKey ?? 'unbound'}`,
-        ariaLabel: 'Capture 审计记录',
-        queryKey: JSON.stringify([state.overview?.chatKey ?? '', 'audit']),
-        pageSize: 20,
-        overscan: 6,
-        maxCachedPages: 6,
-        estimatedItemHeight: 180,
-        getKey: (record) => String(record.id ?? `${record.jobId ?? 'audit'}:${record.batchIndex ?? record.createdAt ?? ''}`),
-        loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!('change-audits', {
-          ...(cursor === undefined ? {} : { cursor }),
-          limit,
-          signal,
-          orderBy: { field: 'createdAt', direction: 'desc' },
-          includeTotal: true,
-        }),
-        renderItem: (record, context) => elementFromMarkup(renderAuditRecord(record, context.index)),
-      });
-      const usageHost = root.querySelector<HTMLElement>('[data-memory-page-list="usage"]');
-      if (usageHost) popupUi.mountList<Record<string, unknown>>(usageHost, {
-        id: `memory-usage:${state.overview?.chatKey ?? 'unbound'}`,
-        ariaLabel: '主聊天 Token 与 usage',
-        queryKey: JSON.stringify([state.overview?.chatKey ?? '', 'usage']),
-        pageSize: 20,
-        overscan: 6,
-        maxCachedPages: 6,
-        estimatedItemHeight: 72,
-        getKey: item => String(item.id ?? `${item.messageId ?? 'usage'}:${item.capturedAt ?? item.createdAt ?? ''}`),
-        loadPage: ({ cursor, limit, signal }) => controller.loadMemoryPage!('usage', {
-          ...(cursor === undefined ? {} : { cursor }),
-          limit,
-          signal,
-          orderBy: { field: 'capturedAt', direction: 'desc' },
-          includeTotal: true,
-        }),
-        renderItem: item => elementFromMarkup(`<article class="stx-memory-evidence"><strong>${escapeHtml(String(item.messageId ?? item.id ?? '生成记录'))}</strong><small>${escapeHtml(formatTime(Number(item.capturedAt ?? item.createdAt ?? 0)))}</small><pre class="stx-memory-code">${escapeHtml(formatJson(item))}</pre></article>`),
-      });
+    if (popupUi && state.page === 'audit') {
+      const localPage = async <T,>(items: readonly T[], cursor: string | undefined, limit: number, signal: AbortSignal): Promise<MemoryPage<T>> => {
+        if (signal.aborted) throw signal.reason;
+        const offset = Math.max(0, Number(cursor ?? 0) || 0);
+        const pageItems = items.slice(offset, offset + limit);
+        const nextOffset = offset + pageItems.length;
+        return {
+          items: pageItems,
+          nextCursor: nextOffset < items.length ? String(nextOffset) : null,
+          total: items.length,
+        };
+      };
+      if (state.auditTab === 'records') {
+        const records = visibleAudits();
+        const auditHost = root.querySelector<HTMLElement>('[data-memory-page-list="audit"]');
+        if (auditHost) popupUi.mountList<MemoryAuditRecord>(auditHost, {
+          id: `memory-audits:${state.overview?.chatKey ?? 'unbound'}`,
+          ariaLabel: 'Capture 审计记录',
+          queryKey: JSON.stringify([state.overview?.chatKey ?? '', state.auditQuery, state.auditStatus, state.auditIssuesOnly]),
+          pageSize: 24,
+          overscan: 8,
+          maxCachedPages: 6,
+          estimatedItemHeight: 112,
+          getKey: record => record.id,
+          loadPage: ({ cursor, limit, signal }) => controller.listAuditRecordsPage
+            ? controller.listAuditRecordsPage(auditPageRequest(limit, { cursor, signal, includeTotal: true }))
+            : localPage(records, cursor, limit, signal),
+          renderItem: record => elementFromMarkup(renderAuditRecord(record)),
+          selectable: true,
+          selectedKey: state.selectedAuditId,
+          onSelect: (record) => {
+            state.selectedAuditId = record.id;
+            if (!state.audits.some(item => item.id === record.id)) state.audits = [...state.audits, record];
+            state.selectedRejectionIds = state.selectedRejectionIds.filter(id => record.issues.some(issue => (issue.rejectionId ?? issue.id) === id));
+            state.auditMobileView = 'detail';
+            rerender('#stx-memory-audit-detail-heading');
+          },
+        });
+      } else {
+        const usages = visibleUsages();
+        const usageHost = root.querySelector<HTMLElement>('[data-memory-page-list="usage"]');
+        if (usageHost) popupUi.mountList<MainChatUsage>(usageHost, {
+          id: `memory-usage:${state.overview?.chatKey ?? 'unbound'}`,
+          ariaLabel: '主聊天 Token 用量',
+          queryKey: JSON.stringify([state.overview?.chatKey ?? '', state.usageQuery, state.usageModel, state.usageCompleteness]),
+          pageSize: 30,
+          overscan: 10,
+          maxCachedPages: 6,
+          estimatedItemHeight: 64,
+          getKey: usage => usage.id,
+          loadPage: ({ cursor, limit, signal }) => controller.getMainChatUsagePage
+            ? controller.getMainChatUsagePage(usagePageRequest(limit, { cursor, signal, includeTotal: true }))
+            : localPage(usages, cursor, limit, signal),
+          renderItem: usage => elementFromMarkup(renderUsageRecord(usage)),
+          selectable: true,
+          selectedKey: state.selectedUsageId,
+          onSelect: (usage) => {
+            state.selectedUsageId = usage.id;
+            if (!state.usages.some(item => item.id === usage.id)) state.usages = [...state.usages, usage];
+            state.auditMobileView = 'detail';
+            rerender('#stx-memory-usage-detail-heading');
+            void loadUsageRecallDetail(usage);
+          },
+        });
+      }
     }
+    if (state.page === 'audit' && state.auditTab === 'usage') window.requestAnimationFrame(() => { if (!disposed) drawUsageTrendChart(); });
     refreshGraphMarquees(root);
     observeGraphMarqueeResize();
     traceMemoryStartup('workbench:controls-refreshed');
@@ -2650,37 +3471,183 @@ export function renderMemoryWorkbench(
     if (action === 'toggle-filter-menu') { const filter = actionNode.dataset.filterMenu as 'kind' | 'status'; state.openFilter = state.openFilter === filter ? '' : filter; rerender(`#stx-memory-${filter}-filter-trigger`); return; }
     if (action === 'navigate') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (PAGES.some((item) => item.id === page)) void loadPage(page); return; }
     if (action === 'navigate-internal') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (INTERNAL_PAGES.some((item) => item.id === page)) void loadPage(page); return; }
+    if (action === 'audit-tab') {
+      const tab = actionNode.dataset.auditTab;
+      if (tab !== 'records' && tab !== 'usage') return;
+      state.auditTab = tab;
+      state.auditMobileView = 'list';
+      normalizeAuditSelection();
+      rerender(`[data-action="audit-tab"][data-audit-tab="${tab}"]`);
+      if (tab === 'usage') {
+        const usage = visibleUsages().find(item => item.id === state.selectedUsageId);
+        if (usage) void loadUsageRecallDetail(usage);
+      }
+      return;
+    }
+    if (action === 'toggle-audit-issues') {
+      state.auditIssuesOnly = !state.auditIssuesOnly;
+      state.auditMobileView = 'list';
+      normalizeAuditSelection();
+      rerender('[data-action="toggle-audit-issues"]');
+      scheduleAuditListRefresh('records', 0);
+      return;
+    }
+    if (action === 'select-audit-record') {
+      const auditId = actionNode.dataset.auditRecordId ?? '';
+      const record = visibleAudits().find(item => item.id === auditId);
+      if (!record) return;
+      state.selectedAuditId = record.id;
+      state.selectedRejectionIds = state.selectedRejectionIds.filter(id => record.issues.some(issue => (issue.rejectionId ?? issue.id) === id));
+      state.auditMobileView = 'detail';
+      rerender('#stx-memory-audit-detail-heading');
+      return;
+    }
+    if (action === 'select-usage') {
+      const usageId = actionNode.dataset.usageId ?? '';
+      const usage = visibleUsages().find(item => item.id === usageId);
+      if (!usage) return;
+      state.selectedUsageId = usage.id;
+      state.auditMobileView = 'detail';
+      rerender('#stx-memory-usage-detail-heading');
+      void loadUsageRecallDetail(usage);
+      return;
+    }
+    if (action === 'audit-mobile-back') {
+      const selector = state.auditTab === 'records'
+        ? '[data-audit-record-id][aria-pressed="true"]'
+        : '[data-usage-id][aria-pressed="true"]';
+      state.auditMobileView = 'list';
+      rerender(selector);
+      return;
+    }
+    if (action === 'export-audit') {
+      if (!controller.listAuditRecordsPage) {
+        const count = downloadAuditExport(visibleAudits());
+        toast('success', '审计记录已导出', `已导出 ${count} 条当前筛选结果。`, 'MEMORY_AUDIT_EXPORTED');
+        return;
+      }
+      state.busyAction = 'export-audit';
+      rerender();
+      void collectAuditExportRecords().then((records) => {
+        if (disposed) return;
+        const count = downloadAuditExport(records);
+        toast('success', '审计记录已导出', `已导出 ${count} 条当前筛选结果。`, 'MEMORY_AUDIT_EXPORTED');
+      }).catch((error) => {
+        if (disposed) return;
+        const diagnostic = describeMemoryError(error, 'INTERNAL_ERROR', 'operation');
+        toast('error', diagnostic.title, diagnostic.reason, diagnostic.reasonCode);
+      }).finally(() => {
+        if (!disposed) { state.busyAction = ''; rerender(); }
+      });
+      return;
+    }
+    if (action === 'export-usage') {
+      if (!controller.getMainChatUsagePage) {
+        const count = downloadUsageExport(visibleUsages());
+        toast('success', 'Token 用量已导出', `已导出 ${count} 条当前筛选结果。`, 'MEMORY_USAGE_EXPORTED');
+        return;
+      }
+      state.busyAction = 'export-usage';
+      rerender();
+      void collectUsageExportRecords().then((usages) => {
+        if (disposed) return;
+        const count = downloadUsageExport(usages);
+        toast('success', 'Token 用量已导出', `已导出 ${count} 条当前筛选结果。`, 'MEMORY_USAGE_EXPORTED');
+      }).catch((error) => {
+        if (disposed) return;
+        const diagnostic = describeMemoryError(error, 'INTERNAL_ERROR', 'operation');
+        toast('error', diagnostic.title, diagnostic.reason, diagnostic.reasonCode);
+      }).finally(() => {
+        if (!disposed) { state.busyAction = ''; rerender(); }
+      });
+      return;
+    }
+    if (action === 'rollback-audit') {
+      const auditId = actionNode.dataset.auditId ?? '';
+      const record = state.audits.find(item => item.id === auditId && item.status !== 'rolled_back');
+      if (!record || !controller.rollbackActorCapture || !popupUi) return;
+      void popupUi.confirm({
+        title: '确认回滚 Capture',
+        message: `将撤销 Capture #${record.batchIndex + 1} 写入的事实、观察、痕迹与派生记录。此操作会保留审计记录。`,
+        confirmLabel: '确认回滚',
+        danger: true,
+      }).then((confirmed) => {
+        if (!confirmed || disposed) return;
+        void runAction('rollback-actor-capture', () => controller.rollbackActorCapture!(auditId), 'Capture 已回滚', '多主体事实、观察、痕迹与派生记录已撤销。', 'MEMORY_ACTOR_CAPTURE_ROLLED_BACK', async () => { await loadPage('audit'); await refreshFacts(); });
+      });
+      return;
+    }
     if (action === 'inventory-set-scope') {
       const scope = actionNode.dataset.scope;
       if (scope !== 'current' && scope !== 'catalog') return;
       state.inventoryScope = scope;
-      state.selectedInventoryItemId = '';
       state.inventoryEvents = [];
       void loadPage('inventory');
+      return;
+    }
+    if (action === 'inventory-set-category') {
+      const category = actionNode.dataset.category ?? '';
+      if (category && !Object.hasOwn(INVENTORY_CATEGORY_LABELS, category)) return;
+      state.inventoryCategory = category as WorkbenchState['inventoryCategory'];
+      state.inventoryEvents = [];
+      rerender();
+      return;
+    }
+    if (action === 'inventory-set-view') {
+      const view = actionNode.dataset.view;
+      if (view !== 'grid' && view !== 'list') return;
+      state.inventoryView = view;
+      rerender(`[data-action="inventory-set-view"][data-view="${view}"]`);
+      return;
+    }
+    if (action === 'inventory-set-operation') {
+      const operation = actionNode.dataset.operation;
+      if (operation !== 'set' && operation !== 'increase' && operation !== 'decrease' && operation !== 'remove') return;
+      state.inventoryCommandOperation = operation;
+      if (operation === 'increase' || operation === 'decrease' || (operation !== 'set' && state.inventoryCommandPrecision === 'unknown')) state.inventoryCommandPrecision = 'exact';
+      rerender(`[data-action="inventory-set-operation"][data-operation="${operation}"]`);
+      return;
+    }
+    if (action === 'inventory-card-flip') {
+      const flipped = inventoryCardRenderer?.flip() ?? false;
+      actionNode.setAttribute('aria-pressed', String(flipped));
       return;
     }
     if (action === 'inventory-select') {
       const itemId = actionNode.dataset.itemId ?? '';
       if (!itemId) return;
-      state.selectedInventoryItemId = itemId;
-      state.inventoryConfirmInvalidId = '';
-      state.inventoryEvents = [];
-      rerender();
-      if (controller.getInventoryHistory) void controller.getInventoryHistory(itemId).then((events) => {
-        if (disposed || state.selectedInventoryItemId !== itemId) return;
-        state.inventoryEvents = [...events];
-        rerender();
-      }).catch(error => toast('error', '账本读取失败', '无法读取该物品的变动历史。', safeErrorCode(error, 'INTERNAL_ERROR')));
+      requestInventorySelection(itemId);
+      return;
+    }
+    if (action === 'inventory-create-open') {
+      state.inventoryCreateOpen = true;
+      rerender('#stx-memory-inventory-new-name');
+      return;
+    }
+    if (action === 'inventory-create-cancel') {
+      state.inventoryCreateOpen = false;
+      state.inventoryNewName = '';
+      state.inventoryNewAliases = '';
+      state.inventoryNewCategory = 'other';
+      rerender('[data-action="inventory-create-open"]');
       return;
     }
     if (action === 'inventory-create') {
       const canonicalName = state.inventoryNewName.trim();
       if (!canonicalName || !controller.createInventoryItem) return;
+      const canonicalKey = canonicalName.normalize('NFKC').toLocaleLowerCase('zh-CN');
+      const aliases = [...new Set(state.inventoryNewAliases.split(/[,，]/u)
+        .map(value => value.normalize('NFKC').trim())
+        .filter(value => value && value.toLocaleLowerCase('zh-CN') !== canonicalKey))];
       void runAction('inventory-create', async () => {
-        const item = await controller.createInventoryItem!({ canonicalName });
+        const item = await controller.createInventoryItem!({ canonicalName, aliases, category: state.inventoryNewCategory });
         state.inventoryScope = 'catalog';
+        state.inventoryCategory = '';
         state.selectedInventoryItemId = item.id;
+        state.inventoryCreateOpen = false;
         state.inventoryNewName = '';
+        state.inventoryNewAliases = '';
+        state.inventoryNewCategory = 'other';
       }, '物品已新增', '物品目录已保存，可继续设置数量。', 'MEMORY_INVENTORY_ITEM_CREATED', () => loadPage('inventory'));
       return;
     }
@@ -2688,7 +3655,7 @@ export function renderMemoryWorkbench(
       const item = state.inventoryItems.find(entry => entry.id === state.selectedInventoryItemId && entry.status !== 'invalid');
       if (!item || !controller.applyInventoryCommand) return;
       const amount = state.inventoryCommandAmount.trim() === '' ? undefined : Number(state.inventoryCommandAmount);
-      if (state.inventoryCommandOperation !== 'remove' && (!Number.isFinite(amount) || Number(amount) < 0)) {
+      if (state.inventoryCommandOperation !== 'remove' && state.inventoryCommandPrecision !== 'unknown' && (!Number.isFinite(amount) || Number(amount) < 0)) {
         toast('warning', '数值无效', '请输入大于或等于 0 的数值。', 'INVALID_PAYLOAD');
         return;
       }
@@ -2696,7 +3663,19 @@ export function renderMemoryWorkbench(
         toast('warning', '操作不适用', '可维持天数只允许设置或移除，不能自动增减。', 'INVALID_PAYLOAD');
         return;
       }
+      if (state.inventoryCommandPrecision === 'unknown' && state.inventoryCommandOperation !== 'set') {
+        toast('warning', '精确度不适用', '数量未知只允许用于设置操作。', 'INVALID_PAYLOAD');
+        return;
+      }
+      if (['increase', 'decrease'].includes(state.inventoryCommandOperation) && state.inventoryCommandPrecision !== 'exact') {
+        toast('warning', '精确度不适用', '增加和减少必须基于精确数量。', 'INVALID_PAYLOAD');
+        return;
+      }
       const unit = state.inventoryCommandUnit.trim();
+      if (!unit && !(state.inventoryCommandOperation === 'set' && state.inventoryCommandPrecision === 'unknown')) {
+        toast('warning', '单位不能为空', '请填写当前计量类型对应的单位。', 'INVALID_PAYLOAD');
+        return;
+      }
       const current = state.inventoryStates.find(entry => entry.itemId === item.id
         && entry.measureKind === state.inventoryCommandMeasure
         && entry.unit.normalize('NFKC').trim().toLocaleLowerCase() === unit.normalize('NFKC').trim().toLocaleLowerCase());
@@ -2707,9 +3686,9 @@ export function renderMemoryWorkbench(
         itemId: item.id,
         operation: state.inventoryCommandOperation,
         measureKind: state.inventoryCommandMeasure,
-        ...(amount === undefined ? {} : { amount, rawAmount: state.inventoryCommandAmount.trim() }),
+        ...(amount === undefined || state.inventoryCommandOperation === 'remove' || state.inventoryCommandPrecision === 'unknown' ? {} : { amount, rawAmount: state.inventoryCommandAmount.trim() }),
         unit,
-        precision: 'exact',
+        precision: state.inventoryCommandPrecision,
         reason,
         origin: 'manual',
         confidence: 1,
@@ -2722,15 +3701,20 @@ export function renderMemoryWorkbench(
       });
       return;
     }
-    if (action === 'inventory-invalidate') { state.inventoryConfirmInvalidId = state.selectedInventoryItemId; rerender(); return; }
-    if (action === 'inventory-invalidate-cancel') { state.inventoryConfirmInvalidId = ''; rerender(); return; }
-    if (action === 'inventory-invalidate-confirm') {
-      const itemId = state.inventoryConfirmInvalidId;
-      if (!itemId || !controller.invalidateInventoryItem) return;
-      void runAction('inventory-invalidate', () => controller.invalidateInventoryItem!(itemId).then(() => undefined), '错误物品已作废', '历史账本仍然保留，该物品不再参与当前库存。', 'MEMORY_INVENTORY_ITEM_INVALIDATED', async () => {
-        state.inventoryConfirmInvalidId = '';
-        state.selectedInventoryItemId = '';
-        await loadPage('inventory');
+    if (action === 'inventory-invalidate') {
+      const item = state.inventoryItems.find(entry => entry.id === state.selectedInventoryItemId && entry.status !== 'invalid');
+      if (!item || !controller.invalidateInventoryItem || !popupUi) return;
+      void popupUi.confirm({
+        title: '确认作废错误物品',
+        message: `“${item.canonicalName}”将从当前库存和全部目录中隐藏，历史账本仍会保留。`,
+        confirmLabel: '确认作废',
+        danger: true,
+      }).then((confirmed) => {
+        if (!confirmed || disposed) return;
+        void runAction('inventory-invalidate', () => controller.invalidateInventoryItem!(item.id).then(() => undefined), '错误物品已作废', '历史账本仍然保留，该物品不再参与当前库存。', 'MEMORY_INVENTORY_ITEM_INVALIDATED', async () => {
+          state.selectedInventoryItemId = '';
+          await loadPage('inventory');
+        });
       });
       return;
     }
@@ -3258,10 +4242,9 @@ export function renderMemoryWorkbench(
     if (action === 'ignore-capture-rejections') {
       const auditId = actionNode.dataset.auditId ?? '';
       const record = state.audits.find(item => item.id === auditId);
-      const validIds = new Set((Array.isArray(record?.rejected) ? record.rejected : [])
-        .filter((item): item is import('../domain').AutomaticIngestRejection => Boolean(item && typeof item === 'object' && ('code' in item || 'id' in item)))
-        .filter(item => (item.status ?? 'unresolved') === 'unresolved' && Boolean(item.id))
-        .map(item => item.id!));
+      const validIds = new Set((record?.issues ?? [])
+        .filter(item => item.canIgnore && item.status === 'unresolved')
+        .map(item => item.rejectionId ?? item.id));
       const rejectionIds = state.selectedRejectionIds.filter(id => validIds.has(id));
       if (!auditId || rejectionIds.length === 0) {
         toast('warning', '请选择失败项', '至少选择一条待处理记录。', 'MEMORY_CAPTURE_REJECTION_SELECTION_REQUIRED');
@@ -3276,16 +4259,6 @@ export function renderMemoryWorkbench(
       return;
     }
     if (action === 'refresh-audit') { void loadPage('audit'); return; }
-    if (action === 'rollback') { state.confirmBatchKey = actionNode.dataset.rollbackKey ?? ''; rerender(); return; }
-    if (action === 'cancel-rollback') { state.confirmBatchKey = ''; rerender(); return; }
-    if (action === 'confirm-rollback') {
-      const auditId = actionNode.dataset.auditId ?? '';
-      if (auditId && controller.rollbackActorCapture) {
-        void runAction('rollback-actor-capture', () => controller.rollbackActorCapture!(auditId), 'Capture 已回滚', '多主体事实、观察、痕迹与派生记录已撤销。', 'MEMORY_ACTOR_CAPTURE_ROLLED_BACK', async () => { state.confirmBatchKey = ''; await loadPage('audit'); await refreshFacts(); });
-        return;
-      }
-      return;
-    }
     if (action === 'export') { void controller.exportSqliteBackup().then(downloadSqlite).then(() => toast('success', '归档已导出', 'Memory 数据快照已下载。', 'MEMORY_ARCHIVE_EXPORTED')).catch((error) => toast('error', '导出失败', '无法生成 Memory 归档。', safeErrorCode(error, 'MEMORY_EXPORT_FAILED'))); return; }
     if (action === 'integrity') { state.integrityText = '正在执行 SQLite 完整性检查…'; rerender(); void controller.checkSqliteIntegrity().then((result) => { state.integrityText = `${result.ok ? '通过' : '失败'}：${result.message}`; if (result.ok) toast('success', '完整性检查通过', 'SQLite 数据结构正常。', 'MEMORY_INTEGRITY_OK'); else toast('warning', '完整性检查未通过', '请导出快照后检查服务端状态。', 'MEMORY_INTEGRITY_FAILED'); }).catch((error) => { state.integrityText = '检查失败，请稍后重试。'; toast('error', '完整性检查失败', '无法完成 SQLite 检查。', safeErrorCode(error, 'MEMORY_INTEGRITY_ERROR')); }).finally(() => rerender()); return; }
     if (action === 'clear-current') { state.dangerConfirm = 'current'; rerender(); return; }
@@ -3296,8 +4269,39 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('input', (event) => {
     const input = event.target as HTMLInputElement;
-    if (input.dataset.inventoryInput === 'query') { state.inventoryQuery = input.value; rerender('', true); return; }
-    if (input.dataset.inventoryInput === 'new-name') { state.inventoryNewName = input.value; rerender(); return; }
+    if (input.dataset.auditInput === 'query') {
+      state.auditQuery = input.value;
+      state.auditMobileView = 'list';
+      normalizeAuditSelection();
+      rerender('', true);
+      scheduleAuditListRefresh('records');
+      return;
+    }
+    if (input.dataset.usageInput === 'query') {
+      state.usageQuery = input.value;
+      state.auditMobileView = 'list';
+      normalizeAuditSelection();
+      rerender('', true);
+      scheduleAuditListRefresh('usage');
+      return;
+    }
+    if (input.dataset.inventoryInput === 'query') {
+      state.inventoryQuery = input.value;
+      if (inventorySearchTimer) window.clearTimeout(inventorySearchTimer);
+      inventorySearchTimer = window.setTimeout(() => {
+        inventorySearchTimer = undefined;
+        state.inventoryEvents = [];
+        rerender('', true);
+      }, 120);
+      return;
+    }
+    if (input.dataset.inventoryInput === 'new-name') {
+      state.inventoryNewName = input.value;
+      const save = root.querySelector<HTMLButtonElement>('[data-action="inventory-create"]');
+      if (save) save.disabled = !controller.createInventoryItem || !state.inventoryNewName.trim() || Boolean(state.busyAction);
+      return;
+    }
+    if (input.dataset.inventoryInput === 'new-aliases') { state.inventoryNewAliases = input.value; return; }
     if (input.dataset.inventoryInput === 'amount') { state.inventoryCommandAmount = input.value; return; }
     if (input.dataset.inventoryInput === 'unit') { state.inventoryCommandUnit = input.value; return; }
     if (input.dataset.actorMemoryInput === 'query') {
@@ -3347,12 +4351,52 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('change', (event) => {
     const input = event.target as HTMLInputElement | HTMLSelectElement;
-    if (input.dataset.inventorySelect === 'category') { state.inventoryCategory = input.value as WorkbenchState['inventoryCategory']; state.selectedInventoryItemId = ''; rerender(); return; }
-    if (input.dataset.inventorySelect === 'operation') { state.inventoryCommandOperation = input.value as import('../domain').InventoryOperation; rerender(); return; }
+    if (input.dataset.auditSelect === 'status') {
+      const value = input.value;
+      if (value !== 'all' && value !== 'completed' && value !== 'partial' && value !== 'rolled_back') return;
+      state.auditStatus = value;
+      state.auditMobileView = 'list';
+      normalizeAuditSelection();
+      rerender();
+      scheduleAuditListRefresh('records', 0);
+      return;
+    }
+    if (input.dataset.usageSelect === 'model') {
+      state.usageModel = input.value;
+      state.auditMobileView = 'list';
+      normalizeAuditSelection();
+      rerender();
+      scheduleAuditListRefresh('usage', 0);
+      return;
+    }
+    if (input.dataset.usageSelect === 'completeness') {
+      if (input.value !== 'all' && input.value !== 'complete' && input.value !== 'missing') return;
+      state.usageCompleteness = input.value;
+      state.auditMobileView = 'list';
+      normalizeAuditSelection();
+      rerender();
+      scheduleAuditListRefresh('usage', 0);
+      return;
+    }
+    if (input.dataset.inventorySelect === 'new-category') { state.inventoryNewCategory = input.value as WorkbenchState['inventoryNewCategory']; return; }
+    if (input.dataset.inventorySelect === 'sort') {
+      if (input.value !== 'recent' && input.value !== 'name' && input.value !== 'amount' && input.value !== 'confidence') return;
+      state.inventorySort = input.value;
+      rerender();
+      return;
+    }
+    if (input.dataset.inventorySelect === 'precision') {
+      if (input.value !== 'exact' && input.value !== 'approximate' && input.value !== 'unknown') return;
+      state.inventoryCommandPrecision = input.value;
+      if (state.inventoryCommandPrecision === 'unknown') state.inventoryCommandAmount = '';
+      rerender();
+      return;
+    }
     if (input.dataset.inventorySelect === 'measure') {
       state.inventoryCommandMeasure = input.value as import('../domain').InventoryMeasureKind;
       if (state.inventoryCommandMeasure === 'coverage_days' && !['set', 'remove'].includes(state.inventoryCommandOperation)) state.inventoryCommandOperation = 'set';
-      if (state.inventoryCommandMeasure === 'coverage_days' && state.inventoryCommandUnit === '个') state.inventoryCommandUnit = '天';
+      if (state.inventoryCommandMeasure === 'coverage_days') state.inventoryCommandUnit = '天';
+      if (state.inventoryCommandMeasure === 'quantity' && state.inventoryCommandUnit === '天') state.inventoryCommandUnit = '个';
       rerender();
       return;
     }
@@ -3461,7 +4505,24 @@ export function renderMemoryWorkbench(
     }
     if (input.dataset.sourceKind) { const selected = (input as HTMLInputElement).checked; state.selectedSourceKinds = selected ? [...new Set([...state.selectedSourceKinds, input.dataset.sourceKind])] : state.selectedSourceKinds.filter((kind) => kind !== input.dataset.sourceKind); void controller.getInitializationEstimate(state.selectedSourceKinds, initializationOptions()).then((estimate) => { if (!disposed) { state.estimate = estimate; rerender(); } }).catch((error) => toast('error', '估算失败', '无法更新初始化成本估算。', safeErrorCode(error, 'INTERNAL_ERROR'))); return; }
   }, { signal: abortController.signal });
+  root.addEventListener('pointerdown', (event) => {
+    const splitter = (event.target as HTMLElement).closest<HTMLElement>('[data-inventory-split]');
+    if (!splitter || state.page !== 'inventory' || splitter.getAttribute('aria-disabled') === 'true' || event.button !== 0) return;
+    const kind = splitter.dataset.inventorySplit;
+    if (kind !== 'detail' && kind !== 'preview') return;
+    stopInventoryResize();
+    inventoryResizeDrag = { kind, pointerId: event.pointerId, splitter };
+    splitter.closest<HTMLElement>('.stx-memory-inventory-console, .stx-memory-inventory-detail-scroll')?.classList.add('is-resizing');
+    splitter.setPointerCapture?.(event.pointerId);
+    updateInventoryResizeFromPointer(event);
+    event.preventDefault();
+  }, { signal: abortController.signal });
   root.addEventListener('pointermove', (event) => {
+    if (inventoryResizeDrag && event.pointerId === inventoryResizeDrag.pointerId) {
+      updateInventoryResizeFromPointer(event);
+      event.preventDefault();
+      return;
+    }
     const zone = (event.target as HTMLElement).closest<HTMLElement>('[data-actor-memory-zone]');
     if (!zone || state.page !== 'actor-memory') return;
     const start = Number(zone.dataset.start);
@@ -3471,6 +4532,15 @@ export function renderMemoryWorkbench(
     const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
     const upper = end >= 100 ? 100 : end - 0.01;
     updateGaugeZonePreview(zone, start + (upper - start) * ratio);
+  }, { signal: abortController.signal });
+  root.addEventListener('pointerup', (event) => {
+    if (inventoryResizeDrag?.pointerId === event.pointerId) stopInventoryResize(event);
+  }, { signal: abortController.signal });
+  root.addEventListener('pointercancel', (event) => {
+    if (inventoryResizeDrag?.pointerId === event.pointerId) stopInventoryResize(event);
+  }, { signal: abortController.signal });
+  root.addEventListener('lostpointercapture', (event) => {
+    if (inventoryResizeDrag?.pointerId === event.pointerId) stopInventoryResize(event);
   }, { signal: abortController.signal });
   root.addEventListener('pointerout', (event) => {
     const zone = (event.target as HTMLElement).closest<HTMLElement>('[data-actor-memory-zone]');
@@ -3487,6 +4557,30 @@ export function renderMemoryWorkbench(
     if (Number.isFinite(start) && Number.isFinite(end)) updateGaugeZonePreview(zone, start + (end - start) / 2);
   }, { signal: abortController.signal });
   root.addEventListener('keydown', (event) => {
+    const splitter = (event.target as HTMLElement).closest<HTMLElement>('[data-inventory-split]');
+    if (splitter && state.page === 'inventory' && splitter.getAttribute('aria-disabled') !== 'true') {
+      const kind = splitter.dataset.inventorySplit;
+      if (kind === 'detail' || kind === 'preview') {
+        const current = kind === 'detail' ? state.inventoryDetailWidth : state.inventoryPreviewHeight;
+        const minimum = kind === 'detail' ? INVENTORY_DETAIL_WIDTH_MIN : INVENTORY_PREVIEW_HEIGHT_MIN;
+        const maximum = kind === 'detail' ? inventoryDetailWidthMax() : INVENTORY_PREVIEW_HEIGHT_MAX;
+        const reset = kind === 'detail' ? INVENTORY_DETAIL_WIDTH_DEFAULT : INVENTORY_PREVIEW_HEIGHT_DEFAULT;
+        const next = event.key === 'Home' ? minimum
+          : event.key === 'End' ? maximum
+            : event.key === 'Enter' || event.key === ' ' ? reset
+              : kind === 'detail' && event.key === 'ArrowLeft' ? current + INVENTORY_SPLITTER_KEYBOARD_STEP
+                : kind === 'detail' && event.key === 'ArrowRight' ? current - INVENTORY_SPLITTER_KEYBOARD_STEP
+                  : kind === 'preview' && event.key === 'ArrowUp' ? current - INVENTORY_SPLITTER_KEYBOARD_STEP
+                    : kind === 'preview' && event.key === 'ArrowDown' ? current + INVENTORY_SPLITTER_KEYBOARD_STEP
+                      : undefined;
+        if (next !== undefined) {
+          setInventorySplitValue(kind, next);
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+      }
+    }
     if (event.key !== 'Escape') return;
     if (state.actorOperation) {
       event.preventDefault();
@@ -3514,6 +4608,7 @@ export function renderMemoryWorkbench(
     state.openFilter = '';
     rerender(`#stx-memory-${filter}-filter-trigger`);
   }, { signal: abortController.signal });
+  window.addEventListener('resize', syncInventorySplitters, { signal: abortController.signal });
   document.addEventListener('click', (event) => {
     if (!state.openFilter || event.composedPath().includes(root)) return;
     state.openFilter = '';
@@ -3544,11 +4639,15 @@ export function renderMemoryWorkbench(
     }
   });
   return () => {
-    disposed = true; pageRequestId += 1; backgroundPageRequestId += 1; progressRequestId += 1; librarySearchRequestId += 1; overviewRequestId += 1; storageUsageRequestId += 1; abortController.abort();
+    disposed = true; pageRequestId += 1; backgroundPageRequestId += 1; progressRequestId += 1; librarySearchRequestId += 1; overviewRequestId += 1; storageUsageRequestId += 1; auditListRequestId += 1; auditSummaryRequestId += 1; usageRecallRequestId += 1; abortController.abort();
+    stopInventoryResize();
+    cancelInventorySelectionTransition();
     if (searchTimer) window.clearTimeout(searchTimer);
+    if (inventorySearchTimer) window.clearTimeout(inventorySearchTimer);
     if (graphSearchTimer) window.clearTimeout(graphSearchTimer);
     if (progressTimer) window.clearTimeout(progressTimer);
     if (storageUsageTimer) window.clearTimeout(storageUsageTimer);
+    if (auditFilterTimer) window.clearTimeout(auditFilterTimer);
     if (renderFrame !== undefined) window.cancelAnimationFrame(renderFrame);
     if (graphMarqueeResizeFrame !== undefined) window.cancelAnimationFrame(graphMarqueeResizeFrame);
     if (graphListModeFrame !== undefined) window.cancelAnimationFrame(graphListModeFrame);
@@ -3556,6 +4655,7 @@ export function renderMemoryWorkbench(
     graphMarqueeResizeObserver?.disconnect();
     graphRenderer?.dispose();
     graphRenderer = undefined;
+    disposeInventoryCardRenderer();
     sceneRendererToken += 1;
     sceneRenderer?.dispose();
     sceneRenderer = undefined;

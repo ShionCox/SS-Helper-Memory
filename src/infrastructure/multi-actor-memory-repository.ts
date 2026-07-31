@@ -1059,7 +1059,7 @@ export class MultiActorMemoryRepository {
       expectedVersion: current?.version ?? 0,
     });
   }
-  async listChangeAudits(): Promise<Record<string, unknown>[]> { return (await this.list('change-audits', { workspaceId: this.workspaceId, chatKey: this.chatKey })).map(record => record.value as unknown as Record<string, unknown>); }
+  async listChangeAudits(): Promise<ChangeAudit[]> { return (await this.list('change-audits', { workspaceId: this.workspaceId, chatKey: this.chatKey })).map(record => record.value as unknown as ChangeAudit); }
   async getChangeAudit(auditId: string): Promise<ChangeAudit | undefined> {
     const record = await this.store.read({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
     const audit = record?.value as unknown as ChangeAudit | undefined;

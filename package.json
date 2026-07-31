@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build",
+    "build": "vite build && node scripts/verify-inventory-card-assets.mjs",
     "lint": "tsc --noEmit && node scripts/legacy-scan.mjs",
     "test": "vitest run",
     "test:watch": "vitest",

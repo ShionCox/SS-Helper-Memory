@@ -3,9 +3,11 @@ import { describe, expect, it } from 'vitest';
 
 describe('Memory 工作台公共 UI 契约门禁', () => {
   it('只消费 SDK 公共标记和主题变量，不恢复内部类或基础控件副本', async () => {
-    const [memoryUiSource, librarySource, styles] = await Promise.all([
+    const [memoryUiSource, librarySource, inventoryThreeSource, inventoryModelSource, styles] = await Promise.all([
       readFile(new URL('../src/ui/memory-ui.ts', import.meta.url), 'utf8'),
       readFile(new URL('../src/ui/memory-library-view.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../src/ui/inventory-card-three.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../src/ui/inventory-workbench-model.ts', import.meta.url), 'utf8'),
       readFile(new URL('../src/ui/memory.css', import.meta.url), 'utf8'),
     ]);
     const source = `${memoryUiSource}\n${librarySource}`;
@@ -48,7 +50,9 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(styles).toMatch(/\.stx-memory-error-guidance\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto/u);
     expect(styles).toMatch(/\.stx-memory-error-request\s*\{[^}]*justify-self:\s*end[^}]*font-size:\s*\.52rem/u);
     expect(styles).toMatch(/\.stx-memory-page-content:has\(> section\.stx-memory-panel\)[^}]*grid-template-columns/u);
-    expect(styles).toMatch(/\.stx-memory-audit-list\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit/u);
+    expect(styles).toMatch(/\.stx-memory-audit-split\s*\{[^}]*grid-template-columns:\s*minmax\(18rem,\s*\.78fr\)\s+minmax\(28rem,\s*1\.22fr\)/u);
+    expect(styles).toMatch(/\.stx-memory-audit-shell\[data-audit-mobile-view="list"\]\s+\.stx-memory-audit-detail\s*\{[^}]*display:\s*none/u);
+    expect(styles).toMatch(/\.stx-memory-usage-chart-stage\s*\{[^}]*position:\s*relative[^}]*height:\s*220px/u);
     expect(styles).toMatch(/\.stx-memory-page-content:has\(> \.stx-memory-card-grid\)[^}]*grid-template-rows/u);
     expect(styles).toMatch(/\.stx-memory-multi-filter-menu\s*\{[^}]*position:\s*absolute[^}]*max-height:/u);
     expect(styles).toMatch(/\.stx-memory-multi-filter-option\s*\{[^}]*display:\s*flex/u);
@@ -83,6 +87,60 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(graphListModeSync).not.toContain('graphView(');
     expect(graphListModeSync).toContain('window.requestAnimationFrame');
     expect(styles).not.toContain('backdrop-filter: blur(14px)');
+    expect(memoryUiSource).toContain("uiControl('segmented')");
+    expect(memoryUiSource).toContain('data-memory-usage-chart');
+    expect(memoryUiSource).toContain('class="stx-memory-usage-table" role="region"');
+    expect(memoryUiSource).not.toContain('class="stx-memory-usage-table" role="table"');
+    expect(memoryUiSource).toContain('/^[=+\\-@]/u');
+    expect(memoryUiSource).toContain('popupUi.confirm({');
+    expect(memoryUiSource).toContain("{ id: 'data', label: '数据维护'");
+    expect(memoryUiSource).not.toMatch(/window\.toastr|\btoastr\./u);
+    expect(memoryUiSource).not.toContain('<svg');
+    expect(memoryUiSource).not.toMatch(/<button[^>]*>\s*(?:←|→|✓|✕|×|⋮)/u);
+    expect(memoryUiSource).not.toContain('error.message');
+    expect(memoryUiSource).not.toContain('candidateSnapshot');
+    expect(memoryUiSource).toContain('mountInventoryCardThree');
+    expect(memoryUiSource).toContain('selectInventoryWorkbenchModel');
+    expect(memoryUiSource).toContain("data-action=\"inventory-create-open\"");
+    expect(memoryUiSource).toContain('data-inventory-select="precision"');
+    expect(memoryUiSource).toContain('data-inventory-split="detail"');
+    expect(memoryUiSource).toContain('data-inventory-split="preview"');
+    expect(memoryUiSource).toContain('requestInventorySelection(itemId)');
+    expect(memoryUiSource).toContain('INVENTORY_CARD_TRANSITION_MS');
+    expect(memoryUiSource).toContain('popupUi.confirm({');
+    expect(inventoryModelSource).toContain("quantity.availability === 'absent'");
+    expect(inventoryThreeSource).toContain("new URL('./assets/inventory-card-front.webp', import.meta.url)");
+    expect(inventoryThreeSource).toContain("new URL('./assets/inventory-card-back.webp', import.meta.url)");
+    expect(inventoryThreeSource).toContain('new THREE.ExtrudeGeometry');
+    expect(inventoryThreeSource).not.toContain('new THREE.TorusGeometry');
+    expect(inventoryThreeSource).toContain('float cellular(vec2 point)');
+    expect(inventoryThreeSource).toContain("particleGeometry.setAttribute('aBlink'");
+    expect(inventoryThreeSource).toContain('MAX_INVENTORY_CARD_PIXEL_RATIO = 1.5');
+    expect(inventoryThreeSource).toContain('new ResizeObserver(resize)');
+    expect(inventoryThreeSource).toContain('new IntersectionObserver');
+    expect(inventoryThreeSource).toContain('teardown(false)');
+    expect(inventoryThreeSource).toContain('teardown(true)');
+    expect(inventoryThreeSource).not.toMatch(/https?:\/\/(?:cdn|unpkg|jsdelivr)/u);
+    expect(inventoryThreeSource).not.toContain('data:image');
+    expect(`${memoryUiSource}\n${inventoryThreeSource}`).not.toContain('<svg');
+    expect(styles).toMatch(/\.stx-memory-inventory-console\s*\{[^}]*grid-template-columns:\s*166px\s+minmax\(360px,\s*1fr\)\s+12px\s+minmax\(300px,\s*var\(--stx-inventory-detail-width\)\)/u);
+    expect(styles).toMatch(/@media \(max-width:\s*900px\)[\s\S]*?\.stx-memory-inventory-console\s*\{[^}]*grid-template-columns:\s*1fr/u);
+    expect(styles).toMatch(/@media \(max-width:\s*900px\)[\s\S]*?\.stx-memory-inventory-splitter\s*\{[^}]*display:\s*none/u);
+    expect(styles).toContain('@keyframes stx-memory-inventory-card-leave');
+    expect(styles).toContain('@keyframes stx-memory-inventory-card-enter');
+    expect(styles).toMatch(/animation:\s*stx-memory-inventory-card-leave\s+300ms/u);
+    expect(styles).toMatch(/animation:\s*stx-memory-inventory-card-enter\s+380ms/u);
+    const inventoryTransitions = styles.slice(styles.indexOf('[data-inventory-transition="leaving"]'), styles.indexOf('.stx-memory-workbench .stx-memory-inventory-hero'));
+    expect(inventoryTransitions).not.toMatch(/filter:|brightness\(|background:/u);
+    expect(inventoryTransitions).not.toContain('stx-memory-inventory-card-canvas');
+    expect(inventoryThreeSource).toContain("Object.assign(flightTarget, { x: -2.7");
+    expect(styles).toMatch(/@media \(max-width:\s*540px\)[\s\S]*?\.stx-memory-inventory-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(116px,\s*1fr\)\)/u);
+    expect(styles).toMatch(/@media \(max-width:\s*540px\)[\s\S]*?\.stx-memory-inventory-create-fields\s*\{[^}]*grid-template-columns:\s*1fr/u);
+    const nativeSelects = memoryUiSource.match(/<select\b[^>]*>/gu) ?? [];
+    expect(nativeSelects.length).toBeGreaterThan(0);
+    expect(nativeSelects.every(tag => tag.includes("${uiControl('select')}"))).toBe(true);
+    const exportSource = memoryUiSource.slice(memoryUiSource.indexOf("if (action === 'export-audit')"), memoryUiSource.indexOf("if (action === 'rollback-audit')"));
+    expect(exportSource).not.toMatch(/candidateSnapshot|promptSnapshot|injectedPrompt|providerError(?:Code|Type|Param)/u);
     expect(source).not.toMatch(/\bstx-ui-/u);
     expect(styles).not.toMatch(/\bstx-ui-/u);
     expect(styles).not.toMatch(/--memory-/u);
