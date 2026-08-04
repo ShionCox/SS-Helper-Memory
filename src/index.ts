@@ -87,6 +87,8 @@ export interface MemoryPluginApi {
   listActorProfiles?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
   listActorDreams?(ownerId?: string): Promise<readonly Record<string, unknown>[]>;
   rollbackActorDream?(auditId: string): Promise<void>;
+  listMemoryReviewItems?(status?: import('./application/extraction').MemoryReviewItem['status']): Promise<readonly import('./application/extraction').MemoryReviewItem[]>;
+  resolveMemoryReviewItem?(id: string, action: import('./application/review').MemoryReviewAction, payload?: import('@ss-helper/sdk').PlainData): Promise<import('./application/extraction').MemoryReviewItem>;
 }
 
 export * from './domain';
@@ -98,5 +100,9 @@ export * from './application/locations';
 export * from './application/profile';
 export * from './application/dream';
 export * from './application/generation';
+export * from './application/extraction';
+export * from './application/tools';
+export * from './application/update';
+export * from './application/review';
 export * from './application/evaluation/multi-actor-offline-evaluator';
 export type { SourceBlock, StructuredClaim, StructuredCaptureResult } from './application/ingest/types';

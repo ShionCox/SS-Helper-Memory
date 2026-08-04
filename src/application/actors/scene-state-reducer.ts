@@ -222,6 +222,9 @@ export class SceneStateReducer {
       sourceRefs,
       createdAt: previous && !epochChanged ? previous.createdAt : now,
       updatedAt: now,
+      validFrom: previous && !epochChanged ? previous.validFrom ?? previous.createdAt : now,
+      observedAt: now,
+      ingestedAt: now,
     };
     const reason = transitionReason({ correction: Boolean(correction), reset, timeJump, locationChanged, exited: exited.size > 0, entered: entered.size > 0 && [...entered].some(id => !(previous?.presentOwnerIds ?? []).includes(id)) });
     const transition: SceneTransition | undefined = reason ? {
@@ -240,6 +243,9 @@ export class SceneStateReducer {
       confidence: correction ? 1 : 0.9,
       sourceRefs: unique([...textSignals.sourceRefs, ...recent.flatMap(source => source.transition ? [source.id] : [])]),
       createdAt: now,
+      validFrom: now,
+      observedAt: now,
+      ingestedAt: now,
     } : undefined;
     if (input.persist !== false) await this.store.saveSceneState(state, transition);
     return { state, ...(transition ? { transition } : {}), sceneCast };

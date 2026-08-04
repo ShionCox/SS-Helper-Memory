@@ -62,6 +62,7 @@ const LOOKUP_CHUNK_SIZE = 100;
 const PROMPT_SNAPSHOT_CHUNK_BYTES = 256 * 1024;
 const PROMPT_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
 const SETTINGS_WORKSPACE_ID = 'settings:global';
+const AGENT_PIPELINE_BASELINE_SETTING = 'agentPipelineBaselineVersion';
 const COLLECTIONS = MEMORY_WORKSPACE_COLLECTIONS;
 
 export interface MemoryWorkspaceHealth {
@@ -83,6 +84,15 @@ export interface MemoryWorkspaceHealth {
 }
 
 function asPlain(value: unknown): PlainData { return structuredClone(value) as PlainData; }
+function plainRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+function containsRetiredReference(value: unknown, retiredJobIds: ReadonlySet<string>, retiredTaskKeys: ReadonlySet<string>, seen = new Set<object>()): boolean {
+  if (typeof value === 'string') return retiredJobIds.has(value) || retiredTaskKeys.has(value);
+  if (!value || typeof value !== 'object' || seen.has(value as object)) return false;
+  seen.add(value as object);
+  return Object.values(value as Record<string, unknown>).some(item => containsRetiredReference(item, retiredJobIds, retiredTaskKeys, seen));
+}
 function paginationStalledError(scope: string): Error {
   return createSSHelperError('WORKSPACE_CONFLICT', {
     stage: 'memory.persistence.pagination',
@@ -1232,6 +1242,37 @@ export class MemoryRepository {
     const result = await this.store.read({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
     const value = result?.value as unknown as MemorySettingRecord | undefined;
     return value?.value as T | undefined;
+  }
+
+  async applyAgentPipelineBaseline(): Promise<number> {
+    const applied = await this.getSetting<number>(AGENT_PIPELINE_BASELINE_SETTING);
+    if (applied === 1) return 0;
+    const workspaceId = this.requireWorkspaceId();
+    const [jobs, repairQueue, audits] = await Promise.all([
+      this.listAllRecordRows('capture-jobs'),
+      this.listAllRecordRows('capture-repair-queue'),
+      this.listAllRecordRows('change-audits'),
+    ]);
+    const terminalJobs = new Set(['completed', 'failed', 'cancelled']);
+    const terminalRepairs = new Set(['resolved', 'ignored']);
+    const retiredJobs = jobs.filter(row => !terminalJobs.has(String(plainRecord(row.value).status ?? '')));
+    const retiredJobIds = new Set(retiredJobs.map(row => row.recordId));
+    const retiredTaskKeys = new Set([
+      ['memory', 'capture'].join('_'),
+      ['memory', 'capture', 'repair'].join('_'),
+    ]);
+    const retiredRepairs = repairQueue.filter(row => !terminalRepairs.has(String(plainRecord(row.value).status ?? '')));
+    const retiredAudits = audits.filter(row => containsRetiredReference(row.value, retiredJobIds, retiredTaskKeys));
+    const operations: StoreOperation[] = [
+      ...retiredJobs.map(row => ({ action: 'delete' as const, collection: 'capture-jobs', recordId: row.recordId, expectedVersion: row.version })),
+      ...retiredRepairs.map(row => ({ action: 'delete' as const, collection: 'capture-repair-queue', recordId: row.recordId, expectedVersion: row.version })),
+      ...retiredAudits.map(row => ({ action: 'delete' as const, collection: 'change-audits', recordId: row.recordId, expectedVersion: row.version })),
+    ];
+    for (let index = 0; index < operations.length; index += TRANSACTION_BATCH_SIZE) {
+      await this.store.apply({ workspaceId, idempotencyKey: `memory-agent-pipeline-baseline-v1:${index / TRANSACTION_BATCH_SIZE}`, operations: operations.slice(index, index + TRANSACTION_BATCH_SIZE) });
+    }
+    await this.setSetting(AGENT_PIPELINE_BASELINE_SETTING, 1);
+    return operations.length;
   }
 
   async setSetting(key: string, value: unknown): Promise<void> {

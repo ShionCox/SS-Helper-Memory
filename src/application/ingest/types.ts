@@ -2,6 +2,12 @@ import type {
   AutomaticIngestRejection,
   MemoryTokenUsage,
 } from '../../domain';
+import type {
+  ExtractionPipelineAudit,
+  ExtractionStageKey,
+  MemoryReviewItem,
+} from '../extraction/extraction-types';
+import type { PlainData } from '@ss-helper/sdk';
 
 export type { RepairFieldAction, RepairResolutionMode } from '../../domain';
 export type { SupportedEvidenceDirectory, SupportedEvidenceSpan } from './supported-evidence-directory';
@@ -21,6 +27,8 @@ export interface KnownLocationContextItem {
   referenceId: string;
   /** Internal deterministic mapping; never serialized to the model. */
   locationId?: string;
+  /** Internal snapshot revision; never serialized to the model. */
+  recordRevision?: number;
   canonicalName: string;
   aliases: string[];
   status: 'confirmed' | 'pending';
@@ -132,6 +140,7 @@ export interface MemoryExtractionAudit {
   latencyMs?: number;
   fallbackUsed?: boolean;
   usage?: MemoryTokenUsage | null;
+  pipeline?: ExtractionPipelineAudit;
 }
 
 export interface MemoryExtractionResult {
@@ -182,6 +191,10 @@ export interface StructuredInventoryOperation {
   sourceRef: string;
   evidenceExcerpt: string;
   confidence: number;
+  /** Server-owned planner result; never accepted from model output. */
+  updateDecision?: 'append_history';
+  /** Explicit review approval; server-owned and never accepted from model output. */
+  reviewApproved?: boolean;
 }
 
 export interface StructuredEpisode {
@@ -228,6 +241,8 @@ export interface StructuredClaim {
   knowledge: StructuredClaimKnowledge;
   confidence: number;
   stableAnchor?: boolean;
+  /** Explicit review approval; server-owned and never accepted from model output. */
+  reviewApproved?: boolean;
 }
 
 /** One-call Claim capture output. Machine times and persistence IDs are server-owned. */
@@ -250,6 +265,10 @@ export interface StructuredCaptureResult {
     transportMode?: 'native_strict' | 'json_object_validated' | 'prompt_json' | 'unknown';
   };
   audit?: MemoryExtractionAudit;
+  /** Shadow runs persist only their controlled audit and never enter domain materialization. */
+  shadowOnly?: boolean;
+  /** Active runs commit review items atomically with the accepted domain subset. */
+  reviewItems?: readonly MemoryReviewItem[];
 }
 
 /**
@@ -260,6 +279,10 @@ export interface StructuredCaptureResult {
 export interface ExistingMemoryContextItem {
   /** Sequential prompt-local identifier, never a persistence record id. */
   referenceId: string;
+  /** Internal deterministic mapping; never serialized to the model. */
+  factId?: string;
+  /** Internal snapshot revision; never serialized to the model. */
+  recordRevision?: number;
   kind: string;
   subjectKey: string;
   predicateKey: string;
@@ -280,6 +303,8 @@ export interface KnownActorContextItem {
   referenceId: string;
   /** Internal deterministic mapping; never serialized to the model. */
   ownerId?: string;
+  /** Internal snapshot revision; never serialized to the model. */
+  recordRevision?: number;
   canonicalName: string;
   aliases: string[];
   status: 'confirmed' | 'pending';
@@ -305,6 +330,8 @@ export interface KnownInventoryContextItem {
   referenceId: string;
   /** Internal deterministic mapping; never serialized to the model. */
   itemId?: string;
+  /** Internal aggregate revision; never serialized to the model. */
+  recordRevision?: number;
   canonicalName: string;
   aliases: string[];
   category: import('../../domain').InventoryItemCategory;
@@ -344,7 +371,18 @@ export interface RepairAttemptContext {
 }
 
 export interface MemoryExtractionInput {
+  workspaceId?: string;
   chatKey: string;
+  /** Capture/job metadata used to build one LLM workflow trace per pipeline. */
+  workflow?: {
+    label?: string;
+    kind?: string;
+    jobId?: string;
+    batchIndex?: number;
+    batchCount?: number;
+  };
+  /** Stage-local trace produced by the extraction coordinator. */
+  llmTrace?: import('@ss-helper/sdk').LlmWorkflowTrace;
   sources: readonly SourceBlock[];
   /**
    * Source ids allowed to create new persisted records. Omitted means every
@@ -362,6 +400,24 @@ export interface MemoryExtractionInput {
   knownInventoryContext?: readonly KnownInventoryContextItem[];
   /** Enables source-grounded relation-fact guidance in the existing single call. */
   graphLlmRelationEnabled?: boolean;
+  /** One-shot human review instruction scoped to one regenerated candidate. */
+  reviewOverride?: {
+    candidateLocalId: string;
+    action: 'accept' | 'edit' | 'merge';
+    payload?: PlainData;
+  };
+  /** Internal fixed Stage selection; never accepted from model output or settings text. */
+  stage?: Exclude<ExtractionStageKey, 'repair'>;
+  /** Job-scoped runtime settings. They override mutable UI settings for resume safety. */
+  runtimeExtraction?: {
+    extractionMode: 'single' | 'agent';
+    agentConcurrency: 1 | 2;
+    agentToolPolicy: 'off' | 'read_only';
+    agentWriteMode: 'shadow' | 'active';
+  };
+  signal?: AbortSignal;
+  /** Receives each completed Provider response usage without inventing absent fields. */
+  onUsage?: (usage: import('./llm-extractor').MemoryLlmUsage | undefined) => void | Promise<void>;
   repair?: RepairAttemptContext & {
     collection: 'actorCandidates' | 'locationCandidates' | 'itemCandidates' | 'episodes' | 'claims' | 'inventoryOperations';
     issues: Array<{ path: string; keyword: string; expected: string }>;

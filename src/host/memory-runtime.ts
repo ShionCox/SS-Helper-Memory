@@ -104,11 +104,10 @@ export class MemoryRuntime {
       registrationVersion: 1,
       tasks: [
         {
-          taskKey: 'memory_capture',
+          taskKey: 'memory_extract_single',
           taskKind: 'generation',
           requiredCapabilities: ['chat', 'json'],
-          description: '多角色事件与 Claim 捕获',
-          maxTokens: 4_096,
+          description: '单阶段结构化记忆提取',
           structuredPolicy: {
             maxProviderAttempts: 2,
             repairOn: ['INVALID_JSON', 'SCHEMA_VALIDATION_FAILED'],
@@ -118,11 +117,49 @@ export class MemoryRuntime {
           },
         },
         {
-          taskKey: 'memory_capture_repair',
+          taskKey: 'memory_extract_entities',
           taskKind: 'generation',
           requiredCapabilities: ['chat', 'json'],
-          description: '局部结构化捕获修复',
-          maxTokens: 2_048,
+          description: '人物与地点实体解析',
+          structuredPolicy: {
+            maxProviderAttempts: 2,
+            repairOn: ['INVALID_JSON', 'SCHEMA_VALIDATION_FAILED'],
+            itemFailure: 'return_partial',
+            envelopeFailure: 'repair_once',
+            itemCollections: ['actorCandidates', 'locationCandidates'],
+          },
+        },
+        {
+          taskKey: 'memory_extract_narrative',
+          taskKind: 'generation',
+          requiredCapabilities: ['chat', 'json'],
+          description: '事件、事实与知识边界提取',
+          structuredPolicy: {
+            maxProviderAttempts: 2,
+            repairOn: ['INVALID_JSON', 'SCHEMA_VALIDATION_FAILED'],
+            itemFailure: 'return_partial',
+            envelopeFailure: 'repair_once',
+            itemCollections: ['episodes', 'claims'],
+          },
+        },
+        {
+          taskKey: 'memory_extract_inventory',
+          taskKind: 'generation',
+          requiredCapabilities: ['chat', 'json'],
+          description: '物品与库存变化提取',
+          structuredPolicy: {
+            maxProviderAttempts: 2,
+            repairOn: ['INVALID_JSON', 'SCHEMA_VALIDATION_FAILED'],
+            itemFailure: 'return_partial',
+            envelopeFailure: 'repair_once',
+            itemCollections: ['itemCandidates', 'inventoryOperations'],
+          },
+        },
+        {
+          taskKey: 'memory_extract_repair',
+          taskKind: 'generation',
+          requiredCapabilities: ['chat', 'json'],
+          description: '局部结构化提取修复',
           structuredPolicy: {
             maxProviderAttempts: 1,
             repairOn: [],
@@ -182,7 +219,11 @@ export class MemoryRuntime {
       (listener) => this.application.onSettingsChanged(() => listener()),
       () => memoryWorkspaceStatus(this.application),
       );
-      this.disposers.push(() => capabilityMonitor.dispose());
+      this.application.setAgentModeAvailabilityResolver(() => capabilityMonitor.isAgentAvailable());
+      this.disposers.push(() => {
+        this.application.setAgentModeAvailabilityResolver(() => true);
+        capabilityMonitor.dispose();
+      });
       const contributions = registerMemoryContributions(
       this.session,
       this.application,

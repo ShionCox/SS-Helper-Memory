@@ -50,6 +50,10 @@ export interface MemoryFact {
   freshestEvidenceAt: number;
   validFrom?: number;
   validUntil?: number;
+  /** System-time observation/ingestion axis, separate from story validity. */
+  observedAt?: number;
+  ingestedAt?: number;
+  supersededAt?: number;
   stableAnchor?: boolean;
   scope?: FactScope;
   origin: FactOrigin;
@@ -189,6 +193,11 @@ export interface MemoryJobCheckpoint {
   degradedCount?: number;
   ignoredCount?: number;
   totalBatches?: number;
+  /** 本次任务选择的 1-based 连续批次范围。 */
+  batchRangeStart?: number;
+  batchRangeEnd?: number;
+  /** 按当前来源和拆分策略可生成的完整批次数。 */
+  availableBatchCount?: number;
   processedCount: number;
   lastSourceRef?: string;
   overlapSourceRefs?: string[];
@@ -201,6 +210,15 @@ export interface MemoryJobCheckpoint {
   summaryEndFloor?: number;
   summaryEndMessageId?: string;
   phase?: MemoryInitializationPhase;
+  /** Immutable extraction configuration captured when this job starts. */
+  extractionMode?: 'single' | 'agent';
+  agentConcurrency?: 1 | 2;
+  agentToolPolicy?: 'off' | 'read_only';
+  agentWriteMode?: 'shadow' | 'active';
+  /** Provider-reported usage accumulated across every completed LLM response. */
+  actualUsage?: MemoryTokenUsage;
+  usageRequestCount?: number;
+  usageReportedCount?: number;
 }
 
 export interface CaptureRepairQueueRecord {
@@ -387,6 +405,7 @@ export interface AutomaticIngestRejection {
   sourceRefs?: string[];
   allowedValues?: string[];
   /** Only known Capture fields are retained; no prompt/provider payloads. */
+  failure?: SSHelperFailureContext;
   requestId?: string;
   parentRequestId?: string;
   resourceId?: string;

@@ -30,6 +30,10 @@ export interface AutomaticSummaryWindow {
 export interface SummaryInitializationEstimate {
   messageCount: number;
   batchCount: number;
+  /** 可参与当前初始化的用户/助手聊天楼层数。 */
+  conversationFloorCount?: number;
+  /** 按用户配置主规则形成的逻辑分组数；batchCount 仍表示真实执行分片数。 */
+  logicalBatchCount?: number;
   tokenLow: number;
   tokenHigh: number;
 }
@@ -209,15 +213,10 @@ export function buildSummaryBatchPlans(blocks: readonly SourceBlock[], strategyI
     for (let index = 0; index < floorGroups.length;) {
       const start = index;
       const blocks: SourceBlock[] = [];
-      let chars = 0;
       while (index < floorGroups.length && index - start < strategy.batchFloors) {
         const parts = flattenedGroups([floorGroups[index]!]).flatMap((message) => splitForCharLimit(message, strategy.batchChars));
-        const length = parts.reduce((total, part) => total + part.content.length, 0);
-        if (blocks.length > 0 && chars + length > strategy.batchChars) break;
         blocks.push(...parts);
-        chars += length;
         index += 1;
-        if (chars >= strategy.batchChars) break;
       }
       groups.push({ start, end: index, blocks });
     }
@@ -262,7 +261,12 @@ export function buildSummaryBatchPlans(blocks: readonly SourceBlock[], strategyI
       messageCount: new Set(writableSources.filter((source) => source.kind === 'message').map(messageSourceId)).size,
     };
   });
-  if (!taskWritableRefs) return hardCapSummaryPlans(plans, strategy.batchChars);
+  // 楼层模式的批次语义必须与用户配置一致：例如每 10 层一批，
+  // 275 层就是 28 批。字符上限只负责切开单个超长来源块，不能再把
+  // 一个楼层批次扩张成多个“执行分片”，否则范围选择和进度都会失真。
+  if (!taskWritableRefs) return strategy.batchMode === 'floors'
+    ? plans
+    : hardCapSummaryPlans(plans, strategy.batchChars);
   const writablePlans: SummaryBatchPlan[] = [];
   let leadingContext: SourceBlock[] = [];
   for (const plan of plans) {
@@ -280,7 +284,9 @@ export function buildSummaryBatchPlans(blocks: readonly SourceBlock[], strategyI
       writablePlans.push(plan);
     }
   }
-  return hardCapSummaryPlans(writablePlans, strategy.batchChars);
+  return strategy.batchMode === 'floors'
+    ? writablePlans
+    : hardCapSummaryPlans(writablePlans, strategy.batchChars);
 }
 
 /** 根据当前总结策略的实际批次估算 LLM 输入成本。 */

@@ -118,6 +118,11 @@ export interface InventoryState {
   readonly revision: number;
   readonly createdAt: number;
   readonly updatedAt: number;
+  readonly validFrom?: number;
+  readonly validUntil?: number;
+  readonly observedAt?: number;
+  readonly ingestedAt?: number;
+  readonly supersededAt?: number;
 }
 
 /** Append-only inventory ledger row. before/after are server-computed. */
@@ -142,6 +147,11 @@ export interface InventoryEvent {
   readonly floor?: number;
   readonly occurredAt: number;
   readonly recordedAt: number;
+  readonly validFrom?: number;
+  readonly validUntil?: number;
+  readonly observedAt?: number;
+  readonly ingestedAt?: number;
+  readonly supersededAt?: number;
   readonly origin: 'automatic' | 'manual' | 'import';
   readonly confidence: number;
   readonly jobId?: string;
@@ -436,6 +446,11 @@ export interface RelationshipClaim {
   readonly status: 'active' | 'superseded' | 'invalid';
   readonly createdAt: number;
   readonly updatedAt: number;
+  readonly validFrom?: number;
+  readonly validUntil?: number;
+  readonly observedAt?: number;
+  readonly ingestedAt?: number;
+  readonly supersededAt?: number;
 }
 
 export interface DreamJob {

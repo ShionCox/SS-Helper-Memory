@@ -22,26 +22,48 @@ describe('SDK LLM typed adapter', () => {
       return { requestId: 'r3', results: [{ id: '1', index: 1, score: 0.9 }], route: { route: 'rerank' } };
     });
     const api = createMemoryLlmClient({ bus: { request: call } } as unknown as PluginSession, signal);
+    const trace = { workflowId: 'pipeline-1', workflowLabel: '初始化记忆', workflowKind: 'agent', jobId: 'job-1', batchIndex: 0, batchCount: 2 };
 
-    await expect(api.runTask({
+    const structured = await api.runTask({
       consumer: 'stx_memory', taskKey: 'memory_extract', taskDescription: 'extract', taskKind: 'generation',
       input: { messages: [{ role: 'user', content: 'hello' }] }, schema: { type: 'object' },
       budget: { maxTokens: 100, maxLatencyMs: 4321 }, enqueue: { displayMode: 'silent' },
-    })).resolves.toMatchObject({ ok: true, data: { facts: [] }, meta: { model: 'm1' } });
-    await expect(api.embed?.({ consumer: 'stx_memory', taskKey: 'memory_embed', texts: ['hello'], budget: { maxLatencyMs: 1234 } }))
+      trace,
+    });
+    expect(structured).toMatchObject({ ok: true, data: { facts: [] }, meta: { model: 'm1' } });
+    expect(structured).toHaveProperty('usage', undefined);
+    await expect(api.embed?.({ consumer: 'stx_memory', taskKey: 'memory_embed', texts: ['hello'], budget: { maxLatencyMs: 1234 }, trace }))
       .resolves.toMatchObject({ ok: true, vectors: [[1, 2]], model: 'e1' });
-    await expect(api.rerank?.({ consumer: 'stx_memory', taskKey: 'memory_rerank', query: 'q', docs: ['a', 'b'], topK: 1 }))
+    await expect(api.rerank?.({ consumer: 'stx_memory', taskKey: 'memory_rerank', query: 'q', docs: ['a', 'b'], topK: 1, trace }))
       .resolves.toMatchObject({ ok: true, results: [{ index: 1, score: 0.9, doc: 'b' }] });
 
-    expect(call).toHaveBeenNthCalledWith(1, LLM_STRUCTURED_TASK_V0, expect.not.objectContaining({ timeoutMs: expect.anything() }), { timeoutMs: 4321, signal });
-    expect(call).toHaveBeenNthCalledWith(2, LLM_EMBEDDING_V0, expect.objectContaining({ timeoutMs: 1234 }), { timeoutMs: 1234, signal });
-    expect(call).toHaveBeenNthCalledWith(3, LLM_RERANK_V0, expect.objectContaining({ timeoutMs: 30_000 }), { timeoutMs: 30_000, signal });
+    expect(call).toHaveBeenNthCalledWith(1, LLM_STRUCTURED_TASK_V0, expect.objectContaining({ timeoutMs: 4321, trace }), { timeoutMs: 4321, signal });
+    expect(call).toHaveBeenNthCalledWith(2, LLM_EMBEDDING_V0, expect.objectContaining({ task: 'memory_embed', timeoutMs: 1234, trace }), { timeoutMs: 1234, signal });
+    expect(call).toHaveBeenNthCalledWith(3, LLM_RERANK_V0, expect.objectContaining({ task: 'memory_rerank', timeoutMs: 30_000, trace }), { timeoutMs: 30_000, signal });
   });
 
   it('propagates typed Bus failures without a Memory error wrapper', async () => {
     const api = createMemoryLlmClient({ bus: { request: async () => { throw new Error('Core unavailable'); } } } as unknown as PluginSession);
     await expect(api.embed?.({ consumer: 'stx_memory', taskKey: 'memory_embed', texts: ['x'] }))
       .rejects.toThrow('Core unavailable');
+  });
+
+  it('returns structured embed and rerank failures with safe route metadata', async () => {
+    const failure = Object.assign(new Error('capability unavailable'), {
+      code: 'NOT_FOUND',
+      details: { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE', stage: 'llm.route.resolve', requestId: 'request-safe', resourceId: 'resource-safe', model: 'model-safe' },
+    });
+    const api = createMemoryLlmClient({ bus: { request: async () => { throw failure; } } } as unknown as PluginSession);
+
+    await expect(api.embed?.({ consumer: 'stx_memory', taskKey: 'memory_embed', texts: ['x'] })).resolves.toMatchObject({
+      ok: false,
+      failure: { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE', stage: 'llm.route.resolve' },
+      meta: { requestId: 'request-safe', resourceId: 'resource-safe', model: 'model-safe' },
+    });
+    await expect(api.rerank?.({ consumer: 'stx_memory', taskKey: 'memory_rerank', query: 'q', docs: ['x'], topK: 1 })).resolves.toMatchObject({
+      ok: false,
+      failure: { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE', stage: 'llm.route.resolve' },
+    });
   });
 
   it('preserves the SDK error code for workbench diagnostics', async () => {
@@ -57,7 +79,10 @@ describe('SDK LLM typed adapter', () => {
   it('prefers the provider reason code retained in SDK error details', async () => {
     const failure = Object.assign(new Error('模型返回内容不是有效 JSON'), {
       code: 'INVALID_PAYLOAD',
-      details: { stage: 'llm.structured.validate', reasonCode: 'INVALID_JSON', requestId: 'request-1' },
+      details: {
+        stage: 'llm.structured.validate', reasonCode: 'INVALID_JSON', requestId: 'request-1',
+        inputTokens: 12, outputTokens: 3, totalTokens: 15,
+      },
     });
     const api = createMemoryLlmClient({ bus: { request: async () => { throw failure; } } } as unknown as PluginSession);
     await expect(api.runTask({
@@ -67,6 +92,7 @@ describe('SDK LLM typed adapter', () => {
     })).resolves.toMatchObject({
       ok: false,
       failure: { reasonCode: 'INVALID_JSON', stage: 'llm.structured.validate', requestId: 'request-1' },
+      usage: { promptTokens: 12, completionTokens: 3, totalTokens: 15 },
     });
   });
 

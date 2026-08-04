@@ -18,6 +18,7 @@ export const MEMORY_WORKSPACE_COLLECTIONS = Object.freeze({
   'scene-casts': ['workspaceId', 'chatKey', 'floor', 'createdAt'],
   'capture-jobs': ['workspaceId', 'chatKey', 'status', 'updatedAt'],
   'capture-repair-queue': ['workspaceId', 'chatKey', 'jobId', 'status', 'batchIndex', 'updatedAt'],
+  'memory-review-items': ['workspaceId', 'chatKey', 'pipelineRunId', 'stage', 'status', 'createdAt'],
   'change-audits': ['workspaceId', 'chatKey', 'createdAt'],
   'memory-details': ['workspaceId', 'chatKey', 'ownerId', 'traceId'],
   'memory-links': ['workspaceId', 'chatKey', 'ownerId', 'updatedAt'],

@@ -1,7 +1,9 @@
 import {
   LLM_CAPABILITY_STATUS_CHANGED_V0,
   LLM_CAPABILITY_STATUS_V0,
+  LLM_TASK_ROUTING_GET_V0,
   type LlmCapabilityStatusResponse,
+  type LlmTaskRoutingSnapshot,
   type PluginSession,
   type SettingsStatusSnapshot,
 } from '@ss-helper/sdk';
@@ -14,12 +16,16 @@ export type MemoryCapabilitySettings = {
   rerankMode: 'off' | 'adaptive' | 'always';
   preExtractReferenceEnabled: boolean;
   preExtractReferenceMode: 'auto' | 'lexical' | 'vector' | 'hybrid';
+  extractionMode?: 'single' | 'agent';
+  agentToolPolicy?: 'off' | 'read_only';
+  agentWriteMode?: 'shadow' | 'active';
 };
 export interface MemorySettingsNotice { readonly title: string; readonly message: string; readonly code: string; }
 export interface MemorySettingsAssessment { readonly blocked?: MemorySettingsNotice; readonly warnings: readonly MemorySettingsNotice[]; }
 type WorkspaceStatusReader = () => SettingsStatusSnapshot | Promise<SettingsStatusSnapshot>;
 
-const TARGET = Object.freeze({ pluginId: 'ss-helper.llm', tabId: 'resources', fieldId: 'resourceWizard' });
+const LLM_RESOURCE_TARGET = Object.freeze({ pluginId: 'ss-helper.llm', tabId: 'resources', fieldId: 'resourceManager' });
+const MEMORY_TASK_ROUTING_TARGET = Object.freeze({ pluginId: 'ss-helper.memory', tabId: 'routing', fieldId: 'taskRouting' });
 /**
  * LLM capability state is advisory for Memory.  A missing or wedged provider
  * must therefore degrade the status card instead of holding the whole Memory
@@ -64,7 +70,7 @@ export class MemoryLlmCapabilityMonitor {
     workspaceStatus: neutral('正在同步'),
   });
   private revision = -1;
-  private availability: Readonly<{ generation: boolean; embedding: boolean; rerank: boolean }> = Object.freeze({ generation: false, embedding: false, rerank: false });
+  private availability: Readonly<{ generation: boolean; embedding: boolean; rerank: boolean; agentRoutes: boolean; agentToolsVerified: boolean }> = Object.freeze({ generation: false, embedding: false, rerank: false, agentRoutes: false, agentToolsVerified: false });
   private timer: ReturnType<typeof setTimeout> | undefined;
   private disposed = false;
   private refreshGeneration = 0;
@@ -112,6 +118,14 @@ export class MemoryLlmCapabilityMonitor {
     if (next.enabled && next.autoOrganize && (activating || !previous.autoOrganize) && !this.availability.generation) {
       return { blocked: { title: '无法启用自动整理', message: '当前没有可用的大语言模型资源，请先完成 LLM 配置。', code: 'MEMORY_GENERATION_UNAVAILABLE' }, warnings: [] };
     }
+    const enablingAgent = next.enabled && next.extractionMode === 'agent'
+      && (previous.extractionMode !== 'agent' || activating);
+    if (enablingAgent && !this.availability.agentRoutes) {
+      return { blocked: { title: '无法启用 Agent 模式', message: '五个固定提取任务尚未全部绑定可用资源，请先在 Memory 的模型路由中完成配置。', code: 'MEMORY_AGENT_ROUTE_UNAVAILABLE' }, warnings: [] };
+    }
+    if (enablingAgent && !this.availability.agentToolsVerified) {
+      return { blocked: { title: '无法启用 Agent 模式', message: '当前选择的一个或多个大语言模型不支持 Agent 模式或尚未通过工具调用验证。', code: 'LLM_TOOL_CAPABILITY_UNVERIFIED' }, warnings: [] };
+    }
     if (next.enabled && (next.recallMode === 'vector' || next.recallMode === 'hybrid') && (activating || next.recallMode !== previous.recallMode) && !this.availability.embedding) {
       return { blocked: { title: '无法启用所选召回模式', message: '当前没有可用的向量模型，请先在 LLM 中配置向量资源。', code: 'MEMORY_EMBEDDING_UNAVAILABLE' }, warnings: [] };
     }
@@ -141,6 +155,8 @@ export class MemoryLlmCapabilityMonitor {
     return { warnings };
   }
 
+  isAgentAvailable(): boolean { return this.availability.agentRoutes && this.availability.agentToolsVerified; }
+
   dispose(): void {
     this.disposed = true;
     this.refreshGeneration += 1;
@@ -156,16 +172,28 @@ export class MemoryLlmCapabilityMonitor {
     const refreshGeneration = ++this.refreshGeneration;
     const settings = this.readSettings();
     let response: LlmCapabilityStatusResponse | undefined;
+    let routing: LlmTaskRoutingSnapshot | undefined;
     try {
-      response = await readStatusWithDeadline(this.session.bus.request(LLM_CAPABILITY_STATUS_V0, {
+      [response, routing] = await Promise.all([
+        readStatusWithDeadline(this.session.bus.request(LLM_CAPABILITY_STATUS_V0, {
         checks: [
-          { id: 'generation', taskKey: 'memory_extract', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] },
+          { id: 'generation', taskKey: 'memory_extract_single', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] },
+          { id: 'agent_single', taskKey: 'memory_extract_single', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] },
+          { id: 'agent_entities', taskKey: 'memory_extract_entities', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] },
+          { id: 'agent_narrative', taskKey: 'memory_extract_narrative', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] },
+          { id: 'agent_inventory', taskKey: 'memory_extract_inventory', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] },
+          { id: 'agent_repair', taskKey: 'memory_extract_repair', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] },
           { id: 'embedding', taskKey: 'memory_embed', taskKind: 'embedding', requiredCapabilities: ['embeddings'] },
           { id: 'rerank', taskKey: 'memory_rerank', taskKind: 'rerank', requiredCapabilities: ['rerank'] },
         ],
-      }, { timeoutMs: MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS }));
+        }, { timeoutMs: MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS })),
+        readStatusWithDeadline(this.session.bus.request(LLM_TASK_ROUTING_GET_V0, {
+          taskKeys: ['memory_extract_single', 'memory_extract_entities', 'memory_extract_narrative', 'memory_extract_inventory', 'memory_extract_repair', 'memory_embed', 'memory_rerank'],
+        }, { timeoutMs: MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS })),
+      ]);
     } catch {
       response = undefined;
+      routing = undefined;
     }
     if (this.disposed || refreshGeneration !== this.refreshGeneration) return;
     if (response && response.revision < this.revision) return;
@@ -174,7 +202,21 @@ export class MemoryLlmCapabilityMonitor {
     const generation = byId.get('generation');
     const embedding = byId.get('embedding');
     const rerank = byId.get('rerank');
-    this.availability = Object.freeze({ generation: generation?.available === true, embedding: embedding?.available === true, rerank: rerank?.available === true });
+    const agentEntries = ['agent_single', 'agent_entities', 'agent_narrative', 'agent_inventory', 'agent_repair'].map(id => byId.get(id));
+    const resourceById = new Map((routing?.resources ?? []).map(item => [item.resourceId, item]));
+    const agentRoutes = agentEntries.every(entry => entry?.available === true);
+    const agentToolsVerified = agentRoutes && agentEntries.every(entry => {
+      const resourceId = entry?.resourceId;
+      const resource = resourceId ? resourceById.get(resourceId) : undefined;
+      const capability = resource?.toolCapabilities;
+      return resource !== undefined
+        && entry?.model !== undefined
+        && entry.model === resource.defaultModel
+        && capability?.model === resource.defaultModel
+        && capability.status === 'verified'
+        && (capability.expiresAt === undefined || capability.expiresAt > Date.now());
+    });
+    this.availability = Object.freeze({ generation: generation?.available === true, embedding: embedding?.available === true, rerank: rerank?.available === true, agentRoutes, agentToolsVerified });
     const next: Record<string, SettingsStatusSnapshot> = {};
     try {
       next.workspaceStatus = this.readWorkspaceStatus
@@ -190,6 +232,23 @@ export class MemoryLlmCapabilityMonitor {
     next.generationStatus = generation?.available
       ? success('已连接', resourceDescription(generation))
       : action('不可用', 'error', reasonText[generation?.reason ?? 'status_unavailable'] ?? '无法满足整理任务。');
+    const routeStatus = (entry: typeof generation): SettingsStatusSnapshot => {
+      if (!entry?.available) return action('路由不可用', 'error', reasonText[entry?.reason ?? 'status_unavailable'] ?? '固定任务没有可用资源。');
+      const resource = entry.resourceId ? resourceById.get(entry.resourceId) : undefined;
+      const capability = resource?.toolCapabilities;
+      if (settings.extractionMode === 'agent') {
+        if (!resource || !entry.model || entry.model !== resource.defaultModel || capability?.model !== resource.defaultModel) return action('模型绑定不匹配', 'error', '当前路由使用了非默认模型覆盖，请在 Memory 的模型路由中重新选择已添加的生成资源。');
+        if (capability?.expiresAt !== undefined && capability.expiresAt <= Date.now()) return action('验证已过期', 'error', '工具调用能力验证已过期，请重新验证。');
+        if (capability?.status !== 'verified') return action('工具未验证', 'error', '当前模型尚未通过工具调用验证，不能用于 Agent 模式。');
+        return success('工具调用已验证', `${resource.label} · ${resource.defaultModel ?? '默认模型'} · ${capability.dialect}`);
+      }
+      return success('路由可用', resourceDescription(entry));
+    };
+    next.agentRouteSingle = routeStatus(byId.get('agent_single'));
+    next.agentRouteEntities = routeStatus(byId.get('agent_entities'));
+    next.agentRouteNarrative = routeStatus(byId.get('agent_narrative'));
+    next.agentRouteInventory = routeStatus(byId.get('agent_inventory'));
+    next.agentRouteRepair = routeStatus(byId.get('agent_repair'));
     const referenceUsesEmbedding = settings.enabled
       && settings.preExtractReferenceEnabled === true
       && settings.preExtractReferenceMode !== 'lexical';
@@ -217,4 +276,5 @@ export class MemoryLlmCapabilityMonitor {
   }
 }
 
-export const MEMORY_LLM_RESOURCE_ACTION = Object.freeze({ buttonLabel: '前往配置', target: TARGET, showWhen: ['warning', 'error'] as const });
+export const MEMORY_LLM_RESOURCE_ACTION = Object.freeze({ buttonLabel: '管理资源', target: LLM_RESOURCE_TARGET, showWhen: ['warning', 'error'] as const });
+export const MEMORY_TASK_ROUTING_ACTION = Object.freeze({ buttonLabel: '配置路由', target: MEMORY_TASK_ROUTING_TARGET, showWhen: ['warning', 'error'] as const });

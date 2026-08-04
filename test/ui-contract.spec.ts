@@ -3,12 +3,13 @@ import { describe, expect, it } from 'vitest';
 
 describe('Memory 工作台公共 UI 契约门禁', () => {
   it('只消费 SDK 公共标记和主题变量，不恢复内部类或基础控件副本', async () => {
-    const [memoryUiSource, librarySource, inventoryThreeSource, inventoryModelSource, styles] = await Promise.all([
+    const [memoryUiSource, librarySource, inventoryThreeSource, inventoryModelSource, styles, initializationStyles] = await Promise.all([
       readFile(new URL('../src/ui/memory-ui.ts', import.meta.url), 'utf8'),
       readFile(new URL('../src/ui/memory-library-view.ts', import.meta.url), 'utf8'),
       readFile(new URL('../src/ui/inventory-card-three.ts', import.meta.url), 'utf8'),
       readFile(new URL('../src/ui/inventory-workbench-model.ts', import.meta.url), 'utf8'),
       readFile(new URL('../src/ui/memory.css', import.meta.url), 'utf8'),
+      readFile(new URL('../src/ui/initialization.css', import.meta.url), 'utf8'),
     ]);
     const source = `${memoryUiSource}\n${librarySource}`;
 
@@ -67,6 +68,10 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(styles).toMatch(/\.stx-memory-reinitialize-drawer\s*\{[^}]*background-color:\s*var\(--ss-theme-surface,\s*#1b1b1a\)[^}]*animation:\s*stx-memory-reinitialize-drawer-in/u);
     expect(styles).toMatch(/\.stx-memory-drawer-backdrop\s*\{[^}]*background:\s*rgba\(0,\s*0,\s*0,\s*\.62\)[^}]*animation:\s*stx-memory-reinitialize-backdrop-in/u);
     expect(styles).toContain('@keyframes stx-memory-reinitialize-drawer-in');
+    expect(initializationStyles).toMatch(/\.stx-memory-workbench \.stx-memory-init-option\s*\{[^}]*height:\s*60px/u);
+    expect(initializationStyles).toMatch(/\.stx-memory-workbench \.stx-memory-init-source-card\s*\{[^}]*height:\s*60px/u);
+    expect(initializationStyles).toMatch(/\.stx-memory-workbench \.stx-memory-init-option\.is-selected\s*\{[^}]*background:/u);
+    expect(initializationStyles).toMatch(/\.stx-memory-workbench \.stx-memory-init-source-card\.is-selected\s*\{[^}]*background:/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-multi-filter-trigger\[data-ss-helper-control="button"\]\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+24px[^}]*justify-content:\s*stretch/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-fact-row\[data-ss-helper-control="button"\]\s*\{[^}]*min-height:\s*116px[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)[^}]*align-items:\s*stretch[^}]*border-color:\s*transparent/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-library-fact-list\s*\{[^}]*grid-auto-rows:\s*max-content/u);

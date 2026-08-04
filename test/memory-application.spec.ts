@@ -284,6 +284,67 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     expect(serialized).not.toContain('候选正文');
   });
 
+  it('把 Agent Shadow change audit 投影为独立的脱敏固定阶段记录', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    const derivedAudit = {
+      id: 'change-audit:agent-shadow', workspaceId: 'character:c1', chatKey: 'chat-a', kind: 'derived-change-set-v0', createdAt: 40,
+      entries: [{ collection: 'facts', recordId: 'fact:secret', after: { content: '候选正文不得进入 UI' } }],
+      metadata: {
+        diagnosticType: 'extraction-pipeline', shadow: true, secretPrompt: '完整 Prompt 不得进入 UI',
+        pipeline: {
+          pipelineRunId: 'pipeline:agent-shadow', mode: 'agent', toolPolicy: 'read_only', writeMode: 'shadow',
+          inputDigest: 'sensitive-input-digest', existingMemoryDigest: 'sensitive-memory-digest',
+          stages: [
+            { stage: 'entities', taskKey: 'extract_entities', status: 'completed', requestId: 'request:entities', resourceId: 'memory_extract', model: 'model-safe', toolRounds: 1, toolCalls: 2, latencyMs: 1200 },
+            { stage: 'narrative', taskKey: 'extract_narrative', status: 'failed', requestId: 'request:narrative', resourceId: 'memory_extract', model: 'model-safe', toolRounds: 0, toolCalls: 0, latencyMs: 900, reasonCode: 'SCHEMA_VALIDATION_FAILED' },
+          ],
+          toolCalls: [{ toolName: 'memory.search_facts', argumentsDigest: 'sensitive-tool-digest' }],
+          totalUsage: { promptTokens: 100, completionTokens: 20, totalTokens: 120 },
+          wallClockLatencyMs: 2100,
+          shadow: {
+            shadowRunId: 'shadow:1', singleCounts: { claims: 2, episodes: 1 }, agentCounts: { claims: 3 },
+            matchingLocalIds: ['claim:1'], agentOnlyLocalIds: ['claim:2', 'claim:3'], singleOnlyLocalIds: ['episode:1'],
+            singleStage: { stage: 'single', status: 'failed', reasonCode: 'STRUCTURED_OUTPUT_EMPTY' },
+          },
+        },
+      },
+    };
+    (app as unknown as {
+      multiActorRepository: {
+        listChangeAudits(): Promise<Array<Record<string, unknown>>>;
+        listCaptureRepairQueue(): Promise<CaptureRepairQueueRecord[]>;
+      };
+    }).multiActorRepository = {
+      listChangeAudits: async () => [derivedAudit],
+      listCaptureRepairQueue: async () => [],
+    };
+
+    const records = await app.listAuditRecords();
+
+    expect(records).toEqual([expect.objectContaining({
+      kind: 'agent_pipeline', id: 'change-audit:agent-shadow', jobId: 'pipeline:agent-shadow', status: 'partial', outcome: 'partial',
+      unresolvedCount: 1, requestId: 'request:entities', resourceId: 'memory_extract', model: 'model-safe', latencyMs: 2100,
+      pipeline: expect.objectContaining({
+        mode: 'agent', toolPolicy: 'read_only', writeMode: 'shadow', stageCount: 2, completedStageCount: 1,
+        failedStageCount: 1, cancelledStageCount: 0, toolCallCount: 1, wallClockLatencyMs: 2100, totalTokens: 120,
+        shadow: { matchingLocalIds: 1, agentOnlyLocalIds: 2, singleOnlyLocalIds: 1, singleCount: 3, agentCount: 3, singleStatus: 'failed', singleReasonCode: 'STRUCTURED_OUTPUT_EMPTY' },
+        stages: [
+          expect.objectContaining({ stage: 'entities', status: 'completed', toolRounds: 1, toolCalls: 2 }),
+          expect.objectContaining({ stage: 'narrative', status: 'failed', reasonCode: 'SCHEMA_VALIDATION_FAILED' }),
+        ],
+      }),
+    })]);
+    const serialized = JSON.stringify(records);
+    expect(serialized).not.toContain('entries');
+    expect(serialized).not.toContain('完整 Prompt');
+    expect(serialized).not.toContain('候选正文');
+    expect(serialized).not.toContain('sensitive-input-digest');
+    expect(serialized).not.toContain('sensitive-memory-digest');
+    expect(serialized).not.toContain('sensitive-tool-digest');
+  });
+
   it('按 Capture 批次隔离 repair queue，补齐安全上下文并展开全部字段问题', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const app = new MemoryApplication(new FakeRepository() as never);
@@ -410,6 +471,40 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     expect(page.mock.calls.filter(([collection]) => collection === 'change-audits').map(([, request]) => request.cursor)).toEqual([undefined, 'cursor:next']);
     expect(listChangeAudits).not.toHaveBeenCalled();
     expect(listCaptureRepairQueue).not.toHaveBeenCalled();
+  });
+
+  it('审计分页保留 Agent Shadow 派生记录且不查询 Capture repair queue', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    const page = vi.fn(async (collection: string) => {
+      if (collection === 'capture-repair-queue') throw new Error('Agent Shadow 不应读取 Capture repair queue');
+      return {
+        items: [{
+          id: 'audit:agent-page', workspaceId: 'character:c1', chatKey: 'chat-a', kind: 'derived-change-set-v0', createdAt: 30, entries: [],
+          metadata: {
+            diagnosticType: 'extraction-pipeline', shadow: true,
+            pipeline: {
+              pipelineRunId: 'pipeline:page', mode: 'agent', toolPolicy: 'off', writeMode: 'shadow',
+              stages: [{ stage: 'entities', taskKey: 'extract_entities', status: 'completed', toolRounds: 0, toolCalls: 0, latencyMs: 10 }],
+              toolCalls: [], totalUsage: { totalTokens: 5 }, wallClockLatencyMs: 10,
+            },
+          },
+        }],
+        nextCursor: null,
+        total: 1,
+      };
+    });
+    (app as unknown as { multiActorRepository: unknown }).multiActorRepository = {
+      boundWorkspaceId: 'character:c1',
+      page,
+    };
+
+    const result = await app.listAuditRecordsPage({ limit: 10, includeTotal: true });
+
+    expect(result.items).toEqual([expect.objectContaining({ kind: 'agent_pipeline', id: 'audit:agent-page', jobId: 'pipeline:page' })]);
+    expect(page).toHaveBeenCalledTimes(1);
+    expect(page).toHaveBeenCalledWith('change-audits', expect.any(Object), expect.any(Object));
   });
 
   it('Token 用量分页保留 null，并把后续 cursor 限定在当前聊天', async () => {
@@ -831,6 +926,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       writableSourceRefs?: readonly string[];
       existingMemoryContext?: readonly ExistingMemoryContextItem[];
       graphLlmRelationEnabled?: boolean;
+      idempotencyKey?: string;
     }> = [];
     const actorCapture = {
       capture: vi.fn(async (input: (typeof captureCalls)[number]) => {
@@ -852,7 +948,11 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     (app as unknown as { actorCapture: unknown }).actorCapture = actorCapture;
     vi.spyOn(app, 'bindCurrentChat').mockResolvedValue();
 
-    await expect(app.getInitializationEstimate(['message'])).resolves.toMatchObject({ messageCount: 8, batchCount: 3 });
+    const fullEstimate = await app.getInitializationEstimate(['message']);
+    const rangedEstimate = await app.getInitializationEstimate(['message'], { batchRange: { start: 1, end: 2 } });
+    expect(fullEstimate).toMatchObject({ messageCount: 8, conversationFloorCount: 8, logicalBatchCount: 3, batchCount: 3 });
+    expect(rangedEstimate).toMatchObject({ messageCount: 8, conversationFloorCount: 8, logicalBatchCount: 3, batchCount: 3 });
+    expect(rangedEstimate.tokenHigh).toBeLessThan(fullEstimate.tokenHigh);
     await app.initialize(['message']);
 
     expect(captureCalls).toHaveLength(3);
@@ -902,6 +1002,30 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       type: 'incremental',
       status: 'completed',
       checkpoint: { batchIndex: 2, totalBatches: 2, processedCount: 2 },
+    });
+    expect(repository.settings.get('summaryProgressByChat')).toMatchObject({
+      'chat-a': { completedFloor: 10, completedMessageId: 'message:10' },
+    });
+
+    await app.initialize(['message'], { batchRange: { start: 2, end: 3 } });
+    expect(captureCalls.slice(5).map((call) => call.sources.map((source) => source.id))).toEqual([
+      ['message:3', 'message:4', 'message:5', 'message:6'],
+      ['message:6', 'message:7', 'message:8', 'message:9'],
+    ]);
+    expect(captureCalls.slice(5).map((call) => call.idempotencyKey?.split(':').at(-1))).toEqual(['2', '3']);
+    expect(captureJobs.at(-1)).toMatchObject({
+      type: 'initialize',
+      status: 'completed',
+      checkpoint: {
+        batchIndex: 2,
+        lastScannedBatch: 3,
+        completedBatchCount: 2,
+        totalBatches: 2,
+        batchRangeStart: 2,
+        batchRangeEnd: 3,
+        availableBatchCount: 4,
+        processedCount: 6,
+      },
     });
     expect(repository.settings.get('summaryProgressByChat')).toMatchObject({
       'chat-a': { completedFloor: 10, completedMessageId: 'message:10' },
@@ -1080,18 +1204,32 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     connectHost(app);
     await app.start();
     attachClaimCapture(app, repository, { block: true });
-    const initialize = app.initialize(['message']);
+    const initialize = app.initialize(['message'], { batchRange: { start: 2, end: 4 } });
     for (let index = 0; index < 20 && !state.release; index += 1) await Promise.resolve();
 
-    expect(await app.getCaptureProgress()).toMatchObject({ status: 'running', batchIndex: 1, totalBatches: 5 });
+    expect(await app.getCaptureProgress()).toMatchObject({
+      status: 'running',
+      batchIndex: 1,
+      totalBatches: 3,
+      batchRangeStart: 2,
+      batchRangeEnd: 4,
+      availableBatchCount: 5,
+    });
     const cancel = app.cancelCapture();
     state.release?.();
     await Promise.all([initialize, cancel]);
 
     expect(repository.commit).not.toHaveBeenCalled();
-    expect(repository.jobs.at(-1)).toMatchObject({ status: 'paused', checkpoint: { batchIndex: 0, totalBatches: 5, selectedSourceGroupIds: ['message'] } });
-    expect(await app.getCaptureProgress()).toMatchObject({ status: 'cancelled', totalBatches: 5 });
-    expect((await app.getInitializationState()).attempts[0]).toMatchObject({ status: 'cancelled', selectedSourceKinds: ['message'] });
+    expect(repository.jobs.at(-1)).toMatchObject({ status: 'paused', checkpoint: {
+      batchIndex: 0,
+      totalBatches: 3,
+      batchRangeStart: 2,
+      batchRangeEnd: 4,
+      availableBatchCount: 5,
+      selectedSourceGroupIds: ['message'],
+    } });
+    expect(await app.getCaptureProgress()).toMatchObject({ status: 'cancelled', totalBatches: 3, batchRangeStart: 2, batchRangeEnd: 4, availableBatchCount: 5 });
+    expect((await app.getInitializationState()).attempts[0]).toMatchObject({ status: 'cancelled', selectedSourceKinds: ['message'], batchRangeStart: 2, batchRangeEnd: 4, availableBatchCount: 5 });
     app.stop();
   });
 

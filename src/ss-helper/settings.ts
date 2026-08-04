@@ -12,6 +12,7 @@ import {
 import config from '../../plugin.config.json' with { type: 'json' };
 import {
   MEMORY_LLM_RESOURCE_ACTION,
+  MEMORY_TASK_ROUTING_ACTION,
   type MemoryCapabilitySettings,
   type MemoryCapabilityStatusMap,
   type MemorySettingsAssessment,
@@ -19,6 +20,10 @@ import {
 import { DEFAULT_CAST_SETTINGS, type CastPlanningSettings, type MemoryGraphStatus } from '../domain';
 
 export interface MemorySettings extends MemoryCapabilitySettings, CastPlanningSettings {
+  extractionMode: 'single' | 'agent';
+  agentConcurrency: 1 | 2;
+  agentToolPolicy: 'off' | 'read_only';
+  agentWriteMode: 'shadow' | 'active';
   summaryBatchMode: 'floors' | 'chars';
   summaryBatchFloors: number;
   summaryBatchChars: number;
@@ -46,6 +51,10 @@ export type MemoryEffectiveSettings = Omit<MemorySettings, 'chatMode'>;
 export const MEMORY_DEFAULT_SETTINGS: Readonly<MemorySettings> = Object.freeze({
   enabled: true,
   autoOrganize: true,
+  extractionMode: 'single',
+  agentConcurrency: 2,
+  agentToolPolicy: 'off',
+  agentWriteMode: 'shadow',
   summaryBatchMode: 'floors',
   summaryBatchFloors: 5,
   summaryBatchChars: 12_000,
@@ -76,6 +85,10 @@ export const MEMORY_WORKBENCH_POPUP = Object.freeze({
   kind: 'popup', provider: 'ss-helper.memory', name: 'workbench', version: 0,
 } as const);
 
+export const MEMORY_TASK_ROUTING_POPUP = Object.freeze({
+  kind: 'popup', provider: 'ss-helper.memory', name: 'task-routing', version: 0,
+} as const);
+
 export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
   id: 'ss-helper.memory',
   title: config.settingsTitle,
@@ -88,14 +101,39 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
     { kind: 'section', id: 'summary', label: '总结', children: [
       { kind: 'toggle', id: 'autoOrganize', label: '自动整理', description: '达到总结间隔后，提炼可追溯的结构化事实。', defaultValue: true },
       { kind: 'status', id: 'generationStatus', label: '大语言模型', value: '正在同步', tone: 'neutral', action: MEMORY_LLM_RESOURCE_ACTION },
+      { kind: 'section', id: 'extractionPipeline', label: '提取管线', description: 'Agent 使用固定阶段、受限只读工具和程序裁决；首次启用保持影子模式。', children: [
+        { kind: 'radio', id: 'extractionMode', label: '提取模式', options: [
+          { value: 'single', label: '单次提取' }, { value: 'agent', label: 'Agent 多阶段' },
+        ], defaultValue: 'single' },
+        { kind: 'radio', id: 'agentConcurrency', label: 'Agent 并发', options: [
+          { value: '1', label: '1' }, { value: '2', label: '2' },
+        ], defaultValue: '2', description: '实体阶段完成后，叙事与库存阶段最多并发 2 路。' },
+        { kind: 'radio', id: 'agentToolPolicy', label: '只读工具', options: [
+          { value: 'off', label: '关闭' }, { value: 'read_only', label: '按需使用' },
+        ], defaultValue: 'off', description: '最多 2 轮、每轮 4 次、总计 6 次；工具结果不是证据。' },
+        { kind: 'radio', id: 'agentWriteMode', label: '写入模式', options: [
+          { value: 'shadow', label: '影子模式' }, { value: 'active', label: '正式写入' },
+        ], defaultValue: 'shadow', description: '影子模式只写安全审计与单次提取对比，正式记忆、目录、场景和库存写入为 0。' },
+        { kind: 'status', id: 'agentSafetyStatus', label: '安全边界', value: '正在同步', tone: 'neutral' },
+      ] },
       { kind: 'select', id: 'summaryBatchMode', label: '分批方式', options: [
-        { value: 'floors', label: '按楼层' }, { value: 'chars', label: '按字数' },
+        { value: 'floors', label: '楼层优先' }, { value: 'chars', label: '字数优先' },
       ], defaultValue: 'floors' },
-      { kind: 'range', id: 'summaryBatchFloors', label: '每批楼层数', description: '按楼层时，每次总结最多处理的可见用户和助手消息数。', min: 1, max: 20, step: 1, defaultValue: 5 },
-      { kind: 'range', id: 'summaryBatchChars', label: '每批字符数', description: '按字数时，单次总结窗口的最大正文字符数。', min: 2_000, max: 16_000, step: 500, defaultValue: 12_000 },
+      { kind: 'range', id: 'summaryBatchFloors', label: '每组最多楼层', description: '楼层优先时先按这个数量形成逻辑分组；超长分组仍会按字符安全上限展开。', min: 1, max: 20, step: 1, defaultValue: 5 },
+      { kind: 'range', id: 'summaryBatchChars', label: '单分片字符上限', description: '单次模型请求的正文字符安全上限；楼层优先时也会用于拆分超长内容。', min: 2_000, max: 16_000, step: 500, defaultValue: 12_000 },
       { kind: 'range', id: 'summaryIntervalFloors', label: '自动触发间隔', description: '已总结边界后每积累多少楼层形成一个窗口；默认每轮生成后捕获一次。', min: 1, max: 50, step: 1, defaultValue: 1 },
       { kind: 'range', id: 'summaryOverlapFloors', label: '前置重叠层数', description: '每个总结窗口额外携带的前置上下文楼层数。', min: 0, max: 10, step: 1, defaultValue: 2 },
       { kind: 'status', id: 'summaryProgress', label: '当前聊天总结进度', value: '正在同步', tone: 'neutral' },
+    ] },
+    { kind: 'section', id: 'routing', label: '模型路由', children: [
+      { kind: 'section', id: 'taskRoutingConfiguration', label: '分任务模型', description: '分别选择五个固定提取任务使用的生成资源；已有路由会继续沿用。', children: [
+        { kind: 'action', id: 'taskRouting', label: '配置分任务模型', description: '选择自动路由或为每项任务指定已添加的生成资源。', actionId: 'open-task-routing', popup: MEMORY_TASK_ROUTING_POPUP, placement: 'inline', buttonLabel: '配置' },
+        { kind: 'status', id: 'agentRouteSingle', label: '单次提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
+        { kind: 'status', id: 'agentRouteEntities', label: '实体提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
+        { kind: 'status', id: 'agentRouteNarrative', label: '叙事提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
+        { kind: 'status', id: 'agentRouteInventory', label: '库存提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
+        { kind: 'status', id: 'agentRouteRepair', label: '结构修复', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
+      ] },
     ] },
     { kind: 'section', id: 'castPlanning', label: '多角色选角', description: '生成前先确定本轮角色范围，再为每个角色独立召回。混合模式只在角色不明确时额外调用一次轻量导演。', children: [
       { kind: 'select', id: 'castPlanningMode', label: '选角模式', options: [
@@ -201,12 +239,17 @@ export interface MemorySettingsStatusSource {
   loadStatus(): MemoryCapabilityStatusMap | Promise<MemoryCapabilityStatusMap>;
   subscribeStatus(listener: (status: MemoryCapabilityStatusMap) => void): () => void;
   assess(next: MemoryCapabilitySettings, previous: MemoryCapabilitySettings): Promise<MemorySettingsAssessment>;
+  isAgentAvailable?(): boolean;
 }
 
 function fromValues(values: SettingsValues, fallback: MemorySettings): MemorySettings {
   return {
     enabled: values.enabled === undefined ? fallback.enabled : values.enabled === true,
     autoOrganize: values.autoOrganize === undefined ? fallback.autoOrganize : values.autoOrganize === true,
+    extractionMode: values.extractionMode === 'agent' ? 'agent' : 'single',
+    agentConcurrency: values.agentConcurrency === '1' ? 1 : 2,
+    agentToolPolicy: values.agentToolPolicy === 'read_only' ? 'read_only' : 'off',
+    agentWriteMode: values.agentWriteMode === 'active' ? 'active' : 'shadow',
     summaryBatchMode: values.summaryBatchMode === 'chars' ? 'chars' : 'floors',
     summaryBatchFloors: typeof values.summaryBatchFloors === 'number' ? Math.min(20, Math.max(1, Math.trunc(values.summaryBatchFloors))) : fallback.summaryBatchFloors,
     summaryBatchChars: typeof values.summaryBatchChars === 'number' ? Math.min(16_000, Math.max(2_000, Math.trunc(values.summaryBatchChars / 500) * 500)) : fallback.summaryBatchChars,
@@ -269,6 +312,10 @@ function toValues(settings: MemorySettings): SettingsValues {
   return {
     enabled: settings.enabled,
     autoOrganize: settings.autoOrganize,
+    extractionMode: settings.extractionMode,
+    agentConcurrency: String(settings.agentConcurrency),
+    agentToolPolicy: settings.agentToolPolicy,
+    agentWriteMode: settings.agentWriteMode,
     summaryBatchMode: settings.summaryBatchMode,
     summaryBatchFloors: settings.summaryBatchFloors,
     summaryBatchChars: settings.summaryBatchChars,
@@ -307,15 +354,26 @@ function toValues(settings: MemorySettings): SettingsValues {
   };
 }
 
-function chatStatuses(controller: MemorySettingsController): Readonly<Record<string, SettingsStatusSnapshot>> {
+function chatStatuses(controller: MemorySettingsController, agentAvailable = true): Readonly<Record<string, SettingsStatusSnapshot>> {
   const chat = controller.getCurrentChatInfo();
   const summary = controller.getSummaryProgressInfo();
   const graph = controller.getGraphStatus();
+  const settings = controller.getSettings();
+  const agentSafetyStatus: SettingsStatusSnapshot = settings.extractionMode !== 'agent'
+    ? { value: '单次提取基线', tone: 'neutral', description: '当前不启用多阶段 Agent。' }
+    : !agentAvailable
+      ? { value: 'Agent 已安全停用', tone: 'error', description: '当前选择的一个或多个大语言模型不支持 Agent 模式或尚未通过工具调用验证；运行时将回退到单次提取。' }
+    : settings.agentWriteMode === 'shadow'
+      ? { value: '影子模式', tone: 'success', description: '只记录安全审计和对比，不写正式领域数据。' }
+      : settings.agentToolPolicy === 'read_only'
+        ? { value: '正式写入 + 已验证工具', tone: 'warning', description: '仅工具能力已验证且未过期的显式路由可以运行。' }
+        : { value: '正式写入', tone: 'warning', description: '固定阶段将进入现有硬校验、读取集守卫和原子提交。' };
   if (!chat.available) return Object.freeze({
     currentChatIdentity: { value: '不可用', tone: 'warning', description: '请先进入角色或群组聊天。' },
     currentChatEffective: { value: '未生效', tone: 'warning', description: '当前没有可应用聊天级设置的聊天。' },
     summaryProgress: { value: '未选择聊天', tone: 'warning', description: '进入角色或群组聊天后显示该聊天独立的总结进度。' },
     graphStatus: { value: '未选择聊天', tone: 'warning', description: '进入聊天后才会建立该聊天独立的事实关系图。' },
+    agentSafetyStatus,
   });
   const modeText = chat.mode === 'inherit' ? '跟随全局' : chat.mode === 'enabled' ? '强制开启' : '强制关闭';
   return Object.freeze({
@@ -331,6 +389,7 @@ function chatStatuses(controller: MemorySettingsController): Readonly<Record<str
         : graph.phase === 'disabled'
           ? { value: '已关闭', tone: 'neutral', description: '当前设置未启用关系图谱。' }
           : { value: graph.phase === 'ready' ? `已就绪（${graph.edgeCount} 条边）` : graph.phase === 'rebuilding' ? '重建中' : graph.phase === 'queued' ? '已排队' : '等待协调', tone: graph.phase === 'ready' ? 'success' : 'neutral', description: '仅展示当前聊天中有来源证据的事实关系，不将语义相似度视为实体关系。' },
+    agentSafetyStatus,
   });
 }
 
@@ -344,14 +403,21 @@ function fieldState(controller: MemorySettingsController): SettingsFieldStateMap
     summaryBatchFloors: summary.summaryBatchMode === 'floors'
       ? Object.freeze({ disabled: false })
       : Object.freeze({ disabled: true, disabledReason: '当前选择“按字数”分批；此项不会参与总结。' }),
-    summaryBatchChars: summary.summaryBatchMode === 'chars'
-      ? Object.freeze({ disabled: false })
-      : Object.freeze({ disabled: true, disabledReason: '当前选择“按楼层”分批；此项不会参与总结。' }),
+    summaryBatchChars: Object.freeze({ disabled: false }),
     graphWorkbench: !chat.available
       ? Object.freeze({ disabled: true, disabledReason: '请先进入角色或群组聊天，再重建关系图谱。' })
       : !chat.effectiveEnabled
         ? Object.freeze({ disabled: true, disabledReason: '当前聊天未启用记忆，不能重建关系图谱。' })
         : Object.freeze({ disabled: false }),
+    agentConcurrency: summary.extractionMode === 'agent'
+      ? Object.freeze({ disabled: false })
+      : Object.freeze({ disabled: true, disabledReason: '仅 Agent 模式使用阶段并发。' }),
+    agentToolPolicy: summary.extractionMode === 'agent'
+      ? Object.freeze({ disabled: false })
+      : Object.freeze({ disabled: true, disabledReason: '仅 Agent 模式配置只读工具。' }),
+    agentWriteMode: summary.extractionMode === 'agent'
+      ? Object.freeze({ disabled: false })
+      : Object.freeze({ disabled: true, disabledReason: 'Single 模式沿用正式可信写入链。' }),
   });
 }
 
@@ -370,6 +436,9 @@ function capabilitySettings(controller: MemorySettingsController, settings: Memo
     rerankMode: settings.rerankMode,
     preExtractReferenceEnabled: settings.preExtractReferenceEnabled,
     preExtractReferenceMode: settings.preExtractReferenceMode,
+    extractionMode: settings.extractionMode,
+    agentToolPolicy: settings.agentToolPolicy,
+    agentWriteMode: settings.agentWriteMode,
   };
 }
 
@@ -416,9 +485,9 @@ export function createMemorySettingsAdapter(
     },
     reset: async () => { await controller.resetSettings(); return toValues(controller.getSettings()); },
     subscribe: (listener) => controller.onSettingsChanged((settings) => listener(toValues(settings))),
-    loadStatus: async () => ({ ...await statusSource.loadStatus(), ...chatStatuses(controller) }),
+    loadStatus: async () => ({ ...await statusSource.loadStatus(), ...chatStatuses(controller, statusSource.isAgentAvailable?.() ?? true) }),
     subscribeStatus: (listener) => {
-      const emit = (): void => listener(Object.freeze({ ...latestCapabilityStatus, ...chatStatuses(controller) }));
+      const emit = (): void => listener(Object.freeze({ ...latestCapabilityStatus, ...chatStatuses(controller, statusSource.isAgentAvailable?.() ?? true) }));
       const disposeCapability = statusSource.subscribeStatus((status) => { latestCapabilityStatus = status; emit(); });
       const disposeSettings = controller.onSettingsChanged(emit);
       emit();

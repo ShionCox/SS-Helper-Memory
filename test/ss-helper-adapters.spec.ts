@@ -72,8 +72,32 @@ describe('SS-Helper Memory typed adapters', () => {
     expect(settings).toEqual(MEMORY_DEFAULT_SETTINGS);
   });
 
-  it('exposes 基础、总结、多角色选角、召回、高级、当前聊天 tabs and graph controls without a chat', async () => {
-    expect(MEMORY_SETTINGS_SCHEMA.fields.map((field) => field.id)).toEqual(['basic', 'summary', 'castPlanning', 'recall', 'advanced', 'currentChat']);
+  it('uses Chinese Agent pipeline labels and routes task configuration to Memory', () => {
+    const fields = flattenSettingsFields(MEMORY_SETTINGS_SCHEMA.fields);
+    const extractionMode = fields.find((field) => field.id === 'extractionMode');
+    const writeMode = fields.find((field) => field.id === 'agentWriteMode');
+    expect(extractionMode?.kind === 'radio' ? extractionMode.options.map((option) => option.label) : []).toEqual(['单次提取', 'Agent 多阶段']);
+    expect(writeMode?.kind === 'radio' ? writeMode.options.map((option) => option.label) : []).toEqual(['影子模式', '正式写入']);
+    expect(['agentRouteSingle', 'agentRouteEntities', 'agentRouteNarrative', 'agentRouteInventory', 'agentRouteRepair'].map((id) => fields.find((field) => field.id === id)?.label)).toEqual([
+      '单次提取', '实体提取', '叙事提取', '库存提取', '结构修复',
+    ]);
+    const route = fields.find((field) => field.id === 'agentRouteSingle');
+    expect(route?.kind === 'status' ? route.action?.target : undefined).toEqual({ pluginId: 'ss-helper.memory', tabId: 'routing', fieldId: 'taskRouting' });
+    for (const id of ['generationStatus', 'embeddingStatus', 'rerankStatus']) {
+      const resourceStatus = fields.find((field) => field.id === id);
+      expect(resourceStatus?.kind === 'status' ? resourceStatus.action?.target : undefined).toEqual({ pluginId: 'ss-helper.llm', tabId: 'resources', fieldId: 'resourceManager' });
+    }
+  });
+
+  it('exposes 基础、总结、模型路由、多角色选角、召回、高级、当前聊天 tabs and graph controls without a chat', async () => {
+    expect(MEMORY_SETTINGS_SCHEMA.fields.map((field) => field.id)).toEqual(['basic', 'summary', 'routing', 'castPlanning', 'recall', 'advanced', 'currentChat']);
+    const routing = MEMORY_SETTINGS_SCHEMA.fields.find((field) => field.id === 'routing');
+    expect(routing).toMatchObject({ label: '模型路由' });
+    const routingGroups = routing?.kind === 'section' ? routing.children : [];
+    const taskRouting = routingGroups.find((field) => field.id === 'taskRoutingConfiguration');
+    expect(taskRouting?.kind === 'section' ? taskRouting.children.map((field) => field.id) : []).toEqual([
+      'taskRouting', 'agentRouteSingle', 'agentRouteEntities', 'agentRouteNarrative', 'agentRouteInventory', 'agentRouteRepair',
+    ]);
     const castPlanning = MEMORY_SETTINGS_SCHEMA.fields.find((field) => field.id === 'castPlanning');
     expect(castPlanning).toMatchObject({ label: '多角色选角' });
     expect(castPlanning?.kind === 'section' ? castPlanning.children.map((field) => field.id) : []).toEqual([
@@ -113,7 +137,7 @@ describe('SS-Helper Memory typed adapters', () => {
     expect(await adapter.loadFieldState?.()).toMatchObject({
       chatMode: { disabled: true, disabledReason: '请先进入角色或群组聊天，再修改当前聊天设置。' },
       summaryBatchFloors: { disabled: false },
-      summaryBatchChars: { disabled: true },
+      summaryBatchChars: { disabled: false },
       graphWorkbench: { disabled: true, disabledReason: '请先进入角色或群组聊天，再重建关系图谱。' },
     });
     await expect(adapter.loadStatus?.()).resolves.toMatchObject({

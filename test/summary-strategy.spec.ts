@@ -95,13 +95,12 @@ describe('Memory 总结策略', () => {
     );
 
     expect(plans.map(plan => plan.sources.map(source => source.id))).toEqual([
-      ['message:2:summary-part:1'],
-      ['message:2:summary-part:2'],
+      ['message:1:summary-part:1', 'message:1:summary-part:2', 'message:2:summary-part:1', 'message:2:summary-part:2'],
     ]);
     expect(plans.map(plan => plan.writableSourceRefs).flat()).toEqual([
       'message:2:summary-part:1', 'message:2:summary-part:2',
     ]);
-    expect(plans.every(plan => plan.sources.reduce((total, source) => total + source.content.length, 0) <= 2_000)).toBe(true);
+    expect(plans).toHaveLength(1);
     expect(plans[0]?.messageCount).toBe(1);
   });
 

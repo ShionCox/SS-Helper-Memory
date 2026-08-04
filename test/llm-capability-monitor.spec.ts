@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { PluginSession } from '@ss-helper/sdk';
+import { LLM_CAPABILITY_STATUS_V0, LLM_TASK_ROUTING_GET_V0, type PluginSession } from '@ss-helper/sdk';
 import {
   MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS,
   MemoryLlmCapabilityMonitor,
@@ -23,7 +23,66 @@ function unavailableMonitor(): MemoryLlmCapabilityMonitor {
   } as unknown as PluginSession, () => disabled);
 }
 
+const agentTaskIds = ['agent_single', 'agent_entities', 'agent_narrative', 'agent_inventory', 'agent_repair'] as const;
+const agentSettings: MemoryCapabilitySettings = {
+  enabled: true, autoOrganize: false, recallMode: 'lexical', rerankMode: 'off',
+  preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto', extractionMode: 'agent',
+  agentToolPolicy: 'off', agentWriteMode: 'shadow',
+};
+
+function agentMonitor(options: { status?: 'verified' | 'failed'; expiresAt?: number; entryModel?: string; capabilityModel?: string } = {}): MemoryLlmCapabilityMonitor {
+  const model = 'agent-model';
+  const capability = {
+    status: options.status ?? 'verified', resourceId: 'agent-resource', model: options.capabilityModel ?? model,
+    dialect: 'openai_chat_compatible', parallelToolCalls: false, streamingToolCalls: false,
+    strictToolSchema: 'none', reasoningReplay: 'none', probeVersion: 2,
+    expiresAt: options.expiresAt ?? Date.now() + 60_000,
+  };
+  const statusResponse = {
+    revision: 1,
+    checks: [
+      { id: 'generation', configured: true, available: true, source: 'custom', resourceId: 'agent-resource', model },
+      ...agentTaskIds.map((id) => ({ id, configured: true, available: true, source: 'custom', resourceId: 'agent-resource', model: options.entryModel ?? model })),
+      { id: 'embedding', configured: false, available: false, reason: 'no_resource' },
+      { id: 'rerank', configured: false, available: false, reason: 'no_resource' },
+    ],
+  };
+  const routingResponse = {
+    revision: 1,
+    assignments: [],
+    resources: [{
+      resourceId: 'agent-resource', label: 'Agent 模型', type: 'generation', apiType: 'openai',
+      defaultModel: model, enabled: true, available: true, capabilities: ['chat', 'json', 'tools'], toolCapabilities: capability,
+    }],
+  };
+  return new MemoryLlmCapabilityMonitor({
+    bus: { request: vi.fn(async (contract: unknown) => contract === LLM_CAPABILITY_STATUS_V0 ? statusResponse : routingResponse), subscribe: vi.fn(() => () => {}) },
+    host: { events: { subscribe: vi.fn(() => () => {}) } },
+  } as unknown as PluginSession, () => agentSettings);
+}
+
 describe('Memory settings capability policy', () => {
+  it('allows Agent with tool policy off only when all resolved default models are verified', async () => {
+    const monitor = agentMonitor();
+    await expect(monitor.assess(agentSettings, disabled)).resolves.toEqual({ warnings: [] });
+    expect(monitor.isAgentAvailable()).toBe(true);
+    monitor.dispose();
+  });
+
+  it.each([
+    ['failed capability', { status: 'failed' as const }],
+    ['expired capability', { expiresAt: Date.now() - 1 }],
+    ['non-default route model', { entryModel: 'old-model' }],
+    ['mismatched capability model', { capabilityModel: 'old-model' }],
+  ])('blocks Agent for %s even when read-only tools are disabled', async (_label, options) => {
+    const monitor = agentMonitor(options);
+    await expect(monitor.assess(agentSettings, disabled)).resolves.toMatchObject({
+      blocked: { code: 'LLM_TOOL_CAPABILITY_UNVERIFIED', message: expect.stringContaining('不支持 Agent 模式') },
+      warnings: [],
+    });
+    expect(monitor.isAgentAvailable()).toBe(false);
+    monitor.dispose();
+  });
   it.each([
     [{ enabled: true, autoOrganize: true, recallMode: 'lexical', rerankMode: 'off', preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto' }, 'MEMORY_GENERATION_UNAVAILABLE'],
     [{ enabled: true, autoOrganize: false, recallMode: 'vector', rerankMode: 'off', preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto' }, 'MEMORY_EMBEDDING_UNAVAILABLE'],
@@ -115,6 +174,23 @@ describe('Memory settings capability policy', () => {
       embeddingStatus: { value: '已连接', description: '自定义资源 · embed-a' },
       rerankStatus: { value: '已连接', description: '自定义资源 · rerank-a' },
     });
+    monitor.dispose();
+  });
+
+  it('requests task routing for embedding and rerank alongside extraction tasks', async () => {
+    const call = vi.fn(async (contract: unknown) => contract === LLM_CAPABILITY_STATUS_V0
+      ? { revision: 1, checks: [] }
+      : { revision: 1, resources: [], taskAssignments: {} });
+    const monitor = new MemoryLlmCapabilityMonitor({
+      bus: { request: call, subscribe: vi.fn(() => () => {}) },
+      host: { events: { subscribe: vi.fn(() => () => {}) } },
+    } as unknown as PluginSession, () => disabled);
+
+    await monitor.start();
+
+    expect(call).toHaveBeenCalledWith(LLM_TASK_ROUTING_GET_V0, expect.objectContaining({
+      taskKeys: expect.arrayContaining(['memory_embed', 'memory_rerank']),
+    }), expect.objectContaining({ timeoutMs: MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS }));
     monitor.dispose();
   });
 

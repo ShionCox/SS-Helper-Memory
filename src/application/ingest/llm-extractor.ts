@@ -1,5 +1,14 @@
 import type { AutomaticIngestRejection, MemoryTokenUsage } from '../../domain';
-import { createSSHelperError, type SSHelperFailureContext } from '@ss-helper/sdk';
+import {
+  createSSHelperError,
+  type LlmTaskRoutingSetRequest,
+  type LlmTaskRoutingSnapshot,
+  type LlmToolCapabilityVerifyResponse,
+  type LlmToolTurnRequest,
+  type LlmToolTurnResponse,
+  type LlmWorkflowTrace,
+  type SSHelperFailureContext,
+} from '@ss-helper/sdk';
 import type {
   MemoryExtractionInput,
   SourceBlock,
@@ -17,13 +26,13 @@ import {
   evidenceSpanById,
   type SupportedEvidenceDirectory,
 } from './supported-evidence-directory';
+import { EXTRACTION_STAGE_SPECS, MEMORY_EXTRACTION_TASK_KEYS } from '../extraction/extraction-stage-specs';
+import { stageSystemPrompt } from '../extraction/extraction-stage-prompts';
+import type { ExtractionStageKey } from '../extraction/extraction-types';
 
 export const MEMORY_PLUGIN_ID = 'stx_memory';
-export const MEMORY_CAPTURE_TASK = 'memory_capture';
-export const MEMORY_CAPTURE_REPAIR_TASK = 'memory_capture_repair';
 export const MEMORY_EMBED_TASK = 'memory_embed';
 export const MEMORY_RERANK_TASK = 'memory_rerank';
-export const MEMORY_CAPTURE_MAX_TOKENS = 4_096;
 
 export type MemoryLlmTaskKind = 'generation' | 'embedding' | 'rerank';
 
@@ -47,9 +56,51 @@ export interface MemoryLlmMeta {
 }
 
 export interface MemoryLlmUsage {
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+}
+
+function reportedToken(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+export function memoryLlmUsageFromProvider(
+  value: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined,
+): MemoryLlmUsage | undefined {
+  if (!value) return undefined;
+  return {
+    promptTokens: reportedToken(value.inputTokens),
+    completionTokens: reportedToken(value.outputTokens),
+    totalTokens: reportedToken(value.totalTokens),
+  };
+}
+
+export function memoryLlmUsageFromError(error: unknown): MemoryLlmUsage | undefined {
+  const source = error && typeof error === 'object' && !Array.isArray(error) ? error as Record<string, unknown> : {};
+  const details = source.details && typeof source.details === 'object' && !Array.isArray(source.details)
+    ? source.details as Record<string, unknown>
+    : {};
+  const inputTokens = reportedToken(details.inputTokens);
+  const outputTokens = reportedToken(details.outputTokens);
+  const totalTokens = reportedToken(details.totalTokens);
+  return inputTokens === null && outputTokens === null && totalTokens === null
+    ? undefined
+    : { promptTokens: inputTokens, completionTokens: outputTokens, totalTokens };
+}
+
+export function mergeMemoryLlmUsage(
+  current: MemoryLlmUsage | undefined,
+  incoming: MemoryLlmUsage | undefined,
+): MemoryLlmUsage | undefined {
+  if (!incoming) return current;
+  const add = (left: number | null | undefined, right: number | null): number | null =>
+    right === null ? left ?? null : left === null || left === undefined ? right : left + right;
+  return {
+    promptTokens: add(current?.promptTokens, incoming.promptTokens),
+    completionTokens: add(current?.completionTokens, incoming.completionTokens),
+    totalTokens: add(current?.totalTokens, incoming.totalTokens),
+  };
 }
 
 export type MemoryLlmFailure = {
@@ -58,6 +109,7 @@ export type MemoryLlmFailure = {
   retryable?: boolean;
   fallbackUsed?: boolean;
   meta?: MemoryLlmMeta;
+  usage?: MemoryLlmUsage;
 };
 
 export type MemoryEmbedResult = {
@@ -91,10 +143,12 @@ export interface MemoryLlmClient {
     taskKind: 'generation';
     input: { messages: Array<{ role: 'system' | 'user'; content: string }> };
     schema: object;
-    budget: { maxTokens: number; maxLatencyMs?: number };
+    budget: { maxTokens?: number; maxLatencyMs?: number };
     enqueue: { displayMode: 'compact' | 'silent' };
     route?: { resourceId?: string; model?: string };
     parentRequestId?: string;
+    trace?: LlmWorkflowTrace;
+    signal?: AbortSignal;
   }): Promise<{
     ok: true;
     data: T;
@@ -105,6 +159,7 @@ export interface MemoryLlmClient {
     failure: SSHelperFailureContext;
     retryable?: boolean;
     meta?: MemoryLlmMeta;
+    usage?: MemoryLlmUsage;
   }>;
   embed?(input: {
     consumer: string;
@@ -113,6 +168,7 @@ export interface MemoryLlmClient {
     texts: string[];
     budget?: { maxLatencyMs?: number };
     enqueue?: { displayMode: 'compact' | 'silent' };
+    trace?: LlmWorkflowTrace;
   }): Promise<MemoryEmbedResult>;
   rerank?(input: {
     consumer: string;
@@ -123,7 +179,10 @@ export interface MemoryLlmClient {
     topK?: number;
     budget?: { maxLatencyMs?: number };
     enqueue?: { displayMode: 'compact' | 'silent' };
+    trace?: LlmWorkflowTrace;
   }): Promise<MemoryRerankResult>;
+  toolTurn?(input: LlmToolTurnRequest, signal?: AbortSignal): Promise<LlmToolTurnResponse>;
+  cancelToolSession?(toolSessionId: string, reason?: 'cancelled' | 'chat_changed' | 'pipeline_disposed'): Promise<void>;
   inspect?: {
     previewRoute(input: {
       consumer: string;
@@ -131,6 +190,9 @@ export interface MemoryLlmClient {
       taskKind: MemoryLlmTaskKind;
       requiredCapabilities?: string[];
     }): Promise<{ available?: boolean; resourceId?: string; model?: string; blockedReason?: string }> | { available?: boolean; resourceId?: string; model?: string; blockedReason?: string };
+    getTaskRouting?(taskKeys?: readonly string[]): Promise<LlmTaskRoutingSnapshot>;
+    setTaskRouting?(input: LlmTaskRoutingSetRequest): Promise<LlmTaskRoutingSnapshot>;
+    verifyToolCapability?(resourceId: string, model?: string, force?: boolean): Promise<LlmToolCapabilityVerifyResponse>;
   };
 }
 
@@ -193,7 +255,7 @@ async function readRouteDiagnostic(
 }
 
 export async function readMemoryLlmRouteDiagnostic(): Promise<MemoryLlmRouteDiagnostic> {
-  return readRouteDiagnostic(MEMORY_CAPTURE_TASK, 'generation', ['chat', 'json']);
+  return readRouteDiagnostic(MEMORY_EXTRACTION_TASK_KEYS.single, 'generation', ['chat', 'json']);
 }
 
 export async function readMemoryRecallRouteDiagnostics(): Promise<MemoryRecallRouteDiagnostics> {
@@ -208,7 +270,7 @@ function safeJson(value: unknown): string {
   return JSON.stringify(value).replace(/[<>&]/g, character => ({ '<': '\\u003c', '>': '\\u003e', '&': '\\u0026' })[character]!);
 }
 
-function serializeExtractionInput(input: MemoryExtractionInput, evidenceDirectory: SupportedEvidenceDirectory): string {
+export function serializeExtractionInput(input: MemoryExtractionInput, evidenceDirectory: SupportedEvidenceDirectory): string {
   const writableSourceRefs = [...new Set(input.writableSourceRefs ?? input.sources.map(source => source.id))];
   const writableSourceRefSet = new Set(writableSourceRefs);
   const repairActorRefs = input.repair?.referenceDirectory
@@ -488,6 +550,26 @@ export function buildStructuredCaptureSchema(
       claims: { type: 'array', maxItems: 32, items: claim },
       inventoryOperations: { type: 'array', maxItems: 48, items: inventoryOperation },
     },
+  };
+}
+
+export function buildExtractionStageSchema(
+  stage: Exclude<ExtractionStageKey, 'repair'>,
+  sourceRefs: readonly string[],
+  evidenceDirectory?: SupportedEvidenceDirectory,
+): object {
+  const full = buildStructuredCaptureSchema(sourceRefs, evidenceDirectory) as {
+    readonly type: 'object';
+    readonly additionalProperties: false;
+    readonly properties: Readonly<Record<string, object>>;
+  };
+  if (stage === 'single') return full;
+  const owned = EXTRACTION_STAGE_SPECS[stage].ownedCollections;
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: [...owned],
+    properties: Object.fromEntries(owned.map(collection => [collection, full.properties[collection]])),
   };
 }
 
@@ -812,13 +894,13 @@ export function normalizeStructuredCapture(
   };
 }
 
-function auditFromResponse(response: { meta?: MemoryLlmMeta; usage?: MemoryLlmUsage }): StructuredCaptureResult['audit'] {
+export function auditFromResponse(response: { meta?: MemoryLlmMeta; usage?: MemoryLlmUsage }): StructuredCaptureResult['audit'] {
   const tokenUsage: MemoryTokenUsage | null = response.usage ? {
-    promptTokens: Number.isFinite(response.usage.promptTokens) ? response.usage.promptTokens : null,
-    completionTokens: Number.isFinite(response.usage.completionTokens) ? response.usage.completionTokens : null,
+    promptTokens: reportedToken(response.usage.promptTokens),
+    completionTokens: reportedToken(response.usage.completionTokens),
     cacheReadTokens: null,
     cacheWriteTokens: null,
-    totalTokens: Number.isFinite(response.usage.totalTokens) ? response.usage.totalTokens : null,
+    totalTokens: reportedToken(response.usage.totalTokens),
   } : null;
   return {
     ...(response.meta?.requestId ? { requestId: response.meta.requestId } : {}),
@@ -830,10 +912,10 @@ function auditFromResponse(response: { meta?: MemoryLlmMeta; usage?: MemoryLlmUs
   };
 }
 
-function systemPrompt(input: MemoryExtractionInput): string {
+export function systemPrompt(input: MemoryExtractionInput): string {
   return [
     '你是 SS-Helper 的多角色长期记忆 Claim 捕获器。只提取已经发生或已经明确成立、且对未来剧情有检索价值的内容。',
-    '最终只返回一个 JSON 对象，固定包含 actorCandidates、locationCandidates、itemCandidates、episodes、claims、inventoryOperations 六个数组。不要 Markdown，不要解释。',
+    '最终只返回一个符合当前固定阶段 Schema 的 JSON 对象；顶层字段以后续“固定阶段”规则为准。不要 Markdown，不要解释。',
     '只有 allowedSourceRefs 可以成为新记录证据；contextOnlySourceRefs 与 existingMemoryContext 只用于理解和去重。',
     'knownActors 与 knownLocations 是系统目录。所有人物和地点引用必须优先使用其中的 ref；简称、昵称、繁简写法不得创建重复候选。',
     '新人物必须具有持续身份、能独立行动、说话、思考或知情；“重构体”“表情的话”、物品、材料、食物、地点、状态和抽象概念都不是人物。',
@@ -868,6 +950,8 @@ export class StructuredMemoryCaptureExtractor {
     if (!llm) throw createSSHelperError('MEMORY_LLM_CLIENT_UNAVAILABLE', { stage: 'memory.capture.llm' });
     const sourceRefs = input.writableSourceRefs ?? input.sources.map(source => source.id);
     const evidenceDirectory = buildSupportedEvidenceDirectory(input.sources, sourceRefs);
+    const stage: ExtractionStageKey = input.repair ? 'repair' : input.stage ?? 'single';
+    const spec = EXTRACTION_STAGE_SPECS[stage];
     const schema = input.repair
       ? buildStructuredRepairSchema(
         sourceRefs,
@@ -878,7 +962,7 @@ export class StructuredMemoryCaptureExtractor {
         (input.repair.targets?.length ? input.repair.targets : [{ repairId: 'repair-item-1', issues: input.repair.issues }])
           .map(target => target.repairId),
       )
-      : buildStructuredCaptureSchema(sourceRefs, evidenceDirectory);
+      : buildExtractionStageSchema(stage as Exclude<ExtractionStageKey, 'repair'>, sourceRefs, evidenceDirectory);
     const repairTargets = input.repair
       ? (input.repair.targets?.length ? input.repair.targets : [{ repairId: 'repair-item-1', issues: input.repair.issues }])
       : [];
@@ -895,18 +979,21 @@ export class StructuredMemoryCaptureExtractor {
     ].join('\n') : '';
     const response = await llm.runTask<unknown>({
       consumer: MEMORY_PLUGIN_ID,
-      taskKey: input.repair ? MEMORY_CAPTURE_REPAIR_TASK : MEMORY_CAPTURE_TASK,
-      taskDescription: input.repair ? '局部结构化捕获修复' : '多角色事件与 Claim 捕获',
+      taskKey: spec.taskKey,
+      taskDescription: spec.description,
       taskKind: 'generation',
       input: { messages: [
-        { role: 'system', content: input.repair ? `${systemPrompt(input)}\n${repairInstruction}` : systemPrompt(input) },
+        { role: 'system', content: input.repair ? `${stageSystemPrompt(systemPrompt(input), 'repair', false)}\n${repairInstruction}` : stageSystemPrompt(systemPrompt(input), stage, false) },
         { role: 'user', content: serializeExtractionInput(input, evidenceDirectory) },
       ] },
       schema,
-      budget: { maxTokens: input.repair ? 2_048 : MEMORY_CAPTURE_MAX_TOKENS, maxLatencyMs: 180_000 },
+      budget: { maxLatencyMs: 600_000 },
       enqueue: { displayMode: 'compact' },
+      ...(input.llmTrace ? { trace: input.llmTrace } : {}),
       ...(input.repair?.parentRequestId ? { parentRequestId: input.repair.parentRequestId } : {}),
+      ...(input.signal ? { signal: input.signal } : {}),
     });
+    await input.onUsage?.(response.usage);
     if (!response.ok) {
       throw createSSHelperError(
         response.failure.reasonCode,
@@ -959,7 +1046,14 @@ export class StructuredMemoryCaptureExtractor {
       episodes: input.repair.collection === 'episodes' ? emittedItems : [],
       claims: input.repair.collection === 'claims' ? emittedItems : [],
       inventoryOperations: input.repair.collection === 'inventoryOperations' ? emittedItems : [],
-    } : response.data;
+    } : stage === 'single' ? response.data : {
+      actorCandidates: stage === 'entities' ? (response.data as { actorCandidates?: unknown }).actorCandidates ?? [] : [],
+      locationCandidates: stage === 'entities' ? (response.data as { locationCandidates?: unknown }).locationCandidates ?? [] : [],
+      itemCandidates: stage === 'inventory' ? (response.data as { itemCandidates?: unknown }).itemCandidates ?? [] : [],
+      episodes: stage === 'narrative' ? (response.data as { episodes?: unknown }).episodes ?? [] : [],
+      claims: stage === 'narrative' ? (response.data as { claims?: unknown }).claims ?? [] : [],
+      inventoryOperations: stage === 'inventory' ? (response.data as { inventoryOperations?: unknown }).inventoryOperations ?? [] : [],
+    };
     const capture = normalizeStructuredCapture(
       normalizedData,
       input.sources.filter(source => writable.has(source.id)),

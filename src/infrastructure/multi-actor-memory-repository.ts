@@ -45,6 +45,7 @@ import {
 } from '../domain';
 import { MEMORY_WORKSPACE_COLLECTIONS } from './memory-workspace-schema';
 import type { MemoryPage, MemoryPageRequest } from '../ui/memory-page';
+import type { ExtractionPipelineAudit, MemoryReviewItem } from '../application/extraction/extraction-types';
 
 const COLLECTIONS = MEMORY_WORKSPACE_COLLECTIONS;
 const REPAIRABLE_REJECTION_CODES = new Set<AutomaticIngestRejection['code']>(AI_REPAIRABLE_PROPOSAL_CODES);
@@ -155,6 +156,8 @@ interface CaptureCommit {
   readonly fallbackUsed?: boolean;
   readonly outcome?: 'complete' | 'partial';
   readonly rejections?: readonly AutomaticIngestRejection[];
+  readonly pipelineAudit?: ExtractionPipelineAudit;
+  readonly reviewItems?: readonly MemoryReviewItem[];
   readonly owners: readonly MemoryOwner[];
   readonly aliases: readonly ActorAlias[];
   readonly pendingCandidates?: readonly ActorCandidate[];
@@ -1508,6 +1511,48 @@ export class MultiActorMemoryRepository {
 
   async listPendingActorCandidates(): Promise<ActorCandidate[]> { return this.listPendingCandidates(); }
 
+  async listMemoryReviewItems(status?: MemoryReviewItem['status']): Promise<MemoryReviewItem[]> {
+    const records = await this.list('memory-review-items', {
+      workspaceId: this.workspaceId,
+      chatKey: this.chatKey,
+      ...(status ? { status } : {}),
+    });
+    return records.map(item => item.value as unknown as MemoryReviewItem)
+      .sort((left, right) => right.createdAt - left.createdAt || left.id.localeCompare(right.id));
+  }
+
+  async resolveMemoryReviewItem(
+    id: string,
+    status: Exclude<MemoryReviewItem['status'], 'pending'>,
+    resolution?: PlainData,
+  ): Promise<MemoryReviewItem> {
+    const current = await this.store.read({ workspaceId: this.workspaceId, collection: 'memory-review-items', recordId: id });
+    const value = current?.value as unknown as MemoryReviewItem | undefined;
+    if (!current || !value || value.workspaceId !== this.workspaceId || value.chatKey !== this.chatKey || value.status !== 'pending') {
+      throw createSSHelperError('MEMORY_REVIEW_ITEM_EXPIRED', { stage: 'memory.review.resolve' });
+    }
+    const next: MemoryReviewItem = { ...value, status, resolvedAt: Date.now(), ...(resolution === undefined ? {} : { resolution }) };
+    await this.store.write({ workspaceId: this.workspaceId, collection: 'memory-review-items', recordId: id, value: asPlain(next), expectedVersion: current.version });
+    return next;
+  }
+
+  async recordShadowExtractionAudit(audit: ExtractionPipelineAudit): Promise<ChangeAudit> {
+    const id = `change-audit:shadow:${stableRecordHash(`${audit.pipelineRunId}\0${audit.sourceBatchDigest}`)}`;
+    const existing = await this.store.read({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: id });
+    if (existing) return structuredClone(existing.value) as unknown as ChangeAudit;
+    const value: ChangeAudit = {
+      id,
+      workspaceId: this.workspaceId,
+      chatKey: this.chatKey,
+      kind: 'derived-change-set-v0',
+      createdAt: Date.now(),
+      entries: [],
+      metadata: asPlain({ diagnosticType: 'extraction-pipeline', shadow: true, pipeline: audit }),
+    };
+    await this.store.write({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: id, value: asPlain(value), expectedVersion: 0 });
+    return value;
+  }
+
   async commitCapture(commit: CaptureCommit): Promise<ChangeAudit> {
     try {
       return await this.commitCaptureOnce(commit);
@@ -1545,6 +1590,8 @@ export class MultiActorMemoryRepository {
       evidence: commit.evidence,
       traces: commit.traces,
       sceneCasts: commit.sceneCasts ?? [],
+      reviewItems: commit.reviewItems ?? [],
+      pipelineAudit: commit.pipelineAudit ?? null,
     }))));
     let retryAttempt = 0;
     let collisionAttempt = 0;
@@ -1932,6 +1979,13 @@ export class MultiActorMemoryRepository {
         });
       }
     }
+    for (const item of commit.reviewItems ?? []) {
+      await add('memory-review-items', {
+        ...item,
+        workspaceId: this.workspaceId,
+        chatKey: this.chatKey,
+      });
+    }
     const audit: ChangeAudit = {
       id: auditId,
       workspaceId: this.workspaceId,
@@ -1957,6 +2011,7 @@ export class MultiActorMemoryRepository {
           ?? 1) - 1),
         outcome: commit.outcome ?? 'complete',
         rejections: [...(commit.rejections ?? [])],
+        ...(commit.pipelineAudit ? { pipeline: commit.pipelineAudit } : {}),
         accepted: {
           actors: commit.envelope.actorCandidates.length,
           locations: commit.envelope.locationCandidates.length,

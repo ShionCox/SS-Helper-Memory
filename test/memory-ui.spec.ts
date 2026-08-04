@@ -92,6 +92,7 @@ function workbenchController(overrides: Partial<MemoryUiController> = {}): Memor
 
 function auditRecord(overrides: Partial<MemoryAuditRecord> = {}): MemoryAuditRecord {
   return {
+    kind: 'capture',
     id: 'change-audit:default',
     jobId: 'job:audit',
     createdAt: 1_725_000_000_000,
@@ -308,6 +309,41 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).toContain('酒馆内置');
     expect(container.textContent).not.toContain('初始化最终写入');
     expect(container.querySelector('.stx-memory-audit-summary')?.children).toHaveLength(4);
+    dispose();
+  });
+
+  it('将 Agent Shadow 审计展示为不可回滚的固定阶段与对照摘要', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      listAuditRecords: async () => [auditRecord({
+        kind: 'agent_pipeline',
+        id: 'change-audit:agent-shadow',
+        jobId: 'pipeline:agent-shadow',
+        latencyMs: 2100,
+        pipeline: {
+          mode: 'agent', toolPolicy: 'read_only', writeMode: 'shadow', stageCount: 2,
+          completedStageCount: 2, failedStageCount: 0, cancelledStageCount: 0,
+          toolCallCount: 1, wallClockLatencyMs: 2100, totalTokens: 120,
+          stages: [
+            { stage: 'entities', status: 'completed', latencyMs: 1200, toolRounds: 1, toolCalls: 1, requestId: 'request:entities', resourceId: 'memory_extract', model: 'model-safe' },
+            { stage: 'narrative', status: 'completed', latencyMs: 900, toolRounds: 0, toolCalls: 0, requestId: 'request:narrative', resourceId: 'memory_extract', model: 'model-safe' },
+          ],
+          shadow: { matchingLocalIds: 1, agentOnlyLocalIds: 2, singleOnlyLocalIds: 1, singleCount: 3, agentCount: 3, singleStatus: 'failed', singleReasonCode: 'STRUCTURED_OUTPUT_EMPTY' },
+        },
+      })],
+    }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="audit"]') as HTMLButtonElement).click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(container.textContent).toContain('Agent Shadow');
+    expect(container.textContent).toContain('固定阶段已记录');
+    expect(container.textContent).toContain('entities');
+    expect(container.textContent).toContain('Shadow（不写入）');
+    expect(container.textContent).toContain('仅 Agent / 仅 Single');
+    expect(container.textContent).toContain('Single 状态不可用 · STRUCTURED_OUTPUT_EMPTY');
+    expect(container.querySelector('[data-action="rollback-audit"]')).toBeNull();
     dispose();
   });
 
@@ -1677,7 +1713,8 @@ describe('Memory UI 展示适配', () => {
     (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(container.textContent).toContain('初始化当前聊天');
-    expect(container.textContent).toContain('按每批 5 层用户/助手正文拆分（包含隐藏楼层）');
+    expect(container.textContent).toContain('当前 1 个聊天楼层按每组最多 5 层形成 1 批');
+    expect(container.textContent).toContain('范围选择和进度均按这些楼层批次计算');
     expect(container.querySelector('[data-source-kind]')?.getAttribute('data-ss-helper-control')).toBe('checkbox');
     expect(container.querySelector('[data-option="include-invisible-history"]')).toBeNull();
     expect(container.querySelector('.stx-memory-init-estimate')).not.toBeNull();
@@ -2061,7 +2098,7 @@ describe('Memory UI 展示适配', () => {
       ],
       getInitializationEstimate: async (kinds) => {
         estimateKinds.push([...(kinds ?? [])]);
-        return { messageCount: 8, batchCount: kinds?.length ?? 0, tokenLow: 100, tokenHigh: 200 };
+        return { messageCount: 8, batchCount: 11, tokenLow: 100, tokenHigh: 200 };
       },
       getInitializationState: async () => ({ initialized: true, lastCompletedAt: 20, selectedSourceKinds: ['message'], attempts: [{ jobId: 'init-ok', status: 'completed', updatedAt: 20, totalBatches: 2, selectedSourceKinds: ['message'] }] }),
     }));
@@ -2074,10 +2111,16 @@ describe('Memory UI 展示适配', () => {
     expect(container.querySelector('[role="alertdialog"]')).not.toBeNull();
     expect(document.activeElement?.id).toBe('stx-memory-reinitialize-cancel');
     expect(container.textContent).toContain('聊天原文与消息');
+    const rangeEnd = container.querySelector<HTMLInputElement>('[role="alertdialog"] #stx-memory-init-batch-end')!;
+    rangeEnd.value = '2';
+    rangeEnd.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(container.querySelector<HTMLInputElement>('[role="alertdialog"] #stx-memory-init-batch-end')?.value).toBe('2');
     const hostCard = container.querySelector<HTMLInputElement>('[data-source-kind="host_card"]')!;
     hostCard.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(estimateKinds.at(-1)).toEqual(['message', 'host_card']);
+    expect(container.querySelector<HTMLInputElement>('[role="alertdialog"] #stx-memory-init-batch-end')?.value).toBe('2');
+    expect(container.textContent).toContain('本次批次2 / 11');
 
     container.querySelector('.stx-memory-workbench')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 0));

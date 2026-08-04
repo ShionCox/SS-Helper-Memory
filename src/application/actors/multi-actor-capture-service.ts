@@ -39,9 +39,9 @@ import type {
   StructuredInventoryOperation,
   StructuredItemCandidate,
   RepairFieldAction,
+  MemoryExtractionInput,
 } from '../ingest/types';
 import { filterSourceBlocks } from '../ingest/source-blocks';
-import type { StructuredMemoryCaptureExtractor } from '../ingest/llm-extractor';
 import { ActiveCastResolver } from './active-cast-resolver';
 import { ActorRegistry, deriveActorAliases, isPlausibleActorName } from './actor-registry';
 import { KnowledgeProjector } from './knowledge-projector';
@@ -135,6 +135,7 @@ interface MaterializedClaim {
   privacy: MemoryPrivacy;
   knowledgeMode: MemoryKnowledgeMode;
   qualityScore: number;
+  reviewApproved: boolean;
 }
 
 export interface MultiActorCaptureResult {
@@ -162,6 +163,8 @@ export interface MultiActorCaptureResult {
   readonly fieldActions?: readonly RepairFieldAction[];
   readonly repairDecisions?: StructuredCaptureResult['repairDecisions'];
   readonly changeAudit?: import('../../infrastructure').ChangeAudit;
+  /** Shadow runs are audit-only and must never enter domain finalization. */
+  readonly shadowOnly?: boolean;
 }
 
 export interface MultiActorCaptureInput {
@@ -178,6 +181,10 @@ export interface MultiActorCaptureInput {
   readonly captureJob?: Record<string, unknown>;
   readonly idempotencyKey?: string;
   readonly repair?: import('../ingest/types').MemoryExtractionInput['repair'];
+  readonly reviewOverride?: import('../ingest/types').MemoryExtractionInput['reviewOverride'];
+  readonly stage?: import('../ingest/types').MemoryExtractionInput['stage'];
+  readonly signal?: AbortSignal;
+  readonly onUsage?: (usage: import('../ingest/llm-extractor').MemoryLlmUsage | undefined) => void | Promise<void>;
 }
 
 function rejection(
@@ -710,7 +717,10 @@ export class MultiActorCaptureService {
   constructor(
     readonly registry: ActorRegistry,
     readonly locationRegistry: LocationRegistry,
-    private readonly extractor: Pick<StructuredMemoryCaptureExtractor, 'extract'>,
+    private readonly extractor: {
+      extract(input: MemoryExtractionInput): Promise<StructuredCaptureResult>;
+      isShadowMode?(): boolean;
+    },
     private readonly repository?: MultiActorMemoryRepository,
     private readonly projector = new KnowledgeProjector(),
   ) {}
@@ -1483,8 +1493,34 @@ export class MultiActorCaptureService {
         ),
     } : undefined;
     const scopedInput: MultiActorCaptureInput = repair ? { ...input, repair } : input;
+    const captureCheckpoint = input.captureJob?.checkpoint && typeof input.captureJob.checkpoint === 'object' && !Array.isArray(input.captureJob.checkpoint)
+      ? input.captureJob.checkpoint as Record<string, unknown>
+      : undefined;
+    const runtimeExtraction: import('../ingest/types').MemoryExtractionInput['runtimeExtraction'] = captureCheckpoint
+      && (captureCheckpoint.extractionMode === 'single' || captureCheckpoint.extractionMode === 'agent')
+      && (captureCheckpoint.agentConcurrency === 1 || captureCheckpoint.agentConcurrency === 2)
+      && (captureCheckpoint.agentToolPolicy === 'off' || captureCheckpoint.agentToolPolicy === 'read_only')
+      && (captureCheckpoint.agentWriteMode === 'shadow' || captureCheckpoint.agentWriteMode === 'active')
+      ? {
+          extractionMode: captureCheckpoint.extractionMode,
+          agentConcurrency: captureCheckpoint.agentConcurrency,
+          agentToolPolicy: captureCheckpoint.agentToolPolicy,
+          agentWriteMode: captureCheckpoint.agentWriteMode,
+        }
+      : undefined;
+    const traceBatchNumber = Number(captureCheckpoint?.batchIndex);
+    const traceBatchCount = Number(captureCheckpoint?.totalBatches);
+    const workflow: import('../ingest/types').MemoryExtractionInput['workflow'] = input.captureJobId ? {
+      label: '初始化记忆',
+      kind: runtimeExtraction?.extractionMode === 'agent' ? 'agent' : 'single',
+      jobId: input.captureJobId,
+      ...(Number.isInteger(traceBatchNumber) && traceBatchNumber > 0 ? { batchIndex: traceBatchNumber - 1 } : {}),
+      ...(Number.isInteger(traceBatchCount) && traceBatchCount > 0 ? { batchCount: traceBatchCount } : {}),
+    } : undefined;
     const extractionInput = {
+      workspaceId: input.workspaceId,
       chatKey: input.chatKey,
+      ...(workflow === undefined ? {} : { workflow }),
       sources,
       writableSourceRefs: [...writableSourceRefs],
       knownActorContext: knownActors,
@@ -1492,15 +1528,31 @@ export class MultiActorCaptureService {
       knownInventoryContext: knownInventory,
       ...(input.existingMemoryContext ? { existingMemoryContext: input.existingMemoryContext } : {}),
       ...(input.graphLlmRelationEnabled === undefined ? {} : { graphLlmRelationEnabled: input.graphLlmRelationEnabled }),
+      ...(input.reviewOverride === undefined ? {} : { reviewOverride: input.reviewOverride }),
+      ...(input.stage === undefined ? {} : { stage: input.stage }),
+      ...(runtimeExtraction === undefined ? {} : { runtimeExtraction }),
       ...(repair === undefined ? {} : { repair }),
+      ...(input.signal ? { signal: input.signal } : {}),
+      ...(input.onUsage ? { onUsage: input.onUsage } : {}),
     };
-    const extracted = mergeDeterministicInventory(await this.extractor.extract(extractionInput), deterministicInventory, knownInventory);
-    const deterministicClaims = extractExplicitDirectiveClaims(
-      sources,
-      writableSourceRefs,
-      knownActors,
-      extracted.claims,
-    );
+    const pipelineOutput = await this.extractor.extract(extractionInput);
+    if (pipelineOutput.shadowOnly) {
+      return {
+        prepared: this.prepare(scopedInput, pipelineOutput, sources, writableSourceRefs, knownActors, knownLocations, knownInventory),
+        structured: pipelineOutput,
+      };
+    }
+    const extracted = input.stage && input.stage !== 'single' && input.stage !== 'inventory'
+      ? pipelineOutput
+      : mergeDeterministicInventory(pipelineOutput, deterministicInventory, knownInventory);
+    const deterministicClaims = input.stage && input.stage !== 'single' && input.stage !== 'narrative'
+      ? []
+      : extractExplicitDirectiveClaims(
+        sources,
+        writableSourceRefs,
+        knownActors,
+        extracted.claims,
+      );
     const first: StructuredCaptureResult = deterministicClaims.length === 0 ? extracted : {
       ...extracted,
       claims: [...extracted.claims, ...deterministicClaims],
@@ -1527,7 +1579,8 @@ export class MultiActorCaptureService {
         ? sourceIds
         : input.writableSourceRefs.filter(sourceRef => sourceIds.has(sourceRef)),
     );
-    this.discoverTrustedDirectories(sources.filter(source => writableSourceRefs.has(source.id)));
+    const shadowRun = !input.repair && this.extractor.isShadowMode?.() === true;
+    if (!shadowRun) this.discoverTrustedDirectories(sources.filter(source => writableSourceRefs.has(source.id)));
     const knownActors = this.actorDirectory(sources);
     const knownLocations = this.locationDirectory(sources);
     const inventoryRepository = this.repository as (MultiActorMemoryRepository & {
@@ -1557,6 +1610,35 @@ export class MultiActorCaptureService {
       knownInventory,
       deterministicInventory,
     );
+    if (structured.shadowOnly) {
+      const sceneCast = new ActiveCastResolver(this.registry).resolve(sources, { currentFloor: input.currentFloor, sceneEpoch: input.sceneEpoch }).scene;
+      const acceptedLocalIds = { actor: [], location: [], item: [], episode: [], claim: [], inventory: [] } as const;
+      return {
+        envelope: {
+          workspaceId: input.workspaceId,
+          chatKey: input.chatKey,
+          sourceRefs: [...writableSourceRefs],
+          actorCandidates: [],
+          locationCandidates: [],
+          episodes: [],
+          claimLocalIds: [],
+          capturedAt: Date.now(),
+        },
+        owners: this.registry.listOwners(),
+        pendingCandidates: this.registry.listPending(),
+        locations: this.locationRegistry.listLocations(),
+        locationAliases: this.locationRegistry.listAliases(),
+        pendingLocationCandidates: this.locationRegistry.listPending(),
+        inventoryItems: [], inventoryStates: [], inventoryEvents: [], episodes: [], observations: [], facts: [], traces: [],
+        sceneCast,
+        diagnostics: structured.diagnostics,
+        audit: structured.audit,
+        shadowOnly: true,
+        outcome: (structured.rejections?.length ?? 0) > 0 ? 'partial' : 'complete',
+        rejections: structured.rejections ?? [],
+        acceptedLocalIds,
+      };
+    }
     if (matchedInventory.length > knownInventory.length) {
       prepared.rejections.push(rejection(
         input,
@@ -1800,7 +1882,7 @@ export class MultiActorCaptureService {
         ...ownerIds,
       ]);
       const stableAnchor = claim.stableAnchor || ['identity', 'world_rule', 'capability'].includes(claim.kind);
-      const status: MemoryFact['status'] = qualityScore >= 0.75 ? 'active' : 'pending';
+      const status: MemoryFact['status'] = claim.reviewApproved || qualityScore >= 0.75 ? 'active' : 'pending';
       const fact: MemoryFact = {
         id: factId,
         chatKey: input.chatKey,
@@ -1820,6 +1902,8 @@ export class MultiActorCaptureService {
         evidenceIds: [`evidence:${factId}:${hash(`${claim.sourceRef}\0${claim.evidenceExcerpt}`)}`],
         freshestEvidenceAt: source.createdAt,
         ...(claim.kind === 'event' ? {} : { validFrom: source.createdAt }),
+        observedAt: source.createdAt,
+        ingestedAt: Date.now(),
         ...(stableAnchor ? { stableAnchor: true } : {}),
         origin: 'automatic',
         revision: 1,
@@ -1866,6 +1950,7 @@ export class MultiActorCaptureService {
         privacy: claim.knowledge.privacy,
         knowledgeMode: claim.knowledge.mode,
         qualityScore,
+        reviewApproved: claim.reviewApproved === true,
       });
       acceptedLocalIds.claim.push(claim.localId);
     }
@@ -1930,8 +2015,9 @@ export class MultiActorCaptureService {
         addEvidenceAndObservation(merged, item);
         continue;
       }
-      if (decision === 'supersede' && existing) {
-        const superseded: MemoryFact = { ...existing, status: 'superseded', supersededById: item.fact.id, revision: existing.revision + 1, updatedAt: Date.now() };
+      if ((decision === 'supersede' || (decision === 'pending' && item.reviewApproved)) && existing) {
+        const supersededAt = Date.now();
+        const superseded: MemoryFact = { ...existing, status: 'superseded', supersededById: item.fact.id, validUntil: item.fact.validFrom ?? supersededAt, supersededAt, revision: existing.revision + 1, updatedAt: supersededAt };
         const incoming: MemoryFact = { ...item.fact, supersedesId: existing.id };
         reconciledFacts.push(superseded, incoming);
         upsertSlotFact(slotKey, superseded);
@@ -1969,18 +2055,19 @@ export class MultiActorCaptureService {
       const unitKey = normalizeInventoryUnit(unit) || 'unitless';
       const stateId = inventoryStateId(input.chatKey, itemId, operation.measureKind, unitKey);
       const previous = inventoryStatesById.get(stateId);
+      const appendHistoryOnly = operation.updateDecision === 'append_history';
       let afterAmount: number | undefined;
       if (operation.operation === 'increase' || operation.operation === 'decrease') {
-        if (!previous || previous.precision !== 'exact' || previous.amount === undefined || operation.amount === undefined || previous.unitKey !== unitKey) {
+        if (!appendHistoryOnly && (!previous || previous.precision !== 'exact' || previous.amount === undefined || operation.amount === undefined || previous.unitKey !== unitKey)) {
           prepared.rejections.push(rejection(input, 'inventory', index, 'dependency_invalid', '库存增减缺少同单位的精确当前数量，已转入审核。', 'amount', operation));
           continue;
         }
-        afterAmount = previous.amount + (operation.operation === 'increase' ? operation.amount : -operation.amount);
-        if (afterAmount < 0) {
+        if (!appendHistoryOnly) afterAmount = previous!.amount! + (operation.operation === 'increase' ? operation.amount! : -operation.amount!);
+        if (!appendHistoryOnly && afterAmount! < 0) {
           prepared.rejections.push(rejection(input, 'inventory', index, 'invalid_shape', '库存减少后不能小于 0。', 'amount', operation));
           continue;
         }
-      } else if (operation.operation === 'set') {
+      } else if (operation.operation === 'set' && !appendHistoryOnly) {
         afterAmount = operation.precision === 'unknown' ? undefined : operation.amount;
       }
       const eventId = `inventory-event:${hash(`${input.chatKey}\0${itemId}\0${operation.sourceRef}\0${operation.evidenceExcerpt}\0${operation.operation}\0${operation.rawAmount ?? ''}`)}`;
@@ -2010,6 +2097,9 @@ export class MultiActorCaptureService {
         ...(source.floor === undefined ? {} : { floor: source.floor }),
         occurredAt: source.createdAt,
         recordedAt: now,
+        validFrom: source.createdAt,
+        observedAt: source.createdAt,
+        ingestedAt: now,
         origin: 'automatic',
         confidence: operation.confidence,
         ...(input.captureJobId ? { jobId: input.captureJobId } : {}),
@@ -2033,9 +2123,16 @@ export class MultiActorCaptureService {
         revision: (previous?.revision ?? 0) + 1,
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
+        validFrom: source.createdAt,
+        observedAt: source.createdAt,
+        ingestedAt: now,
       };
       existingInventoryEventIds.add(eventId);
       inventoryEventsToCommit.push(event);
+      if (appendHistoryOnly) {
+        acceptedLocalIds.inventory.push(operation.localId);
+        continue;
+      }
       inventoryStatesById.set(stateId, state);
       inventoryStatesToCommit.set(stateId, state);
       acceptedLocalIds.inventory.push(operation.localId);
@@ -2100,6 +2197,8 @@ export class MultiActorCaptureService {
         ...(structured.audit?.resourceId ? { resourceId: structured.audit.resourceId } : {}),
         ...(structured.audit?.model ? { model: structured.audit.model } : {}),
         ...(structured.audit?.fallbackUsed === undefined ? {} : { fallbackUsed: structured.audit.fallbackUsed }),
+        ...(structured.audit?.pipeline ? { pipelineAudit: structured.audit.pipeline } : {}),
+        ...(structured.reviewItems?.length ? { reviewItems: structured.reviewItems } : {}),
         outcome,
         rejections: auditedRejections,
         owners: this.registry.listOwners(),

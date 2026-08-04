@@ -1,3 +1,151 @@
+# 初始化真实分片、Agent 标记与最新流程验收
+
+- 用户问题证据：当前长聊天在“每组最多 10 层”时显示 110 批次，范围输入失焦后恢复旧值
+- 真实验收聊天：`助手 · 2026年7月18日 03:30:01`，275 个聊天楼层与 1 个角色卡来源
+- 本地实现：`http://127.0.0.1:8000/`
+- 验收日期：2026-08-01
+- 版本：Memory / SDK `0.0.1`（未调整版本源）
+- 部署证据：`G:/SillyTavern/backups/ss-helper-0.0.1-20260801T114328Z/deployment-evidence.json`
+- final result: passed
+
+## 批次语义与 Agent 状态
+
+该聊天包含 275 个可处理聊天楼层。楼层模式现在严格按“每组最多 10 层”形成 28 个真实批次，不再由字符上限二次扩张为 110 个执行分片；字符上限仅控制字数分组模式和单个超长来源块。估算、范围选择、任务断点和完成状态统一使用 28 批口径。网页实测输入范围 1–2 后失焦仍保持 2，并以“第 1–2 批 / 共 28 批”启动。
+
+当前配置实测为 Agent 影子审计。初始化区显示独立的 `Agent · 影子审计` 状态标记、并发 2、只读工具和“开始 Agent 影子评估”操作文案；若 Agent 已配置但运行能力不可用，开始操作会被阻止，不再静默退回 Single。影子完成态只报告审计结果，不声称已写入正式记忆或可召回。
+
+## 最新流程核对
+
+| 阶段 | 当前界面 | 实际管线 | 状态 |
+| --- | --- | --- | --- |
+| 1 | 确定性预取 | 清洗来源、建立短引用、锁定数据修订 | passed |
+| 2 | 实体优先与双路提取 | 实体先行；叙事与库存并行；歧义时按需只读工具 | passed |
+| 3 | 合并、校验与裁决 | 程序合并、硬校验、Read Set、更新规划与定向修复 | passed |
+| 4 | 影子审计 | 与 Single 基线比较，只保存安全审计，不写正式记忆 | passed |
+
+Single 模式也已使用对应的四阶段描述：读取与确定性预取、单阶段结构化提取、硬校验与定向修复、原子提交并召回。界面不再展示与实际执行脱节的通用旧流程。
+
+## 视觉、交互与运行结果
+
+| 检查项 | 实测结果 | 状态 |
+| --- | --- | --- |
+| 指标层级 | 来源、楼层、真实批次和 Token 估算使用同一口径 | passed |
+| Agent 标记 | 独立状态条 54 px；模式、写入策略、并发和工具策略均可见 | passed |
+| 流程卡高度 | 四张流程卡均为 64 px，宽度一致，无单项拉伸 | passed |
+| 范围语义 | 起止值使用真实楼层批次，输入草稿在重绘后保持，带分组和可访问名称 | passed |
+| 溢出 | 页面与工作台主区横向溢出均为 0 | passed |
+| 控制台 | 实测 `error = 0`，没有 SS-Helper / Memory 新警告 | passed |
+
+本轮在酒馆网页直接执行了真实模型调用。已保存的 `grok / grok-4.3` 中转资源通过连接与原生工具调用验证，Chat Completions 工具协议有效，五个 Memory 提取任务均绑定 Grok 并显示 `5 / 5 可用于 Agent`。Agent 影子模式处理 1–2 批约 157 秒后完成，正式事实保持 0；Single 模式完成相同两批并写入 1 条正式记忆，随后在自动定向修复阶段收到结构化 `RATE_LIMITED` 并安全暂停，断点保留。整个实测没有再出现固定请求超时；修复任务数量与聊天批次数已分开展示。Memory 全量 541 项测试通过（另 2 项外部实测跳过），生产构建与根目录 SDK / LLM / Memory 三件套构建通过。
+
+---
+
+# 初始化来源等高卡片与批次范围验收
+
+- 变更前截图：`G:/vue/SS-Helpers/SS-Helper-Memory/.tmp/product-design/initialization-before.png`
+- 同视口同状态对照：`G:/vue/SS-Helpers/SS-Helper-Memory/.tmp/product-design/initialization-before-after-comparison.png`
+- 全选实现截图：`G:/vue/SS-Helpers/SS-Helper-Memory/.tmp/product-design/initialization-range-after-all-selected.png`
+- 未选中状态截图：`G:/vue/SS-Helpers/SS-Helper-Memory/.tmp/product-design/initialization-range-after-unselected.png`
+- 本地实现：`http://127.0.0.1:8000/`
+- 验收日期：2026-08-01
+- 版本：Memory / SDK `0.0.1`（未调整版本源）
+- 部署证据：`G:/SillyTavern/backups/ss-helper-0.0.1-20260801T063742Z/deployment-evidence.json`
+- final result: passed
+
+## 视觉与交互结果
+
+对照图左右均为 2061×1065 px、同一长聊天、同一深色主题和全部来源选中状态。变更后保留原有 SmartTheme、字体、金色强调与双栏工作台结构，只把隐藏楼层选项和两张来源卡统一为固定 60 px 高，并在估算区加入连续批次范围控件。三张卡实测高度均为 60 px；全选时三项均带 `is-selected`，取消“处理隐藏楼层”后该项立即回到中性灰色背景、灰色图标和普通边框，另外两张已勾选来源继续保持金色高亮。
+
+长聊天包含隐藏楼层时共 110 批，实测选择 1–5 后估算区显示 `5 / 110`、底栏显示 `1–5 / 110`。取消隐藏楼层后来源缩减为 34 / 275 项、共 17 批，范围自动保留为 1–5，估算区和底栏同步显示 `5 / 17` 与 `1–5 / 17`。本轮未点击“开始初始化”，没有改写记忆数据。
+
+| 检查项 | 实测结果 | 状态 |
+| --- | --- | --- |
+| 卡片高度 | 隐藏楼层、聊天消息、角色卡世界容器均为 60 px | passed |
+| 选中反馈 | 只有复选框为选中状态的卡片使用金色背景、边框与图标；未选中项保持中性灰 | passed |
+| 批次范围 | 起止输入支持连续区间，范围、Token 估算、操作底栏同步更新 | passed |
+| 状态切换 | 隐藏楼层开关会重新计算可用批次数，并安全夹取、保留有效范围 | passed |
+| 溢出与密度 | 2061×1065 桌面视口无新增横向溢出，流程卡和固定底栏保持原节奏 | passed |
+| 键盘与语义 | 两个数字输入有可访问名称、`min/max` 和分组语义，复选框沿用原生键盘能力 | passed |
+| 控制台 | 交互过程未产生新错误；仅保留页面首次加载时已有的 4 条 SillyTavern `MutationObserver` 错误 | passed |
+
+视觉复核未发现 P0、P1 或 P2 问题。Memory lint、typecheck、535 项测试（另 2 项外部实测跳过）、生产构建及根目录 SDK / LLM / Memory 三件套构建均通过；随后完成 dry-run、停止 SillyTavern、保留数据部署、重新启动、HTTP 200、卡片像素测量与浏览器交互验收。
+
+---
+
+# 提取模型分配固定任务行高度跟进验收
+
+- 问题截图：`C:/Users/liao/AppData/Local/Temp/codex-clipboard-8e057327-7432-452a-9aeb-f0757aed872c.png`
+- 同状态对照：`G:/vue/SS-Helpers/SS-Helper-Memory/.tmp/product-design/task-routing-fixed-items-comparison.png`
+- 完整实现截图：`G:/vue/SS-Helpers/SS-Helper-Memory/.tmp/product-design/task-routing-fixed-items-2001x1065.png`
+- 聚焦区域截图：`G:/vue/SS-Helpers/SS-Helper-Memory/.tmp/product-design/task-routing-fixed-items-nav.png`
+- 本地实现：`http://127.0.0.1:8000/`
+- 验收日期：2026-08-01
+- 版本：Memory / SDK `0.0.1`（未调整版本源）
+- 部署证据：`G:/SillyTavern/backups/ss-helper-0.0.1-20260801T045805Z/deployment-evidence.json`
+- final result: passed
+
+## 对照与密度
+
+问题截图为用户提供的 558×919 px 聚焦裁图，截图密度未知；实现以 2001×1065 CSS 视口、`devicePixelRatio = 1.5` 实测，完整截图为 2001×1065 px，左侧任务栏聚焦裁图为 316×573 px。对照图保持两侧原始像素与顶部对齐，不做几何拉伸。状态统一为深色主题、实体提取选中、自动选择。
+
+首轮实测确认五行虽彼此等高，但 `repeat(5, minmax(4.75rem, 1fr))` 会把每行随容器拉伸到 105.74 px，形成大面积空白，属于 P2 密度与节奏问题。修正后桌面网格轨道和 SDK 按钮均固定为 76 px，五行实测高度全部为 76 px，行距均为 4 px；图标与状态点中心和选中项中心同为 y=410.95，标题与说明维持紧凑的两行层级。移动断点继续固定为 48 px 横向任务条。
+
+## 必查视觉面
+
+| 检查项 | 跟进结果 | 状态 |
+| --- | --- | --- |
+| 字体与文案 | 现有字体、字号、字重和五项任务文案不变；标题与“自动选择”均无换行或截断 | passed |
+| 间距与布局节奏 | 五行从弹性拉伸改为固定 76 px，剩余空间留在任务栏底部；选中背景不再形成过高色块 | passed |
+| 颜色与令牌 | SmartTheme 暖白、灰色和金色选中令牌不变，未引入新颜色 | passed |
+| 图标与资源 | 继续使用 SDK 公共图标，尺寸和光栅质量无变化；本轮无新增图像资产 | passed |
+| 响应式与溢出 | 桌面工作区 `scrollWidth = clientWidth = 1039`，任务栏 `scrollWidth = clientWidth = 315`；移动规则显式保持 48 px | passed |
+
+## 验证
+
+任务切换在“单次提取 / 叙事提取 / 实体提取”之间实测可用并回到问题截图状态；本轮仅修改受 Popup 根节点约束的 CSS。Memory lint、3 项定向弹窗测试、生产构建和根目录三件套构建通过；随后完成 dry-run、停止 SillyTavern、`--apply --preserveData` 部署、重新启动、HTTP 200 与插件加载核验。既有完整交互验收的页面控制台 `error` 为 0，本轮 CSS 跟进未引入脚本逻辑。
+
+---
+
+# 提取模型分配方案 3 重设计验收
+
+- 视觉基准：`C:/Users/liao/.codex/generated_images/019fbb87-144d-79a0-8603-c3923239dff0/exec-19ce3933-1eb8-407d-aae4-8680247afb3c.png`
+- 同视口对照：`G:/vue/SS-Helpers/SS-Helper-Memory/.tmp/product-design/task-routing-comparison-1680x938.png`
+- 桌面实测：`G:/vue/SS-Helpers/SS-Helper-Memory/.tmp/product-design/task-routing-implementation-1680x938.png`
+- 移动实测：`G:/vue/SS-Helpers/SS-Helper-Memory/.tmp/product-design/task-routing-implementation-480x900.png`
+- 本地实现：`http://127.0.0.1:8000/`
+- 验收日期：2026-08-01
+- 版本：Memory / SDK `0.0.1`（未调整版本源）
+- 部署证据：`G:/SillyTavern/backups/ss-helper-0.0.1-20260801T044721Z/deployment-evidence.json`
+- final result: passed
+
+## 视觉对齐
+
+| 检查项 | 方案 3 基准 | 酒馆实测 | 状态 |
+| --- | --- | --- | --- |
+| 弹窗比例 | 居中的约 1040×744 px 主从弹窗 | 1680×938 视口实测为 1040×747 px，位置为 x=320、y=95 | passed |
+| 信息架构 | 左侧五项任务总览，右侧当前任务详情 | 五项路由、当前资源、Provider / 资源 / 模型、Agent 能力和提示卡均集中在一个视图 | passed |
+| 视觉语言 | 炭黑表面、暖白正文、金色选中与能力强调 | 使用 SDK SmartTheme 令牌与公共图标；选中项、状态点、能力值和边框层级一致 | passed |
+| 桌面密度 | 五个等节奏任务行、三列路由摘要、纵向能力表、固定底栏 | 主区无横向或纵向溢出；任务栏和详情面板独立成面，底栏固定 | passed |
+| 移动布局 | 全屏单列并保留任务切换 | 480×900 实测弹窗为 480×900，工作区 `scrollWidth = clientWidth = 480`；任务栏可横向滑动且隐藏滚动条，详情区无横向溢出 | passed |
+
+## 功能与无障碍验收
+
+| 检查项 | 实测结果 | 状态 |
+| --- | --- | --- |
+| 任务切换 | 点击“单次提取”后标题、说明、选择框与 `aria-current` 同步更新并恢复键盘焦点 | passed |
+| 资源选择 | SDK 顶层选择器显示自动路由与真实 DeepSeek 资源，不撑开或裁切弹窗 | passed |
+| 即时保存 | 实际将实体任务切换到 DeepSeek，出现热加载状态与成功 Toast；Provider、资源、模型和能力快照同步刷新；随后恢复自动选择并再次保存成功 | passed |
+| 能力呈现 | 已绑定资源时展示“重新验证”、工具调用、严格 Schema、流式工具与 Agent 可用提示；真实 Provider 探测未在视觉验收中触发，定向测试校验了公共 Bus 请求和刷新流程 | passed |
+| 恢复确认 | “全部恢复自动选择”调用 SDK 确认框；实测取消不会修改现有配置 | passed |
+| 响应式与焦点 | 桌面和移动均可通过语义按钮、页签、组合框与对话框访问；移动端单列、无页面级横向溢出 | passed |
+| 控制台 | 完整交互后的浏览器 `error` 为 0；仅保留页面启动时既有的 LLM 路由重声明与 SillyTavern 宏弃用 warning，没有新增弹窗交互 warning | passed |
+
+## 自动验证与部署
+
+Memory `lint`、定向 3 项路由弹窗测试和生产构建通过；根目录三件套发布构建、版本策略和 workspace 一致性检查通过。最终产物经过 dry-run，停止 SillyTavern 后以 `--apply --preserveData` 部署；备份、暂存和已部署目录的文件清单与 content digest 均由脚本核验，随后 127.0.0.1:8000 监听、插件加载和真实浏览器交互通过。
+
+---
+
 # 召回预览悬浮窗设计验收
 
 - 视觉基准：`I:/VUE/SS-Helpers/.tmp/preview.html`

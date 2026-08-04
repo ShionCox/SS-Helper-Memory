@@ -17,6 +17,7 @@ import {
   type GenerationRecallDetailController,
 } from './message-recall-action';
 import config from '../../plugin.config.json' with { type: 'json' };
+import { registerMemoryTaskRoutingPopup } from './task-routing-popup';
 
 export interface MemoryContributionController extends MemorySettingsController, MemoryRecallController, GenerationRecallDetailController {
   isChatEnabled(workspaceId: string, chatKey: string): boolean;
@@ -78,6 +79,7 @@ export function registerMemoryContributions(
       ? []
       : [registerMemoryMessageRecallAction(session, controller, async (floor) => session.host.chat.navigate({ index: floor }))]),
     session.registerSettings(MEMORY_SETTINGS_SCHEMA, createMemorySettingsAdapter(controller, statusSource, (notification) => session.ui.showToast(notification))),
+    registerMemoryTaskRoutingPopup(session),
     session.registerPopup({
       token: MEMORY_WORKBENCH_POPUP,
       title: '记忆工作台',

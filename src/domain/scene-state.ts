@@ -28,6 +28,11 @@ export interface SceneState {
   readonly sourceRefs: readonly string[];
   readonly createdAt: number;
   readonly updatedAt: number;
+  readonly validFrom?: number;
+  readonly validUntil?: number;
+  readonly observedAt?: number;
+  readonly ingestedAt?: number;
+  readonly supersededAt?: number;
 }
 
 export type SceneTransitionReason =
@@ -55,6 +60,11 @@ export interface SceneTransition {
   readonly confidence: number;
   readonly sourceRefs: readonly string[];
   readonly createdAt: number;
+  readonly validFrom?: number;
+  readonly validUntil?: number;
+  readonly observedAt?: number;
+  readonly ingestedAt?: number;
+  readonly supersededAt?: number;
 }
 
 export function sceneStateRecordId(workspaceId: string, chatKey: string): string {

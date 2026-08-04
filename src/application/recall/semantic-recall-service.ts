@@ -129,13 +129,13 @@ function clampRequestedItems(value: number | undefined): number {
   return Math.min(recallLimits.max, Math.max(recallLimits.min, Math.trunc(value!)));
 }
 
-function usageOrNull(usage: { promptTokens: number; completionTokens: number; totalTokens: number } | undefined): MemoryTokenUsage | null {
+function usageOrNull(usage: { promptTokens: number | null; completionTokens: number | null; totalTokens: number | null } | undefined): MemoryTokenUsage | null {
   return usage ? {
-    promptTokens: Number.isFinite(usage.promptTokens) ? usage.promptTokens : null,
-    completionTokens: Number.isFinite(usage.completionTokens) ? usage.completionTokens : null,
+    promptTokens: typeof usage.promptTokens === 'number' && Number.isFinite(usage.promptTokens) ? usage.promptTokens : null,
+    completionTokens: typeof usage.completionTokens === 'number' && Number.isFinite(usage.completionTokens) ? usage.completionTokens : null,
     cacheReadTokens: null,
     cacheWriteTokens: null,
-    totalTokens: Number.isFinite(usage.totalTokens) ? usage.totalTokens : null,
+    totalTokens: typeof usage.totalTokens === 'number' && Number.isFinite(usage.totalTokens) ? usage.totalTokens : null,
   } : null;
 }
 

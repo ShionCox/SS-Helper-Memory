@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { PluginSession } from '@ss-helper/sdk';
 import { registerMemoryContributions, type MemoryHostCapability } from '../src/ss-helper/plugin';
-import { MEMORY_WORKBENCH_POPUP } from '../src/ss-helper/settings';
+import { MEMORY_TASK_ROUTING_POPUP, MEMORY_WORKBENCH_POPUP } from '../src/ss-helper/settings';
 
 function createSession() {
   const popupRegistrations: any[] = [];
@@ -62,6 +62,7 @@ describe('Memory extension menu contribution', () => {
       recovery,
     );
     expect(fixture.popupRegistrations.some((registration) => registration.token === MEMORY_WORKBENCH_POPUP)).toBe(true);
+    expect(fixture.popupRegistrations.some((registration) => registration.token === MEMORY_TASK_ROUTING_POPUP)).toBe(true);
     expect(fixture.menuRegistrations).toHaveLength(1);
     expect(fixture.messageActionRegistrations).toEqual([
       expect.objectContaining({ id: 'generation-recall-detail', icon: 'brain' }),

@@ -17,7 +17,17 @@ function model(overrides: Partial<InitializationViewModel> = {}): Initialization
     ],
     selectedSourceKinds: ['message'],
     includeHiddenMessageFloors: true,
-    estimate: { messageCount: 18, batchCount: 4, tokenLow: 900, tokenHigh: 1400 },
+    extractionMode: 'single',
+    runtimeExtractionMode: 'single',
+    agentConcurrency: 2,
+    agentToolPolicy: 'off',
+    agentWriteMode: 'shadow',
+    summaryBatchMode: 'floors',
+    summaryBatchFloors: 5,
+    summaryBatchChars: 12_000,
+    batchRangeStart: 1,
+    batchRangeEnd: 4,
+    estimate: { messageCount: 18, batchCount: 4, conversationFloorCount: 18, logicalBatchCount: 4, tokenLow: 900, tokenHigh: 1400 },
     progress: { status: 'idle', batchIndex: 0, totalBatches: 0, processedCount: 0, elapsedMs: 0 },
     initialized: false,
     lastCompletedAt: null,
@@ -25,7 +35,6 @@ function model(overrides: Partial<InitializationViewModel> = {}): Initialization
     attempts: [],
     factCount: 0,
     storageBytes: 0,
-    summaryNote: '按每批 5 层可见消息拆分。',
     submitting: false,
     busy: false,
     reinitializeOpen: false,
@@ -53,6 +62,11 @@ describe('initialization view', () => {
     expect(html).toContain('data-option="include-hidden-message-floors"');
     expect(html).toContain('处理隐藏楼层');
     expect(html).toMatch(/data-option="include-hidden-message-floors"[^>]*checked/u);
+    expect(html).toContain('stx-memory-init-option is-selected');
+    expect(html).toContain('data-option="batch-range-start"');
+    expect(html).toContain('data-option="batch-range-end"');
+    expect(html).toContain('楼层分组</dt><dd>4');
+    expect(html).toContain('本次批次</dt><dd>4 / 4');
     expect(html).toContain('<b>18 / 20</b><small>项</small>');
     expect(html).toContain('data-ss-helper-control="checkbox"');
     expect(html).toContain('class="stx-memory-init-source-checkbox"');
@@ -60,6 +74,76 @@ describe('initialization view', () => {
     expect(html).not.toContain('class="stx-memory-sr-only" data-ss-helper-control="checkbox"');
     expect(html).toContain('data-action="initialize-start"');
     expect(html).not.toContain('原型预览状态');
+  });
+
+  it('highlights only selected source cards and renders a bounded batch range', () => {
+    const html = renderInitializationView(model({
+      includeHiddenMessageFloors: false,
+      selectedSourceKinds: ['message'],
+      batchRangeStart: 1,
+      batchRangeEnd: 3,
+      estimate: { messageCount: 55, batchCount: 11, conversationFloorCount: 55, logicalBatchCount: 11, tokenLow: 900, tokenHigh: 1400 },
+    }));
+
+    expect(html).toContain('class="stx-memory-init-option"');
+    expect(html).not.toContain('class="stx-memory-init-option is-selected"');
+    expect(html).toMatch(/class="stx-memory-init-source-card is-selected"[\s\S]*data-source-kind="message"/u);
+    expect(html).toMatch(/class="stx-memory-init-source-card"[\s\S]*data-source-kind="host_card"/u);
+    expect(html).toContain('max="11" value="1" data-option="batch-range-start"');
+    expect(html).toContain('max="11" value="3" data-option="batch-range-end"');
+    expect(html).toContain('本次批次</dt><dd>3 / 11');
+    expect(html).toContain('1–3 / 11');
+  });
+
+  it('uses the configured floor groups as the real selectable batches', () => {
+    const html = renderInitializationView(model({
+      summaryBatchFloors: 10,
+      summaryBatchChars: 12_000,
+      batchRangeEnd: 28,
+      estimate: {
+        messageCount: 275,
+        batchCount: 28,
+        conversationFloorCount: 275,
+        logicalBatchCount: 28,
+        tokenLow: 768_500,
+        tokenHigh: 1_280_900,
+      },
+    }));
+
+    expect(html).toContain('聊天楼层</dt><dd>275');
+    expect(html).toContain('楼层分组</dt><dd>28');
+    expect(html).toContain('本次批次</dt><dd>28 / 28');
+    expect(html).toContain('按每组最多 10 层形成 28 批');
+    expect(html).toContain('初始化批次范围');
+  });
+
+  it('marks a runnable Agent pipeline and renders its current fixed flow', () => {
+    const html = renderInitializationView(model({
+      extractionMode: 'agent',
+      runtimeExtractionMode: 'agent',
+      agentConcurrency: 2,
+      agentToolPolicy: 'read_only',
+      agentWriteMode: 'shadow',
+    }));
+
+    expect(html).toContain('Agent · 影子审计');
+    expect(html).toContain('开始 Agent 影子评估');
+    expect(html).toContain('确定性预取');
+    expect(html).toContain('实体优先与双路提取');
+    expect(html).toContain('合并、校验与裁决');
+    expect(html).toContain('与 Single 基线对比，不写正式记忆');
+    expect(html).not.toContain('事务写入');
+  });
+
+  it('blocks initialization instead of silently falling back when Agent is unavailable', () => {
+    const html = renderInitializationView(model({
+      extractionMode: 'agent',
+      runtimeExtractionMode: 'single',
+    }));
+
+    expect(html).toContain('Agent 未就绪');
+    expect(html).toContain('不会静默回退到单次提取');
+    expect(html).toMatch(/data-action="initialize-start"[^>]*disabled/u);
   });
 
   it('renders running and paused states with locked sources and matching actions', () => {
@@ -248,6 +332,61 @@ describe('initialization view', () => {
 
     expect(html).toContain('部分完成 · 召回可用');
     expect(html).toContain('已隔离 2 项等待证据变化');
+  });
+
+  it('shows Provider-reported Token usage without replacing missing fields with zero', () => {
+    const html = renderInitializationView(model({
+      progress: {
+        status: 'running', jobId: 'job-1', batchIndex: 2, totalBatches: 4, processedCount: 9, elapsedMs: 5000,
+        usageRequestCount: 3,
+        usageReportedCount: 2,
+        actualUsage: { promptTokens: 1200, completionTokens: 340, cacheReadTokens: null, cacheWriteTokens: null, totalTokens: null },
+      },
+    }));
+
+    expect(html).toContain('Provider 实际 Token 用量');
+    expect(html).toContain('API 响应</dt><dd>3');
+    expect(html).toContain('返回用量</dt><dd>2');
+    expect(html).toContain('输入 Token</dt><dd>1,200');
+    expect(html).toContain('输出 Token</dt><dd>340');
+    expect(html).toContain('总 Token</dt><dd>API 未返回');
+  });
+
+  it('keeps chat batch progress separate from active repair task progress', () => {
+    const html = renderInitializationView(model({
+      progress: {
+        status: 'repairing',
+        jobId: 'job-repair',
+        batchIndex: 3,
+        totalBatches: 26,
+        processedCount: 3,
+        elapsedMs: 76_000,
+        phase: 'repair',
+        batchRangeStart: 1,
+        batchRangeEnd: 2,
+        availableBatchCount: 28,
+      },
+    }));
+    expect(html).toContain('已完成批次 2 / 2 · 第 1–2 批 / 共 28 批');
+    expect(html).toContain('修复任务 3 / 26 · 76 秒');
+    expect(html).not.toContain('已完成批次 3 / 26');
+  });
+
+  it('does not claim recall was written after an Agent shadow evaluation', () => {
+    const html = renderInitializationView(model({
+      initialized: true,
+      extractionMode: 'agent',
+      runtimeExtractionMode: 'agent',
+      agentWriteMode: 'shadow',
+      successfulSourceKinds: ['message'],
+      lastCompletedAt: 100,
+      attempts: [{ jobId: 'agent-shadow', status: 'completed', updatedAt: 100, totalBatches: 4, selectedSourceKinds: ['message'] }],
+    }));
+
+    expect(html).toContain('Agent 影子评估已完成');
+    expect(html).toContain('正式记忆没有写入');
+    expect(html).toContain('查看 Agent 审计');
+    expect(html).not.toContain('当前聊天可以使用记忆召回');
   });
 
   it('keeps sources browseable but disables submission when capabilities are unavailable', () => {

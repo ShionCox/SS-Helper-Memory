@@ -1,14 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   configureMemoryLlmClient,
-  MEMORY_CAPTURE_REPAIR_TASK,
-  MEMORY_CAPTURE_MAX_TOKENS,
   MEMORY_LLM_ROUTE_DIAGNOSTIC_TIMEOUT_MS,
   normalizeStructuredCapture,
   readMemoryLlmRouteDiagnostic,
   StructuredMemoryCaptureExtractor,
   type MemoryLlmClient,
 } from '../src/application/ingest/llm-extractor';
+import { MEMORY_EXTRACTION_TASK_KEYS } from '../src/application/extraction';
 import type { SourceBlock } from '../src/application/ingest/types';
 import { buildSupportedEvidenceDirectory } from '../src/application/ingest/supported-evidence-directory';
 
@@ -20,7 +19,7 @@ const source: SourceBlock = {
 const emptyCapture = { actorCandidates: [], locationCandidates: [], itemCandidates: [], episodes: [], claims: [], inventoryOperations: [] };
 
 describe('StructuredMemoryCaptureExtractor', () => {
-  it('uses the Claim task budget and returns safe audit metadata', async () => {
+  it('delegates output length to LLM settings and returns safe audit metadata', async () => {
     const runTask = vi.fn(async (_input: Parameters<MemoryLlmClient['runTask']>[0]) => ({
       ok: true as const,
       data: emptyCapture,
@@ -33,11 +32,28 @@ describe('StructuredMemoryCaptureExtractor', () => {
     });
     expect(runTask).toHaveBeenCalledTimes(1);
     expect(runTask.mock.calls[0]?.[0]).toMatchObject({
-      taskKey: 'memory_capture',
-      budget: { maxTokens: MEMORY_CAPTURE_MAX_TOKENS, maxLatencyMs: 180_000 },
+      taskKey: MEMORY_EXTRACTION_TASK_KEYS.single,
+      budget: { maxLatencyMs: 600_000 },
     });
     expect(result.audit).toMatchObject({ requestId: 'req', resourceId: 'resource', model: 'model', latencyMs: 42, fallbackUsed: true });
     expect(result.audit?.usage).toMatchObject({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+  });
+
+  it('reports Provider usage before rethrowing a failed structured response', async () => {
+    const onUsage = vi.fn();
+    const runTask = vi.fn(async () => ({
+      ok: false as const,
+      failure: { reasonCode: 'STRUCTURED_OUTPUT_TRUNCATED' as const, stage: 'llm.service.response' },
+      usage: { promptTokens: 12, completionTokens: 3, totalTokens: 15 },
+    }));
+
+    await expect(new StructuredMemoryCaptureExtractor(() => ({ runTask } as MemoryLlmClient)).extract({
+      chatKey: source.chatKey,
+      sources: [source],
+      onUsage,
+    })).rejects.toMatchObject({ details: { reasonCode: 'STRUCTURED_OUTPUT_TRUNCATED' } });
+    expect(onUsage).toHaveBeenCalledOnce();
+    expect(onUsage).toHaveBeenCalledWith({ promptTokens: 12, completionTokens: 3, totalTokens: 15 });
   });
 
   it('delegates bounded Schema repair to one LLM bus call and records its diagnostics', async () => {
@@ -147,9 +163,9 @@ describe('StructuredMemoryCaptureExtractor', () => {
     const request = runTask.mock.calls[0]![0];
     const messages = (request.input as { messages: Array<{ role: string; content: string }> }).messages;
     expect(request).toMatchObject({
-      taskKey: MEMORY_CAPTURE_REPAIR_TASK,
+      taskKey: MEMORY_EXTRACTION_TASK_KEYS.repair,
       parentRequestId: 'capture-request',
-      budget: { maxTokens: 2_048, maxLatencyMs: 180_000 },
+      budget: { maxLatencyMs: 600_000 },
       schema: {
         required: ['decisions'],
         properties: { decisions: { minItems: 1, maxItems: 1 } },
