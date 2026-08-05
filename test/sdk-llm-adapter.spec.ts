@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { LLM_CAPABILITY_STATUS_V0, LLM_EMBEDDING_V0, LLM_RERANK_V0, LLM_STRUCTURED_TASK_V0, type PluginSession } from '@ss-helper/sdk';
+import { LLM_EMBEDDING_V0, LLM_RERANK_V0, LLM_STRUCTURED_TASK_V0, LLM_TASK_STATUS_V0, type PluginSession } from '@ss-helper/sdk';
 import { createMemoryLlmClient } from '../src/ss-helper/llm-client';
 
 describe('SDK LLM typed adapter', () => {
@@ -9,7 +9,7 @@ describe('SDK LLM typed adapter', () => {
       if (contract === LLM_STRUCTURED_TASK_V0) return {
         requestId: 'r1',
         output: { facts: [] },
-        route: { route: 'memory', model: 'm1' },
+        route: { resourceId: 'memory', source: 'custom', provider: 'openai', model: 'm1', execution: 'structured', transport: 'json_schema' },
         diagnostics: {
           transport: 'json_schema',
           attemptCount: 1,
@@ -18,8 +18,8 @@ describe('SDK LLM typed adapter', () => {
           itemRejections: [],
         },
       };
-      if (contract === LLM_EMBEDDING_V0) return { requestId: 'r2', embeddings: [[1, 2]], route: { route: 'embed', model: 'e1' } };
-      return { requestId: 'r3', results: [{ id: '1', index: 1, score: 0.9 }], route: { route: 'rerank' } };
+      if (contract === LLM_EMBEDDING_V0) return { requestId: 'r2', embeddings: [[1, 2]], route: { resourceId: 'embed', source: 'custom', provider: 'openai', model: 'e1', execution: 'embedding', transport: 'embedding' } };
+      return { requestId: 'r3', results: [{ id: '1', index: 1, score: 0.9 }], route: { resourceId: 'rerank', source: 'custom', provider: 'openai', model: 'r1', execution: 'rerank', transport: 'rerank' } };
     });
     const api = createMemoryLlmClient({ bus: { request: call } } as unknown as PluginSession, signal);
     const trace = { workflowId: 'pipeline-1', workflowLabel: '初始化记忆', workflowKind: 'agent', jobId: 'job-1', batchIndex: 0, batchCount: 2 };
@@ -100,15 +100,14 @@ describe('SDK LLM typed adapter', () => {
     const signal = new AbortController().signal;
     const call = vi.fn(async () => ({
       revision: 3,
-      checks: [{ id: 'memory_embed', configured: false, available: false, reason: 'no_resource' }],
+      tasks: [{ taskKey: 'memory_embed', execution: 'embedding', available: false, failure: { reasonCode: 'LLM_TASK_ROUTE_UNAVAILABLE', stage: 'llm.task.status' } }],
+      defaults: {}, assignments: [], resources: [],
     }));
     const api = createMemoryLlmClient({ bus: { request: call } } as unknown as PluginSession, signal);
 
     await expect(api.inspect?.previewRoute({
       consumer: 'stx_memory', taskKey: 'memory_embed', taskKind: 'embedding', requiredCapabilities: ['embeddings'],
-    })).resolves.toEqual({ available: false, blockedReason: 'LLM 中尚未配置匹配的资源' });
-    expect(call).toHaveBeenCalledWith(LLM_CAPABILITY_STATUS_V0, {
-      checks: [{ id: 'memory_embed', taskKey: 'memory_embed', taskKind: 'embedding', requiredCapabilities: ['embeddings'] }],
-    }, { timeoutMs: 5_000, signal });
+    })).resolves.toEqual({ available: false, failure: { reasonCode: 'LLM_TASK_ROUTE_UNAVAILABLE', stage: 'llm.task.status' } });
+    expect(call).toHaveBeenCalledWith(LLM_TASK_STATUS_V0, { taskKeys: ['memory_embed'] }, { timeoutMs: 5_000, signal });
   });
 });

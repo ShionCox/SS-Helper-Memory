@@ -1,11 +1,10 @@
 import {
-  LLM_CAPABILITY_STATUS_V0,
   LLM_EMBEDDING_V0,
   LLM_RERANK_V0,
   LLM_STRUCTURED_TASK_V0,
-  LLM_TASK_ROUTING_GET_V0,
-  LLM_TASK_ROUTING_SET_V0,
-  LLM_TOOL_CAPABILITY_VERIFY_V0,
+  LLM_TASK_STATUS_V0,
+  LLM_TASK_ROUTE_SET_V0,
+  LLM_RESOURCE_CAPABILITY_VERIFY_V0,
   LLM_TOOL_SESSION_CANCEL_V0,
   LLM_TOOL_TURN_V0,
   readSSHelperFailure,
@@ -37,52 +36,34 @@ function structuredTaskFailure(error: unknown): {
   };
 }
 
-const capabilityReason: Readonly<Record<string, string>> = Object.freeze({
-  llm_disabled: 'LLM 已停用',
-  no_resource: 'LLM 中尚未配置匹配的资源',
-  resource_disabled: '匹配的 LLM 资源已停用',
-  credential_missing: '匹配的 LLM 资源缺少凭据',
-  route_unavailable: 'LLM 中没有满足当前任务的路由',
-  tavern_unavailable: '酒馆当前没有可用的来源或模型',
-  status_unavailable: '暂时无法读取 LLM 资源状态',
-});
-
 export function createMemoryLlmClient(session: PluginSession, signal?: AbortSignal): MemoryLlmClient {
   return {
     inspect: {
       async previewRoute(input) {
         const timeoutMs = 5_000;
-        const response = await session.bus.request(LLM_CAPABILITY_STATUS_V0, {
-          checks: [{
-            id: input.taskKey,
-            taskKey: input.taskKey,
-            taskKind: input.taskKind,
-            requiredCapabilities: input.requiredCapabilities,
-          }],
-        }, { timeoutMs, signal });
-        const route = response.checks[0];
-        if (!route) return { available: false, blockedReason: 'LLM 未返回资源状态' };
+        const response = await session.bus.request(LLM_TASK_STATUS_V0, { taskKeys: [input.taskKey] }, { timeoutMs, signal });
+        const route = response.tasks.find((task) => task.taskKey === input.taskKey);
+        if (!route) return {
+          available: false,
+          failure: { reasonCode: 'LLM_TASK_ROUTE_UNAVAILABLE', stage: 'memory.routing.inspect' },
+        };
         return {
-          available: route.available === true,
+          available: route.available,
           ...(route.resourceId ? { resourceId: route.resourceId } : {}),
-          ...(route.model ? { model: route.model } : {}),
-          ...(route.available ? {} : { blockedReason: capabilityReason[route.reason ?? 'status_unavailable'] ?? 'LLM 资源不可用' }),
+          ...(route.route?.model ? { model: route.route.model } : {}),
+          ...(route.failure ? { failure: route.failure } : {}),
         };
       },
-      async getTaskRouting(taskKeys) {
-        return session.bus.request(LLM_TASK_ROUTING_GET_V0, {
+      async getTaskStatus(taskKeys) {
+        return session.bus.request(LLM_TASK_STATUS_V0, {
           ...(taskKeys && taskKeys.length > 0 ? { taskKeys: [...taskKeys] } : {}),
         }, { timeoutMs: 10_000, signal });
       },
-      async setTaskRouting(input) {
-        return session.bus.request(LLM_TASK_ROUTING_SET_V0, input, { timeoutMs: 10_000, signal });
+      async setTaskRoute(input) {
+        return session.bus.request(LLM_TASK_ROUTE_SET_V0, input, { timeoutMs: 10_000, signal });
       },
-      async verifyToolCapability(resourceId, model, force) {
-        return session.bus.request(LLM_TOOL_CAPABILITY_VERIFY_V0, {
-          resourceId,
-          ...(model ? { model } : {}),
-          ...(force === undefined ? {} : { force }),
-        }, { timeoutMs: 30_000, signal });
+      async verifyResourceCapability(input) {
+        return session.bus.request(LLM_RESOURCE_CAPABILITY_VERIFY_V0, input, { timeoutMs: 30_000, signal });
       },
     },
     async runTask<T>(input: RunTaskInput) {
@@ -94,7 +75,6 @@ export function createMemoryLlmClient(session: PluginSession, signal?: AbortSign
           input: input.input,
           outputSchema: input.schema as Record<string, never>,
           ...(input.route?.resourceId ? { route: input.route.resourceId } : {}),
-          ...(input.route?.model ? { model: input.route.model } : {}),
           timeoutMs,
           ...(input.parentRequestId ? { parentRequestId: input.parentRequestId } : {}),
           ...(input.trace ? { trace: input.trace } : {}),
@@ -109,9 +89,8 @@ export function createMemoryLlmClient(session: PluginSession, signal?: AbortSign
         data: response.output as T,
         meta: {
           requestId: response.requestId,
-          resourceId: response.route.route,
+          resourceId: response.route.resourceId ?? 'unknown',
           model: response.route.model,
-          fallbackUsed: response.route.fallback,
           attemptCount: response.diagnostics.attemptCount,
           repairCount: response.diagnostics.repairCount,
           transport: response.diagnostics.transport,
@@ -142,9 +121,8 @@ export function createMemoryLlmClient(session: PluginSession, signal?: AbortSign
           model: response.route.model,
           meta: {
             requestId: response.requestId,
-            resourceId: response.route.route,
+            resourceId: response.route.resourceId ?? 'unknown',
             model: response.route.model,
-            fallbackUsed: response.route.fallback,
           },
           usage: memoryLlmUsageFromProvider(response.usage),
         };
@@ -168,13 +146,11 @@ export function createMemoryLlmClient(session: PluginSession, signal?: AbortSign
         return {
           ok: true as const,
           results: response.results.map((item) => ({ index: item.index, score: item.score, doc: input.docs[item.index] })),
-          resource: response.route.route,
-          fallbackUsed: response.route.fallback,
+          resource: response.route.resourceId ?? 'unknown',
           meta: {
             requestId: response.requestId,
-            resourceId: response.route.route,
+            resourceId: response.route.resourceId ?? 'unknown',
             model: response.route.model,
-            fallbackUsed: response.route.fallback,
           },
           usage: memoryLlmUsageFromProvider(response.usage),
         };

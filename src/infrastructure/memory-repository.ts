@@ -62,7 +62,6 @@ const LOOKUP_CHUNK_SIZE = 100;
 const PROMPT_SNAPSHOT_CHUNK_BYTES = 256 * 1024;
 const PROMPT_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
 const SETTINGS_WORKSPACE_ID = 'settings:global';
-const AGENT_PIPELINE_BASELINE_SETTING = 'agentPipelineBaselineVersion';
 const COLLECTIONS = MEMORY_WORKSPACE_COLLECTIONS;
 
 export interface MemoryWorkspaceHealth {
@@ -84,15 +83,6 @@ export interface MemoryWorkspaceHealth {
 }
 
 function asPlain(value: unknown): PlainData { return structuredClone(value) as PlainData; }
-function plainRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-function containsRetiredReference(value: unknown, retiredJobIds: ReadonlySet<string>, retiredTaskKeys: ReadonlySet<string>, seen = new Set<object>()): boolean {
-  if (typeof value === 'string') return retiredJobIds.has(value) || retiredTaskKeys.has(value);
-  if (!value || typeof value !== 'object' || seen.has(value as object)) return false;
-  seen.add(value as object);
-  return Object.values(value as Record<string, unknown>).some(item => containsRetiredReference(item, retiredJobIds, retiredTaskKeys, seen));
-}
 function paginationStalledError(scope: string): Error {
   return createSSHelperError('WORKSPACE_CONFLICT', {
     stage: 'memory.persistence.pagination',
@@ -1244,37 +1234,6 @@ export class MemoryRepository {
     return value?.value as T | undefined;
   }
 
-  async applyAgentPipelineBaseline(): Promise<number> {
-    const applied = await this.getSetting<number>(AGENT_PIPELINE_BASELINE_SETTING);
-    if (applied === 1) return 0;
-    const workspaceId = this.requireWorkspaceId();
-    const [jobs, repairQueue, audits] = await Promise.all([
-      this.listAllRecordRows('capture-jobs'),
-      this.listAllRecordRows('capture-repair-queue'),
-      this.listAllRecordRows('change-audits'),
-    ]);
-    const terminalJobs = new Set(['completed', 'failed', 'cancelled']);
-    const terminalRepairs = new Set(['resolved', 'ignored']);
-    const retiredJobs = jobs.filter(row => !terminalJobs.has(String(plainRecord(row.value).status ?? '')));
-    const retiredJobIds = new Set(retiredJobs.map(row => row.recordId));
-    const retiredTaskKeys = new Set([
-      ['memory', 'capture'].join('_'),
-      ['memory', 'capture', 'repair'].join('_'),
-    ]);
-    const retiredRepairs = repairQueue.filter(row => !terminalRepairs.has(String(plainRecord(row.value).status ?? '')));
-    const retiredAudits = audits.filter(row => containsRetiredReference(row.value, retiredJobIds, retiredTaskKeys));
-    const operations: StoreOperation[] = [
-      ...retiredJobs.map(row => ({ action: 'delete' as const, collection: 'capture-jobs', recordId: row.recordId, expectedVersion: row.version })),
-      ...retiredRepairs.map(row => ({ action: 'delete' as const, collection: 'capture-repair-queue', recordId: row.recordId, expectedVersion: row.version })),
-      ...retiredAudits.map(row => ({ action: 'delete' as const, collection: 'change-audits', recordId: row.recordId, expectedVersion: row.version })),
-    ];
-    for (let index = 0; index < operations.length; index += TRANSACTION_BATCH_SIZE) {
-      await this.store.apply({ workspaceId, idempotencyKey: `memory-agent-pipeline-baseline-v1:${index / TRANSACTION_BATCH_SIZE}`, operations: operations.slice(index, index + TRANSACTION_BATCH_SIZE) });
-    }
-    await this.setSetting(AGENT_PIPELINE_BASELINE_SETTING, 1);
-    return operations.length;
-  }
-
   async setSetting(key: string, value: unknown): Promise<void> {
     await this.ensureCollections(SETTINGS_WORKSPACE_ID); const current = await this.store.read({ workspaceId: SETTINGS_WORKSPACE_ID, collection: 'settings', recordId: key });
     const setting: MemorySettingRecord = { id: key, namespace: 'stx_memory', key, value, updatedAt: Date.now() };
@@ -1305,8 +1264,9 @@ export class MemoryRepository {
   async clearCurrentChatData(chatKey: string): Promise<void> {
     chatKey = this.requireChatKey(chatKey);
     const workspaceId = this.requireWorkspaceId();
-    const [evidenceRecords, jobRecords, auditRecords, usageRecords, logRecords, recallDetailRecords, promptSnapshotRecords, promptChunkRecords, factRecords, slotRecords, graphNodeRecords, graphEdgeRecords] = await Promise.all([
+    const [evidenceRecords, jobRecords, auditRecords, candidateRecords, usageRecords, logRecords, recallDetailRecords, promptSnapshotRecords, promptChunkRecords, factRecords, slotRecords, graphNodeRecords, graphEdgeRecords] = await Promise.all([
       this.listAllRecordRows('evidence', { chatKey }), this.listAllRecordRows('capture-jobs', { chatKey }), this.listAllRecordRows('change-audits', { chatKey }),
+      this.listAllRecordRows('memory-candidates', { chatKey }),
       this.listAllRecordRows('usage', { chatKey }), this.listAllRecordRows('recall-logs', { chatKey }),
       this.listAllRecordRows('generation-recall-details', { chatKey }),
       this.listAllRecordRows('generation-prompt-snapshots', { chatKey }), this.listAllRecordRows('generation-prompt-snapshot-chunks', { chatKey }),
@@ -1315,7 +1275,7 @@ export class MemoryRepository {
       this.listAllRecordRows('graph-nodes', { chatKey }), this.listAllRecordRows('graph-edges', { chatKey }),
     ]);
     const collections = [
-      ['evidence', evidenceRecords], ['capture-jobs', jobRecords], ['change-audits', auditRecords],
+      ['evidence', evidenceRecords], ['capture-jobs', jobRecords], ['change-audits', auditRecords], ['memory-candidates', candidateRecords],
       ['usage', usageRecords], ['recall-logs', logRecords], ['generation-recall-details', recallDetailRecords],
       ['generation-prompt-snapshots', promptSnapshotRecords], ['generation-prompt-snapshot-chunks', promptChunkRecords],
       ['facts', factRecords], ['fact-heads', slotRecords],
@@ -1330,7 +1290,7 @@ export class MemoryRepository {
   }
 
   async getChatKeys(): Promise<string[]> {
-    const values = await Promise.all(['facts', 'evidence', 'capture-jobs', 'change-audits', 'usage', 'recall-logs', 'generation-recall-details', 'generation-prompt-snapshots', 'generation-prompt-snapshot-chunks', 'graph-nodes', 'graph-edges'].map((collection) => this.listAllRecordRows(collection)));
+    const values = await Promise.all(['facts', 'evidence', 'capture-jobs', 'change-audits', 'memory-candidates', 'usage', 'recall-logs', 'generation-recall-details', 'generation-prompt-snapshots', 'generation-prompt-snapshot-chunks', 'graph-nodes', 'graph-edges'].map((collection) => this.listAllRecordRows(collection)));
     return [...new Set(values.flat().map((record) => (record.value as unknown as { chatKey?: string }).chatKey).filter((value): value is string => Boolean(value)))].sort();
   }
 

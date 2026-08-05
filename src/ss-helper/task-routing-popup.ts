@@ -1,11 +1,12 @@
 import {
-  LLM_TASK_ROUTING_GET_V0,
-  LLM_TASK_ROUTING_SET_V0,
-  LLM_TOOL_CAPABILITY_VERIFY_V0,
+  LLM_TASK_STATUS_V0,
+  LLM_TASK_ROUTE_SET_V0,
+  LLM_RESOURCE_CAPABILITY_VERIFY_V0,
+  LLM_TASK_STATUS_CHANGED_V0,
   readSSHelperFailure,
   type LlmSafeResourceSummary,
   type LlmTaskRoutingAssignment,
-  type LlmTaskRoutingSnapshot,
+  type LlmTaskStatusSnapshot,
   type PluginSession,
   type PopupUiContext,
   type SSHelperReasonCode,
@@ -14,11 +15,14 @@ import {
 import { MEMORY_TASK_ROUTING_POPUP } from './settings';
 
 export const MEMORY_TASK_ROUTING_TASKS = Object.freeze([
-  { taskKey: 'memory_extract_single', label: '单次提取', description: '单阶段结构化记忆提取', icon: 'bolt' },
-  { taskKey: 'memory_extract_entities', label: '实体提取', description: '人物与地点实体解析', icon: 'user-tag' },
-  { taskKey: 'memory_extract_narrative', label: '叙事提取', description: '事件、事实与知识边界提取', icon: 'book-open' },
-  { taskKey: 'memory_extract_inventory', label: '库存提取', description: '物品与库存变化提取', icon: 'box-open' },
-  { taskKey: 'memory_extract_repair', label: '结构修复', description: '局部结构化提取修复', icon: 'wrench' },
+  { taskKey: 'memory_extract_single', label: '单次提取', description: '单阶段结构化记忆提取', execution: 'structured', icon: 'bolt' },
+  { taskKey: 'memory_extract_entities', label: '实体提取', description: '人物与地点实体解析', execution: 'tool_turn', icon: 'user-tag' },
+  { taskKey: 'memory_extract_content', label: '内容与库存提取', description: '叙事、事实与库存联合提取', execution: 'tool_turn', icon: 'book-open' },
+  { taskKey: 'memory_extract_repair', label: '结构修复', description: '局部结构化提取修复', execution: 'structured', icon: 'wrench' },
+  { taskKey: 'memory_cast_plan', label: '角色规划', description: '下一轮角色规划', execution: 'structured', icon: 'bolt' },
+  { taskKey: 'memory_recall_intent', label: '召回意图', description: '复杂召回查询规划', execution: 'structured', icon: 'magnifying-glass' },
+  { taskKey: 'memory_embed', label: '向量索引', description: '记忆向量化与查询', execution: 'embedding', icon: 'database' },
+  { taskKey: 'memory_rerank', label: '候选重排', description: '召回候选模型重排', execution: 'rerank', icon: 'sort' },
 ] as const);
 
 const taskKeys = MEMORY_TASK_ROUTING_TASKS.map((task) => task.taskKey);
@@ -46,14 +50,17 @@ function resourceLabel(resource: LlmSafeResourceSummary): string {
   return `${resource.label} · ${resource.defaultModel ?? '默认模型'} · ${capabilityLabel(resource)}`;
 }
 
-function capabilityValue(value: boolean | undefined): string {
-  return value === undefined ? '未验证' : value ? '支持' : '不支持';
+function capabilityValue(value: 'incremental' | 'whole_call' | 'unsupported' | 'unknown' | undefined): string {
+  if (value === 'incremental') return '增量流式';
+  if (value === 'whole_call') return '整块工具调用';
+  if (value === 'unsupported') return '不支持';
+  return '未验证';
 }
 
-function strictSchemaLabel(value: 'native' | 'beta' | 'none' | undefined): string {
+function strictSchemaLabel(value: 'native' | 'beta' | 'unsupported' | 'unknown' | undefined): string {
   if (value === 'native') return '原生支持';
   if (value === 'beta') return 'Beta';
-  if (value === 'none') return '不支持';
+  if (value === 'unsupported') return '不支持';
   return '未验证';
 }
 
@@ -65,7 +72,7 @@ export async function renderMemoryTaskRoutingPopup(
   const document = container.ownerDocument;
   let disposed = false;
   let selectedTaskKey: MemoryRoutingTaskKey = 'memory_extract_entities';
-  let snapshot = await session.bus.request(LLM_TASK_ROUTING_GET_V0, { taskKeys });
+  let snapshot: LlmTaskStatusSnapshot = await session.bus.request(LLM_TASK_STATUS_V0, { taskKeys });
 
   const workspace = document.createElement('div');
   workspace.className = 'ss-helper-memory-routing-workspace';
@@ -76,7 +83,7 @@ export async function renderMemoryTaskRoutingPopup(
   eyebrow.className = 'ss-helper-memory-routing-eyebrow';
   eyebrow.textContent = 'MEMORY PIPELINE';
   const note = document.createElement('p');
-  note.textContent = '为五个记忆提取任务分别选择生成资源。工具调用未通过的资源仍可绑定，但会阻止 Agent 模式。';
+  note.textContent = '为记忆提取、规划、召回、向量和重排场景分别选择资源；每个场景进入自己的执行链。';
   introCopy.append(eyebrow, note);
   const readiness = document.createElement('span');
   readiness.className = 'ss-helper-memory-routing-readiness';
@@ -100,7 +107,7 @@ export async function renderMemoryTaskRoutingPopup(
   status.textContent = '修改会即时保存。';
   const resetButton = ui.createButton({
     label: '全部恢复自动选择',
-    ariaLabel: '将五个提取任务全部恢复为自动选择',
+    ariaLabel: '将全部记忆场景恢复为自动选择',
     icon: 'rotate-left',
     tone: 'neutral',
     size: 'sm',
@@ -116,70 +123,120 @@ export async function renderMemoryTaskRoutingPopup(
 
   const selectedButton = (): HTMLButtonElement | null => nav.querySelector(`[data-task-key="${selectedTaskKey}"]`);
 
+  let loadSequence = 0;
+  let saveQueue: Promise<void> = Promise.resolve();
+  let pendingSave: { assignments: readonly LlmTaskRoutingAssignment[]; successMessage: string } | undefined;
+  let saveInProgress = false;
+  let refreshPending = false;
+
+  const readLatest = async (): Promise<LlmTaskStatusSnapshot> => session.bus.request(LLM_TASK_STATUS_V0, { taskKeys });
   const load = async (focusTask = false): Promise<void> => {
-    snapshot = await session.bus.request(LLM_TASK_ROUTING_GET_V0, { taskKeys });
-    if (!disposed) renderWorkspace(focusTask);
+    if (saveInProgress) {
+      refreshPending = true;
+      return;
+    }
+    const sequence = ++loadSequence;
+    const next = await readLatest();
+    if (disposed || saveInProgress || sequence !== loadSequence || next.revision < snapshot.revision) return;
+    snapshot = next;
+    renderWorkspace(focusTask);
   };
 
-  const saveAssignments = async (
-    assignments: readonly LlmTaskRoutingAssignment[],
-    successMessage = '新的模型分配已经生效。',
-  ): Promise<void> => {
-    status.textContent = '正在保存任务路由…';
+  const runSaveQueue = async (): Promise<void> => {
+    saveInProgress = true;
     try {
-      snapshot = await session.bus.request(LLM_TASK_ROUTING_SET_V0, {
-        expectedRevision: snapshot.revision,
-        assignments,
-      });
-      if (disposed) return;
-      status.textContent = '任务路由已保存并热加载。';
-      notify({
-        level: 'success',
-        title: '任务路由已保存',
-        message: successMessage,
-        code: 'MEMORY_TASK_ROUTING_SAVED',
-      });
-      renderWorkspace();
-    } catch (error) {
-      if (disposed) return;
-      const code = safeReasonCode(error);
-      if (code === 'WORKSPACE_CONFLICT') {
-        status.textContent = '配置已被其他操作更新，正在重新载入。';
-        notify({
-          level: 'warning',
-          title: '路由配置已刷新',
-          message: '检测到并发修改，请重新选择需要的模型。',
-          code,
-        });
-        await load().catch(() => undefined);
-        return;
+      while (pendingSave !== undefined && !disposed) {
+        let intent = pendingSave;
+        pendingSave = undefined;
+        let replayed = false;
+        while (!disposed) {
+          // A newer UI intent supersedes an older one before it reaches the bus.
+          if (pendingSave !== undefined) {
+            intent = pendingSave;
+            pendingSave = undefined;
+            replayed = false;
+          }
+          status.textContent = '正在保存任务路由…';
+          try {
+            snapshot = await session.bus.request(LLM_TASK_ROUTE_SET_V0, {
+              expectedRevision: snapshot.revision,
+              assignments: intent.assignments,
+            });
+            status.textContent = '任务路由已保存并热加载。';
+            notify({
+              level: 'success',
+              title: '任务路由已保存',
+              message: intent.successMessage,
+              code: 'MEMORY_TASK_ROUTING_SAVED',
+            });
+            renderWorkspace();
+            break;
+          } catch (error) {
+            if (disposed) return;
+            const code = safeReasonCode(error);
+            if (code === 'WORKSPACE_CONFLICT' && !replayed) {
+              replayed = true;
+              status.textContent = '配置已被其他操作更新，正在重放最新选择。';
+              try {
+                const latest = await readLatest();
+                if (latest.revision >= snapshot.revision) snapshot = latest;
+              } catch {
+                // The retry below reports the original conflict without applying
+                // a stale local snapshot.
+              }
+              continue;
+            }
+            status.textContent = code === 'WORKSPACE_CONFLICT' ? '配置已被其他操作更新，请重新选择需要的模型。' : `路由保存失败（${code}）。`;
+            notify({
+              level: code === 'WORKSPACE_CONFLICT' ? 'warning' : 'error',
+              title: code === 'WORKSPACE_CONFLICT' ? '路由配置已刷新' : '路由保存失败',
+              message: code === 'WORKSPACE_CONFLICT' ? '检测到连续并发修改，请重新选择需要的模型。' : '当前选择已回滚，请检查资源状态后重试。',
+              code,
+            });
+            if (code !== 'WORKSPACE_CONFLICT') {
+              try {
+                const latest = await readLatest();
+                if (latest.revision >= snapshot.revision) snapshot = latest;
+              } catch { /* Keep the last known safe snapshot. */ }
+            }
+            renderWorkspace();
+            break;
+          }
+        }
       }
-      status.textContent = `路由保存失败（${code}）。`;
-      notify({
-        level: 'error',
-        title: '路由保存失败',
-        message: '当前选择已回滚，请检查资源状态后重试。',
-        code,
-      });
-      await load().catch(() => undefined);
+    } finally {
+      saveInProgress = false;
+      if (refreshPending && !disposed) {
+        refreshPending = false;
+        await load().catch(() => undefined);
+      }
     }
   };
 
+  const saveAssignments = (
+    assignments: readonly LlmTaskRoutingAssignment[],
+    successMessage = '新的模型分配已经生效。',
+  ): Promise<void> => {
+    pendingSave = { assignments: assignments.map((assignment) => ({ ...assignment })), successMessage };
+    saveQueue = saveQueue.then(runSaveQueue, runSaveQueue);
+    return saveQueue;
+  };
+
   const saveAssignment = async (taskKey: MemoryRoutingTaskKey, resourceId: string): Promise<void> => {
-    if (resourceId.startsWith('legacy:') || resourceId.startsWith('unavailable:')) return;
-    const current = new Map(snapshot.assignments.map((assignment) => [assignment.taskKey, assignment]));
+    if (resourceId.startsWith('unavailable:')) return;
+    const current = new Map((pendingSave?.assignments ?? snapshot.assignments ?? []).map((assignment) => [assignment.taskKey, assignment]));
     current.set(taskKey, { taskKey, ...(resourceId ? { resourceId } : {}) });
     await saveAssignments(taskKeys.map((key) => current.get(key) ?? { taskKey: key }));
   };
 
-  const verifyResource = async (resource: LlmSafeResourceSummary, button: HTMLButtonElement): Promise<void> => {
+  const verifyResource = async (resource: LlmSafeResourceSummary, taskKey: string, button: HTMLButtonElement): Promise<void> => {
     status.textContent = `正在验证 ${resource.label} 的 Agent 工具能力…`;
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
     try {
-      await session.bus.request(LLM_TOOL_CAPABILITY_VERIFY_V0, {
+      await session.bus.request(LLM_RESOURCE_CAPABILITY_VERIFY_V0, {
         resourceId: resource.resourceId,
-        ...(resource.defaultModel ? { model: resource.defaultModel } : {}),
+        taskKeys: [taskKey],
         force: true,
       });
       if (disposed) return;
@@ -227,12 +284,18 @@ export async function renderMemoryTaskRoutingPopup(
   const renderDetail = (): void => {
     detail.replaceChildren();
     const task = MEMORY_TASK_ROUTING_TASKS.find((candidate) => candidate.taskKey === selectedTaskKey)!;
-    const assignment = snapshot.assignments.find((item) => item.taskKey === task.taskKey);
+    const assignment = (snapshot.assignments ?? []).find((item) => item.taskKey === task.taskKey);
     const resourcesById = new Map(snapshot.resources.map((resource) => [resource.resourceId, resource]));
-    const availableResources = snapshot.resources.filter((resource) => resource.type === 'generation' && resource.enabled && resource.available);
+    const resourceType = task.execution === 'embedding' ? 'embedding' : task.execution === 'rerank' ? 'rerank' : 'generation';
+    const availableResources = snapshot.resources.filter((resource) => resource.type === resourceType && resource.enabled && resource.available);
     const availableIds = new Set(availableResources.map((resource) => resource.resourceId));
     const assignedResource = assignment?.resourceId ? resourcesById.get(assignment.resourceId) : undefined;
-    const legacyOverride = assignment?.model !== undefined && assignment.model !== assignedResource?.defaultModel;
+    const taskStatus = (snapshot.tasks ?? []).find((item) => item.taskKey === task.taskKey);
+    const resolvedRoute = assignment?.resourceId === undefined ? taskStatus : undefined;
+    const resolvedResource = resolvedRoute?.resourceId ? resourcesById.get(resolvedRoute.resourceId) : undefined;
+    const activeResource = assignedResource ?? resolvedResource;
+    const taskReady = taskStatus?.available === true
+      && (task.execution !== 'tool_turn' || capabilityCurrent(activeResource));
     const unavailableAssignment = assignment?.resourceId !== undefined && !availableIds.has(assignment.resourceId);
 
     const heading = document.createElement('div');
@@ -253,24 +316,19 @@ export async function renderMemoryTaskRoutingPopup(
     const resourceTitle = document.createElement('h4');
     resourceTitle.textContent = '生成资源';
     const resourceHint = document.createElement('p');
-    resourceHint.textContent = '选择已添加的生成资源；模型跟随资源的默认模型。';
+    resourceHint.textContent = task.execution === 'tool_turn' ? '选择生成资源；工具能力按当前模型独立验证。' : '选择匹配此执行链的资源；模型跟随资源默认模型。';
     resourceHeading.append(resourceTitle, resourceHint);
     const options = [
       { value: '', label: '自动选择（使用默认生成路由）' },
-      ...(legacyOverride && assignment?.resourceId
-        ? [{ value: `legacy:${assignment.resourceId}`, label: `${assignedResource?.label ?? '旧资源'} · ${assignment.model} · 非默认模型覆盖，请重新选择` }]
-        : []),
-      ...(!legacyOverride && unavailableAssignment && assignment?.resourceId
+      ...(unavailableAssignment && assignment?.resourceId
         ? [{ value: `unavailable:${assignment.resourceId}`, label: `${assignedResource?.label ?? '原资源'} · 当前不可用，请重新选择` }]
         : []),
       ...availableResources.map((resource) => ({
         value: resource.resourceId,
-        label: resourceLabel(resource),
+        label: task.execution === 'tool_turn' ? resourceLabel(resource) : `${resource.label} · ${resource.defaultModel ?? '默认模型'}`,
       })),
     ];
-    const selected = legacyOverride && assignment?.resourceId
-      ? `legacy:${assignment.resourceId}`
-      : unavailableAssignment && assignment?.resourceId
+    const selected = unavailableAssignment && assignment?.resourceId
         ? `unavailable:${assignment.resourceId}`
         : assignment?.resourceId ?? '';
     const select = ui.createSelect({
@@ -283,11 +341,12 @@ export async function renderMemoryTaskRoutingPopup(
 
     const routeMetrics = document.createElement('dl');
     routeMetrics.className = 'ss-helper-memory-routing-metrics';
-    const metricValues = assignedResource
+    const metricValues = activeResource
       ? [
-          ['Provider', assignedResource.apiType],
-          ['资源', assignedResource.label],
-          ['模型', assignment?.model ?? assignedResource.defaultModel ?? '默认模型'],
+          ['Provider', activeResource.apiType],
+          ['资源', `${activeResource.label}${assignedResource ? '' : '（自动）'}`],
+          ['模型', resolvedRoute?.route?.model ?? activeResource.defaultModel ?? '默认模型'],
+          ['链路', resolvedRoute?.route?.transport ?? task.execution],
         ]
       : [
           ['Provider', '自动解析'],
@@ -309,64 +368,62 @@ export async function renderMemoryTaskRoutingPopup(
     const capabilityHeading = document.createElement('div');
     const capabilityCopy = document.createElement('div');
     const capabilityTitle = document.createElement('h4');
-    capabilityTitle.textContent = 'Agent 能力';
+    capabilityTitle.textContent = task.execution === 'tool_turn' ? 'Agent 工具能力' : '场景能力';
     const capabilityHint = document.createElement('p');
-    capabilityHint.textContent = assignedResource ? '基于当前资源与默认模型的能力快照。' : '自动路由的能力会在运行时解析。';
+    capabilityHint.textContent = assignedResource
+      ? '基于当前资源与默认模型的能力快照。'
+      : activeResource
+        ? `自动路由当前解析为 ${activeResource.label}。`
+        : '当前未解析到可用的默认生成资源。';
     capabilityCopy.append(capabilityTitle, capabilityHint);
     capabilityHeading.append(capabilityCopy);
-    if (assignedResource && !legacyOverride && !unavailableAssignment) {
+    if (activeResource && !unavailableAssignment) {
       const verifyButton = ui.createButton({
         label: '重新验证',
-        ariaLabel: `重新验证 ${assignedResource.label} 的 Agent 工具能力`,
+        ariaLabel: `重新验证 ${activeResource.label} 的${task.execution === 'tool_turn' ? ' Agent 工具能力' : '场景能力'}`,
         icon: 'rotate',
         tone: 'neutral',
         size: 'sm',
       });
       verifyButton.classList.add('ss-helper-memory-routing-verify');
-      verifyButton.addEventListener('click', () => { void verifyResource(assignedResource, verifyButton); });
+      verifyButton.addEventListener('click', () => { void verifyResource(activeResource, task.taskKey, verifyButton); });
       capabilityHeading.append(verifyButton);
     }
     const capabilityList = document.createElement('dl');
-    const capability = assignedResource?.toolCapabilities;
-    const toolLabel = assignedResource ? capabilityLabel(assignedResource) : '随默认路由';
-    appendCapabilityRow(capabilityList, '工具调用', toolLabel, capabilityCurrent(assignedResource) ? 'success' : 'warning');
-    appendCapabilityRow(
-      capabilityList,
-      '严格 Schema',
-      strictSchemaLabel(capability?.strictToolSchema),
-      capability?.strictToolSchema === 'native' ? 'success' : capability ? 'warning' : 'neutral',
-    );
-    appendCapabilityRow(
-      capabilityList,
-      '流式工具',
-      capabilityValue(capability?.streamingToolCalls),
-      capability?.streamingToolCalls ? 'success' : capability ? 'warning' : 'neutral',
-    );
+    const capability = activeResource?.toolCapabilities;
+    if (task.execution === 'tool_turn') {
+      const toolLabel = activeResource ? capabilityLabel(activeResource) : '默认路由不可用';
+      appendCapabilityRow(capabilityList, '工具调用', toolLabel, capabilityCurrent(activeResource) ? 'success' : 'warning');
+      appendCapabilityRow(capabilityList, '严格 Schema', strictSchemaLabel(capability?.strictToolSchema), capability?.strictToolSchema === 'native' ? 'success' : capability ? 'warning' : 'neutral');
+      appendCapabilityRow(capabilityList, '流式工具', capabilityValue(capability?.streamingToolCalls), capability?.streamingToolCalls === 'incremental' ? 'success' : capability ? 'warning' : 'neutral');
+    } else {
+      appendCapabilityRow(capabilityList, '执行链', task.execution, taskReady ? 'success' : 'warning');
+      appendCapabilityRow(capabilityList, '场景状态', taskReady ? '可用' : '不可用', taskReady ? 'success' : 'warning');
+    }
     capabilitySection.append(capabilityHeading, capabilityList);
 
     const callout = document.createElement('aside');
     callout.className = 'ss-helper-memory-routing-callout';
     const calloutIcon = ui.createIcon({
-      name: legacyOverride || unavailableAssignment || (assignedResource && !capabilityCurrent(assignedResource)) ? 'triangle-exclamation' : 'circle-info',
+      name: unavailableAssignment || (activeResource && !capabilityCurrent(activeResource)) ? 'triangle-exclamation' : 'circle-info',
       decorative: true,
       fixedWidth: true,
     });
     const calloutCopy = document.createElement('p');
-    if (legacyOverride) {
-      callout.dataset.tone = 'danger';
-      calloutCopy.textContent = '当前绑定了非默认模型，不能视为已通过 Agent 工具验证，请重新选择资源。';
-    } else if (unavailableAssignment) {
+    if (unavailableAssignment) {
       callout.dataset.tone = 'danger';
       calloutCopy.textContent = '当前绑定的生成资源已停用、不可用或不存在，请重新选择。';
-    } else if (assignedResource && !capabilityCurrent(assignedResource)) {
+    } else if (activeResource && !taskReady) {
       callout.dataset.tone = 'warning';
-      calloutCopy.textContent = '此资源仍可用于普通提取，但会阻止 Agent 模式。请完成工具能力验证。';
-    } else if (assignedResource) {
+      calloutCopy.textContent = task.execution === 'tool_turn'
+        ? `${assignedResource ? '此资源' : '默认路由当前解析的资源'}尚未通过基础工具调用验证；严格 Schema或流式能力不足不会阻止非严格/非流式 Agent。`
+        : `${assignedResource ? '此资源' : '默认路由当前解析的资源'}尚未满足当前场景的执行能力。`;
+    } else if (activeResource) {
       callout.dataset.tone = 'success';
-      calloutCopy.textContent = '当前资源的工具能力验证有效，可用于 Agent 模式。';
+      calloutCopy.textContent = assignedResource ? '当前资源已满足此场景执行能力。' : `自动选择当前解析为 ${activeResource.label}，已满足此场景执行能力。`;
     } else {
-      callout.dataset.tone = 'neutral';
-      calloutCopy.textContent = '自动选择会跟随 AI 调度中心的默认生成路由，实际能力将在运行时解析。';
+      callout.dataset.tone = 'warning';
+      calloutCopy.textContent = '当前默认生成路由没有解析到可用资源，Agent 模式不可用。';
     }
     callout.append(calloutIcon, calloutCopy);
     detail.append(heading, resourceSection, routeMetrics, capabilitySection, callout);
@@ -376,17 +433,23 @@ export async function renderMemoryTaskRoutingPopup(
   const renderWorkspace = (focusTask = false): void => {
     nav.replaceChildren();
     const resourcesById = new Map(snapshot.resources.map((resource) => [resource.resourceId, resource]));
-    const availableIds = new Set(snapshot.resources
-      .filter((resource) => resource.type === 'generation' && resource.enabled && resource.available)
-      .map((resource) => resource.resourceId));
     let readyCount = 0;
+    const agentTasks = MEMORY_TASK_ROUTING_TASKS.filter((task) => task.execution === 'tool_turn');
     for (const task of MEMORY_TASK_ROUTING_TASKS) {
-      const assignment = snapshot.assignments.find((item) => item.taskKey === task.taskKey);
+      const assignment = (snapshot.assignments ?? []).find((item) => item.taskKey === task.taskKey);
       const assignedResource = assignment?.resourceId ? resourcesById.get(assignment.resourceId) : undefined;
-      const legacyOverride = assignment?.model !== undefined && assignment.model !== assignedResource?.defaultModel;
+      const taskStatus = (snapshot.tasks ?? []).find((item) => item.taskKey === task.taskKey);
+      const resolvedRoute = assignment?.resourceId === undefined ? taskStatus : undefined;
+      const resolvedResource = resolvedRoute?.resourceId ? resourcesById.get(resolvedRoute.resourceId) : undefined;
+      const activeResource = assignedResource ?? resolvedResource;
+      const availableIds = new Set(snapshot.resources
+        .filter((resource) => resource.type === (task.execution === 'embedding' ? 'embedding' : task.execution === 'rerank' ? 'rerank' : 'generation') && resource.enabled && resource.available)
+        .map((resource) => resource.resourceId));
       const unavailableAssignment = assignment?.resourceId !== undefined && !availableIds.has(assignment.resourceId);
-      const ready = !legacyOverride && !unavailableAssignment && capabilityCurrent(assignedResource);
-      if (ready) readyCount += 1;
+      const ready = !unavailableAssignment
+        && taskStatus?.available === true
+        && (task.execution !== 'tool_turn' || capabilityCurrent(activeResource));
+      if (ready && task.execution === 'tool_turn') readyCount += 1;
       const button = ui.createButton({
         label: task.label,
         ariaLabel: `配置${task.label}模型`,
@@ -398,14 +461,12 @@ export async function renderMemoryTaskRoutingPopup(
       button.dataset.taskKey = task.taskKey;
       button.setAttribute('aria-current', task.taskKey === selectedTaskKey ? 'page' : 'false');
       const route = document.createElement('small');
-      route.textContent = legacyOverride
-        ? '非默认模型覆盖'
-        : unavailableAssignment
+      route.textContent = unavailableAssignment
           ? '资源不可用'
-          : assignedResource?.label ?? '自动选择';
+          : assignedResource?.label ?? (resolvedResource ? `${resolvedResource.label}（自动）` : '自动选择');
       const dot = document.createElement('i');
       dot.className = 'ss-helper-memory-routing-dot';
-      dot.dataset.tone = ready ? 'success' : assignedResource ? 'warning' : 'neutral';
+      dot.dataset.tone = ready ? 'success' : activeResource ? 'warning' : 'neutral';
       dot.setAttribute('aria-hidden', 'true');
       button.append(route, dot);
       button.addEventListener('click', () => {
@@ -414,8 +475,8 @@ export async function renderMemoryTaskRoutingPopup(
       });
       nav.append(button);
     }
-    readiness.textContent = `${readyCount} / ${MEMORY_TASK_ROUTING_TASKS.length} 可用于 Agent`;
-    readiness.dataset.ssHelperTone = readyCount === MEMORY_TASK_ROUTING_TASKS.length ? 'success' : 'warning';
+    readiness.textContent = `${readyCount} / ${agentTasks.length} 个 Agent 场景可用`;
+    readiness.dataset.ssHelperTone = readyCount === agentTasks.length ? 'success' : 'warning';
     renderDetail();
     if (focusTask) selectedButton()?.focus();
   };
@@ -423,20 +484,41 @@ export async function renderMemoryTaskRoutingPopup(
   resetButton.addEventListener('click', () => {
     void ui.confirm({
       title: '恢复自动选择？',
-      message: '五个提取任务的手动资源分配都会被清除，并立即跟随默认生成路由。',
+      message: '全部记忆场景的手动资源分配都会被清除，并立即跟随对应 execution 默认资源。',
       confirmLabel: '恢复自动选择',
     }).then((confirmed) => {
       if (!confirmed || disposed) return;
       void saveAssignments(
         MEMORY_TASK_ROUTING_TASKS.map((task) => ({ taskKey: task.taskKey })),
-        '五个提取任务已恢复为自动选择。',
+        '全部记忆场景已恢复为自动选择。',
       );
     });
   });
 
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let unsubscribeCapabilityChange = (): void => undefined;
+  try {
+    unsubscribeCapabilityChange = session.bus.subscribe(LLM_TASK_STATUS_CHANGED_V0, () => {
+      if (refreshTimer !== undefined) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = undefined;
+        if (saveInProgress) {
+          refreshPending = true;
+          return;
+        }
+        void load().then(() => {
+          if (!disposed && !saveInProgress) status.textContent = '工具能力状态已刷新。';
+        }).catch((error) => {
+          if (!disposed) status.textContent = `工具能力状态刷新失败（${safeReasonCode(error)}）。`;
+        });
+      }, 80);
+    });
+  } catch { /* Capability events are optional while Core is starting. */ }
   renderWorkspace();
   return () => {
     disposed = true;
+    if (refreshTimer !== undefined) clearTimeout(refreshTimer);
+    unsubscribeCapabilityChange();
     workspace.replaceChildren();
     workspace.remove();
   };

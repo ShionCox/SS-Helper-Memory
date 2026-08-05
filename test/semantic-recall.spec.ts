@@ -397,7 +397,7 @@ describe('语义、混合召回与 LLM rerank', () => {
         previewRoute: vi.fn(async () => ({
           resourceId: 'Rerank',
           model: 'Qwen3-Reranker-4B',
-          blockedReason: '资源 gitee_Rerank 未配置 API Key',
+          failure: { reasonCode: 'AUTH_FAILED', stage: 'test.recall.rerank.route' },
         })),
       },
     } as unknown as MemoryLlmClient;
@@ -414,7 +414,7 @@ describe('语义、混合召回与 LLM rerank', () => {
       requested: true,
       success: false,
       resourceId: 'Rerank',
-      error: '资源 gitee_Rerank 未配置 API Key',
+      failure: { reasonCode: 'AUTH_FAILED', stage: 'test.recall.rerank.route' },
     });
   });
 

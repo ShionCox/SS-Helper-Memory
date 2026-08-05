@@ -39,14 +39,12 @@ interface PendingGenerationCompletion {
   readonly latestText: string;
   readonly allowAutoCapture: boolean;
 }
-
 export function memoryWorkspaceStatus(application: Pick<MemoryApplication, 'getCurrentChatInfo'>): SettingsStatusSnapshot {
   const chat = application.getCurrentChatInfo();
   if (!chat.available) return { value: '未选择', tone: 'warning', description: '请先选择一个角色或加入群组聊天；全局记忆设置和 LLM 连接仍然有效。' };
   if (!chat.effectiveEnabled) return { value: '已关闭', tone: 'neutral', description: '当前聊天按聊天级策略关闭了记忆；可在“当前聊天”中改为强制开启。' };
   return { value: '已就绪', tone: 'success', description: '当前角色或群组可用于记忆整理与召回。' };
 }
-
 /** Production runtime backed exclusively by the SDK session public surface. */
 export class MemoryRuntime {
   readonly application: MemoryApplication;
@@ -99,14 +97,15 @@ export class MemoryRuntime {
     if (this.stopped || this.abortController.signal.aborted || this.consumerDeclared) return Promise.resolve();
     if (this.consumerDeclarationPromise) return this.consumerDeclarationPromise;
     const attempt = this.consumerDeclarationAttempt;
-    const request = this.session.bus.request(LLM_CONSUMER_DECLARE_V0, {
+    const registration = {
       displayName: 'SS-Helper Memory',
       registrationVersion: 1,
       tasks: [
         {
           taskKey: 'memory_extract_single',
           taskKind: 'generation',
-          requiredCapabilities: ['chat', 'json'],
+          execution: 'structured',
+          requirements: { nativeStructured: 'preferred' },
           description: '单阶段结构化记忆提取',
           structuredPolicy: {
             maxProviderAttempts: 2,
@@ -119,7 +118,8 @@ export class MemoryRuntime {
         {
           taskKey: 'memory_extract_entities',
           taskKind: 'generation',
-          requiredCapabilities: ['chat', 'json'],
+          execution: 'tool_turn',
+          requirements: { strictToolSchema: 'preferred', streamingToolCalls: 'preferred' },
           description: '人物与地点实体解析',
           structuredPolicy: {
             maxProviderAttempts: 2,
@@ -130,35 +130,24 @@ export class MemoryRuntime {
           },
         },
         {
-          taskKey: 'memory_extract_narrative',
+          taskKey: 'memory_extract_content',
           taskKind: 'generation',
-          requiredCapabilities: ['chat', 'json'],
-          description: '事件、事实与知识边界提取',
+          execution: 'tool_turn',
+          requirements: { strictToolSchema: 'preferred', streamingToolCalls: 'preferred' },
+          description: '内容与库存联合提取',
           structuredPolicy: {
             maxProviderAttempts: 2,
             repairOn: ['INVALID_JSON', 'SCHEMA_VALIDATION_FAILED'],
             itemFailure: 'return_partial',
             envelopeFailure: 'repair_once',
-            itemCollections: ['episodes', 'claims'],
-          },
-        },
-        {
-          taskKey: 'memory_extract_inventory',
-          taskKind: 'generation',
-          requiredCapabilities: ['chat', 'json'],
-          description: '物品与库存变化提取',
-          structuredPolicy: {
-            maxProviderAttempts: 2,
-            repairOn: ['INVALID_JSON', 'SCHEMA_VALIDATION_FAILED'],
-            itemFailure: 'return_partial',
-            envelopeFailure: 'repair_once',
-            itemCollections: ['itemCandidates', 'inventoryOperations'],
+            itemCollections: ['episodes', 'claims', 'itemCandidates', 'inventoryOperations'],
           },
         },
         {
           taskKey: 'memory_extract_repair',
           taskKind: 'generation',
-          requiredCapabilities: ['chat', 'json'],
+          execution: 'structured',
+          requirements: { nativeStructured: 'preferred' },
           description: '局部结构化提取修复',
           structuredPolicy: {
             maxProviderAttempts: 1,
@@ -167,11 +156,15 @@ export class MemoryRuntime {
             envelopeFailure: 'fail',
           },
         },
-        { taskKey: 'memory_cast_plan', taskKind: 'generation', requiredCapabilities: ['chat', 'json'], description: '下一轮角色规划' },
-        { taskKey: 'memory_embed', taskKind: 'embedding', requiredCapabilities: ['embeddings'], description: '记忆向量' },
-        { taskKey: 'memory_rerank', taskKind: 'rerank', requiredCapabilities: ['rerank'], description: '记忆候选重排' },
+        { taskKey: 'memory_cast_plan', taskKind: 'generation', execution: 'structured', requirements: { nativeStructured: 'preferred' }, description: '下一轮角色规划' },
+        { taskKey: 'memory_recall_intent', taskKind: 'generation', execution: 'structured', requirements: { nativeStructured: 'preferred' }, description: '召回意图规划' },
+        { taskKey: 'memory_embed', taskKind: 'embedding', execution: 'embedding', description: '记忆向量' },
+        { taskKey: 'memory_rerank', taskKind: 'rerank', execution: 'rerank', description: '记忆候选重排' },
       ],
-    }, { timeoutMs: 10_000 });
+    };
+    // Keep the public bus boundary strict: strip any optional undefined fields and
+    // detach the registration from module-owned prototypes before validation.
+    const request = this.session.bus.request(LLM_CONSUMER_DECLARE_V0, JSON.parse(JSON.stringify(registration)), { timeoutMs: 10_000 });
     const pending = request.then(() => {
       if (this.stopped || this.abortController.signal.aborted) return;
       this.consumerDeclared = true;

@@ -6,7 +6,7 @@ import {
   type MemoryLlmClient,
 } from '../ingest/llm-extractor';
 import { buildSupportedEvidenceDirectory } from '../ingest/supported-evidence-directory';
-import type { MemoryExtractionInput, StructuredCaptureResult, StructuredClaim, StructuredInventoryOperation } from '../ingest/types';
+import type { MemoryExtractionInput, StructuredCaptureResult, StructuredCandidateAttempt, StructuredClaim, StructuredInventoryOperation } from '../ingest/types';
 import { AgentToolGateway } from '../tools/agent-tool-gateway';
 import { FactUpdatePlanner, InventoryUpdatePlanner, SceneUpdatePlanner, TemporalStateResolver } from '../update';
 import { DeterministicContextPrefetcher } from './context-prefetcher';
@@ -14,7 +14,6 @@ import { EXTRACTION_STAGE_SPECS } from './extraction-stage-specs';
 import { ExtractionStageRunner, type StageRunResult } from './stage-runner';
 import type {
   AgentPipelineSettings,
-  CaptureCollection,
   ExtractionPipelineAudit,
   ExtractionRunContext,
   ExtractionStageAudit,
@@ -119,22 +118,35 @@ function mergeStages(stages: readonly StageRunResult[], rejections: readonly Aut
   };
 }
 
-function counts(value: StructuredCaptureResult): Record<CaptureCollection, number> {
+function candidateAttemptFromStage(result: StageRunResult, attemptIndex: number): StructuredCandidateAttempt {
+  const output = result.output;
+  const collection = <T extends { localId: string; sourceRef?: string; sourceRefs?: readonly string[]; evidenceExcerpt?: string; evidenceExcerpts?: readonly string[]; summary?: string }>(items: readonly T[]) => items.map(item => ({
+    localId: item.localId,
+    sourceRefs: item.sourceRefs ? [...item.sourceRefs] : item.sourceRef ? [item.sourceRef] : [],
+    evidenceExcerpts: item.evidenceExcerpts ? [...item.evidenceExcerpts] : item.evidenceExcerpt ? [item.evidenceExcerpt] : [],
+    summary: item.summary ?? item.evidenceExcerpt ?? item.localId,
+    normalizedCandidate: plain(item),
+  }));
   return {
-    actorCandidates: value.actorCandidates.length,
-    locationCandidates: value.locationCandidates.length,
-    itemCandidates: value.itemCandidates?.length ?? 0,
-    episodes: value.episodes.length,
-    claims: value.claims.length,
-    inventoryOperations: value.inventoryOperations?.length ?? 0,
+    stage: result.audit.stage,
+    stageAttemptId: result.audit.stageAttemptId ?? `memory-stage:${result.audit.stage}:${attemptIndex}`,
+    attemptIndex,
+    collections: {
+      actorCandidates: collection(output.actorCandidates),
+      locationCandidates: collection(output.locationCandidates),
+      itemCandidates: collection(output.itemCandidates ?? []),
+      episodes: collection(output.episodes),
+      claims: collection(output.claims),
+      inventoryOperations: collection(output.inventoryOperations ?? []),
+    },
   };
 }
 
-function localIds(value: StructuredCaptureResult): Set<string> {
-  return new Set([
-    ...value.actorCandidates, ...value.locationCandidates, ...(value.itemCandidates ?? []),
-    ...value.episodes, ...value.claims, ...(value.inventoryOperations ?? []),
-  ].map(item => item.localId));
+function attachCandidateAttempts(output: StructuredCaptureResult, attempts: readonly StageRunResult[]): StructuredCaptureResult {
+  return {
+    ...output,
+    candidateAttempts: attempts.map((attempt, index) => candidateAttemptFromStage(attempt, index)),
+  };
 }
 
 function uniqueStages(values: readonly ExtractionStageKey[]): ExtractionStageKey[] {
@@ -149,7 +161,7 @@ function stagesRequiringRerun(entries: readonly ToolReadSetEntry[]): ExtractionS
     // scene, quantity direction, or time-slot interpretation and must rerun.
     if (entry.kind === 'fact') continue;
     stages.add(entry.stage);
-    if (entry.stage === 'entities') { stages.add('narrative'); stages.add('inventory'); }
+    if (entry.stage === 'entities') stages.add('content');
   }
   return [...stages];
 }
@@ -173,11 +185,6 @@ export class ExtractionPipelineCoordinator {
     this.#runner = new ExtractionStageRunner(getLlm);
   }
 
-  isShadowMode(): boolean {
-    const settings = this.getSettings();
-    return settings.extractionMode === 'agent' && settings.agentWriteMode === 'shadow';
-  }
-
   async extract(input: MemoryExtractionInput): Promise<StructuredCaptureResult> {
     const startedAt = Date.now();
     const currentSettings = this.getSettings();
@@ -185,7 +192,7 @@ export class ExtractionPipelineCoordinator {
       ? { ...currentSettings, ...input.runtimeExtraction }
       : currentSettings;
     const prefetched = await this.#prefetcher.prefetch(input);
-    const routeRequest = this.getLlm()?.inspect?.getTaskRouting?.(Object.values(EXTRACTION_STAGE_SPECS).map(item => item.taskKey));
+    const routeRequest = this.getLlm()?.inspect?.getTaskStatus?.(Object.values(EXTRACTION_STAGE_SPECS).map(item => item.taskKey));
     const routeSnapshot = routeRequest ? await routeRequest.catch(() => undefined) : undefined;
     const settingsDigest = await sha256(settings);
     if (settingsDigest !== this.#settingsDigest) { this.#settingsDigest = settingsDigest; this.#settingsRevision += 1; }
@@ -205,7 +212,6 @@ export class ExtractionPipelineCoordinator {
       mode: settings.extractionMode,
       agentConcurrency: settings.agentConcurrency,
       agentToolPolicy: settings.agentToolPolicy,
-      agentWriteMode: settings.agentWriteMode,
       settingsRevision: this.#settingsRevision,
       routeRevision: routeSnapshot?.revision ?? 0,
       dataRevision: prefetched.dataRevision,
@@ -242,13 +248,13 @@ export class ExtractionPipelineCoordinator {
         throw createSSHelperError('MEMORY_AGENT_TOOL_STALE_REVISION', { stage: 'memory.extraction.repair.read-set' });
       }
       const audit = this.buildAudit(context, attempts, gateways, [], startedAt);
-      return { ...result.output, audit: { ...result.output.audit, pipeline: audit } };
+      return { ...attachCandidateAttempts(result.output, attempts), audit: { ...result.output.audit, pipeline: audit } };
     }
     if (input.stage && input.stage !== 'single') {
       const gateways: AgentToolGateway[] = [];
       const attempts: StageRunResult[] = [];
       let finalInput = prefetched.input;
-      let finalContext = { ...context, mode: 'single' as const, agentToolPolicy: 'off' as const, agentWriteMode: 'active' as const };
+      let finalContext = { ...context, mode: 'single' as const, agentToolPolicy: 'off' as const };
       let gateway = new AgentToolGateway(finalInput, this.repository);
       gateways.push(gateway);
       let stageResult = await this.#runner.run(input.stage, finalInput, finalContext, gateway);
@@ -267,7 +273,7 @@ export class ExtractionPipelineCoordinator {
       const staleStages = stagesRequiringRerun(guard.staleEntries);
       const planned = await this.planUpdates(stageResult.output, finalInput, finalContext, staleStages.length === 0, staleStages, guard.staleEntries, gateways);
       const audit = this.buildAudit(finalContext, attempts, gateways, planned.decisions, startedAt);
-      return { ...planned.output, reviewItems: planned.reviewItems, audit: { ...stageResult.output.audit, pipeline: audit } };
+      return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, attempts), audit: { ...stageResult.output.audit, pipeline: audit } };
     }
     if (input.stage === 'single' || settings.extractionMode === 'single') {
       const gateways: AgentToolGateway[] = [];
@@ -277,7 +283,6 @@ export class ExtractionPipelineCoordinator {
         ...context,
         mode: 'single' as const,
         agentToolPolicy: 'off' as const,
-        agentWriteMode: 'active' as const,
       };
       let gateway = new AgentToolGateway(finalInput, this.repository);
       gateways.push(gateway);
@@ -297,7 +302,7 @@ export class ExtractionPipelineCoordinator {
       const staleStages = stagesRequiringRerun(guard.staleEntries);
       const planned = await this.planUpdates(single.output, finalInput, finalContext, staleStages.length === 0, staleStages, guard.staleEntries, gateways);
       const audit = this.buildAudit(finalContext, attempts, gateways, planned.decisions, startedAt);
-      return { ...planned.output, reviewItems: planned.reviewItems, audit: { ...single.output.audit, pipeline: audit } };
+      return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, attempts), audit: { ...single.output.audit, pipeline: audit } };
     }
 
     const gateways: AgentToolGateway[] = [];
@@ -305,7 +310,7 @@ export class ExtractionPipelineCoordinator {
     gateways.push(gateway);
     const rejections: AutomaticIngestRejection[] = [];
     const allAttempts: StageRunResult[] = [];
-    const safeRun = async (stage: 'entities' | 'narrative' | 'inventory', stageInput: MemoryExtractionInput, stageContext: ExtractionRunContext, stageGateway: AgentToolGateway): Promise<StageRunResult> => {
+    const safeRun = async (stage: 'entities' | 'content', stageInput: MemoryExtractionInput, stageContext: ExtractionRunContext, stageGateway: AgentToolGateway): Promise<StageRunResult> => {
       const began = Date.now();
       try {
         const result = await this.#runner.run(stage, stageInput, stageContext, stageGateway);
@@ -333,14 +338,7 @@ export class ExtractionPipelineCoordinator {
     });
     let downstream: MemoryExtractionInput = downstreamInput(prefetched.input, entities);
     await gateway.registerPendingReferences(downstream);
-    let narrative: StageRunResult;
-    let inventory: StageRunResult;
-    if (settings.agentConcurrency === 1) {
-      narrative = await safeRun('narrative', downstream, context, gateway);
-      inventory = await safeRun('inventory', downstream, context, gateway);
-    } else {
-      [narrative, inventory] = await Promise.all([safeRun('narrative', downstream, context, gateway), safeRun('inventory', downstream, context, gateway)]);
-    }
+    let content = await safeRun('content', downstream, context, gateway);
     const initialGateway = gateway;
     let finalInput = prefetched.input;
     let finalContext = context;
@@ -355,17 +353,8 @@ export class ExtractionPipelineCoordinator {
       if (rerunStages.includes('entities')) entities = await safeRun('entities', finalInput, finalContext, gateway);
       downstream = downstreamInput(finalInput, entities);
       await gateway.registerPendingReferences(downstream);
-      const rerunNarrative = rerunStages.includes('narrative');
-      const rerunInventory = rerunStages.includes('inventory');
-      if (rerunNarrative && rerunInventory && settings.agentConcurrency === 2) {
-        [narrative, inventory] = await Promise.all([
-          safeRun('narrative', downstream, finalContext, gateway),
-          safeRun('inventory', downstream, finalContext, gateway),
-        ]);
-      } else {
-        if (rerunNarrative) narrative = await safeRun('narrative', downstream, finalContext, gateway);
-        if (rerunInventory) inventory = await safeRun('inventory', downstream, finalContext, gateway);
-      }
+      const rerunContent = rerunStages.includes('content');
+      if (rerunContent) content = await safeRun('content', downstream, finalContext, gateway);
       const [unaffectedGuard, retryGuard] = await Promise.all([
         initialGateway.verifyReadSet(rerunStages),
         gateway.verifyReadSet(),
@@ -376,60 +365,12 @@ export class ExtractionPipelineCoordinator {
         staleEntries: [...unaffectedGuard.staleEntries, ...retryGuard.staleEntries],
       };
     }
-    const finalStages = [entities, narrative, inventory];
+    const finalStages = [entities, content];
     const merged = mergeStages(finalStages, rejections);
     const staleStages = stagesRequiringRerun(guard.staleEntries);
     const planned = await this.planUpdates(merged, finalInput, finalContext, staleStages.length === 0, staleStages, guard.staleEntries, gateways);
     const audit = this.buildAudit(context, allAttempts, gateways, planned.decisions, startedAt);
-    if (settings.agentWriteMode === 'shadow') {
-      const baselineStartedAt = Date.now();
-      let baseline: StageRunResult;
-      try {
-        baseline = await this.#runner.run('single', prefetched.input, {
-          ...context,
-          agentToolPolicy: 'off',
-          agentWriteMode: 'active',
-          shadowBaseline: true,
-          workflowLabel: '影子对照基线',
-          workflowKind: 'agent_shadow',
-        }, new AgentToolGateway(prefetched.input, this.repository));
-      } catch (error) {
-        const failure = readSSHelperFailure(error, { reasonCode: 'MEMORY_EXTRACTION_STAGE_FAILED', stage: 'memory.extraction.single' });
-        if (context.signal.aborted || ['MEMORY_EXTRACTION_PIPELINE_CANCELLED', 'CANCELLED', 'REQUEST_ABORTED'].includes(failure?.reasonCode ?? '')) throw error;
-        const failed = stageFailure('single', error, Date.now() - baselineStartedAt);
-        baseline = failed.result;
-      }
-      const agentIds = localIds(planned.output);
-      const singleIds = localIds(baseline.output);
-      const auditedStages = [...allAttempts, baseline];
-      const shadowAudit: ExtractionPipelineAudit = {
-        ...audit,
-        // The Single run is a comparison baseline, not an Agent pipeline stage.
-        // Keep its diagnostic separately so an unavailable baseline cannot make
-        // a valid entities/narrative/inventory run look partially failed.
-        stages: allAttempts.map(item => item.audit),
-        totalUsage: usageFromStages(auditedStages),
-        wallClockLatencyMs: Date.now() - startedAt,
-        shadow: {
-          shadowRunId: `shadow:${crypto.randomUUID()}`,
-          singleCounts: counts(baseline.output),
-          agentCounts: counts(planned.output),
-          matchingLocalIds: [...agentIds].filter(id => singleIds.has(id)).length,
-          agentOnlyLocalIds: [...agentIds].filter(id => !singleIds.has(id)).length,
-          singleOnlyLocalIds: [...singleIds].filter(id => !agentIds.has(id)).length,
-          singleStage: baseline.audit,
-        },
-      };
-      await this.repository?.recordShadowExtractionAudit(shadowAudit);
-      return {
-        ...EMPTY_CAPTURE,
-        shadowOnly: true,
-        rejections: planned.output.rejections,
-        diagnostics: planned.output.diagnostics,
-        audit: { pipeline: shadowAudit },
-      };
-    }
-    return { ...planned.output, reviewItems: planned.reviewItems, audit: { ...planned.output.audit, pipeline: audit } };
+    return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, allAttempts), audit: { ...planned.output.audit, pipeline: audit } };
   }
 
   private buildAudit(
@@ -449,7 +390,6 @@ export class ExtractionPipelineCoordinator {
       ...(context.batchCount === undefined ? {} : { batchCount: context.batchCount }),
       mode: context.mode,
       toolPolicy: context.agentToolPolicy,
-      writeMode: context.agentWriteMode,
       sourceBatchDigest: context.sourceBatchDigest,
       evidenceSetHash: context.evidenceDirectory.evidenceSetHash,
       routeSnapshotDigest: context.routeSnapshotDigest,
@@ -499,16 +439,15 @@ export class ExtractionPipelineCoordinator {
       ...workingCapture.actorCandidates.map(item => [item.localId, item.displayName] as const),
       ...workingCapture.locationCandidates.map(item => [item.localId, item.displayName] as const),
     ]);
-    const decisionStage = (owned: 'entities' | 'narrative' | 'inventory'): ExtractionStageKey => context.mode === 'single' || input.stage === 'single' ? 'single' : owned;
+    const decisionStage = (owned: 'entities' | 'content'): ExtractionStageKey => context.mode === 'single' || input.stage === 'single' ? 'single' : owned;
     const stageToolCallIds = (stage: ExtractionStageKey): string[] => gateways.flatMap(gateway => gateway.audits()).filter(item => item.stage === stage).map(item => item.callId);
     const stageReadSet = (stage: ExtractionStageKey): ToolReadSetEntry[] => gateways.flatMap(gateway => gateway.readSet()).filter(item => item.stage === stage);
     const stageDigests = new Map<ExtractionStageKey, string>();
-    for (const stage of uniqueStages([decisionStage('entities'), decisionStage('narrative'), decisionStage('inventory')])) stageDigests.set(stage, await sha256(stageReadSet(stage)));
+    for (const stage of uniqueStages([decisionStage('entities'), decisionStage('content')])) stageDigests.set(stage, await sha256(stageReadSet(stage)));
     const evidenceIds = (sourceRefs: readonly string[], excerpt?: string): string[] => context.evidenceDirectory.spans
       .filter(span => sourceRefs.includes(span.sourceRef) && (!excerpt || span.text === excerpt))
       .map(span => span.evidenceSpanId);
-    const narrativeStage = decisionStage('narrative');
-    const inventoryStage = decisionStage('inventory');
+    const contentStage = decisionStage('content');
     const entitiesStage = decisionStage('entities');
     const reviewTrace = (stage: ExtractionStageKey): Pick<MemoryReviewItem, 'readSetSummary' | 'toolCallSummary'> => {
       const calls = gateways.flatMap(gateway => gateway.audits()).filter(item => item.stage === stage);
@@ -532,12 +471,12 @@ export class ExtractionPipelineCoordinator {
       const comparableClaim = { ...claim };
       if (claim.subjectRef && referenceNames.has(claim.subjectRef)) { delete comparableClaim.subjectRef; comparableClaim.subjectText = referenceNames.get(claim.subjectRef); }
       if (claim.objectRef && referenceNames.has(claim.objectRef)) { delete comparableClaim.objectRef; comparableClaim.objectText = referenceNames.get(claim.objectRef); }
-      const basePlan = this.#factPlanner.plan(comparableClaim, facts, temporal, readSetValid || !staleStages.includes(narrativeStage));
+      const basePlan = this.#factPlanner.plan(comparableClaim, facts, temporal, readSetValid || !staleStages.includes(contentStage));
       if (reviewOverride?.candidateLocalId === claim.localId && reviewOverride.action === 'merge') {
         const targetRef = typeof objectRecord(reviewOverride.payload).targetRef === 'string' ? String(objectRecord(reviewOverride.payload).targetRef) : '';
         const target = facts.find(fact => fact.id === targetRef) ?? (/^F\d+$/u.test(targetRef) ? basePlan.current : undefined);
         if (!target) {
-          decisions.push({ stage: narrativeStage, candidateLocalId: claim.localId, decision: 'reject', reasonCode: 'MEMORY_UPDATE_PENDING_REVIEW', evidenceSpanIds: evidenceIds([claim.sourceRef], claim.evidenceExcerpt), toolCallIds: stageToolCallIds(narrativeStage), ...(stageDigests.get(narrativeStage) ? { readSetDigest: stageDigests.get(narrativeStage)! } : {}) });
+          decisions.push({ stage: contentStage, candidateLocalId: claim.localId, decision: 'reject', reasonCode: 'MEMORY_UPDATE_PENDING_REVIEW', evidenceSpanIds: evidenceIds([claim.sourceRef], claim.evidenceExcerpt), toolCallIds: stageToolCallIds(contentStage), ...(stageDigests.get(contentStage) ? { readSetDigest: stageDigests.get(contentStage)! } : {}) });
           return [];
         }
         const { subjectRef: _subjectRef, objectRef: _objectRef, ...claimWithoutRefs } = claim;
@@ -551,29 +490,33 @@ export class ExtractionPipelineCoordinator {
           confidence: Math.max(claim.confidence, target.confidence),
           reviewApproved: true,
         };
-        decisions.push({ stage: narrativeStage, candidateLocalId: claim.localId, currentRef: target.id, decision: 'merge', reasonCode: 'MEMORY_REVIEW_APPROVED', evidenceSpanIds: evidenceIds([claim.sourceRef], claim.evidenceExcerpt), toolCallIds: stageToolCallIds(narrativeStage), ...(stageDigests.get(narrativeStage) ? { readSetDigest: stageDigests.get(narrativeStage)! } : {}) });
+        decisions.push({ stage: contentStage, candidateLocalId: claim.localId, currentRef: target.id, decision: 'merge', reasonCode: 'MEMORY_REVIEW_APPROVED', evidenceSpanIds: evidenceIds([claim.sourceRef], claim.evidenceExcerpt), toolCallIds: stageToolCallIds(contentStage), ...(stageDigests.get(contentStage) ? { readSetDigest: stageDigests.get(contentStage)! } : {}) });
         return [mergedClaim];
       }
       const plan = claim.reviewApproved && basePlan.decision === 'pending_review'
         ? { ...basePlan, decision: basePlan.current ? 'supersede' as const : 'create' as const, reasonCode: 'MEMORY_REVIEW_APPROVED' }
         : basePlan;
       const itemEvidenceIds = evidenceIds([claim.sourceRef], claim.evidenceExcerpt);
-      const review = plan.decision === 'pending_review' ? this.reviewItem(context, narrativeStage, claim.localId, plan.reasonCode, [claim.sourceRef], itemEvidenceIds, plain({ kind: claim.kind, subject: claim.subjectRef ?? claim.subjectText, predicate: claim.predicateKey, content: claim.content.slice(0, 240) }), reviewTrace(narrativeStage), plan.current ? plain({ factId: plan.current.id, content: plan.current.content.slice(0, 240), revision: plan.current.revision }) : undefined) : undefined;
+      const review = plan.decision === 'pending_review' ? this.reviewItem(context, contentStage, claim.localId, plan.reasonCode, [claim.sourceRef], itemEvidenceIds, plain({ kind: claim.kind, subject: claim.subjectRef ?? claim.subjectText, predicate: claim.predicateKey, content: claim.content.slice(0, 240) }), reviewTrace(contentStage), plan.current ? plain({ factId: plan.current.id, content: plan.current.content.slice(0, 240), revision: plan.current.revision }) : undefined) : undefined;
       if (review) reviews.push(review);
-      decisions.push({ stage: narrativeStage, candidateLocalId: claim.localId, ...(plan.current ? { currentRef: plan.current.id } : {}), comparison: plan.reasonCode, decision: plan.decision, reasonCode: plan.reasonCode, evidenceSpanIds: itemEvidenceIds, toolCallIds: stageToolCallIds(narrativeStage), ...(stageDigests.get(narrativeStage) ? { readSetDigest: stageDigests.get(narrativeStage)! } : {}), temporalDecision: plan.decision === 'append_history' ? 'historical' : 'current', ...(review ? { reviewItemId: review.id } : {}) });
+      decisions.push({ stage: contentStage, candidateLocalId: claim.localId, ...(plan.current ? { currentRef: plan.current.id } : {}), comparison: plan.reasonCode, decision: plan.decision, reasonCode: plan.reasonCode, evidenceSpanIds: itemEvidenceIds, toolCallIds: stageToolCallIds(contentStage), ...(stageDigests.get(contentStage) ? { readSetDigest: stageDigests.get(contentStage)! } : {}), temporalDecision: plan.decision === 'append_history' ? 'historical' : 'current', ...(review ? { reviewItemId: review.id } : {}) });
       return ['duplicate_noop', 'pending_review', 'reject'].includes(plan.decision) ? [] : [claim];
     });
-    const inventoryOperations = (workingCapture.inventoryOperations ?? []).flatMap(operation => {
+    const inventoryCandidates = workingCapture.inventoryOperations ?? [];
+    const inventoryOperations = [...new Map(inventoryCandidates.map(operation => [
+      `${operation.itemRef}\u0000${operation.measureKind}\u0000${operation.unit}\u0000${operation.operation}\u0000${operation.amount ?? ''}`,
+      operation,
+    ])).values()].flatMap(operation => {
       const itemId = knownItemIds.get(operation.itemRef);
       const current = itemId ? states.find(state => state.itemId === itemId && state.measureKind === operation.measureKind) : undefined;
-      const basePlan = this.#inventoryPlanner.plan(operation, current, this.#temporal.resolve(operation, input.sources), readSetValid || !staleStages.includes(inventoryStage));
+      const basePlan = this.#inventoryPlanner.plan(operation, current, this.#temporal.resolve(operation, input.sources), readSetValid || !staleStages.includes(contentStage));
       const plan = operation.reviewApproved && basePlan.decision === 'pending_review'
         ? { decision: current ? (operation.operation === 'set' ? 'set_snapshot' as const : 'apply_delta' as const) : 'create_item' as const, reasonCode: 'MEMORY_REVIEW_APPROVED' }
         : basePlan;
       const itemEvidenceIds = evidenceIds([operation.sourceRef], operation.evidenceExcerpt);
-      const review = plan.decision === 'pending_review' ? this.reviewItem(context, inventoryStage, operation.localId, plan.reasonCode, [operation.sourceRef], itemEvidenceIds, plain({ itemRef: operation.itemRef, operation: operation.operation, measureKind: operation.measureKind, amount: operation.amount, unit: operation.unit }), reviewTrace(inventoryStage), current ? plain({ itemId: current.itemId, amount: current.amount, unit: current.unit, revision: current.revision }) : undefined) : undefined;
+      const review = plan.decision === 'pending_review' ? this.reviewItem(context, contentStage, operation.localId, plan.reasonCode, [operation.sourceRef], itemEvidenceIds, plain({ itemRef: operation.itemRef, operation: operation.operation, measureKind: operation.measureKind, amount: operation.amount, unit: operation.unit }), reviewTrace(contentStage), current ? plain({ itemId: current.itemId, amount: current.amount, unit: current.unit, revision: current.revision }) : undefined) : undefined;
       if (review) reviews.push(review);
-      decisions.push({ stage: inventoryStage, candidateLocalId: operation.localId, ...(current ? { currentRef: current.id } : {}), comparison: plan.reasonCode, decision: plan.decision, reasonCode: plan.reasonCode, evidenceSpanIds: itemEvidenceIds, toolCallIds: stageToolCallIds(inventoryStage), ...(stageDigests.get(inventoryStage) ? { readSetDigest: stageDigests.get(inventoryStage)! } : {}), temporalDecision: plan.decision === 'append_history' ? 'historical' : 'current', ...(review ? { reviewItemId: review.id } : {}) });
+      decisions.push({ stage: contentStage, candidateLocalId: operation.localId, ...(current ? { currentRef: current.id } : {}), comparison: plan.reasonCode, decision: plan.decision, reasonCode: plan.reasonCode, evidenceSpanIds: itemEvidenceIds, toolCallIds: stageToolCallIds(contentStage), ...(stageDigests.get(contentStage) ? { readSetDigest: stageDigests.get(contentStage)! } : {}), temporalDecision: plan.decision === 'append_history' ? 'historical' : 'current', ...(review ? { reviewItemId: review.id } : {}) });
       if (['duplicate_noop', 'pending_review', 'reject'].includes(plan.decision)) return [];
       return [{ ...operation, ...(plan.decision === 'append_history' ? { updateDecision: 'append_history' as const } : {}) }];
     });

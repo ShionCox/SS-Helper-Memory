@@ -172,6 +172,7 @@ export type MemoryJobStatus = 'queued' | 'running' | 'repairing' | 'needs_repair
 export type MemoryJobOutcome = 'complete' | 'partial';
 export type MemoryInitializationPhase = 'capture' | 'repair';
 export type RepairResolutionMode = 'repaired' | 'degraded' | 'ignored';
+export type RepairClassification = 'locally_fixed' | 'duplicate_noop' | 'unsupported_evidence' | 'ai_required';
 
 export interface RepairFieldAction {
   path: string;
@@ -214,7 +215,6 @@ export interface MemoryJobCheckpoint {
   extractionMode?: 'single' | 'agent';
   agentConcurrency?: 1 | 2;
   agentToolPolicy?: 'off' | 'read_only';
-  agentWriteMode?: 'shadow' | 'active';
   /** Provider-reported usage accumulated across every completed LLM response. */
   actualUsage?: MemoryTokenUsage;
   usageRequestCount?: number;
@@ -248,6 +248,8 @@ export interface CaptureRepairQueueRecord {
   /** The one evidence-change retry has already been released. */
   evidenceRetryUsed?: boolean;
   repairPolicyVersion?: number;
+  /** Deterministic pre-provider classification. Only ai_required enters the LLM. */
+  classification?: RepairClassification;
   resolutionMode?: RepairResolutionMode;
   fieldActions?: RepairFieldAction[];
   resolvedAt?: number;
@@ -392,6 +394,10 @@ export interface MemoryRecallLog {
 export interface AutomaticIngestRejection {
   /** Stable within a Capture batch; older audit rows may omit it. */
   id?: string;
+  /** Prompt-local candidate identity for Workbench traceability. */
+  candidateLocalId?: string;
+  /** Safe normalized candidate snapshot; never contains prompt/provider payloads. */
+  candidateSnapshot?: import('@ss-helper/sdk').PlainData;
   index: number;
   code: AutomaticProposalErrorCode;
   message: string;

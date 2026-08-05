@@ -1,13 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createSSHelperError } from '@ss-helper/sdk';
+import { createSSHelperError, type SSHelperFailureContext } from '@ss-helper/sdk';
 import type { ActorMemoryTrace, CaptureRepairQueueRecord, MemoryFact, MemoryJob, MemoryRecallLog } from '../src/domain';
 import type { ExistingMemoryContextItem, SourceBlock } from '../src/application/ingest/types';
 import { buildEvidenceWindowHash } from '../src/application/ingest/supported-evidence-directory';
 import { MEMORY_DEFAULT_SETTINGS } from '../src/ss-helper/settings';
 
 type TestRecallRoutes = {
-  embedding: { available: boolean; resourceId?: string; model?: string; blockedReason?: string };
-  rerank: { available: boolean; resourceId?: string; model?: string; blockedReason?: string };
+  embedding: { available: boolean; resourceId?: string; model?: string; failure?: SSHelperFailureContext };
+  rerank: { available: boolean; resourceId?: string; model?: string; failure?: SSHelperFailureContext };
 };
 
 const state = vi.hoisted(() => ({
@@ -29,8 +29,8 @@ vi.mock('../src/application/ingest/llm-extractor', () => ({
   readMemoryLlmClient: () => ({}),
   readMemoryLlmRouteDiagnostic: async () => ({ available: true, resourceId: 'test-resource', model: 'test-model' }),
   readMemoryRecallRouteDiagnostics: () => state.recallRoutePromise ?? Promise.resolve({
-    embedding: { available: false, blockedReason: 'test route disabled' },
-    rerank: { available: false, blockedReason: 'test route disabled' },
+    embedding: { available: false, failure: { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE', stage: 'test.route' } },
+    rerank: { available: false, failure: { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE', stage: 'test.route' } },
   }),
   MEMORY_PLUGIN_ID: 'stx_memory',
   MEMORY_EMBED_TASK: 'memory_embed',
@@ -284,67 +284,6 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     expect(serialized).not.toContain('候选正文');
   });
 
-  it('把 Agent Shadow change audit 投影为独立的脱敏固定阶段记录', async () => {
-    const { MemoryApplication } = await import('../src/application/memory-application');
-    const app = new MemoryApplication(new FakeRepository() as never);
-    connectHost(app);
-    const derivedAudit = {
-      id: 'change-audit:agent-shadow', workspaceId: 'character:c1', chatKey: 'chat-a', kind: 'derived-change-set-v0', createdAt: 40,
-      entries: [{ collection: 'facts', recordId: 'fact:secret', after: { content: '候选正文不得进入 UI' } }],
-      metadata: {
-        diagnosticType: 'extraction-pipeline', shadow: true, secretPrompt: '完整 Prompt 不得进入 UI',
-        pipeline: {
-          pipelineRunId: 'pipeline:agent-shadow', mode: 'agent', toolPolicy: 'read_only', writeMode: 'shadow',
-          inputDigest: 'sensitive-input-digest', existingMemoryDigest: 'sensitive-memory-digest',
-          stages: [
-            { stage: 'entities', taskKey: 'extract_entities', status: 'completed', requestId: 'request:entities', resourceId: 'memory_extract', model: 'model-safe', toolRounds: 1, toolCalls: 2, latencyMs: 1200 },
-            { stage: 'narrative', taskKey: 'extract_narrative', status: 'failed', requestId: 'request:narrative', resourceId: 'memory_extract', model: 'model-safe', toolRounds: 0, toolCalls: 0, latencyMs: 900, reasonCode: 'SCHEMA_VALIDATION_FAILED' },
-          ],
-          toolCalls: [{ toolName: 'memory.search_facts', argumentsDigest: 'sensitive-tool-digest' }],
-          totalUsage: { promptTokens: 100, completionTokens: 20, totalTokens: 120 },
-          wallClockLatencyMs: 2100,
-          shadow: {
-            shadowRunId: 'shadow:1', singleCounts: { claims: 2, episodes: 1 }, agentCounts: { claims: 3 },
-            matchingLocalIds: ['claim:1'], agentOnlyLocalIds: ['claim:2', 'claim:3'], singleOnlyLocalIds: ['episode:1'],
-            singleStage: { stage: 'single', status: 'failed', reasonCode: 'STRUCTURED_OUTPUT_EMPTY' },
-          },
-        },
-      },
-    };
-    (app as unknown as {
-      multiActorRepository: {
-        listChangeAudits(): Promise<Array<Record<string, unknown>>>;
-        listCaptureRepairQueue(): Promise<CaptureRepairQueueRecord[]>;
-      };
-    }).multiActorRepository = {
-      listChangeAudits: async () => [derivedAudit],
-      listCaptureRepairQueue: async () => [],
-    };
-
-    const records = await app.listAuditRecords();
-
-    expect(records).toEqual([expect.objectContaining({
-      kind: 'agent_pipeline', id: 'change-audit:agent-shadow', jobId: 'pipeline:agent-shadow', status: 'partial', outcome: 'partial',
-      unresolvedCount: 1, requestId: 'request:entities', resourceId: 'memory_extract', model: 'model-safe', latencyMs: 2100,
-      pipeline: expect.objectContaining({
-        mode: 'agent', toolPolicy: 'read_only', writeMode: 'shadow', stageCount: 2, completedStageCount: 1,
-        failedStageCount: 1, cancelledStageCount: 0, toolCallCount: 1, wallClockLatencyMs: 2100, totalTokens: 120,
-        shadow: { matchingLocalIds: 1, agentOnlyLocalIds: 2, singleOnlyLocalIds: 1, singleCount: 3, agentCount: 3, singleStatus: 'failed', singleReasonCode: 'STRUCTURED_OUTPUT_EMPTY' },
-        stages: [
-          expect.objectContaining({ stage: 'entities', status: 'completed', toolRounds: 1, toolCalls: 2 }),
-          expect.objectContaining({ stage: 'narrative', status: 'failed', reasonCode: 'SCHEMA_VALIDATION_FAILED' }),
-        ],
-      }),
-    })]);
-    const serialized = JSON.stringify(records);
-    expect(serialized).not.toContain('entries');
-    expect(serialized).not.toContain('完整 Prompt');
-    expect(serialized).not.toContain('候选正文');
-    expect(serialized).not.toContain('sensitive-input-digest');
-    expect(serialized).not.toContain('sensitive-memory-digest');
-    expect(serialized).not.toContain('sensitive-tool-digest');
-  });
-
   it('按 Capture 批次隔离 repair queue，补齐安全上下文并展开全部字段问题', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const app = new MemoryApplication(new FakeRepository() as never);
@@ -471,40 +410,6 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     expect(page.mock.calls.filter(([collection]) => collection === 'change-audits').map(([, request]) => request.cursor)).toEqual([undefined, 'cursor:next']);
     expect(listChangeAudits).not.toHaveBeenCalled();
     expect(listCaptureRepairQueue).not.toHaveBeenCalled();
-  });
-
-  it('审计分页保留 Agent Shadow 派生记录且不查询 Capture repair queue', async () => {
-    const { MemoryApplication } = await import('../src/application/memory-application');
-    const app = new MemoryApplication(new FakeRepository() as never);
-    connectHost(app);
-    const page = vi.fn(async (collection: string) => {
-      if (collection === 'capture-repair-queue') throw new Error('Agent Shadow 不应读取 Capture repair queue');
-      return {
-        items: [{
-          id: 'audit:agent-page', workspaceId: 'character:c1', chatKey: 'chat-a', kind: 'derived-change-set-v0', createdAt: 30, entries: [],
-          metadata: {
-            diagnosticType: 'extraction-pipeline', shadow: true,
-            pipeline: {
-              pipelineRunId: 'pipeline:page', mode: 'agent', toolPolicy: 'off', writeMode: 'shadow',
-              stages: [{ stage: 'entities', taskKey: 'extract_entities', status: 'completed', toolRounds: 0, toolCalls: 0, latencyMs: 10 }],
-              toolCalls: [], totalUsage: { totalTokens: 5 }, wallClockLatencyMs: 10,
-            },
-          },
-        }],
-        nextCursor: null,
-        total: 1,
-      };
-    });
-    (app as unknown as { multiActorRepository: unknown }).multiActorRepository = {
-      boundWorkspaceId: 'character:c1',
-      page,
-    };
-
-    const result = await app.listAuditRecordsPage({ limit: 10, includeTotal: true });
-
-    expect(result.items).toEqual([expect.objectContaining({ kind: 'agent_pipeline', id: 'audit:agent-page', jobId: 'pipeline:page' })]);
-    expect(page).toHaveBeenCalledTimes(1);
-    expect(page).toHaveBeenCalledWith('change-audits', expect.any(Object), expect.any(Object));
   });
 
   it('Token 用量分页保留 null，并把后续 cursor 限定在当前聊天', async () => {
@@ -850,12 +755,12 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
 
     state.recallRouteRelease?.({
       embedding: { available: true, resourceId: 'embed-route', model: 'Embed-Test' },
-      rerank: { available: false, blockedReason: 'LLMHub 未加载或版本过旧' },
+      rerank: { available: false, failure: { reasonCode: 'MEMORY_LLM_CLIENT_UNAVAILABLE', stage: 'test.route' } },
     });
     await vi.waitFor(() => expect(overviewChanged).toBe(1));
     await expect(app.getOverview()).resolves.toMatchObject({
       embedding: { available: true, resourceId: 'embed-route' },
-      rerank: { available: false, blockedReason: 'LLMHub 未加载或版本过旧' },
+      rerank: { available: false, failure: { reasonCode: 'MEMORY_LLM_CLIENT_UNAVAILABLE', stage: 'test.route' } },
     });
     removeOverviewListener();
     app.stop();
@@ -1196,6 +1101,44 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     expect(upsertCaptureJob.mock.calls[0]?.[0]).not.toHaveProperty('failure');
   });
 
+  it.each(['queued', 'running'] as const)('启动协调会把遗留的 %s Capture 标记为已取消而不让界面永久卡住', async (status) => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    const job = {
+      id: `job:stale-${status}`,
+      workspaceId: 'character:c1',
+      chatKey: 'chat-a',
+      type: 'initialize' as const,
+      status,
+      checkpoint: { batchIndex: 0, totalBatches: 1, phase: 'capture' as const },
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    const upsertCaptureJob = vi.fn(async (_job: unknown) => undefined);
+    const repository = {
+      listCaptureJobs: async () => [job],
+      reconcileCaptureRepairQueue: vi.fn(async () => []),
+      listCaptureRepairQueue: async () => [],
+      upsertCaptureJob,
+    };
+
+    await (app as unknown as {
+      reconcileHistoricalCaptureRepairs(repository: unknown): Promise<void>;
+    }).reconcileHistoricalCaptureRepairs(repository);
+
+    expect(upsertCaptureJob).toHaveBeenCalledWith(expect.objectContaining({
+      id: job.id,
+      status: 'cancelled',
+      outcome: 'partial',
+      failure: expect.objectContaining({
+        reasonCode: 'MEMORY_EXTRACTION_PIPELINE_CANCELLED',
+        stage: 'memory.capture.reconcile.stale',
+      }),
+      checkpoint: expect.objectContaining({ phase: 'cancelled' }),
+    }));
+    expect(repository.reconcileCaptureRepairQueue).not.toHaveBeenCalled();
+  });
+
   it('显示批次进度，并在停止后保存 paused checkpoint', async () => {
     state.sources = Array.from({ length: 21 }, (_, index) => message(index));
     const { MemoryApplication } = await import('../src/application/memory-application');
@@ -1210,10 +1153,10 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     expect(await app.getCaptureProgress()).toMatchObject({
       status: 'running',
       batchIndex: 1,
-      totalBatches: 3,
+      totalBatches: 1,
       batchRangeStart: 2,
-      batchRangeEnd: 4,
-      availableBatchCount: 5,
+      batchRangeEnd: 2,
+      availableBatchCount: 2,
     });
     const cancel = app.cancelCapture();
     state.release?.();
@@ -1222,14 +1165,14 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     expect(repository.commit).not.toHaveBeenCalled();
     expect(repository.jobs.at(-1)).toMatchObject({ status: 'paused', checkpoint: {
       batchIndex: 0,
-      totalBatches: 3,
+      totalBatches: 1,
       batchRangeStart: 2,
-      batchRangeEnd: 4,
-      availableBatchCount: 5,
+      batchRangeEnd: 2,
+      availableBatchCount: 2,
       selectedSourceGroupIds: ['message'],
     } });
-    expect(await app.getCaptureProgress()).toMatchObject({ status: 'cancelled', totalBatches: 3, batchRangeStart: 2, batchRangeEnd: 4, availableBatchCount: 5 });
-    expect((await app.getInitializationState()).attempts[0]).toMatchObject({ status: 'cancelled', selectedSourceKinds: ['message'], batchRangeStart: 2, batchRangeEnd: 4, availableBatchCount: 5 });
+    expect(await app.getCaptureProgress()).toMatchObject({ status: 'cancelled', totalBatches: 1, batchRangeStart: 2, batchRangeEnd: 2, availableBatchCount: 2 });
+    expect((await app.getInitializationState()).attempts[0]).toMatchObject({ status: 'cancelled', selectedSourceKinds: ['message'], batchRangeStart: 2, batchRangeEnd: 2, availableBatchCount: 2 });
     app.stop();
   });
 
@@ -1396,7 +1339,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       type: 'initialize',
       status: index === 4 ? 'completed' : 'failed',
       checkpoint: { batchIndex: index + 1, totalBatches: index + 1, processedCount: index, selectedSourceGroupIds: index === 4 ? ['host_card'] : ['message'] },
-      ...(index === 4 ? {} : { error: `failure-${index}` }),
+      ...(index === 4 ? {} : { failure: { reasonCode: 'MEMORY_EXTRACTION_STAGE_FAILED', stage: 'test.capture' } }),
       createdAt: index,
       updatedAt: index,
     })));

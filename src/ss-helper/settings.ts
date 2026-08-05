@@ -23,7 +23,6 @@ export interface MemorySettings extends MemoryCapabilitySettings, CastPlanningSe
   extractionMode: 'single' | 'agent';
   agentConcurrency: 1 | 2;
   agentToolPolicy: 'off' | 'read_only';
-  agentWriteMode: 'shadow' | 'active';
   summaryBatchMode: 'floors' | 'chars';
   summaryBatchFloors: number;
   summaryBatchChars: number;
@@ -54,12 +53,11 @@ export const MEMORY_DEFAULT_SETTINGS: Readonly<MemorySettings> = Object.freeze({
   extractionMode: 'single',
   agentConcurrency: 2,
   agentToolPolicy: 'off',
-  agentWriteMode: 'shadow',
-  summaryBatchMode: 'floors',
-  summaryBatchFloors: 5,
-  summaryBatchChars: 12_000,
+  summaryBatchMode: 'chars',
+  summaryBatchFloors: 16,
+  summaryBatchChars: 16_000,
   summaryIntervalFloors: 1,
-  summaryOverlapFloors: 2,
+  summaryOverlapFloors: 1,
   maxRecallItems: 12,
   promptMaxChars: 8_000,
   answerMode: 'auto',
@@ -72,7 +70,7 @@ export const MEMORY_DEFAULT_SETTINGS: Readonly<MemorySettings> = Object.freeze({
   structuredRepairEnabled: true,
   structuredRepairBeforeFloors: 2,
   structuredRepairAfterFloors: 2,
-  structuredRepairMaxItems: 4,
+  structuredRepairMaxItems: 8,
   graphEnabled: true,
   graphLlmRelationEnabled: true,
   graphMaxHops: 1,
@@ -101,38 +99,38 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
     { kind: 'section', id: 'summary', label: '总结', children: [
       { kind: 'toggle', id: 'autoOrganize', label: '自动整理', description: '达到总结间隔后，提炼可追溯的结构化事实。', defaultValue: true },
       { kind: 'status', id: 'generationStatus', label: '大语言模型', value: '正在同步', tone: 'neutral', action: MEMORY_LLM_RESOURCE_ACTION },
-      { kind: 'section', id: 'extractionPipeline', label: '提取管线', description: 'Agent 使用固定阶段、受限只读工具和程序裁决；首次启用保持影子模式。', children: [
+      { kind: 'section', id: 'extractionPipeline', label: '提取管线', description: 'Agent 使用固定阶段、受限只读工具和程序裁决，验证通过后原子写入正式记忆。', children: [
         { kind: 'radio', id: 'extractionMode', label: '提取模式', options: [
           { value: 'single', label: '单次提取' }, { value: 'agent', label: 'Agent 多阶段' },
         ], defaultValue: 'single' },
         { kind: 'radio', id: 'agentConcurrency', label: 'Agent 并发', options: [
           { value: '1', label: '1' }, { value: '2', label: '2' },
-        ], defaultValue: '2', description: '实体阶段完成后，叙事与库存阶段最多并发 2 路。' },
+        ], defaultValue: '2', description: '实体阶段完成后运行一次内容与库存联合提取；最多 2 轮只读工具。' },
         { kind: 'radio', id: 'agentToolPolicy', label: '只读工具', options: [
           { value: 'off', label: '关闭' }, { value: 'read_only', label: '按需使用' },
         ], defaultValue: 'off', description: '最多 2 轮、每轮 4 次、总计 6 次；工具结果不是证据。' },
-        { kind: 'radio', id: 'agentWriteMode', label: '写入模式', options: [
-          { value: 'shadow', label: '影子模式' }, { value: 'active', label: '正式写入' },
-        ], defaultValue: 'shadow', description: '影子模式只写安全审计与单次提取对比，正式记忆、目录、场景和库存写入为 0。' },
         { kind: 'status', id: 'agentSafetyStatus', label: '安全边界', value: '正在同步', tone: 'neutral' },
       ] },
       { kind: 'select', id: 'summaryBatchMode', label: '分批方式', options: [
-        { value: 'floors', label: '楼层优先' }, { value: 'chars', label: '字数优先' },
-      ], defaultValue: 'floors' },
-      { kind: 'range', id: 'summaryBatchFloors', label: '每组最多楼层', description: '楼层优先时先按这个数量形成逻辑分组；超长分组仍会按字符安全上限展开。', min: 1, max: 20, step: 1, defaultValue: 5 },
-      { kind: 'range', id: 'summaryBatchChars', label: '单分片字符上限', description: '单次模型请求的正文字符安全上限；楼层优先时也会用于拆分超长内容。', min: 2_000, max: 16_000, step: 500, defaultValue: 12_000 },
+        { value: 'chars', label: '字符优先（推荐）' }, { value: 'floors', label: '楼层优先' },
+      ], defaultValue: 'chars' },
+      { kind: 'range', id: 'summaryBatchFloors', label: '每批最多楼层', description: '字符装箱的安全楼层上限，避免单批跨越过长上下文。', min: 1, max: 16, step: 1, defaultValue: 16 },
+      { kind: 'range', id: 'summaryBatchChars', label: '单批字符上限', description: '每次模型请求最多携带的正文字符；超长消息会独立拆分。', min: 2_000, max: 16_000, step: 500, defaultValue: 16_000 },
       { kind: 'range', id: 'summaryIntervalFloors', label: '自动触发间隔', description: '已总结边界后每积累多少楼层形成一个窗口；默认每轮生成后捕获一次。', min: 1, max: 50, step: 1, defaultValue: 1 },
-      { kind: 'range', id: 'summaryOverlapFloors', label: '前置重叠层数', description: '每个总结窗口额外携带的前置上下文楼层数。', min: 0, max: 10, step: 1, defaultValue: 2 },
+      { kind: 'range', id: 'summaryOverlapFloors', label: '前置重叠层数', description: '每个总结窗口额外携带的只读上下文楼层数，默认 1 层。', min: 0, max: 10, step: 1, defaultValue: 1 },
       { kind: 'status', id: 'summaryProgress', label: '当前聊天总结进度', value: '正在同步', tone: 'neutral' },
     ] },
     { kind: 'section', id: 'routing', label: '模型路由', children: [
-      { kind: 'section', id: 'taskRoutingConfiguration', label: '分任务模型', description: '分别选择五个固定提取任务使用的生成资源；已有路由会继续沿用。', children: [
+      { kind: 'section', id: 'taskRoutingConfiguration', label: '分任务模型', description: '分别选择八个记忆场景使用的生成资源；每个场景按 execution 进入对应执行链。', children: [
         { kind: 'action', id: 'taskRouting', label: '配置分任务模型', description: '选择自动路由或为每项任务指定已添加的生成资源。', actionId: 'open-task-routing', popup: MEMORY_TASK_ROUTING_POPUP, placement: 'inline', buttonLabel: '配置' },
         { kind: 'status', id: 'agentRouteSingle', label: '单次提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
         { kind: 'status', id: 'agentRouteEntities', label: '实体提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
-        { kind: 'status', id: 'agentRouteNarrative', label: '叙事提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
-        { kind: 'status', id: 'agentRouteInventory', label: '库存提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
+        { kind: 'status', id: 'agentRouteContent', label: '内容与库存提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
         { kind: 'status', id: 'agentRouteRepair', label: '结构修复', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
+        { kind: 'status', id: 'agentRouteCastPlan', label: '角色规划', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
+        { kind: 'status', id: 'agentRouteRecallIntent', label: '召回意图', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
+        { kind: 'status', id: 'agentRouteEmbed', label: '向量索引', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
+        { kind: 'status', id: 'agentRouteRerank', label: '候选重排', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
       ] },
     ] },
     { kind: 'section', id: 'castPlanning', label: '多角色选角', description: '生成前先确定本轮角色范围，再为每个角色独立召回。混合模式只在角色不明确时额外调用一次轻量导演。', children: [
@@ -187,7 +185,7 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
         { kind: 'toggle', id: 'structuredRepairEnabled', label: '自动处理格式失败', description: '普通批次全部扫描后，自动对可定位的失败项进行一次定向修复。', defaultValue: true },
         { kind: 'range', id: 'structuredRepairBeforeFloors', label: '向前补充楼层', description: '定向修复时在来源楼层前附带的上下文层数。', min: 0, max: 10, step: 1, defaultValue: 2 },
         { kind: 'range', id: 'structuredRepairAfterFloors', label: '向后补充楼层', description: '定向修复时在来源楼层后附带的上下文层数。', min: 0, max: 10, step: 1, defaultValue: 2 },
-        { kind: 'range', id: 'structuredRepairMaxItems', label: '单次修复项目数', description: '同类型且来源窗口重叠时，每次最多合并的失败项目数。', min: 1, max: 10, step: 1, defaultValue: 4 },
+        { kind: 'range', id: 'structuredRepairMaxItems', label: '单次修复项目数', description: '同类型且来源窗口重叠时，每次最多合并 8 个失败项目，并受 8,000 Token 安全上限约束。', min: 1, max: 8, step: 1, defaultValue: 8 },
       ] },
       { kind: 'section', id: 'relationshipGraph', label: '关系图谱', description: '仅从当前聊天中已验证、带证据的事实派生关系；不会把语义相似度当作实体关系。', children: [
         { kind: 'toggle', id: 'graphEnabled', label: '启用关系图谱', description: '在后台回填当前聊天的事实关系图；图谱不可用时，整理和普通召回仍会继续。', defaultValue: true },
@@ -249,9 +247,8 @@ function fromValues(values: SettingsValues, fallback: MemorySettings): MemorySet
     extractionMode: values.extractionMode === 'agent' ? 'agent' : 'single',
     agentConcurrency: values.agentConcurrency === '1' ? 1 : 2,
     agentToolPolicy: values.agentToolPolicy === 'read_only' ? 'read_only' : 'off',
-    agentWriteMode: values.agentWriteMode === 'active' ? 'active' : 'shadow',
     summaryBatchMode: values.summaryBatchMode === 'chars' ? 'chars' : 'floors',
-    summaryBatchFloors: typeof values.summaryBatchFloors === 'number' ? Math.min(20, Math.max(1, Math.trunc(values.summaryBatchFloors))) : fallback.summaryBatchFloors,
+    summaryBatchFloors: typeof values.summaryBatchFloors === 'number' ? Math.min(16, Math.max(1, Math.trunc(values.summaryBatchFloors))) : fallback.summaryBatchFloors,
     summaryBatchChars: typeof values.summaryBatchChars === 'number' ? Math.min(16_000, Math.max(2_000, Math.trunc(values.summaryBatchChars / 500) * 500)) : fallback.summaryBatchChars,
     summaryIntervalFloors: typeof values.summaryIntervalFloors === 'number' ? Math.min(50, Math.max(1, Math.trunc(values.summaryIntervalFloors))) : fallback.summaryIntervalFloors,
     summaryOverlapFloors: typeof values.summaryOverlapFloors === 'number' ? Math.min(10, Math.max(0, Math.trunc(values.summaryOverlapFloors))) : fallback.summaryOverlapFloors,
@@ -278,7 +275,7 @@ function fromValues(values: SettingsValues, fallback: MemorySettings): MemorySet
       ? Math.min(10, Math.max(0, Math.trunc(values.structuredRepairAfterFloors)))
       : fallback.structuredRepairAfterFloors,
     structuredRepairMaxItems: typeof values.structuredRepairMaxItems === 'number'
-      ? Math.min(10, Math.max(1, Math.trunc(values.structuredRepairMaxItems)))
+      ? Math.min(8, Math.max(1, Math.trunc(values.structuredRepairMaxItems)))
       : fallback.structuredRepairMaxItems,
     graphEnabled: values.graphEnabled === undefined ? fallback.graphEnabled : values.graphEnabled === true,
     graphLlmRelationEnabled: values.graphLlmRelationEnabled === undefined ? fallback.graphLlmRelationEnabled : values.graphLlmRelationEnabled === true,
@@ -315,7 +312,6 @@ function toValues(settings: MemorySettings): SettingsValues {
     extractionMode: settings.extractionMode,
     agentConcurrency: String(settings.agentConcurrency),
     agentToolPolicy: settings.agentToolPolicy,
-    agentWriteMode: settings.agentWriteMode,
     summaryBatchMode: settings.summaryBatchMode,
     summaryBatchFloors: settings.summaryBatchFloors,
     summaryBatchChars: settings.summaryBatchChars,
@@ -362,10 +358,8 @@ function chatStatuses(controller: MemorySettingsController, agentAvailable = tru
   const agentSafetyStatus: SettingsStatusSnapshot = settings.extractionMode !== 'agent'
     ? { value: '单次提取基线', tone: 'neutral', description: '当前不启用多阶段 Agent。' }
     : !agentAvailable
-      ? { value: 'Agent 已安全停用', tone: 'error', description: '当前选择的一个或多个大语言模型不支持 Agent 模式或尚未通过工具调用验证；运行时将回退到单次提取。' }
-    : settings.agentWriteMode === 'shadow'
-      ? { value: '影子模式', tone: 'success', description: '只记录安全审计和对比，不写正式领域数据。' }
-      : settings.agentToolPolicy === 'read_only'
+      ? { value: 'Agent 已安全停用', tone: 'error', description: '当前选择的一个或多个大语言模型不支持 Agent 模式或尚未通过工具调用验证；运行时保持停用，不会静默切换到其他场景。' }
+    : settings.agentToolPolicy === 'read_only'
         ? { value: '正式写入 + 已验证工具', tone: 'warning', description: '仅工具能力已验证且未过期的显式路由可以运行。' }
         : { value: '正式写入', tone: 'warning', description: '固定阶段将进入现有硬校验、读取集守卫和原子提交。' };
   if (!chat.available) return Object.freeze({
@@ -415,9 +409,6 @@ function fieldState(controller: MemorySettingsController): SettingsFieldStateMap
     agentToolPolicy: summary.extractionMode === 'agent'
       ? Object.freeze({ disabled: false })
       : Object.freeze({ disabled: true, disabledReason: '仅 Agent 模式配置只读工具。' }),
-    agentWriteMode: summary.extractionMode === 'agent'
-      ? Object.freeze({ disabled: false })
-      : Object.freeze({ disabled: true, disabledReason: 'Single 模式沿用正式可信写入链。' }),
   });
 }
 
@@ -438,7 +429,6 @@ function capabilitySettings(controller: MemorySettingsController, settings: Memo
     preExtractReferenceMode: settings.preExtractReferenceMode,
     extractionMode: settings.extractionMode,
     agentToolPolicy: settings.agentToolPolicy,
-    agentWriteMode: settings.agentWriteMode,
   };
 }
 

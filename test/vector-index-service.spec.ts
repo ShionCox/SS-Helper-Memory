@@ -91,13 +91,13 @@ describe('事实向量索引服务', () => {
     const status = await service.getStatus('chat-a');
 
     expect(repository.upsertFactVector).not.toHaveBeenCalled();
-    expect(status.lastError).toBe('INTERNAL_ERROR · 程序内部错误');
+    expect(status.failure?.reasonCode).toBe('INTERNAL_ERROR');
   });
 
   it('服务端返回备用 embedding 路由时，后续批次使用实际路由而不重复回填', async () => {
     const repository = new FakeVectorRepository(2);
     const embed = vi.fn(async ({ texts }: { texts: string[] }) => {
-      if (embed.mock.calls.length > 1) return { ok: false as const, error: '不应重复回填同一批事实' };
+      if (embed.mock.calls.length > 1) return { ok: false as const, failure: { reasonCode: 'INTERNAL_ERROR', stage: 'test.vector.duplicate' } };
       return {
         ok: true as const,
         vectors: texts.map(() => [1, 0]),

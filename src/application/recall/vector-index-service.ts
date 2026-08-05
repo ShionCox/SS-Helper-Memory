@@ -1,5 +1,5 @@
 import type { MemoryFact, MemoryFactVectorCoverage, MemoryTokenUsage } from '../../domain';
-import { createSSHelperError, describeSSHelperFailure, readSSHelperFailure } from '@ss-helper/sdk';
+import { createSSHelperError, describeSSHelperFailure, readSSHelperFailure, type SSHelperFailureContext } from '@ss-helper/sdk';
 import { MemoryRepository } from '../../infrastructure';
 import {
   MEMORY_EMBED_TASK,
@@ -56,12 +56,12 @@ export interface VectorIndexStatus {
     available: boolean;
     resourceId?: string;
     model?: string;
-    blockedReason?: string;
+    failure?: SSHelperFailureContext;
   };
   coverage: MemoryFactVectorCoverage | null;
   rebuilding: boolean;
   pendingFacts: number;
-  lastError?: string;
+  failure?: SSHelperFailureContext;
   batches: readonly VectorBatchAudit[];
 }
 
@@ -139,6 +139,8 @@ export class MemoryVectorIndexService {
    * the diagnostic route.
    */
   private readonly resolvedEmbeddingTargets = new Map<string, ResolvedEmbeddingTarget>();
+  private readonly pendingQueries = new Map<string, Promise<CachedQueryVector>>();
+  private readonly queryRouteKeys = new Map<string, string>();
   private syncPromise: Promise<void> | null = null;
   private rebuildPromise: Promise<void> | null = null;
   private pendingSyncChatKey = '';
@@ -200,7 +202,9 @@ export class MemoryVectorIndexService {
     this.active = false;
     this.lifecycleRevision += 1;
     this.queryCache.clear();
+    this.pendingQueries.clear();
     this.resolvedEmbeddingTargets.clear();
+    this.queryRouteKeys.clear();
     this.pendingSyncChatKey = '';
   }
 
@@ -251,7 +255,7 @@ export class MemoryVectorIndexService {
       const lifecycleRevision = this.lifecycleRevision;
       const route = (await this.getRoutes()).embedding;
       const llm = this.getLlm();
-      if (!route.available || !route.resourceId || !route.model || route.blockedReason || !llm?.embed) {
+      if (!route.available || !route.resourceId || !route.model || route.failure || !llm?.embed) {
         throw createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', {
           stage: 'memory.vector.route',
           resourceId: route.resourceId,
@@ -260,12 +264,13 @@ export class MemoryVectorIndexService {
       }
       const facts = (await Promise.all([...new Set(factIds)].map((factId) => this.repository.getFact(chatKey, factId))))
         .filter((fact): fact is MemoryFact => Boolean(fact && (fact.status === 'active' || fact.status === 'pending')));
+      const batchLimit = route.verifiedMaxBatchInputs ?? VECTOR_BATCH_SIZE;
       this.queryCache.clear();
       let observedResponseRoute: { resourceId: string; model: string } | undefined;
       try {
-        for (let offset = 0; offset < facts.length; offset += VECTOR_BATCH_SIZE) {
+        for (let offset = 0; offset < facts.length; offset += batchLimit) {
           if (!this.active || lifecycleRevision !== this.lifecycleRevision) throw new Error('Memory 生命周期已变化。');
-          const batch = facts.slice(offset, offset + VECTOR_BATCH_SIZE);
+          const batch = facts.slice(offset, offset + batchLimit);
           const response = await withTimeout(llm.embed({
             consumer: MEMORY_PLUGIN_ID,
             taskKey: MEMORY_EMBED_TASK,
@@ -273,6 +278,8 @@ export class MemoryVectorIndexService {
             texts: batch.map(embeddingText),
             budget: { maxLatencyMs: EMBEDDING_TIMEOUT_MS },
             enqueue: { displayMode: 'silent' },
+            workflowStage: 'memory_embed_index',
+            trace: { workflowId: `memory-embed:${chatKey}`, workflowLabel: '记忆向量索引', workflowKind: 'memory_embed', stageKey: 'memory_embed_index', stageDescription: '事实向量回填' },
           }), EMBEDDING_TIMEOUT_MS, '回滚向量修复');
           if (!this.active || lifecycleRevision !== this.lifecycleRevision) throw new Error('Memory 生命周期已变化。');
           if (!response.ok || response.vectors.length !== batch.length) throw new Error('回滚向量修复失败。');
@@ -322,7 +329,7 @@ export class MemoryVectorIndexService {
       coverage,
       rebuilding: previous?.rebuilding ?? false,
       pendingFacts: (coverage?.missing ?? 0) + (coverage?.stale ?? 0),
-      ...(previous?.lastError ? { lastError: previous.lastError } : {}),
+      ...(previous?.failure ? { failure: previous.failure } : {}),
       batches: previous?.batches ?? [],
     };
   }
@@ -377,25 +384,26 @@ export class MemoryVectorIndexService {
         ...patch,
       });
     };
-    if (!route.available || !route.resourceId || !route.model || route.blockedReason) {
-      status({ rebuilding: false, lastError: route.blockedReason ?? '没有可用的 embedding 路由。' });
+    if (!route.available || !route.resourceId || !route.model || route.failure) {
+      status({ rebuilding: false, failure: route.failure ?? { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE', stage: 'memory.vector.route' } });
       return;
     }
     const llm = this.getLlm();
     if (!llm?.embed) {
-      status({ rebuilding: false, lastError: 'LLMHub 未加载或版本过旧。' });
+      status({ rebuilding: false, failure: { reasonCode: 'MEMORY_LLM_CLIENT_UNAVAILABLE', stage: 'memory.vector.client' } });
       return;
     }
     status({ rebuilding: true });
     let dimensions: number | undefined;
     let targetRoute = this.getEmbeddingTarget(chatKey, route.resourceId, route.model);
+    const batchLimit = route.verifiedMaxBatchInputs ?? VECTOR_BATCH_SIZE;
     let observedResponseRoute: { resourceId: string; model: string } | undefined;
     let batchIndex = 0;
     try {
       while (true) {
         if (!this.active || lifecycleRevision !== this.lifecycleRevision) return;
         const target = { ...targetRoute, ...(dimensions ? { dimensions } : {}) };
-        const facts = await this.repository.listFactsNeedingVectorRebuild(chatKey, target, VECTOR_BATCH_SIZE);
+        const facts = await this.repository.listFactsNeedingVectorRebuild(chatKey, target, batchLimit);
         const coverage = await this.repository.getFactVectorCoverage(chatKey, target);
         status({ coverage, pendingFacts: coverage.missing + coverage.stale });
         if (facts.length === 0) break;
@@ -407,6 +415,8 @@ export class MemoryVectorIndexService {
           texts: facts.map(embeddingText),
           budget: { maxLatencyMs: EMBEDDING_TIMEOUT_MS },
           enqueue: { displayMode: 'silent' },
+          workflowStage: 'memory_embed_index',
+          trace: { workflowId: `memory-embed:${chatKey}`, workflowLabel: '记忆向量索引', workflowKind: 'memory_embed', stageKey: 'memory_embed_index', stageDescription: '事实向量回填' },
         }), EMBEDDING_TIMEOUT_MS, '事实 embedding');
         if (!response.ok) throw createSSHelperError(response.failure.reasonCode, response.failure);
         if (response.vectors.length !== facts.length) {
@@ -458,7 +468,7 @@ export class MemoryVectorIndexService {
         reasonCode: 'INTERNAL_ERROR',
         stage: 'memory.vector.rebuild',
       });
-      status({ rebuilding: false, lastError: `${diagnostic.reasonCode} · ${diagnostic.title}` });
+      status({ rebuilding: false, failure: diagnostic });
     }
   }
 
@@ -497,12 +507,19 @@ export class MemoryVectorIndexService {
   private async embedQuery(chatKey: string, query: string): Promise<CachedQueryVector> {
     const diagnostics = await this.getRoutes();
     const route = diagnostics.embedding;
-    if (!route.available || !route.resourceId || !route.model || route.blockedReason) {
-      throw new Error(route.blockedReason ?? '没有可用的 embedding 路由。');
+    if (!route.available || !route.resourceId || !route.model || route.failure) {
+      throw createSSHelperError(route.failure?.reasonCode ?? 'LLM_CAPABILITY_UNAVAILABLE', route.failure ?? { stage: 'memory.vector.route' });
     }
     const requestedTarget = this.getEmbeddingTarget(chatKey, route.resourceId, route.model);
     const normalizedQuery = query.normalize('NFKC').trim();
-    const key = `${requestedTarget.resourceId}\u0000${requestedTarget.model}\u0000${normalizedQuery}`;
+    const routeKey = `${requestedTarget.resourceId}\u0000${requestedTarget.model}\u0000${route.routeRevision ?? ''}`;
+    const previousRouteKey = this.queryRouteKeys.get(chatKey);
+    if (previousRouteKey !== undefined && previousRouteKey !== routeKey) {
+      for (const [cacheKey] of this.queryCache) if (cacheKey.startsWith(`${previousRouteKey}\u0000`)) this.queryCache.delete(cacheKey);
+    }
+    this.queryRouteKeys.set(chatKey, routeKey);
+    const lifecycleRevision = this.lifecycleRevision;
+    const key = `${routeKey}\u0000${normalizedQuery}`;
     const cached = this.queryCache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
       this.queryCache.delete(key);
@@ -510,39 +527,51 @@ export class MemoryVectorIndexService {
       return { ...cached, cached: true };
     }
     if (cached) this.queryCache.delete(key);
+    const pending = this.pendingQueries.get(key);
+    if (pending) return { ...(await pending), cached: true };
     const llm = this.getLlm();
     if (!llm?.embed) throw new Error('LLMHub 未加载或不支持 embedding。');
-    const response = await withTimeout(llm.embed({
-      consumer: MEMORY_PLUGIN_ID,
-      taskKey: MEMORY_EMBED_TASK,
-      taskDescription: '记忆查询向量',
-      texts: [query],
-      budget: { maxLatencyMs: EMBEDDING_TIMEOUT_MS },
-      enqueue: { displayMode: 'silent' },
-    }), EMBEDDING_TIMEOUT_MS, '查询 embedding');
-    if (!response.ok) throw createSSHelperError(response.failure.reasonCode, response.failure);
-    if (response.vectors.length !== 1) throw new Error('查询 embedding 返回数量不为 1。');
-    const resourceId = response.meta?.resourceId ?? route.resourceId;
-    const model = response.meta?.model ?? response.model ?? route.model;
-    this.rememberEmbeddingTarget(chatKey, route.resourceId, route.model, { resourceId, model });
-    const actualKey = `${resourceId}\u0000${model}\u0000${normalizedQuery}`;
-    const entry: CachedQueryVector = {
-      key: actualKey,
-      vector: validateVector(response.vectors[0]!),
-      resourceId,
-      model,
-      ...(response.meta ? { meta: response.meta } : {}),
-      usage: memoryUsage(response.usage),
-      expiresAt: Date.now() + QUERY_CACHE_TTL_MS,
-      cached: false,
-    };
-    this.queryCache.set(actualKey, entry);
-    while (this.queryCache.size > QUERY_CACHE_SIZE) {
-      const oldest = this.queryCache.keys().next().value as string | undefined;
-      if (!oldest) break;
-      this.queryCache.delete(oldest);
-    }
-    return entry;
+    const request = (async (): Promise<CachedQueryVector> => {
+      const response = await withTimeout(llm.embed!({
+        consumer: MEMORY_PLUGIN_ID,
+        taskKey: MEMORY_EMBED_TASK,
+        taskDescription: '记忆查询向量',
+        texts: [query],
+        budget: { maxLatencyMs: EMBEDDING_TIMEOUT_MS },
+        enqueue: { displayMode: 'silent' },
+        workflowStage: 'memory_embed_query',
+        trace: { workflowId: `memory-embed-query:${chatKey}`, workflowLabel: '记忆查询向量', workflowKind: 'memory_embed', stageKey: 'memory_embed_query', stageDescription: '查询向量' },
+      }), EMBEDDING_TIMEOUT_MS, '查询 embedding');
+      if (!this.active || lifecycleRevision !== this.lifecycleRevision) {
+        throw createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', { stage: 'memory.vector.query.stale' });
+      }
+      if (!response.ok) throw createSSHelperError(response.failure.reasonCode, response.failure);
+      if (response.vectors.length !== 1) throw new Error('查询 embedding 返回数量不为 1。');
+      const resourceId = response.meta?.resourceId ?? route.resourceId!;
+      const model = response.meta?.model ?? response.model ?? route.model!;
+      this.rememberEmbeddingTarget(chatKey, route.resourceId!, route.model!, { resourceId, model });
+      const actualKey = `${resourceId}\u0000${model}\u0000${route.routeRevision ?? ''}\u0000${normalizedQuery}`;
+      const entry: CachedQueryVector = {
+        key: actualKey,
+        vector: validateVector(response.vectors[0]!),
+        resourceId,
+        model,
+        ...(response.meta ? { meta: response.meta } : {}),
+        usage: memoryUsage(response.usage),
+        expiresAt: Date.now() + QUERY_CACHE_TTL_MS,
+        cached: false,
+      };
+      this.queryCache.set(actualKey, entry);
+      while (this.queryCache.size > QUERY_CACHE_SIZE) {
+        const oldest = this.queryCache.keys().next().value as string | undefined;
+        if (!oldest) break;
+        this.queryCache.delete(oldest);
+      }
+      return entry;
+    })();
+    this.pendingQueries.set(key, request);
+    try { return await request; }
+    finally { if (this.pendingQueries.get(key) === request) this.pendingQueries.delete(key); }
   }
 }
 

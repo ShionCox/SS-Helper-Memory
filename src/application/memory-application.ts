@@ -9,7 +9,7 @@ import {
   type ChatMessageSnapshot,
   type FinalPromptSnapshot,
 } from '@ss-helper/sdk';
-import { DEFAULT_CAST_SETTINGS, FIXED_OWNER_IDS, deriveMemoryGraphProjection, isAiRepairableProposalCode } from '../domain';
+import { DEFAULT_CAST_SETTINGS, FIXED_OWNER_IDS, deriveMemoryGraphProjection, isAiRepairableProposalCode, type RepairClassification } from '../domain';
 import type {
   MainChatUsage,
   ManualFactInput,
@@ -80,6 +80,8 @@ import type {
   MemoryUiFact,
   MemoryUiOverview,
   MemoryUiSettings,
+  MemoryCandidateStats,
+  MemoryCandidateSourcePreview,
 } from '../ui/memory-ui';
 import type { MemoryPage, MemoryPageRequest, MemoryPageResource } from '../ui/memory-page';
 import type { MemoryHostContext } from '../host/sdk-host-context';
@@ -106,7 +108,7 @@ import { LocationRegistry } from './locations';
 import { ProfileCoordinator } from './profile';
 import { DreamCoordinator, type DreamApplyResult } from './dream';
 import { buildMemoryRecallPacket } from './recall/memory-strength';
-import type { ActorCandidate, ActorMemoryTrace, ProfileClaim } from '../domain';
+import type { ActorCandidate, ActorMemoryTrace, ProfileClaim, MemoryCandidateRecord } from '../domain';
 import {
   GenerationMemoryCoordinator,
   createGenerationRecallDetail,
@@ -114,6 +116,19 @@ import {
 } from './generation';
 
 type MemoryGlobalSettings = Omit<MemoryUiSettings, 'chatMode'>;
+function candidateSourceDigest(value: string): string {
+  const normalized = value.normalize('NFKC');
+  const parts: string[] = [];
+  for (let variant = 0; variant < 4; variant += 1) {
+    let result = 2166136261;
+    for (const char of `${variant}\0${normalized}`) {
+      result ^= char.codePointAt(0) ?? 0;
+      result = Math.imul(result, 16777619);
+    }
+    parts.push((result >>> 0).toString(16).padStart(8, '0'));
+  }
+  return `sha256:${parts.join('')}`;
+}
 function addReportedToken(current: number | null | undefined, incoming: number | null | undefined): number | null {
   return incoming === null || incoming === undefined
     ? current ?? null
@@ -151,7 +166,6 @@ const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   extractionMode: 'single',
   agentConcurrency: 2,
   agentToolPolicy: 'off',
-  agentWriteMode: 'shadow',
   summaryBatchMode: DEFAULT_SUMMARY_STRATEGY.batchMode,
   summaryBatchFloors: DEFAULT_SUMMARY_STRATEGY.batchFloors,
   summaryBatchChars: DEFAULT_SUMMARY_STRATEGY.batchChars,
@@ -169,7 +183,7 @@ const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   structuredRepairEnabled: true,
   structuredRepairBeforeFloors: 2,
   structuredRepairAfterFloors: 2,
-  structuredRepairMaxItems: 4,
+  structuredRepairMaxItems: 8,
   graphEnabled: true,
   graphLlmRelationEnabled: true,
   graphMaxHops: 1,
@@ -289,6 +303,16 @@ function isRetryableCaptureError(error: unknown): boolean {
   return SS_HELPER_DIAGNOSTICS[failure.reasonCode].retryable;
 }
 
+function classifyRepairRecord(record: CaptureRepairQueueRecord, sources: readonly SourceBlock[]): RepairClassification {
+  if (record.classification) return record.classification;
+  if (record.issues.some(issue => issue.keyword === 'duplicate_proposal' || issue.keyword === 'duplicate_noop')) return 'duplicate_noop';
+  if (record.issues.some(issue => ['excerpt_mismatch', 'invalid_shape', 'invalid_reference', 'entity_ref_unsupported'].includes(issue.keyword))
+    && !record.issues.some(issue => /ambiguous|multiple|候选/u.test(issue.expected))) return 'unsupported_evidence';
+  const refs = [...record.sourceRefs, ...record.fallbackSourceRefs];
+  if (refs.length === 0 || !refs.some(ref => sources.some(source => source.id === ref))) return 'unsupported_evidence';
+  return 'ai_required';
+}
+
 /** Memory 唯一应用服务，SQLite 是唯一持久数据源。 */
 export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   readonly facts: MemoryPluginApi['facts'];
@@ -323,9 +347,11 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   private boundScopeKey = '';
   private captureStartedAt = 0;
   private activeCaptureProgress: MemoryCaptureProgress | null = null;
-  private activeExtractionSnapshot: Pick<MemoryCaptureProgress, 'extractionMode' | 'agentConcurrency' | 'agentToolPolicy' | 'agentWriteMode'> | null = null;
+  private activeExtractionSnapshot: Pick<MemoryCaptureProgress, 'extractionMode' | 'agentConcurrency' | 'agentToolPolicy'> | null = null;
   private cancelRequested = false;
   private captureAbortController: AbortController | null = null;
+  private initializationVectorSyncBarrier = false;
+  private readonly pendingVectorSyncChats = new Set<string>();
   private sqliteAvailable = false;
   private hostContext: MemoryHostContext | null = null;
   private llmRouteDiagnostic: MemoryLlmRouteDiagnostic | undefined;
@@ -354,6 +380,23 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   private readonly automaticDreamTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private generationActive = false;
   private rollbackActive = false;
+
+  private scheduleVectorSync(chatKey: string): void {
+    if (!chatKey) return;
+    if (this.initializationVectorSyncBarrier) {
+      this.pendingVectorSyncChats.add(chatKey);
+      return;
+    }
+    this.vectorIndex.scheduleSync(chatKey);
+  }
+
+  private finishInitializationVectorSync(): void {
+    if (!this.initializationVectorSyncBarrier) return;
+    this.initializationVectorSyncBarrier = false;
+    const chats = [...this.pendingVectorSyncChats];
+    this.pendingVectorSyncChats.clear();
+    for (const chatKey of chats) this.vectorIndex.scheduleSync(chatKey);
+  }
 
   private readonly settingsListeners = new Set<(settings: MemoryUiSettings) => void>();
   private readonly overviewListeners = new Set<() => void>();
@@ -394,14 +437,14 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         if (this.multiActorRepository) {
           const fact = await this.multiActorRepository.upsertManualFact(input);
           this.recallIndex.upsert(fact);
-          this.vectorIndex.scheduleSync(fact.chatKey);
+          this.scheduleVectorSync(fact.chatKey);
           this.scheduleGraph(fact.chatKey);
           this.emitOverviewChanged();
           return fact;
         }
         const fact = await this.repository.upsertManualFact(this.requireChatKey(), input);
         this.recallIndex.upsert(fact);
-        this.vectorIndex.scheduleSync(fact.chatKey);
+        this.scheduleVectorSync(fact.chatKey);
         this.scheduleGraph(fact.chatKey);
         this.emitOverviewChanged();
         return fact;
@@ -413,7 +456,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           if (!removed) return;
           this.recallIndex.remove(id);
           this.scheduleGraph(chatKey);
-          this.vectorIndex.scheduleSync(chatKey);
+          this.scheduleVectorSync(chatKey);
           this.emitOverviewChanged();
           return;
         }
@@ -499,7 +542,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           extractionMode: this.getExtractionRuntimeMode(),
           agentConcurrency: settings.agentConcurrency,
           agentToolPolicy: settings.agentToolPolicy,
-          agentWriteMode: settings.agentWriteMode,
         };
       }, repository),
       repository,
@@ -624,14 +666,17 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     if (this.llmRouteDiagnosticPending === undefined) {
       const pending = readMemoryLlmRouteDiagnostic()
         .then((diagnostic) => { this.llmRouteDiagnostic = diagnostic; })
-        .catch(() => { this.llmRouteDiagnostic = { available: false, blockedReason: '暂时无法读取 LLM 资源状态' }; })
+        .catch(() => { this.llmRouteDiagnostic = { available: false, failure: { reasonCode: 'BUS_REQUEST_TIMEOUT', stage: 'memory.routing.inspect' } }; })
         .finally(() => {
           if (this.llmRouteDiagnosticPending === pending) this.llmRouteDiagnosticPending = undefined;
           if (!this.stopped) this.emitSettingsChanged();
         });
       this.llmRouteDiagnosticPending = pending;
     }
-    return this.llmRouteDiagnostic ?? { available: readMemoryLlmClient() !== null, blockedReason: 'LLM 路由状态正在加载' };
+    return this.llmRouteDiagnostic ?? {
+      available: readMemoryLlmClient() !== null,
+      failure: { reasonCode: 'BUS_REQUEST_TIMEOUT', stage: 'memory.routing.inspect' },
+    };
   }
 
   private currentRecallRouteDiagnostics(): MemoryRecallRouteDiagnostics | undefined {
@@ -650,8 +695,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         .catch(() => {
           if (this.recallRouteProbeVersion !== probeVersion) return;
           this.recallRouteDiagnostic = {
-            embedding: { available: false, blockedReason: '暂时无法读取 LLM 资源状态' },
-            rerank: { available: false, blockedReason: '暂时无法读取 LLM 资源状态' },
+            embedding: { available: false, failure: { reasonCode: 'BUS_REQUEST_TIMEOUT', stage: 'memory.routing.inspect' } },
+            rerank: { available: false, failure: { reasonCode: 'BUS_REQUEST_TIMEOUT', stage: 'memory.routing.inspect' } },
           };
           this.recallRouteDiagnosticAt = Date.now();
         })
@@ -857,7 +902,31 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     for (const job of await repository.listCaptureJobs()) {
       const jobId = String(job.id ?? '').trim();
       const status = String(job.status ?? '');
-      if (!jobId || status === 'queued' || status === 'running') continue;
+      if (!jobId) continue;
+      // A queued/running capture belongs to a worker in the previous page or
+      // server session. There is no resumable worker after a reload, so leave
+      // an explicit cancelled terminal record instead of showing an infinite
+      // "正在处理" state. A new initialization can safely start from the
+      // persisted checkpoint; no facts are committed by this reconciliation.
+      if (status === 'queued' || status === 'running') {
+        const failure: SSHelperFailureContext = {
+          reasonCode: 'MEMORY_EXTRACTION_PIPELINE_CANCELLED',
+          stage: 'memory.capture.reconcile.stale',
+          ...(typeof job.requestId === 'string' ? { requestId: job.requestId } : {}),
+        };
+        await repository.upsertCaptureJob({
+          ...job,
+          status: 'cancelled',
+          outcome: 'partial',
+          failure,
+          updatedAt: Date.now(),
+          checkpoint: {
+            ...((job.checkpoint && typeof job.checkpoint === 'object') ? job.checkpoint : {}),
+            phase: 'cancelled',
+          },
+        });
+        continue;
+      }
       await repository.reconcileCaptureRepairQueue(jobId);
       if (status !== 'repairing' && status !== 'needs_repair' && status !== 'needs_review') continue;
       // A persisted `repairing` state has no live worker after a page reload.
@@ -1109,6 +1178,34 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     degraded: number;
   }> {
     await repository.reconcileCaptureRepairQueue?.(jobId);
+    // Deterministic failures never enter the provider queue. Keep the original
+    // rejection row for audit, but mark duplicate/no-evidence candidates once.
+    const classifiedQueue = await repository.listCaptureRepairQueue(jobId);
+    for (const record of classifiedQueue) {
+      const classification = classifyRepairRecord(record, allSources);
+      if (record.classification === classification || record.status === 'resolved' || record.status === 'ignored') continue;
+      if (classification === 'ai_required') {
+        await repository.updateCaptureRepairRecord({ ...record, classification, updatedAt: Date.now() });
+        continue;
+      }
+      const nextRecord: CaptureRepairQueueRecord = {
+        ...record,
+        classification,
+        status: 'ignored',
+        resolutionMode: 'ignored',
+        waitingForEvidenceChange: false,
+        resolvedAt: Date.now(),
+        failure: {
+          reasonCode: classification === 'duplicate_noop' ? 'MEMORY_UPDATE_DUPLICATE' : 'MEMORY_REPAIR_SOURCE_UNAVAILABLE',
+          stage: 'memory.repair.deterministic',
+          batchIndex: record.batchIndex,
+          collection: record.collection,
+        },
+        updatedAt: Date.now(),
+      };
+      await repository.updateCaptureRepairRecord(nextRecord);
+      await this.resolveCaptureRepairAudit(repository, jobId, nextRecord, record.attemptCount, 'ignored');
+    }
     const rank = (collection: CaptureRepairQueueRecord['collection']): number =>
       ({ actorCandidates: 0, locationCandidates: 1, itemCandidates: 2, episodes: 3, claims: 4, inventoryOperations: 5, batch: 6 })[collection];
     if (!settings.structuredRepairEnabled) {
@@ -1161,7 +1258,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       const maxAttempts = record.maxAttempts ?? 1;
       const attemptNo = record.attemptCount + 1;
       const seedWindowIds = new Set(this.repairSourceWindow([record], allSources, settings).map(source => source.id));
-      const group = pending.filter(candidate => {
+      const compatible = pending.filter(candidate => {
         if (candidate.collection !== record.collection
           || candidate.attemptCount + 1 !== attemptNo
           || (candidate.maxAttempts ?? 1) !== maxAttempts
@@ -1169,7 +1266,17 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           || dependencyPending(candidate, liveQueue)) return false;
         const candidateWindow = this.repairSourceWindow([candidate], allSources, settings);
         return candidate.id === record.id || candidateWindow.some(source => seedWindowIds.has(source.id));
-      }).slice(0, Math.min(4, settings.structuredRepairMaxItems));
+      });
+      const group: CaptureRepairQueueRecord[] = [];
+      let estimatedTokens = 0;
+      for (const candidate of compatible) {
+        const candidateTokens = Math.ceil(candidate.issues.reduce((sum, issue) => sum + issue.path.length + issue.keyword.length + issue.expected.length, 0) / 3)
+          + Math.ceil(this.repairSourceWindow([candidate], allSources, settings).reduce((sum, source) => sum + source.content.length, 0) / 4);
+        if (group.length >= Math.min(8, settings.structuredRepairMaxItems)) break;
+        if (group.length > 0 && estimatedTokens + candidateTokens > 8_000) break;
+        group.push(candidate);
+        estimatedTokens += candidateTokens;
+      }
       const sources = this.repairSourceWindow(group, allSources, settings);
       const writableSourceRefs = [...new Set(
         group.flatMap(candidate => candidate.sourceRefs.length > 0 ? candidate.sourceRefs : candidate.fallbackSourceRefs),
@@ -1362,6 +1469,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         const nextRecord: CaptureRepairQueueRecord = {
           ...recordWithoutFailure,
           status: succeeded ? 'running' : dropped || finalFailure ? 'ignored' : 'unresolved',
+          classification: succeeded && (result.fieldActions?.length || result.resolutionMode === 'degraded')
+            ? 'locally_fixed'
+            : candidate.classification ?? 'ai_required',
           attemptCount: attemptNo,
           maxAttempts,
           evidenceSetHash: evidenceSetHashes.get(candidate.id)!,
@@ -1469,16 +1579,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   ): Promise<void> {
     const repository = this.multiActorRepository;
     const registry = this.actorRegistry;
-    const committedResults = results.filter(result => result.shadowOnly !== true);
+    const committedResults = results;
     const lastResult = committedResults.at(-1);
-    if (repository && results.length > 0 && committedResults.length === 0) {
-      // Shadow execution has already persisted its controlled comparison audit.
-      // Do not rebuild Scene, Profile, Dream, Trace, graph/vector indexes or any
-      // other derived projection from an audit-only result.
-      this.assertCaptureCurrent(captureVersion, chatKey);
-      this.emitOverviewChanged();
-      return;
-    }
     if (!repository || !lastResult) return;
     const currentFloor = Math.max(0, ...sources.map(source => source.floor ?? 0));
     const [facts, traces] = await Promise.all([repository.listFacts(), repository.listTraces()]);
@@ -1579,7 +1681,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.actorExposureTracker = new RecallExposureTracker(persistedTraces);
     this.lastExposureIds.clear();
     const effectiveSettings = this.getEffectiveSettings();
-    if (scheduleIndexes && usesVectorIndex(effectiveSettings)) this.vectorIndex.scheduleSync(chatKey);
+    if (scheduleIndexes && usesVectorIndex(effectiveSettings)) this.scheduleVectorSync(chatKey);
     if (scheduleIndexes && effectiveSettings.graphEnabled) this.scheduleGraph(chatKey);
     for (const schedule of dreamSchedules) this.scheduleAutomaticDream(schedule.jobId, chatKey, schedule.ownerId);
   }
@@ -2111,7 +2213,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   async getInventoryHistory(itemId: string): Promise<readonly import('../domain').InventoryEvent[]> {
-    return this.multiActorRepository ? this.multiActorRepository.listInventoryEvents(itemId) : [];
+    return this.multiActorRepository ? this.multiActorRepository.listInventoryEvents(itemId, { includeNoop: true }) : [];
   }
 
   async createInventoryItem(input: {
@@ -2341,9 +2443,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.actorExposureTracker = new RecallExposureTracker(rebuilt.traces);
       this.lastExposureIds.clear();
       if (affectedFactIds.length > 0) {
-        await this.vectorIndex.rebuildFacts(this.getChatKey(), [...new Set(affectedFactIds)]).catch(() => this.vectorIndex.scheduleSync(this.getChatKey()));
+        await this.vectorIndex.rebuildFacts(this.getChatKey(), [...new Set(affectedFactIds)]).catch(() => this.scheduleVectorSync(this.getChatKey()));
       }
-      this.vectorIndex.scheduleSync(this.getChatKey());
+      this.scheduleVectorSync(this.getChatKey());
       this.scheduleGraph(this.getChatKey());
     } finally {
       this.rollbackActive = false;
@@ -2579,18 +2681,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         return;
       }
     }
-    if (workspaceId && chatKey) {
-      try {
-        await this.repository.applyAgentPipelineBaseline?.();
-        if (!isCurrent()) return;
-      } catch (error) {
-        finish('error');
-        if (!isCurrent()) return;
-        this.setRuntimeError(error, 'WORKSPACE_DATABASE_UNAVAILABLE', 'chat-bind');
-        this.emitOverviewChanged();
-        return;
-      }
-    }
     if (actorScopeChanged && !workspaceId) this.actorCorrectionChangeSets.clear();
     if (this.boundScopeKey !== scopeKey) {
       this.captureVersion += 1;
@@ -2676,7 +2766,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const effective = this.getEffectiveSettings();
     if (!effective.enabled) this.status = 'disabled';
     else if (this.status === 'disabled' || this.status === 'unselected') this.status = 'ready';
-    if (effective.enabled && chatKey && usesVectorIndex(effective)) this.vectorIndex.scheduleSync(chatKey);
+    if (effective.enabled && chatKey && usesVectorIndex(effective)) this.scheduleVectorSync(chatKey);
     if (effective.enabled && chatKey) this.scheduleGraph(chatKey);
     this.lastRecall = null;
     this.lastRecallLogId = null;
@@ -2706,7 +2796,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       extractionMode: settings.extractionMode === 'agent' ? 'agent' : 'single',
       agentConcurrency: settings.agentConcurrency === 1 ? 1 : 2,
       agentToolPolicy: settings.agentToolPolicy === 'read_only' ? 'read_only' : 'off',
-      agentWriteMode: settings.agentWriteMode === 'active' ? 'active' : 'shadow',
       summaryBatchMode: settings.summaryBatchMode === 'chars' ? 'chars' : 'floors',
       summaryBatchFloors: Math.min(20, Math.max(1, Math.trunc(settings.summaryBatchFloors))),
       summaryBatchChars: Math.min(16_000, Math.max(2_000, Math.round(settings.summaryBatchChars / 500) * 500)),
@@ -2728,7 +2817,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       structuredRepairEnabled: settings.structuredRepairEnabled === true,
       structuredRepairBeforeFloors: Math.min(10, Math.max(0, Math.trunc(settings.structuredRepairBeforeFloors))),
       structuredRepairAfterFloors: Math.min(10, Math.max(0, Math.trunc(settings.structuredRepairAfterFloors))),
-      structuredRepairMaxItems: Math.min(10, Math.max(1, Math.trunc(settings.structuredRepairMaxItems))),
+      structuredRepairMaxItems: Math.min(8, Math.max(1, Math.trunc(settings.structuredRepairMaxItems))),
       graphEnabled: settings.graphEnabled === true,
       graphLlmRelationEnabled: settings.graphLlmRelationEnabled === true,
       graphMaxHops: clampGraphMaxHops(settings.graphMaxHops),
@@ -2763,7 +2852,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const effective = this.getEffectiveSettings();
     if (!effective.enabled) this.status = 'disabled';
     else if (this.status === 'disabled') this.status = 'ready';
-    if (effective.enabled && usesVectorIndex(effective)) this.vectorIndex.scheduleSync(this.getChatKey());
+    if (effective.enabled && usesVectorIndex(effective)) this.scheduleVectorSync(this.getChatKey());
     if (effective.enabled) this.scheduleGraph(this.getChatKey());
     this.emitOverviewChanged();
     this.emitOverviewChanged();
@@ -2778,7 +2867,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     this.emitSettingsChanged();
     const effective = this.getEffectiveSettings();
     this.status = effective.enabled ? 'ready' : 'disabled';
-    if (effective.enabled && usesVectorIndex(effective)) this.vectorIndex.scheduleSync(this.getChatKey());
+    if (effective.enabled && usesVectorIndex(effective)) this.scheduleVectorSync(this.getChatKey());
     if (effective.enabled) this.scheduleGraph(this.getChatKey());
   }
 
@@ -2798,7 +2887,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       pendingFacts: vector?.pendingFacts ?? 0,
       rebuilding: vector?.rebuilding ?? false,
       ...(this.lastRecall?.diagnostics.degradedReason ? { degradedReason: this.lastRecall.diagnostics.degradedReason } : {}),
-      ...(vector?.lastError ? { lastError: vector.lastError } : {}),
+      ...(vector?.failure ? { failure: vector.failure } : {}),
       batches: vector?.batches ?? [],
     };
   }
@@ -3076,7 +3165,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ...(latest.checkpoint.extractionMode === undefined ? {} : { extractionMode: latest.checkpoint.extractionMode }),
       ...(latest.checkpoint.agentConcurrency === undefined ? {} : { agentConcurrency: latest.checkpoint.agentConcurrency }),
       ...(latest.checkpoint.agentToolPolicy === undefined ? {} : { agentToolPolicy: latest.checkpoint.agentToolPolicy }),
-      ...(latest.checkpoint.agentWriteMode === undefined ? {} : { agentWriteMode: latest.checkpoint.agentWriteMode }),
       ...(latest.checkpoint.batchRangeStart === undefined ? {} : { batchRangeStart: latest.checkpoint.batchRangeStart }),
       ...(latest.checkpoint.batchRangeEnd === undefined ? {} : { batchRangeEnd: latest.checkpoint.batchRangeEnd }),
       ...(latest.checkpoint.availableBatchCount === undefined ? {} : { availableBatchCount: latest.checkpoint.availableBatchCount }),
@@ -3308,7 +3396,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         };
       });
     const agentAudits = changeAudits
-      .filter(record => record.kind === 'derived-change-set-v0' && record.chatKey === chatKey)
+      .filter(record => record.kind === 'capture-change-set-v0' && record.chatKey === chatKey)
       .flatMap((record): MemoryAuditRecord[] => {
         const metadata = record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
           ? record.metadata as Record<string, unknown>
@@ -3316,8 +3404,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         const pipeline = metadata.pipeline && typeof metadata.pipeline === 'object' && !Array.isArray(metadata.pipeline)
           ? metadata.pipeline as Record<string, unknown>
           : undefined;
-        if (metadata.diagnosticType !== 'extraction-pipeline' || metadata.shadow !== true || !pipeline
-          || pipeline.mode !== 'agent' || pipeline.writeMode !== 'shadow') return [];
+        if (!pipeline || pipeline.mode !== 'agent') return [];
         const stages = (Array.isArray(pipeline.stages) ? pipeline.stages : []).flatMap((value) => {
           if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
           const stage = value as Record<string, unknown>;
@@ -3352,16 +3439,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           : {};
         const rawTotalTokens = Number(totalUsage.totalTokens);
         const totalTokens = Number.isFinite(rawTotalTokens) && rawTotalTokens >= 0 ? rawTotalTokens : null;
-        const shadow = pipeline.shadow && typeof pipeline.shadow === 'object' && !Array.isArray(pipeline.shadow)
-          ? pipeline.shadow as Record<string, unknown>
-          : undefined;
-        const singleStage = shadow?.singleStage && typeof shadow.singleStage === 'object' && !Array.isArray(shadow.singleStage)
-          ? shadow.singleStage as Record<string, unknown>
-          : undefined;
-        const sumCounts = (value: unknown): number => value && typeof value === 'object' && !Array.isArray(value)
-          ? Object.values(value as Record<string, unknown>).reduce<number>((total, count) => total + safeCount(count), 0)
-          : 0;
-        const countIds = (value: unknown): number => Array.isArray(value) ? value.length : safeCount(value);
         const firstRequestId = stages.find(stage => stage.requestId)?.requestId;
         const firstResourceId = stages.find(stage => stage.resourceId)?.resourceId;
         const firstModel = stages.find(stage => stage.model)?.model;
@@ -3391,7 +3468,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           pipeline: {
             mode: 'agent',
             toolPolicy: pipeline.toolPolicy === 'read_only' ? 'read_only' : 'off',
-            writeMode: 'shadow',
             stageCount: stages.length,
             completedStageCount,
             failedStageCount,
@@ -3400,19 +3476,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
             wallClockLatencyMs,
             totalTokens,
             stages,
-            ...(shadow ? {
-              shadow: {
-                matchingLocalIds: countIds(shadow.matchingLocalIds),
-                agentOnlyLocalIds: countIds(shadow.agentOnlyLocalIds),
-                singleOnlyLocalIds: countIds(shadow.singleOnlyLocalIds),
-                singleCount: sumCounts(shadow.singleCounts),
-                agentCount: sumCounts(shadow.agentCounts),
-                ...(singleStage?.status === 'completed' || singleStage?.status === 'failed' || singleStage?.status === 'cancelled'
-                  ? { singleStatus: singleStage.status }
-                  : {}),
-                ...(cleanString(singleStage?.reasonCode) ? { singleReasonCode: cleanString(singleStage?.reasonCode)! } : {}),
-              },
-            } : {}),
           },
         }];
       });
@@ -3513,7 +3576,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         record.kind,
         record.pipeline?.mode,
         record.pipeline?.toolPolicy,
-        record.pipeline?.writeMode,
         ...record.sourceRefs,
         ...record.issues.flatMap(issue => [issue.collection, issue.path, issue.failure.reasonCode, issue.failure.requestId]),
         ...(record.pipeline?.stages.flatMap(stage => [stage.stage, stage.status, stage.reasonCode, stage.requestId, stage.resourceId, stage.model]) ?? []),
@@ -3853,7 +3915,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   refreshLlmRegistration(): void {
     const settings = this.getEffectiveSettings();
     if (this.sqliteAvailable && settings.enabled && usesVectorIndex(settings)) {
-      this.vectorIndex.scheduleSync(this.getChatKey());
+      this.scheduleVectorSync(this.getChatKey());
     }
   }
 
@@ -4078,6 +4140,110 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return { items, nextCursor };
   }
 
+  async listMemoryCandidatesPage(request: MemoryPageRequest): Promise<MemoryPage<MemoryCandidateRecord>> {
+    return this.loadMemoryPage<MemoryCandidateRecord>('memory-candidates', request);
+  }
+
+  async getMemoryCandidateStats(filters: Readonly<Record<string, string | number>> = {}): Promise<MemoryCandidateStats> {
+    const chatKey = this.requireChatKey();
+    const floorFilter = filters.floor === undefined || filters.floor === '' ? undefined : Number(filters.floor);
+    const filter = Object.fromEntries(Object.entries(filters).filter(([key, value]) => key !== 'floor' && value !== '' && value !== undefined));
+    const rows: MemoryCandidateRecord[] = [];
+    let cursor: string | undefined;
+    const seen = new Set<string>();
+    do {
+      const page = await this.loadMemoryPage<MemoryCandidateRecord>('memory-candidates', {
+        limit: 500,
+        ...(cursor ? { cursor } : {}),
+        filter: filter as unknown as Readonly<Record<string, PlainData>>,
+      });
+      rows.push(...page.items);
+      if (!page.nextCursor) break;
+      if (seen.has(page.nextCursor)) throw createSSHelperError('INTERNAL_ERROR', { stage: 'memory.ui.memory-candidates.stats-pagination' });
+      seen.add(page.nextCursor);
+      cursor = page.nextCursor;
+    } while (cursor);
+    const scopedRows = floorFilter === undefined || !Number.isFinite(floorFilter)
+      ? rows
+      : rows.filter(row => row.evidence.some(span => span.floor === floorFilter));
+    const byStatus = scopedRows.reduce<Record<string, number>>((counts, row) => {
+      counts[row.status] = (counts[row.status] ?? 0) + 1;
+      return counts;
+    }, {});
+    const accepted = byStatus.accepted ?? 0;
+    const rejectedOrIgnored = (byStatus.rejected ?? 0) + (byStatus.ignored ?? 0);
+    const jobIds = [...new Set(scopedRows.map(row => row.jobId).filter((value): value is string => Boolean(value)))];
+    const batchIndexes = new Set(scopedRows.map(row => row.batchIndex).filter((value): value is number => Number.isInteger(value)));
+    return {
+      total: scopedRows.length,
+      accepted,
+      notWritten: scopedRows.length - accepted,
+      rejectedOrIgnored,
+      byStatus,
+      ...(jobIds.length === 1 ? { jobId: jobIds[0] } : {}),
+      batchCount: batchIndexes.size,
+    };
+  }
+
+  async getMemoryCandidateSourcePreview(candidateId: string, sourceRef: string): Promise<MemoryCandidateSourcePreview> {
+    const chatKey = this.requireChatKey();
+    const page = await this.loadMemoryPage<MemoryCandidateRecord>('memory-candidates', {
+      limit: 1,
+      filter: { id: candidateId },
+    });
+    const candidate = page.items[0];
+    if (!candidate || candidate.chatKey !== chatKey) throw createSSHelperError('WORKSPACE_NOT_FOUND', { stage: 'memory.ui.memory-candidates.lookup' });
+    const saved = candidate.evidence.filter(span => span.sourceRef === sourceRef);
+    const sources = await this.collectSources(chatKey);
+    const source = sources.find(item => item.id === sourceRef);
+    if (!source) {
+      const fallback = saved[0];
+      if (!fallback) throw createSSHelperError('WORKSPACE_NOT_FOUND', { stage: 'memory.ui.memory-candidates.source' });
+      return {
+        candidateId,
+        sourceRef,
+        sourceKind: fallback.sourceKind,
+        ...(fallback.floor === undefined ? {} : { floor: fallback.floor }),
+        ...(fallback.floor === undefined ? {} : { messageIndex: fallback.floor }),
+        text: fallback.text,
+        digest: fallback.sourceDigest,
+        sourceChanged: true,
+        warning: 'source_missing',
+        highlights: [{ start: fallback.start, end: fallback.end, text: fallback.text }],
+      };
+    }
+    const digest = candidateSourceDigest(source.content);
+    const highlights: Array<{ start: number; end: number; text: string }> = [];
+    let warning: MemoryCandidateSourcePreview['warning'];
+    for (const span of saved) {
+      if (digest === span.sourceDigest && span.start >= 0 && span.end <= source.content.length && source.content.slice(span.start, span.end) === span.text) {
+        highlights.push({ start: span.start, end: span.end, text: span.text });
+        continue;
+      }
+      const positions: number[] = [];
+      let offset = source.content.indexOf(span.text);
+      while (offset >= 0) {
+        positions.push(offset);
+        offset = source.content.indexOf(span.text, offset + Math.max(1, span.text.length));
+      }
+      if (positions.length === 1) highlights.push({ start: positions[0]!, end: positions[0]! + span.text.length, text: span.text });
+      else warning = positions.length === 0 ? 'no_match' : 'ambiguous_match';
+    }
+    return {
+      candidateId,
+      sourceRef,
+      sourceKind: source.kind,
+      ...(source.floor === undefined ? {} : { floor: source.floor }),
+      ...(source.floor === undefined ? {} : { messageIndex: source.floor }),
+      text: source.content,
+      digest,
+      sourceChanged: digest !== (saved[0]?.sourceDigest ?? digest),
+      ...(warning && !highlights.length && saved.length ? { savedText: saved.map(span => span.text).join('\n') } : {}),
+      ...(warning ? { warning } : {}),
+      highlights,
+    };
+  }
+
   onSettingsChanged(listener: (settings: MemoryUiSettings) => void): () => void {
     this.settingsListeners.add(listener);
     return () => this.settingsListeners.delete(listener);
@@ -4114,7 +4280,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         ...(current.scope === undefined ? {} : { scope: current.scope }),
       });
       this.recallIndex.upsert(fact);
-      this.vectorIndex.scheduleSync(chatKey);
+      this.scheduleVectorSync(chatKey);
       this.scheduleGraph(chatKey);
       this.emitOverviewChanged();
       return;
@@ -4138,7 +4304,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     };
     const fact = await this.repository.upsertManualFact(chatKey, input);
     this.recallIndex.upsert(fact);
-    this.vectorIndex.scheduleSync(chatKey);
+    this.scheduleVectorSync(chatKey);
     this.scheduleGraph(chatKey);
     this.emitOverviewChanged();
   }
@@ -4333,13 +4499,12 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   private async loadSettings(): Promise<void> {
-    const [enabled, autoOrganize, extractionMode, agentConcurrency, agentToolPolicy, agentWriteMode, summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode, preExtractReferenceEnabled, preExtractReferenceItems, preExtractReferenceMode, preExtractReferenceMaxChars, structuredRepairEnabled, structuredRepairBeforeFloors, structuredRepairAfterFloors, structuredRepairMaxItems, graphEnabled, graphLlmRelationEnabled, graphMaxHops, graphMaxEdges, chatOverrides, summaryProgressByChat] = await Promise.all([
+    const [enabled, autoOrganize, extractionMode, agentConcurrency, agentToolPolicy, summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode, preExtractReferenceEnabled, preExtractReferenceItems, preExtractReferenceMode, preExtractReferenceMaxChars, structuredRepairEnabled, structuredRepairBeforeFloors, structuredRepairAfterFloors, structuredRepairMaxItems, graphEnabled, graphLlmRelationEnabled, graphMaxHops, graphMaxEdges, chatOverrides, summaryProgressByChat] = await Promise.all([
       this.repository.getSetting<boolean>('enabled'),
       this.repository.getSetting<boolean>('autoOrganize'),
       this.repository.getSetting<MemoryGlobalSettings['extractionMode']>('extractionMode'),
       this.repository.getSetting<number>('agentConcurrency'),
       this.repository.getSetting<MemoryGlobalSettings['agentToolPolicy']>('agentToolPolicy'),
-      this.repository.getSetting<MemoryGlobalSettings['agentWriteMode']>('agentWriteMode'),
       this.repository.getSetting<MemoryGlobalSettings['summaryBatchMode']>('summaryBatchMode'),
       this.repository.getSetting<number>('summaryBatchFloors'),
       this.repository.getSetting<number>('summaryBatchChars'),
@@ -4385,7 +4550,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       extractionMode: extractionMode === 'agent' ? 'agent' : 'single',
       agentConcurrency: agentConcurrency === 1 ? 1 : 2,
       agentToolPolicy: agentToolPolicy === 'read_only' ? 'read_only' : 'off',
-      agentWriteMode: agentWriteMode === 'active' ? 'active' : 'shadow',
       summaryBatchMode: summaryBatchMode === 'chars' ? 'chars' : 'floors',
       summaryBatchFloors: Math.min(20, Math.max(1, Math.trunc(summaryBatchFloors ?? DEFAULT_SETTINGS.summaryBatchFloors))),
       summaryBatchChars: Math.min(16_000, Math.max(2_000, Math.round((summaryBatchChars ?? DEFAULT_SETTINGS.summaryBatchChars) / 500) * 500)),
@@ -4405,7 +4569,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       structuredRepairEnabled: structuredRepairEnabled ?? DEFAULT_SETTINGS.structuredRepairEnabled,
       structuredRepairBeforeFloors: Math.min(10, Math.max(0, Math.trunc(structuredRepairBeforeFloors ?? DEFAULT_SETTINGS.structuredRepairBeforeFloors))),
       structuredRepairAfterFloors: Math.min(10, Math.max(0, Math.trunc(structuredRepairAfterFloors ?? DEFAULT_SETTINGS.structuredRepairAfterFloors))),
-      structuredRepairMaxItems: Math.min(10, Math.max(1, Math.trunc(structuredRepairMaxItems ?? DEFAULT_SETTINGS.structuredRepairMaxItems))),
+      structuredRepairMaxItems: Math.min(8, Math.max(1, Math.trunc(structuredRepairMaxItems ?? DEFAULT_SETTINGS.structuredRepairMaxItems))),
       graphEnabled: graphEnabled ?? DEFAULT_SETTINGS.graphEnabled,
       graphLlmRelationEnabled: graphLlmRelationEnabled ?? DEFAULT_SETTINGS.graphLlmRelationEnabled,
       graphMaxHops: clampGraphMaxHops(graphMaxHops ?? DEFAULT_SETTINGS.graphMaxHops),
@@ -4500,6 +4664,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   ): Promise<void> {
     if (this.capturePromise) return this.capturePromise;
     this.capturePromise = this.runCapture(mode, resumeJob, selectedSourceGroups, options).finally(() => {
+      this.finishInitializationVectorSync();
       this.capturePromise = null;
       this.emitOverviewChanged();
     });
@@ -4520,6 +4685,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const chatKey = this.requireChatKey();
     const captureVersion = this.captureVersion;
     const captureSettings = this.getEffectiveSettings();
+    if (mode === 'initialize') this.initializationVectorSyncBarrier = true;
     const strategy = summaryStrategyFromSettings(captureSettings);
     const includeHiddenMessageFloors = mode === 'initialize'
       && (resumeJob?.checkpoint.includeHiddenMessageFloors ?? options.includeHiddenMessageFloors ?? true);
@@ -4631,7 +4797,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       extractionMode: resumeJob?.checkpoint.extractionMode ?? captureSettings.extractionMode,
       agentConcurrency: resumeJob?.checkpoint.agentConcurrency ?? captureSettings.agentConcurrency,
       agentToolPolicy: resumeJob?.checkpoint.agentToolPolicy ?? captureSettings.agentToolPolicy,
-      agentWriteMode: resumeJob?.checkpoint.agentWriteMode ?? captureSettings.agentWriteMode,
       ...(resumeJob?.checkpoint.actualUsage ? { actualUsage: resumeJob.checkpoint.actualUsage } : {}),
       ...(resumeJob?.checkpoint.usageRequestCount === undefined ? {} : { usageRequestCount: resumeJob.checkpoint.usageRequestCount }),
       ...(resumeJob?.checkpoint.usageReportedCount === undefined ? {} : { usageReportedCount: resumeJob.checkpoint.usageReportedCount }),
@@ -4640,7 +4805,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       extractionMode: baseCheckpoint.extractionMode,
       agentConcurrency: baseCheckpoint.agentConcurrency,
       agentToolPolicy: baseCheckpoint.agentToolPolicy,
-      agentWriteMode: baseCheckpoint.agentWriteMode,
     };
     const persistJob = (job: MemoryJob): Promise<void> => actorRepository.upsertCaptureJob({
       ...job,
@@ -4850,7 +5014,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           sources: plan.sources,
           maxItems: captureSettings.preExtractReferenceItems,
           maxChars: captureSettings.preExtractReferenceMaxChars,
-          mode: captureSettings.preExtractReferenceMode,
+          // Initialization must not issue one query embedding per source batch.
+          // Formal chat recall keeps its configured lexical/vector/hybrid mode.
+          mode: mode === 'initialize' ? 'lexical' : captureSettings.preExtractReferenceMode,
           characterKeys: referenceScope?.characterKeys ?? [],
           worldKeys: referenceScope?.worldKeys ?? [],
           graphMaxHops: captureSettings.graphMaxHops,

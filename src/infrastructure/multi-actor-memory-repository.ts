@@ -41,6 +41,7 @@ import {
   type CastPlanAudit,
   type RecallCoverageLog,
   type MemoryUsageLog,
+  type MemoryCandidateRecord,
   sceneStateRecordId,
 } from '../domain';
 import { MEMORY_WORKSPACE_COLLECTIONS } from './memory-workspace-schema';
@@ -158,6 +159,7 @@ interface CaptureCommit {
   readonly rejections?: readonly AutomaticIngestRejection[];
   readonly pipelineAudit?: ExtractionPipelineAudit;
   readonly reviewItems?: readonly MemoryReviewItem[];
+  readonly candidateRecords?: readonly MemoryCandidateRecord[];
   readonly owners: readonly MemoryOwner[];
   readonly aliases: readonly ActorAlias[];
   readonly pendingCandidates?: readonly ActorCandidate[];
@@ -412,12 +414,15 @@ export class MultiActorMemoryRepository {
     return (await this.list('inventory-states', { workspaceId: this.workspaceId, chatKey: this.chatKey }))
       .map(record => record.value as unknown as InventoryState);
   }
-  async listInventoryEvents(itemId?: string): Promise<InventoryEvent[]> {
-    return (await this.list('inventory-events', {
+  async listInventoryEvents(itemId?: string, options: { readonly includeNoop?: boolean } = {}): Promise<InventoryEvent[]> {
+    const events = (await this.list('inventory-events', {
       workspaceId: this.workspaceId,
       chatKey: this.chatKey,
       ...(itemId ? { itemId } : {}),
     })).map(record => record.value as unknown as InventoryEvent);
+    return options.includeNoop === true
+      ? events
+      : events.filter(event => event.beforeAmount === undefined || event.beforeAmount !== event.afterAmount);
   }
   async createInventoryItem(input: {
     readonly canonicalName: string;
@@ -1536,23 +1541,6 @@ export class MultiActorMemoryRepository {
     return next;
   }
 
-  async recordShadowExtractionAudit(audit: ExtractionPipelineAudit): Promise<ChangeAudit> {
-    const id = `change-audit:shadow:${stableRecordHash(`${audit.pipelineRunId}\0${audit.sourceBatchDigest}`)}`;
-    const existing = await this.store.read({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: id });
-    if (existing) return structuredClone(existing.value) as unknown as ChangeAudit;
-    const value: ChangeAudit = {
-      id,
-      workspaceId: this.workspaceId,
-      chatKey: this.chatKey,
-      kind: 'derived-change-set-v0',
-      createdAt: Date.now(),
-      entries: [],
-      metadata: asPlain({ diagnosticType: 'extraction-pipeline', shadow: true, pipeline: audit }),
-    };
-    await this.store.write({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: id, value: asPlain(value), expectedVersion: 0 });
-    return value;
-  }
-
   async commitCapture(commit: CaptureCommit): Promise<ChangeAudit> {
     try {
       return await this.commitCaptureOnce(commit);
@@ -1591,6 +1579,7 @@ export class MultiActorMemoryRepository {
       traces: commit.traces,
       sceneCasts: commit.sceneCasts ?? [],
       reviewItems: commit.reviewItems ?? [],
+      candidateRecords: commit.candidateRecords ?? [],
       pipelineAudit: commit.pipelineAudit ?? null,
     }))));
     let retryAttempt = 0;
@@ -1986,6 +1975,12 @@ export class MultiActorMemoryRepository {
         chatKey: this.chatKey,
       });
     }
+    for (const candidate of commit.candidateRecords ?? []) {
+      if (candidate.workspaceId !== this.workspaceId || candidate.chatKey !== this.chatKey) {
+        throw createSSHelperError('WORKSPACE_ACCESS_DENIED', { stage: 'memory.repository.candidate.scope', collection: 'memory-candidates' });
+      }
+      await add('memory-candidates', { ...candidate });
+    }
     const audit: ChangeAudit = {
       id: auditId,
       workspaceId: this.workspaceId,
@@ -2089,6 +2084,16 @@ export class MultiActorMemoryRepository {
       : []);
     for (const entry of [...audit.entries].reverse()) {
       const current = currentByRecord.get(`${entry.collection}:${entry.recordId}`) ?? null;
+      if (entry.collection === 'memory-candidates' && current) {
+        operations.push({
+          action: 'upsert',
+          collection: entry.collection,
+          recordId: entry.recordId,
+          value: asPlain({ ...(current.value as Record<string, unknown>), rolledBackAt: Date.now() }),
+          expectedVersion: current.version,
+        });
+        continue;
+      }
       if (entry.before === undefined) {
         if (current) operations.push({ action: 'delete', collection: entry.collection, recordId: entry.recordId, expectedVersion: current.version });
       }
@@ -2422,7 +2427,7 @@ export class MultiActorMemoryRepository {
   }
 
   async clearCurrentChatData(): Promise<void> {
-    const chatScopedCollections = ['actor-candidates', 'location-candidates', 'inventory-states', 'inventory-events', 'episodes', 'observations', 'facts', 'evidence', 'fact-heads', 'memory-traces', 'scene-casts', 'scene-states', 'scene-transitions', 'generation-cast-plans', 'cast-plan-audits', 'recall-coverage-logs', 'memory-usage-logs', 'capture-jobs', 'capture-repair-queue', 'change-audits', 'memory-details', 'memory-links', 'vector-index', 'graph-nodes', 'graph-edges', 'recall-exposures', 'dream-jobs', 'dream-audits', 'dream-narratives', 'usage', 'recall-logs', 'generation-recall-details', 'generation-prompt-snapshots', 'generation-prompt-snapshot-chunks'] as const;
+    const chatScopedCollections = ['actor-candidates', 'location-candidates', 'memory-candidates', 'inventory-states', 'inventory-events', 'episodes', 'observations', 'facts', 'evidence', 'fact-heads', 'memory-traces', 'scene-casts', 'scene-states', 'scene-transitions', 'generation-cast-plans', 'cast-plan-audits', 'recall-coverage-logs', 'memory-usage-logs', 'capture-jobs', 'capture-repair-queue', 'change-audits', 'memory-details', 'memory-links', 'vector-index', 'graph-nodes', 'graph-edges', 'recall-exposures', 'dream-jobs', 'dream-audits', 'dream-narratives', 'usage', 'recall-logs', 'generation-recall-details', 'generation-prompt-snapshots', 'generation-prompt-snapshot-chunks'] as const;
     const operations: StoreOperation[] = [];
     // Observations intentionally point at an Episode instead of duplicating
     // chat metadata. Resolve the current chat's episode ids before deleting so

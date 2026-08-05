@@ -52,11 +52,11 @@ export interface SummaryBatchPlan {
 }
 
 export const DEFAULT_SUMMARY_STRATEGY: Readonly<SummaryStrategy> = Object.freeze({
-  batchMode: 'floors',
-  batchFloors: 5,
-  batchChars: 12_000,
+  batchMode: 'chars',
+  batchFloors: 16,
+  batchChars: 16_000,
   triggerIntervalFloors: 1,
-  overlapFloors: 2,
+  overlapFloors: 1,
 });
 
 function clamp(value: number, min: number, max: number, fallback: number): number {
@@ -66,7 +66,7 @@ function clamp(value: number, min: number, max: number, fallback: number): numbe
 export function normalizeSummaryStrategy(value: Partial<SummaryStrategy>): SummaryStrategy {
   return {
     batchMode: value.batchMode === 'chars' ? 'chars' : 'floors',
-    batchFloors: clamp(value.batchFloors ?? DEFAULT_SUMMARY_STRATEGY.batchFloors, 1, 20, DEFAULT_SUMMARY_STRATEGY.batchFloors),
+    batchFloors: clamp(value.batchFloors ?? DEFAULT_SUMMARY_STRATEGY.batchFloors, 1, 16, DEFAULT_SUMMARY_STRATEGY.batchFloors),
     batchChars: clamp(value.batchChars ?? DEFAULT_SUMMARY_STRATEGY.batchChars, 2_000, 16_000, DEFAULT_SUMMARY_STRATEGY.batchChars),
     triggerIntervalFloors: clamp(value.triggerIntervalFloors ?? DEFAULT_SUMMARY_STRATEGY.triggerIntervalFloors, 1, 50, DEFAULT_SUMMARY_STRATEGY.triggerIntervalFloors),
     overlapFloors: clamp(value.overlapFloors ?? DEFAULT_SUMMARY_STRATEGY.overlapFloors, 0, 10, DEFAULT_SUMMARY_STRATEGY.overlapFloors),
@@ -227,7 +227,7 @@ export function buildSummaryBatchPlans(blocks: readonly SourceBlock[], strategyI
     for (const [index, floorGroup] of floorGroups.entries()) {
       const parts = flattenedGroups([floorGroup]).flatMap((message) => splitForCharLimit(message, strategy.batchChars));
       const length = parts.reduce((total, part) => total + part.content.length, 0);
-      if (current.length > 0 && currentChars + length > strategy.batchChars) {
+      if (current.length > 0 && (currentChars + length > strategy.batchChars || index - start >= strategy.batchFloors)) {
         groups.push({ start, end: index, blocks: current });
         current = [];
         currentChars = 0;
@@ -261,12 +261,11 @@ export function buildSummaryBatchPlans(blocks: readonly SourceBlock[], strategyI
       messageCount: new Set(writableSources.filter((source) => source.kind === 'message').map(messageSourceId)).size,
     };
   });
-  // 楼层模式的批次语义必须与用户配置一致：例如每 10 层一批，
-  // 275 层就是 28 批。字符上限只负责切开单个超长来源块，不能再把
-  // 一个楼层批次扩张成多个“执行分片”，否则范围选择和进度都会失真。
-  if (!taskWritableRefs) return strategy.batchMode === 'floors'
-    ? plans
-    : hardCapSummaryPlans(plans, strategy.batchChars);
+  // 楼层模式先遵守用户选择的楼层分组，再对每个执行计划应用正文总量上限。
+  // 这样“每组最多楼层”仍然是主要分组规则，但一组中有很多长消息时不会
+  // 把整个 JSON 请求推到 Provider 的上下文或输出上限；拆出的计划会计入
+  // batchCount，范围选择和进度因此继续与真实执行批次一致。
+  if (!taskWritableRefs) return hardCapSummaryPlans(plans, strategy.batchChars);
   const writablePlans: SummaryBatchPlan[] = [];
   let leadingContext: SourceBlock[] = [];
   for (const plan of plans) {

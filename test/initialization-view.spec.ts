@@ -21,7 +21,6 @@ function model(overrides: Partial<InitializationViewModel> = {}): Initialization
     runtimeExtractionMode: 'single',
     agentConcurrency: 2,
     agentToolPolicy: 'off',
-    agentWriteMode: 'shadow',
     summaryBatchMode: 'floors',
     summaryBatchFloors: 5,
     summaryBatchChars: 12_000,
@@ -67,6 +66,7 @@ describe('initialization view', () => {
     expect(html).toContain('data-option="batch-range-end"');
     expect(html).toContain('楼层分组</dt><dd>4');
     expect(html).toContain('本次批次</dt><dd>4 / 4');
+    expect(html).toContain('预计输入 Token</dt><dd>900–1,400');
     expect(html).toContain('<b>18 / 20</b><small>项</small>');
     expect(html).toContain('data-ss-helper-control="checkbox"');
     expect(html).toContain('class="stx-memory-init-source-checkbox"');
@@ -123,22 +123,22 @@ describe('initialization view', () => {
       runtimeExtractionMode: 'agent',
       agentConcurrency: 2,
       agentToolPolicy: 'read_only',
-      agentWriteMode: 'shadow',
     }));
 
-    expect(html).toContain('Agent · 影子审计');
-    expect(html).toContain('开始 Agent 影子评估');
+    expect(html).toContain('Agent · 正式写入');
+    expect(html).toContain('开始 Agent 初始化');
     expect(html).toContain('确定性预取');
-    expect(html).toContain('实体优先与双路提取');
-    expect(html).toContain('合并、校验与裁决');
-    expect(html).toContain('与 Single 基线对比，不写正式记忆');
-    expect(html).not.toContain('事务写入');
+    expect(html).toContain('实体优先与联合提取');
+    expect(html).toContain('本地合并、强校验与裁决');
+    expect(html).toContain('原子提交并召回');
+    expect(html).not.toContain('影子');
   });
 
   it('blocks initialization instead of silently falling back when Agent is unavailable', () => {
     const html = renderInitializationView(model({
       extractionMode: 'agent',
       runtimeExtractionMode: 'single',
+      agentToolPolicy: 'read_only',
     }));
 
     expect(html).toContain('Agent 未就绪');
@@ -334,6 +334,19 @@ describe('initialization view', () => {
     expect(html).toContain('已隔离 2 项等待证据变化');
   });
 
+  it('does not flash back to setup when a completed repair snapshot arrives before initialization state refresh', () => {
+    const html = renderInitializationView(model({
+      initialized: false,
+      progress: {
+        status: 'completed', jobId: 'job-repair-completed', batchIndex: 4, totalBatches: 4, processedCount: 18, elapsedMs: 6000,
+        phase: 'repair', outcome: 'partial', quarantinedCount: 2,
+      },
+      attempts: [{ jobId: 'job-repair-completed', status: 'completed', updatedAt: 10, totalBatches: 4, selectedSourceKinds: ['message'] }],
+    }));
+    expect(html).toContain('当前聊天已初始化');
+    expect(html).not.toContain('初始化当前聊天');
+  });
+
   it('shows Provider-reported Token usage without replacing missing fields with zero', () => {
     const html = renderInitializationView(model({
       progress: {
@@ -350,6 +363,23 @@ describe('initialization view', () => {
     expect(html).toContain('输入 Token</dt><dd>1,200');
     expect(html).toContain('输出 Token</dt><dd>340');
     expect(html).toContain('总 Token</dt><dd>API 未返回');
+  });
+
+  it('uses a looping repair bar and switches the estimate card to actual total usage', () => {
+    const html = renderInitializationView(model({
+      progress: {
+        status: 'repairing', jobId: 'job-repair', batchIndex: 0, totalBatches: 307, processedCount: 0, elapsedMs: 5000,
+        phase: 'repair',
+        actualUsage: { promptTokens: 2_519_748, completionTokens: 908_213, cacheReadTokens: null, cacheWriteTokens: null, totalTokens: 3_427_961 },
+        usageRequestCount: 122,
+        usageReportedCount: 122,
+      },
+    }));
+    expect(html).toContain('class="stx-memory-init-progress-loop"');
+    expect(html).toContain('aria-label="修复进行中"');
+    expect(html).not.toContain('<progress');
+    expect(html).toContain('实际累计 Token</dt><dd>3,427,961');
+    expect(html).toContain('包含本任务的输出、工具回合、重试和定向修复');
   });
 
   it('keeps chat batch progress separate from active repair task progress', () => {
@@ -370,23 +400,6 @@ describe('initialization view', () => {
     expect(html).toContain('已完成批次 2 / 2 · 第 1–2 批 / 共 28 批');
     expect(html).toContain('修复任务 3 / 26 · 76 秒');
     expect(html).not.toContain('已完成批次 3 / 26');
-  });
-
-  it('does not claim recall was written after an Agent shadow evaluation', () => {
-    const html = renderInitializationView(model({
-      initialized: true,
-      extractionMode: 'agent',
-      runtimeExtractionMode: 'agent',
-      agentWriteMode: 'shadow',
-      successfulSourceKinds: ['message'],
-      lastCompletedAt: 100,
-      attempts: [{ jobId: 'agent-shadow', status: 'completed', updatedAt: 100, totalBatches: 4, selectedSourceKinds: ['message'] }],
-    }));
-
-    expect(html).toContain('Agent 影子评估已完成');
-    expect(html).toContain('正式记忆没有写入');
-    expect(html).toContain('查看 Agent 审计');
-    expect(html).not.toContain('当前聊天可以使用记忆召回');
   });
 
   it('keeps sources browseable but disables submission when capabilities are unavailable', () => {

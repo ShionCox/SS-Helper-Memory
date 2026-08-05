@@ -312,41 +312,6 @@ describe('Memory UI 展示适配', () => {
     dispose();
   });
 
-  it('将 Agent Shadow 审计展示为不可回滚的固定阶段与对照摘要', async () => {
-    const container = document.createElement('div');
-    document.body.append(container);
-    const dispose = renderMemoryWorkbench(container, workbenchController({
-      listAuditRecords: async () => [auditRecord({
-        kind: 'agent_pipeline',
-        id: 'change-audit:agent-shadow',
-        jobId: 'pipeline:agent-shadow',
-        latencyMs: 2100,
-        pipeline: {
-          mode: 'agent', toolPolicy: 'read_only', writeMode: 'shadow', stageCount: 2,
-          completedStageCount: 2, failedStageCount: 0, cancelledStageCount: 0,
-          toolCallCount: 1, wallClockLatencyMs: 2100, totalTokens: 120,
-          stages: [
-            { stage: 'entities', status: 'completed', latencyMs: 1200, toolRounds: 1, toolCalls: 1, requestId: 'request:entities', resourceId: 'memory_extract', model: 'model-safe' },
-            { stage: 'narrative', status: 'completed', latencyMs: 900, toolRounds: 0, toolCalls: 0, requestId: 'request:narrative', resourceId: 'memory_extract', model: 'model-safe' },
-          ],
-          shadow: { matchingLocalIds: 1, agentOnlyLocalIds: 2, singleOnlyLocalIds: 1, singleCount: 3, agentCount: 3, singleStatus: 'failed', singleReasonCode: 'STRUCTURED_OUTPUT_EMPTY' },
-        },
-      })],
-    }));
-    await new Promise(resolve => setTimeout(resolve, 0));
-    (container.querySelector('[data-page="audit"]') as HTMLButtonElement).click();
-    await new Promise(resolve => setTimeout(resolve, 0));
-
-    expect(container.textContent).toContain('Agent Shadow');
-    expect(container.textContent).toContain('固定阶段已记录');
-    expect(container.textContent).toContain('entities');
-    expect(container.textContent).toContain('Shadow（不写入）');
-    expect(container.textContent).toContain('仅 Agent / 仅 Single');
-    expect(container.textContent).toContain('Single 状态不可用 · STRUCTURED_OUTPUT_EMPTY');
-    expect(container.querySelector('[data-action="rollback-audit"]')).toBeNull();
-    dispose();
-  });
-
   it('展示部分完成失败项，并把所选 ID 交给忽略操作', async () => {
     const ignoreCaptureRejections = vi.fn(async () => undefined);
     const issue = {
@@ -729,9 +694,9 @@ describe('Memory UI 展示适配', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await vi.waitFor(() => expect(container.querySelector('.stx-memory-status-storage')?.textContent).toContain('2.00 KB'));
 
-    expect(container.querySelectorAll('[data-action="navigate"]')).toHaveLength(12);
+    expect(container.querySelectorAll('[data-action="navigate"]')).toHaveLength(13);
     expect(container.querySelector('[data-action="navigate"][data-page="data"]')).not.toBeNull();
-    expect([...container.querySelectorAll('[data-action="navigate"]')].slice(0, 3).map((node) => node.getAttribute('data-page'))).toEqual(['overview', 'initialize', 'actors']);
+    expect([...container.querySelectorAll('[data-action="navigate"]')].slice(0, 3).map((node) => node.getAttribute('data-page'))).toEqual(['overview', 'initialize', 'candidates']);
     expect(container.querySelector('[data-action="select-fact"]')).not.toBeNull();
     expect(container.querySelector('[data-action="select-fact"]')?.getAttribute('data-ss-helper-control')).toBe('button');
     expect(container.querySelector('.stx-memory-page-heading [data-action="refresh"]')?.getAttribute('data-ss-helper-tone')).toBe('neutral');
@@ -1244,8 +1209,8 @@ describe('Memory UI 展示适配', () => {
       pendingJobs: 0,
       llmAvailable: true,
       llmModel: 'test-llm',
-      embedding: { available: false, blockedReason: '未配置向量资源' },
-      rerank: { available: false, blockedReason: '未配置重排资源' },
+      embedding: { available: false, failure: { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE' as const, stage: 'test.route' } },
+      rerank: { available: false, failure: { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE' as const, stage: 'test.route' } },
     }));
     const dispose = renderMemoryWorkbench(container, workbenchController({ getOverview }));
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1261,7 +1226,7 @@ describe('Memory UI 展示适配', () => {
     expect(overview?.textContent).toContain('152.5 KB');
     expect(overview?.textContent).toContain('占角色记忆 85%');
     expect(overview?.textContent).toContain('大语言模型（LLM）');
-    expect(overview?.textContent).toContain('未配置向量资源');
+    expect(overview?.textContent).toContain('该资源不支持当前任务要求的能力');
     expect(overview?.querySelector('[data-action="view-library"]')).not.toBeNull();
     expect(overview?.querySelector('[data-action="navigate"][data-page="initialize"]')).not.toBeNull();
     expect(overview?.querySelector('[data-action="navigate"][data-page="scenes"]')).not.toBeNull();
@@ -1416,7 +1381,7 @@ describe('Memory UI 展示适配', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const navPages = [...container.querySelectorAll<HTMLElement>('.stx-memory-nav [data-page]')].map((item) => item.dataset.page);
-    expect(navPages.slice(0, 5)).toEqual(['overview', 'initialize', 'actors', 'inventory', 'scenes']);
+    expect(navPages.slice(0, 5)).toEqual(['overview', 'initialize', 'candidates', 'actors', 'inventory']);
     (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(container.querySelector('.stx-memory-initialize-shell')).not.toBeNull();
@@ -1771,7 +1736,7 @@ describe('Memory UI 展示适配', () => {
       getOverview: async () => ({
         status: 'ready', bound: true, factCount: 1, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: true,
         embedding: { available: true, resourceId: 'embed-route', model: 'Embed-Test' },
-        rerank: { available: false, blockedReason: 'LLMHub 未加载或版本过旧' },
+        rerank: { available: false, failure: { reasonCode: 'MEMORY_LLM_CLIENT_UNAVAILABLE', stage: 'test.route' } },
       }),
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1788,7 +1753,7 @@ describe('Memory UI 展示适配', () => {
     expect(routeChips[1]?.textContent).toBe('不可用');
     expect(routeChips[1]?.getAttribute('data-ss-helper-tone')).toBe('error');
     expect(container.querySelectorAll('.stx-memory-status-route-detail')).toHaveLength(2);
-    expect([...container.querySelectorAll('.stx-memory-status-route-detail')].some((node) => node.textContent?.includes('LLMHub 未加载或版本过旧'))).toBe(true);
+    expect([...container.querySelectorAll('.stx-memory-status-route-detail')].some((node) => node.textContent?.includes('当前会话没有可用的 LLM structured-task 客户端'))).toBe(true);
     dispose();
   });
 
@@ -1806,7 +1771,7 @@ describe('Memory UI 展示适配', () => {
           : {
             status: 'ready', bound: true, factCount: 1, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: true,
             embedding: { available: true, model: 'Embed-Test' },
-            rerank: { available: false, blockedReason: '暂时无法读取 LLM 资源状态' },
+            rerank: { available: false, failure: { reasonCode: 'BUS_REQUEST_TIMEOUT', stage: 'test.route' } },
           };
       },
       onOverviewChanged: (listener) => { notifyOverviewChanged = listener; return () => { unsubscribed = true; }; },
@@ -1817,7 +1782,7 @@ describe('Memory UI 展示适配', () => {
     notifyOverviewChanged?.();
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(container.textContent).toContain('Embed-Test');
-    expect(container.textContent).toContain('暂时无法读取 LLM 资源状态');
+    expect(container.textContent).toContain('Bus 请求没有在限定时间内完成');
     dispose();
     expect(unsubscribed).toBe(true);
   });
@@ -2167,8 +2132,8 @@ describe('Memory UI 展示适配', () => {
       getLastRecall: async () => null,
       getRecallStatus: async () => ({
         resolvedMode: 'lexical',
-        embedding: { available: false, blockedReason: 'LLM 中尚未配置向量资源' },
-        rerank: { available: false, blockedReason: 'LLM 中尚未配置重排序资源' },
+        embedding: { available: false, failure: { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE', stage: 'test.route' } },
+        rerank: { available: false, failure: { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE', stage: 'test.route' } },
         indexedFacts: 0, eligibleFacts: 0, pendingFacts: 0, rebuilding: false, batches: [],
       }),
     }));
@@ -2449,7 +2414,7 @@ describe('Memory UI 展示适配', () => {
     const container = document.createElement('div');
     document.body.append(container);
     const dispose = renderMemoryWorkbench(container, workbenchController({
-      getOverview: async () => ({ status: 'disabled', bound: false, factCount: 0, lastOrganizedAt: null, pendingJobs: 0, llmAvailable: true, error: '当前没有绑定聊天。' }),
+      getOverview: async () => ({ status: 'disabled', bound: false, factCount: 0, lastOrganizedAt: null, pendingJobs: 0, llmAvailable: true }),
     }));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(container.textContent).not.toContain('大语言模型服务不可用');

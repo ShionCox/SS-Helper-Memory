@@ -25,6 +25,12 @@ const forbidden = [
   /\b(?:UndoLog|RollbackMarker)V[1-9]\d*\b/u,
   /\b(?:undo|rollback)-v[1-9]\d*:/u,
   /\.settings\.v[1-9]\d*\b/u,
+  /\bapiType\s*:\s*['"]auto['"]/iu,
+  /\btask\s*:\s*\{[^{}]{0,240}\bmodel\s*:/isu,
+  /(?:^|[,{\s])['"]?route['"]?\s*:\s*['"][^'"]+['"]/imu,
+  /\bok\s*:\s*false[\s\S]{0,260}(?:(?:['"]?error['"]?\s*:\s*['"][^'"]+['"][\s\S]{0,120}['"]?reasonCode['"]?\s*:)|(?:['"]?reasonCode['"]?\s*:\s*[^,}]+,[\s\S]{0,120}['"]?error['"]?\s*:\s*['"][^'"]+['"]))/imu,
+  /\b(?:MEMORY_CAPTURE_LLM_UNAVAILABLE|MEMORY_LLM_TASK_FAILED|MEMORY_CAPTURE_FAILED|HTTP_REQUEST_FAILED)\b/u,
+  /(?:\b(?:agentWriteMode|AgentWriteMode|shadowOnly|agent_shadow|shadowBaseline|shadowRunId|recordShadowExtractionAudit|MEMORY_SHADOW_WRITE_BLOCKED)\b|影子模式|影子审计|影子对照|Shadow（不写入）)/u,
 ];
 
 const executableExtensions = new Set(['.ts', '.js', '.mjs', '.cjs', '.json', '.css']);

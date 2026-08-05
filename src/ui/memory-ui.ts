@@ -16,6 +16,7 @@ import {
   type UiControlTone,
   type ChatNavigationTarget,
   type SSHelperFailureContext,
+  type PopupListHandle,
 } from '@ss-helper/sdk';
 import type { SummaryInitializationEstimate } from '../application/ingest/summary-strategy';
 import {
@@ -71,6 +72,7 @@ import {
   type ActorMemoryTab,
   type ActorMemoryViewState,
 } from './actor-memory-view';
+import { renderMemoryCandidatesView, renderCandidateRow, type MemoryCandidatesViewState } from './memory-candidates-view';
 
 export interface MemoryUiSettings extends CastPlanningSettings {
   enabled: boolean;
@@ -78,7 +80,6 @@ export interface MemoryUiSettings extends CastPlanningSettings {
   extractionMode: 'single' | 'agent';
   agentConcurrency: 1 | 2;
   agentToolPolicy: 'off' | 'read_only';
-  agentWriteMode: 'shadow' | 'active';
   summaryBatchMode: 'floors' | 'chars';
   summaryBatchFloors: number;
   summaryBatchChars: number;
@@ -108,7 +109,7 @@ export interface MemoryRecallRouteStatus {
   available: boolean;
   resourceId?: string;
   model?: string;
-  blockedReason?: string;
+  failure?: SSHelperFailureContext;
 }
 
 export interface MemoryRecallBatchStatus {
@@ -132,7 +133,7 @@ export interface MemoryRecallStatus {
   pendingFacts: number;
   rebuilding: boolean;
   degradedReason?: string;
-  lastError?: string;
+  failure?: SSHelperFailureContext;
   batches: readonly MemoryRecallBatchStatus[];
 }
 
@@ -248,7 +249,6 @@ export interface MemoryCaptureProgress {
   extractionMode?: 'single' | 'agent';
   agentConcurrency?: 1 | 2;
   agentToolPolicy?: 'off' | 'read_only';
-  agentWriteMode?: 'shadow' | 'active';
 }
 
 export interface MemoryInitializationAttempt {
@@ -307,21 +307,10 @@ export interface MemoryAgentPipelineStageSummary {
   reasonCode?: string;
 }
 
-export interface MemoryAgentPipelineShadowSummary {
-  matchingLocalIds: number;
-  agentOnlyLocalIds: number;
-  singleOnlyLocalIds: number;
-  singleCount: number;
-  agentCount: number;
-  singleStatus?: 'completed' | 'failed' | 'cancelled';
-  singleReasonCode?: string;
-}
-
 /** UI-safe Agent extraction audit. Hashes, prompts, provider payloads and candidate bodies stay in storage. */
 export interface MemoryAgentPipelineSummary {
   mode: 'agent';
   toolPolicy: 'off' | 'read_only';
-  writeMode: 'active' | 'shadow';
   stageCount: number;
   completedStageCount: number;
   failedStageCount: number;
@@ -330,7 +319,31 @@ export interface MemoryAgentPipelineSummary {
   wallClockLatencyMs: number;
   totalTokens: number | null;
   stages: MemoryAgentPipelineStageSummary[];
-  shadow?: MemoryAgentPipelineShadowSummary;
+}
+
+export interface MemoryCandidateStats {
+  readonly total: number;
+  readonly accepted: number;
+  readonly notWritten: number;
+  readonly rejectedOrIgnored: number;
+  readonly byStatus: Readonly<Record<string, number>>;
+  readonly jobId?: string;
+  readonly batchCount: number;
+}
+
+export interface MemoryCandidateSourcePreview {
+  readonly candidateId: string;
+  readonly sourceRef: string;
+  readonly sourceKind: 'message' | 'state' | 'host_card' | 'persona' | 'worldbook' | 'manual';
+  readonly floor?: number;
+  readonly messageId?: string;
+  readonly messageIndex?: number;
+  readonly text: string;
+  readonly digest: string;
+  readonly savedText?: string;
+  readonly sourceChanged: boolean;
+  readonly warning?: 'source_missing' | 'ambiguous_match' | 'no_match';
+  readonly highlights: readonly { readonly start: number; readonly end: number; readonly text: string }[];
 }
 
 /** Required, allow-listed audit projection consumed by the workbench. */
@@ -399,6 +412,9 @@ export interface MemoryUiController {
     statusCounts: Readonly<Record<string, number>>;
   }>;
   loadMemoryPage?<T>(resource: MemoryPageResource, request: MemoryPageRequest): Promise<MemoryPage<T>>;
+  listMemoryCandidatesPage?(request: MemoryPageRequest): Promise<MemoryPage<import('../domain').MemoryCandidateRecord>>;
+  getMemoryCandidateStats?(filters?: Readonly<Record<string, string | number>>): Promise<MemoryCandidateStats>;
+  getMemoryCandidateSourcePreview?(candidateId: string, sourceRef: string): Promise<MemoryCandidateSourcePreview>;
   updateFact(id: string, content: string): Promise<void>;
   removeFact(id: string): Promise<void>;
   getLastRecall(): Promise<unknown>;
@@ -611,10 +627,11 @@ function safeInlineError(value: unknown, _fallback: string): string {
   return isSSHelperReasonCode(value) ? value : 'INTERNAL_ERROR';
 }
 
-export type MemoryWorkbenchPage = 'overview' | 'actors' | 'inventory' | 'scenes' | 'library' | 'actor-memory' | 'profiles' | 'dreams' | 'recall' | 'audit' | 'initialize' | 'graph' | 'data';
+export type MemoryWorkbenchPage = 'overview' | 'initialize' | 'candidates' | 'actors' | 'inventory' | 'scenes' | 'library' | 'actor-memory' | 'profiles' | 'dreams' | 'recall' | 'audit' | 'graph' | 'data';
 const PAGES: ReadonlyArray<{ id: MemoryWorkbenchPage; label: string; description: string; icon: string }> = [
   { id: 'overview', label: '概览', description: '当前工作区与场景状态', icon: 'gauge-high' },
   { id: 'initialize', label: '初始化', description: '选择来源并捕获当前聊天记忆', icon: 'wand-magic-sparkles' },
+  { id: 'candidates', label: '候选检查', description: '查看提取候选与原文证据', icon: 'list-tree' },
   { id: 'actors', label: '人物与别名', description: '主体发现与待确认归属', icon: 'users' },
   { id: 'inventory', label: '物品与资源', description: '当前数量与完整变动账本', icon: 'boxes-stacked' },
   { id: 'scenes', label: '场景与事件', description: '在场、提及与事件来源', icon: 'timeline' },
@@ -656,6 +673,16 @@ interface WorkbenchState {
   pendingActors: Array<import('../domain').ActorCandidate>;
   actorCorrectionReviews: ActorCorrectionReview[];
   memoryReviews: Array<import('../application/extraction').MemoryReviewItem>;
+  memoryCandidates: Array<import('../domain').MemoryCandidateRecord>;
+  memoryCandidateStats?: MemoryCandidateStats;
+  memoryCandidateQuery: string;
+  memoryCandidateBatch: string;
+  memoryCandidateCollection: string;
+  memoryCandidateStatus: string;
+  memoryCandidateFloor: string;
+  selectedMemoryCandidateId: string;
+  selectedMemoryCandidateSourceRef: string;
+  memoryCandidateSourcePreview?: MemoryCandidateSourcePreview;
   actorView: 'people' | 'pending';
   actorQuery: string;
   actorStatus: '' | import('../domain').ActorResolutionStatus;
@@ -804,7 +831,9 @@ function renderErrorDetails(diagnostic: MemoryErrorDiagnostic, action: 'retry-lo
 }
 function renderRoute(label: string, route: MemoryRecallRouteStatus): string {
   const tone = route.available ? 'success' : 'error';
-  const detail = route.available ? route.resourceId ?? '已配置' : route.blockedReason ?? '尚未在 LLM 中配置';
+  const detail = route.available
+    ? route.resourceId ?? '已配置'
+    : route.failure ? describeSSHelperFailure(route.failure).reason : '尚未在 LLM 中配置';
   return `<div class="stx-memory-route"><div><strong>${escapeHtml(label)}</strong>${renderStatusChip(route.available ? '可用' : '不可用', tone)}</div><small>${escapeHtml(detail)}</small>${route.model ? `<small>模型：${escapeHtml(route.model)}</small>` : ''}</div>`;
 }
 function renderOverviewRouteStatus(label: string, route: MemoryRecallRouteStatus | undefined): string {
@@ -814,7 +843,7 @@ function renderOverviewRouteStatus(label: string, route: MemoryRecallRouteStatus
     ? ''
     : route.available
       ? route.model ?? route.resourceId ?? '已配置'
-      : route.blockedReason ?? '尚未在 LLM 中配置';
+      : route.failure ? describeSSHelperFailure(route.failure).reason : '尚未在 LLM 中配置';
   return `<div class="stx-memory-status-route"><span class="stx-memory-kicker">${escapeHtml(label)}</span>${renderStatusChip(status, tone)}${detail ? `<small class="stx-memory-status-route-detail" title="${escapeHtml(detail)}">${escapeHtml(detail)}</small>` : ''}</div>`;
 }
 
@@ -855,6 +884,12 @@ export function renderMemoryWorkbench(
   let auditListRequestId = 0;
   let auditSummaryRequestId = 0;
   let usageRecallRequestId = 0;
+  let candidateListRequestId = 0;
+  let candidateSourceRequestId = 0;
+  let candidateFilterTimer: number | undefined;
+  let candidateListAbort: AbortController | undefined;
+  let candidateSourceAbort: AbortController | undefined;
+  let candidateListHandle: PopupListHandle | undefined;
   let liveRefreshRunning = false;
   let liveRefreshRequested = false;
   let graphRenderer: RelationshipGraphRenderer | undefined;
@@ -876,7 +911,7 @@ export function renderMemoryWorkbench(
   let sceneRendererToken = 0;
   const requestedGraphPage = initialActionId === 'open-relationship-graph' || initialActionId === 'rebuild-relationship-graph';
   const state: WorkbenchState = {
-    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], memoryReviews: [], actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', inventoryItems: [], inventoryStates: [], inventoryEvents: [], inventoryScope: 'current', inventoryQuery: '', inventoryCategory: '', inventorySort: 'recent', inventoryView: 'grid', selectedInventoryItemId: '', inventoryDetailWidth: INVENTORY_DETAIL_WIDTH_DEFAULT, inventoryPreviewHeight: INVENTORY_PREVIEW_HEIGHT_DEFAULT, inventoryCreateOpen: false, inventoryNewName: '', inventoryNewAliases: '', inventoryNewCategory: 'other', inventoryCommandOperation: 'set', inventoryCommandMeasure: 'quantity', inventoryCommandAmount: '', inventoryCommandUnit: '个', inventoryCommandPrecision: 'exact', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
+    page: requestedGraphPage ? 'graph' : 'library', loading: true, pageLoading: false, busyAction: '', actors: [], actorAliases: [], pendingActors: [], actorCorrectionReviews: [], memoryReviews: [], memoryCandidates: [], memoryCandidateQuery: '', memoryCandidateBatch: '', memoryCandidateCollection: '', memoryCandidateStatus: '', memoryCandidateFloor: '', selectedMemoryCandidateId: '', selectedMemoryCandidateSourceRef: '', actorView: 'people', actorQuery: '', actorStatus: '', selectedActorId: '', selectedCandidateId: '', renamingActorId: '', actorRenameValue: '', editingActorTraitsId: '', actorOperation: '', actorOperationAliasId: '', actorOperationTargetId: '', actorOperationName: '', candidateResolutionMode: 'existing', candidateTargetOwnerId: '', candidateCanonicalName: '', inventoryItems: [], inventoryStates: [], inventoryEvents: [], inventoryScope: 'current', inventoryQuery: '', inventoryCategory: '', inventorySort: 'recent', inventoryView: 'grid', selectedInventoryItemId: '', inventoryDetailWidth: INVENTORY_DETAIL_WIDTH_DEFAULT, inventoryPreviewHeight: INVENTORY_PREVIEW_HEIGHT_DEFAULT, inventoryCreateOpen: false, inventoryNewName: '', inventoryNewAliases: '', inventoryNewCategory: 'other', inventoryCommandOperation: 'set', inventoryCommandMeasure: 'quantity', inventoryCommandAmount: '', inventoryCommandUnit: '个', inventoryCommandPrecision: 'exact', scenes: [], sceneTransitions: [], generationCastPlans: [], castPlanAudits: [], recallCoverageLogs: [], memoryUsageLogs: [], episodes: [], observations: [], sceneCategory: 'scene', sceneQuery: '', sceneFilter: '', selectedSceneId: '', selectedEpisodeId: '', selectedObservationId: '', selectedSceneOwnerId: '', showSceneBoundaries: true, showSceneSources: false, showSceneConfidence: true, actorTraces: [], actorMemoryQuery: '', actorMemoryKnowledgeMode: '', actorMemoryPrivacy: '', actorMemoryLevel: '', actorMemorySort: 'updated_desc', actorMemorySelectedOwnerId: '', actorMemorySelectedTraceId: '', actorMemoryTab: 'overview', actorMemoryCollapsedGroups: [], actorMemoryNow: Date.now(), profiles: [], dreams: [], facts: [], libraryResults: [], query: '', selectedKinds: Object.keys(FACT_KIND_LABELS), selectedStatuses: Object.keys(FACT_STATUS_LABELS), openFilter: '', sort: 'updated_desc',
     selectedFactId: '', editingFactId: '', confirmFactId: '', sources: [], selectedSourceKinds: [], includeHiddenMessageFloors: true, batchRangeStart: 1, batchRangeEnd: 0, batchRangeEdited: false, reinitializeOpen: false, audits: [], usages: [], auditTotal: 0, usageTotal: 0, auditSummaryLoading: false, auditTab: 'records', auditQuery: '', auditStatus: 'all', auditIssuesOnly: false, auditMobileView: 'list', selectedAuditId: '', selectedUsageId: '', usageQuery: '', usageModel: '', usageCompleteness: 'all', usageRecallLoading: false, storageUsageStatus: 'loading', integrityText: '尚未执行完整性检查。', selectedRejectionIds: [], dangerConfirm: '', graphQuery: '', graphKind: '', graphStatusFilter: '', graphListMode: 'edges', selectedGraphEdgeId: '', selectedGraphEventId: '', selectedGraphNodeId: '', graphNeighborFocus: false,
   };
   const sceneEventsState = (): SceneEventsState => ({
@@ -991,6 +1026,11 @@ export function renderMemoryWorkbench(
     state.actorMemoryTab = 'overview';
     state.actorMemoryCollapsedGroups = [];
     state.actorMemoryNow = Date.now();
+    state.memoryCandidates = [];
+    delete state.memoryCandidateStats;
+    state.selectedMemoryCandidateId = '';
+    state.selectedMemoryCandidateSourceRef = '';
+    delete state.memoryCandidateSourcePreview;
   };
   const renderSourceReference = (value: string, mode: 'chip' | 'evidence' = 'chip'): string => {
     const label = escapeHtml(formatSourceReference(value));
@@ -1348,6 +1388,28 @@ export function renderMemoryWorkbench(
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     ...(options.includeTotal ? { includeTotal: true } : {}),
   });
+  const candidatePageRequest = (
+    limit: number,
+    options: { cursor?: string; signal?: AbortSignal; includeTotal?: boolean } = {},
+  ): MemoryPageRequest => ({
+    limit,
+    query: state.memoryCandidateQuery.trim(),
+    filter: {
+      ...(state.memoryCandidateBatch ? { batchIndex: Number(state.memoryCandidateBatch) } : {}),
+      ...(state.memoryCandidateCollection ? { collection: state.memoryCandidateCollection } : {}),
+      ...(state.memoryCandidateStatus ? { status: state.memoryCandidateStatus } : {}),
+    },
+    ...(options.cursor === undefined ? {} : { cursor: options.cursor }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.includeTotal ? { includeTotal: true } : {}),
+    orderBy: { field: 'createdAt', direction: 'asc' },
+  });
+  const sortCandidates = (items: readonly import('../domain').MemoryCandidateRecord[]): import('../domain').MemoryCandidateRecord[] => [...items].sort((left, right) =>
+    (left.batchIndex ?? Number.MAX_SAFE_INTEGER) - (right.batchIndex ?? Number.MAX_SAFE_INTEGER)
+    || left.stage.localeCompare(right.stage)
+    || left.attemptIndex - right.attemptIndex
+    || left.createdAt - right.createdAt
+    || left.id.localeCompare(right.id));
   const refreshLibrarySearch = async (): Promise<boolean> => {
     const requestId = ++librarySearchRequestId;
     const query = state.query.trim();
@@ -1366,6 +1428,62 @@ export function renderMemoryWorkbench(
     state.libraryResults = [...results];
     normalizeLibrarySelection();
     return true;
+  };
+  const refreshMemoryCandidates = async (isCurrent: () => boolean = () => !disposed): Promise<boolean> => {
+    const requestId = ++candidateListRequestId;
+    candidateListAbort?.abort();
+    candidateListAbort = new AbortController();
+    const signal = candidateListAbort.signal;
+    if (state.overview?.bound === false) {
+      state.memoryCandidates = [];
+      delete state.memoryCandidateStats;
+      state.selectedMemoryCandidateId = '';
+      return true;
+    }
+    try {
+      const load = controller.listMemoryCandidatesPage
+        ? controller.listMemoryCandidatesPage(candidatePageRequest(200, { signal, includeTotal: true }))
+        : controller.loadMemoryPage
+          ? controller.loadMemoryPage<import('../domain').MemoryCandidateRecord>('memory-candidates', candidatePageRequest(200, { signal, includeTotal: true }))
+          : Promise.resolve({ items: [], nextCursor: null } as MemoryPage<import('../domain').MemoryCandidateRecord>);
+      const [page, stats] = await Promise.all([
+        load,
+        controller.getMemoryCandidateStats ? controller.getMemoryCandidateStats({
+          ...(state.memoryCandidateBatch ? { batchIndex: Number(state.memoryCandidateBatch) } : {}),
+          ...(state.memoryCandidateCollection ? { collection: state.memoryCandidateCollection } : {}),
+          ...(state.memoryCandidateStatus ? { status: state.memoryCandidateStatus } : {}),
+          ...(state.memoryCandidateFloor ? { floor: Number(state.memoryCandidateFloor) } : {}),
+        }) : Promise.resolve(undefined),
+      ]);
+      if (!isCurrent() || disposed || requestId !== candidateListRequestId || signal.aborted || state.page !== 'candidates') return false;
+      const floor = state.memoryCandidateFloor.trim() === '' ? undefined : Number(state.memoryCandidateFloor);
+      state.memoryCandidates = sortCandidates([...page.items].filter(candidate => floor === undefined || candidate.evidence.some(span => span.floor === floor)));
+      state.memoryCandidateStats = stats;
+      if (!state.memoryCandidates.some(candidate => candidate.id === state.selectedMemoryCandidateId)) {
+        state.selectedMemoryCandidateId = state.memoryCandidates[0]?.id ?? '';
+        state.selectedMemoryCandidateSourceRef = state.memoryCandidates[0]?.evidence[0]?.sourceRef ?? '';
+        delete state.memoryCandidateSourcePreview;
+      }
+      return true;
+    } finally {
+      if (candidateListAbort?.signal === signal) candidateListAbort = undefined;
+    }
+  };
+  const loadMemoryCandidateSource = async (candidateId: string, sourceRef: string): Promise<void> => {
+    if (!controller.getMemoryCandidateSourcePreview || !candidateId || !sourceRef) return;
+    const requestId = ++candidateSourceRequestId;
+    candidateSourceAbort?.abort();
+    candidateSourceAbort = new AbortController();
+    try {
+      const preview = await controller.getMemoryCandidateSourcePreview(candidateId, sourceRef);
+      if (disposed || requestId !== candidateSourceRequestId || state.selectedMemoryCandidateId !== candidateId || state.selectedMemoryCandidateSourceRef !== sourceRef) return;
+      state.memoryCandidateSourcePreview = preview;
+      rerender('', true);
+    } catch {
+      if (disposed || requestId !== candidateSourceRequestId) return;
+      delete state.memoryCandidateSourcePreview;
+      rerender('', true);
+    }
   };
   const acceptOverview = (overview: MemoryUiOverview): void => {
     const chatChanged = state.overview?.chatKey !== overview.chatKey;
@@ -1724,6 +1842,13 @@ export function renderMemoryWorkbench(
         if (!isCurrent()) return;
         state.progress = progress;
         scheduleProgress();
+      } else if (page === 'candidates') {
+        await refreshMemoryCandidates(isCurrent);
+        if (!isCurrent()) return;
+        const selected = state.memoryCandidates.find(candidate => candidate.id === state.selectedMemoryCandidateId);
+        const sourceRef = state.selectedMemoryCandidateSourceRef || selected?.evidence[0]?.sourceRef || '';
+        state.selectedMemoryCandidateSourceRef = sourceRef;
+        if (selected && sourceRef) await loadMemoryCandidateSource(selected.id, sourceRef);
       } else if (page === 'recall') {
         const recall = await controller.getRecallStatus();
         if (!isCurrent()) return;
@@ -1943,7 +2068,7 @@ export function renderMemoryWorkbench(
       </div>
       <aside class="stx-memory-overview-aside" aria-label="概览操作与能力状态">
         <section class="stx-memory-overview-aside-section"><h4>下一步操作</h4><p>尚未整理时先初始化；已有记忆时可直接浏览或检查召回。</p><div class="stx-memory-overview-actions"><button class="stx-memory-overview-action is-primary" ${uiControl('button', 'primary')} type="button" data-action="navigate" data-page="initialize"><ss-helper-icon name="wand-magic-sparkles" decorative></ss-helper-icon><span>初始化</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="view-library"><ss-helper-icon name="book-open" decorative></ss-helper-icon><span>查看记忆库</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="navigate" data-page="scenes"><ss-helper-icon name="timeline" decorative></ss-helper-icon><span>场景与事件</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button><button class="stx-memory-overview-action" ${uiControl('button', 'neutral')} type="button" data-action="navigate" data-page="recall"><ss-helper-icon name="magnifying-glass-chart" decorative></ss-helper-icon><span>检查召回</span><ss-helper-icon name="chevron-right" decorative></ss-helper-icon></button></div></section>
-        <section class="stx-memory-overview-aside-section"><h4>能力与资源状态</h4><p>当前能力可用性一览。</p><div class="stx-memory-overview-routes">${routeRow('大语言模型（LLM）', 'comments', overview.llmAvailable, overview.llmAvailable ? overview.llmModel ?? overview.llmResource ?? '服务已就绪' : 'LLM 服务暂不可用')}${routeRow('向量资源（嵌入）', 'circle-nodes', overview.embedding?.available, overview.embedding?.available ? overview.embedding.model ?? overview.embedding.resourceId ?? '已配置' : overview.embedding?.blockedReason ?? '未配置向量资源')}${routeRow('重排资源（Rerank）', 'arrow-down-wide-short', overview.rerank?.available, overview.rerank?.available ? overview.rerank.model ?? overview.rerank.resourceId ?? '已配置' : overview.rerank?.blockedReason ?? '未配置重排资源')}</div></section>
+        <section class="stx-memory-overview-aside-section"><h4>能力与资源状态</h4><p>当前能力可用性一览。</p><div class="stx-memory-overview-routes">${routeRow('大语言模型（LLM）', 'comments', overview.llmAvailable, overview.llmAvailable ? overview.llmModel ?? overview.llmResource ?? '服务已就绪' : 'LLM 服务暂不可用')}${routeRow('向量资源（嵌入）', 'circle-nodes', overview.embedding?.available, overview.embedding?.available ? overview.embedding.model ?? overview.embedding.resourceId ?? '已配置' : overview.embedding?.failure ? describeSSHelperFailure(overview.embedding.failure).reason : '未配置向量资源')}${routeRow('重排资源（Rerank）', 'arrow-down-wide-short', overview.rerank?.available, overview.rerank?.available ? overview.rerank.model ?? overview.rerank.resourceId ?? '已配置' : overview.rerank?.failure ? describeSSHelperFailure(overview.rerank.failure).reason : '未配置重排资源')}</div></section>
         <section class="stx-memory-overview-aside-section"><h4>快速入口</h4><p>更多查看与管理选项。</p><div class="stx-memory-overview-quick-grid">${shortcut('actors', 'users', '查看人物与别名')}${shortcut('profiles', 'address-card', '画像与关系')}${shortcut('audit', 'list-check', '查看审计记录')}</div></section>
       </aside>
     </section>`;
@@ -2335,7 +2460,6 @@ export function renderMemoryWorkbench(
       runtimeExtractionMode: progress?.extractionMode ?? extractionRuntimeMode(),
       agentConcurrency: progress?.agentConcurrency ?? settings.agentConcurrency,
       agentToolPolicy: progress?.agentToolPolicy ?? settings.agentToolPolicy,
-      agentWriteMode: progress?.agentWriteMode ?? settings.agentWriteMode,
       summaryBatchMode: settings.summaryBatchMode,
       summaryBatchFloors: settings.summaryBatchFloors,
       summaryBatchChars: settings.summaryBatchChars,
@@ -2389,7 +2513,8 @@ export function renderMemoryWorkbench(
     const recall = state.recall;
     if (!recall) return renderEmpty('暂无召回状态', '点击刷新或稍后重试。');
     const coverage = recall.eligibleFacts ? Math.round((recall.indexedFacts / recall.eligibleFacts) * 100) : 0;
-    const recallError = recall.degradedReason ?? recall.lastError;
+    const recallError = recall.degradedReason
+      ?? (recall.failure ? describeSSHelperFailure(recall.failure).reason : undefined);
     const rebuildDisabled = !recall.embedding.available || recall.rebuilding || Boolean(state.busyAction);
     const diagnostic = state.diagnostics == null
       ? renderEmpty('暂无召回诊断', '完成一次召回后，这里会显示诊断摘要。')
@@ -2633,7 +2758,6 @@ export function renderMemoryWorkbench(
         record.kind,
         record.pipeline?.mode,
         record.pipeline?.toolPolicy,
-        record.pipeline?.writeMode,
         ...record.sourceRefs,
         ...record.issues.flatMap(issue => [issue.collection, issue.path, issue.failure.reasonCode, issue.failure.requestId]),
         ...(record.pipeline?.stages.flatMap(stage => [stage.stage, stage.status, stage.reasonCode, stage.requestId, stage.resourceId, stage.model]) ?? []),
@@ -2702,7 +2826,6 @@ export function renderMemoryWorkbench(
         pipeline: {
           mode: record.pipeline.mode,
           toolPolicy: record.pipeline.toolPolicy,
-          writeMode: record.pipeline.writeMode,
           stageCount: record.pipeline.stageCount,
           completedStageCount: record.pipeline.completedStageCount,
           failedStageCount: record.pipeline.failedStageCount,
@@ -2711,7 +2834,6 @@ export function renderMemoryWorkbench(
           wallClockLatencyMs: record.pipeline.wallClockLatencyMs,
           totalTokens: record.pipeline.totalTokens,
           stages: record.pipeline.stages.map(stage => ({ ...stage })),
-          ...(record.pipeline.shadow ? { shadow: { ...record.pipeline.shadow } } : {}),
         },
       } : {}),
       issues: record.issues.map(issue => ({
@@ -2783,7 +2905,7 @@ export function renderMemoryWorkbench(
     if (!(state.auditTab === 'records' ? state.selectedAuditId : state.selectedUsageId)) state.auditMobileView = 'list';
   };
   const renderAuditRecord = (record: MemoryAuditRecord): string => {
-    const title = record.kind === 'agent_pipeline' ? 'Agent Shadow' : `Capture #${formatNumber(record.batchIndex + 1)}`;
+    const title = record.kind === 'agent_pipeline' ? 'Agent 阶段' : `Capture #${formatNumber(record.batchIndex + 1)}`;
     const metrics = record.kind === 'agent_pipeline' && record.pipeline
       ? `<span>${formatNumber(record.pipeline.completedStageCount)} / ${formatNumber(record.pipeline.stageCount)} 阶段</span><span>${formatNumber(record.pipeline.toolCallCount)} 工具调用</span>`
       : `<span>${formatNumber(record.acceptedCount)} 接受</span><span>${formatNumber(record.rejectedCount)} 拒绝</span>`;
@@ -2822,10 +2944,7 @@ export function renderMemoryWorkbench(
           return `<article class="stx-memory-audit-issue" data-stage-status="${escapeHtml(stage.status)}"><div class="stx-memory-audit-issue-head"><span class="stx-memory-audit-issue-icon" aria-hidden="true"><ss-helper-icon name="${stage.status === 'completed' ? 'circle-check' : 'triangle-exclamation'}" decorative></ss-helper-icon></span><div><strong>${escapeHtml(stage.stage)}</strong><small>${escapeHtml(stage.model ?? '模型未记录')} · ${escapeHtml(formatAuditResource(stage.resourceId))}</small></div>${renderStatusChip(stageStatusLabel(stage.status), stage.status === 'completed' ? 'success' : stage.status === 'failed' ? 'error' : 'warning')}</div><div class="stx-memory-audit-diagnostic"><code>${escapeHtml(technical)}</code></div></article>`;
         }).join('')}</div>`
       : renderEmpty('没有阶段摘要', '本条 Agent 审计没有可展示的固定阶段。');
-    const shadowMarkup = pipeline.shadow
-      ? `<section class="stx-memory-audit-source-block"><h4>Shadow 对照</h4><dl class="stx-memory-audit-summary"><div><dt>Single 状态</dt><dd>${pipeline.shadow.singleStatus === 'completed' ? '已完成' : pipeline.shadow.singleStatus === 'cancelled' ? '已取消' : pipeline.shadow.singleStatus === 'failed' ? '不可用' : '未记录'}${pipeline.shadow.singleReasonCode ? ` · <code>${escapeHtml(pipeline.shadow.singleReasonCode)}</code>` : ''}</dd></div><div><dt>Single 项</dt><dd>${formatNumber(pipeline.shadow.singleCount)}</dd></div><div><dt>Agent 项</dt><dd>${formatNumber(pipeline.shadow.agentCount)}</dd></div><div><dt>匹配</dt><dd>${formatNumber(pipeline.shadow.matchingLocalIds)}</dd></div><div><dt>仅 Agent / 仅 Single</dt><dd>${formatNumber(pipeline.shadow.agentOnlyLocalIds)} / ${formatNumber(pipeline.shadow.singleOnlyLocalIds)}</dd></div></dl></section>`
-      : '';
-    return `<section class="stx-memory-audit-detail" data-audit-detail><button class="stx-memory-audit-mobile-back" ${uiButton('neutral', 'sm')} type="button" data-action="audit-mobile-back"><ss-helper-icon name="arrow-left" decorative></ss-helper-icon>返回记录</button><header class="stx-memory-audit-detail-head"><div><span class="stx-memory-kicker">Agent Shadow</span><h3 id="stx-memory-audit-detail-heading" tabindex="-1">${escapeHtml(auditStatusLabel(record.status))}</h3><p>${escapeHtml(formatTime(record.createdAt))}</p></div>${renderStatusChip(pipeline.failedStageCount || pipeline.cancelledStageCount ? '存在异常阶段' : '固定阶段已记录', pipeline.failedStageCount ? 'error' : pipeline.cancelledStageCount ? 'warning' : 'success')}</header><dl class="stx-memory-audit-summary"><div><dt>阶段</dt><dd>${formatNumber(pipeline.completedStageCount)} / ${formatNumber(pipeline.stageCount)}</dd></div><div><dt>工具调用</dt><dd>${formatNumber(pipeline.toolCallCount)}</dd></div><div><dt>总 Token</dt><dd>${formatTokenCount(pipeline.totalTokens)}</dd></div><div><dt>墙钟耗时</dt><dd>${formatNumber(pipeline.wallClockLatencyMs)} ms</dd></div></dl><div class="stx-memory-audit-route"><div><small>模式</small><strong>Agent</strong></div><div><small>工具策略</small><strong>${pipeline.toolPolicy === 'read_only' ? '只读' : '关闭'}</strong></div><div><small>写入模式</small><strong>Shadow（不写入）</strong></div><div><small>管线 ID</small><code>${escapeHtml(record.jobId)}</code></div></div>${shadowMarkup}<section class="stx-memory-audit-issues"><div class="stx-memory-audit-section-head"><div><h4>固定阶段</h4><p>${formatNumber(pipeline.completedStageCount)} 个完成，${formatNumber(pipeline.failedStageCount)} 个失败，${formatNumber(pipeline.cancelledStageCount)} 个取消</p></div></div>${stageMarkup}</section></section>`;
+    return `<section class="stx-memory-audit-detail" data-audit-detail><button class="stx-memory-audit-mobile-back" ${uiButton('neutral', 'sm')} type="button" data-action="audit-mobile-back"><ss-helper-icon name="arrow-left" decorative></ss-helper-icon>返回记录</button><header class="stx-memory-audit-detail-head"><div><span class="stx-memory-kicker">Agent 阶段</span><h3 id="stx-memory-audit-detail-heading" tabindex="-1">${escapeHtml(auditStatusLabel(record.status))}</h3><p>${escapeHtml(formatTime(record.createdAt))}</p></div>${renderStatusChip(pipeline.failedStageCount || pipeline.cancelledStageCount ? '存在异常阶段' : '固定阶段已记录', pipeline.failedStageCount ? 'error' : pipeline.cancelledStageCount ? 'warning' : 'success')}</header><dl class="stx-memory-audit-summary"><div><dt>阶段</dt><dd>${formatNumber(pipeline.completedStageCount)} / ${formatNumber(pipeline.stageCount)}</dd></div><div><dt>工具调用</dt><dd>${formatNumber(pipeline.toolCallCount)}</dd></div><div><dt>总 Token</dt><dd>${formatTokenCount(pipeline.totalTokens)}</dd></div><div><dt>墙钟耗时</dt><dd>${formatNumber(pipeline.wallClockLatencyMs)} ms</dd></div></dl><div class="stx-memory-audit-route"><div><small>模式</small><strong>Agent</strong></div><div><small>工具策略</small><strong>${pipeline.toolPolicy === 'read_only' ? '只读' : '关闭'}</strong></div><div><small>管线 ID</small><code>${escapeHtml(record.jobId)}</code></div></div><section class="stx-memory-audit-issues"><div class="stx-memory-audit-section-head"><div><h4>固定阶段</h4><p>${formatNumber(pipeline.completedStageCount)} 个完成，${formatNumber(pipeline.failedStageCount)} 个失败，${formatNumber(pipeline.cancelledStageCount)} 个取消</p></div></div>${stageMarkup}</section></section>`;
   };
   const renderAuditDetail = (record: MemoryAuditRecord | undefined): string => {
     if (!record) return `<section class="stx-memory-audit-detail" data-audit-detail>${renderEmpty('选择一条操作记录', '右侧会显示安全诊断、来源与真实可用操作。')}</section>`;
@@ -2972,6 +3091,22 @@ export function renderMemoryWorkbench(
     const reviewQueue = `<section class="stx-memory-panel" aria-labelledby="stx-memory-review-title"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">Agent 更新裁决</span><h3 id="stx-memory-review-title">待人工审核</h3></div>${renderStatusChip(`${pendingReviews.length} 条`, pendingReviews.length ? 'warning' : 'success')}</div>${pendingReviews.length ? `<div class="stx-memory-actor-review-list">${pendingReviews.map(item => `<article class="stx-memory-actor-review"><div><strong>${escapeHtml(item.stage)} · ${escapeHtml(item.reasonCode)}</strong><small>${escapeHtml(formatTime(item.createdAt))}</small><pre class="stx-memory-code">${escapeHtml(formatJson(item.candidateSummary))}</pre>${item.currentStateSummary === undefined ? '' : `<details><summary>当前旧状态</summary><pre class="stx-memory-code">${escapeHtml(formatJson(item.currentStateSummary))}</pre></details>`}<div class="stx-memory-muted"><span>证据 ${formatNumber(item.evidenceSpanIds.length)} 条</span> · <span>Read Set ${formatNumber(item.readSetSummary?.readCount ?? 0)} 条${item.readSetSummary?.stale ? `，变化：${escapeHtml(item.readSetSummary.changedRefs.join('、') || '未定位')}` : '，提交前一致'}</span> · <span>工具 ${formatNumber(item.toolCallSummary?.callCount ?? 0)} 次${item.toolCallSummary?.failedCount ? `，失败 ${formatNumber(item.toolCallSummary.failedCount)}` : ''}</span></div><small>工具：${escapeHtml(item.toolCallSummary?.tools.join('、') || '未调用')}；调用 ID：${escapeHtml(item.toolCallSummary?.callIds.join('、') || '无')}</small><label><span>编辑后的候选 JSON</span><textarea ${uiControl('input')} rows="4" data-memory-review-edit="${escapeHtml(item.id)}">${escapeHtml(formatJson(item.candidateSummary))}</textarea></label><label><span>合并目标短引用</span><input ${uiControl('input')} type="text" data-memory-review-merge="${escapeHtml(item.id)}" placeholder="例如 F03 / O02"></label></div><div class="stx-memory-error-actions"><button ${uiButton('primary', 'sm')} type="button" data-action="resolve-memory-review" data-review-action="accept" data-review-id="${escapeHtml(item.id)}">接受</button><button ${uiButton('neutral', 'sm')} type="button" data-action="resolve-memory-review" data-review-action="edit" data-review-id="${escapeHtml(item.id)}">编辑后接受</button><button ${uiButton('neutral', 'sm')} type="button" data-action="resolve-memory-review" data-review-action="merge" data-review-id="${escapeHtml(item.id)}">合并</button><button ${uiButton('neutral', 'sm')} type="button" data-action="resolve-memory-review" data-review-action="reextract" data-review-id="${escapeHtml(item.id)}">重新提取</button><button ${uiButton('danger', 'sm')} type="button" data-action="resolve-memory-review" data-review-action="reject" data-review-id="${escapeHtml(item.id)}">拒绝</button></div></article>`).join('')}</div>` : '<p class="stx-memory-muted">当前没有待审核更新。</p>'}<div class="stx-memory-panel-actions"><button ${uiButton('neutral', 'sm')} type="button" data-action="export-memory-review-gold" ${controller.exportMemoryReviewGold ? '' : 'disabled'}><ss-helper-icon name="download" decorative></ss-helper-icon>导出 Gold</button></div></section>`;
     return `${reviewQueue}<div class="stx-memory-audit-shell" data-audit-tab="${state.auditTab}" data-audit-mobile-view="${state.auditMobileView}"><div class="stx-memory-audit-tabs" ${uiControl('segmented')} role="tablist" aria-label="审计视图"><button type="button" role="tab" data-action="audit-tab" data-audit-tab="records" aria-selected="${state.auditTab === 'records'}">操作记录</button><button type="button" role="tab" data-action="audit-tab" data-audit-tab="usage" aria-selected="${state.auditTab === 'usage'}">Token 用量</button></div><section class="stx-memory-audit-metric-grid" aria-label="${state.auditTab === 'records' ? '操作记录汇总' : 'Token 用量汇总'}">${metrics.map(([label, value, icon]) => `<article><span aria-hidden="true"><ss-helper-icon name="${icon}" decorative></ss-helper-icon></span><div><small>${label}</small><strong>${value}</strong></div></article>`).join('')}</section>${state.auditTab === 'usage' ? `<p class="stx-memory-usage-known-note">${usageSummaryNote}</p>` : ''}${toolbar}${state.auditTab === 'usage' ? renderUsageTrend(usages) : ''}<div class="stx-memory-audit-split"><section class="stx-memory-audit-master"><div class="stx-memory-audit-list-title"><h3>${state.auditTab === 'records' ? '操作记录' : '用量明细'}</h3><span>${formatNumber(state.auditTab === 'records' ? records.length : usages.length)} 条</span></div>${state.auditTab === 'records' ? recordList : usageList}</section>${state.auditTab === 'records' ? renderAuditDetail(selectedAudit) : renderUsageDetail(selectedUsage)}</div></div>`;
   };
+  const renderCandidates = (): string => renderMemoryCandidatesView({
+    candidates: state.memoryCandidates,
+    stats: state.memoryCandidateStats,
+    selectedId: state.selectedMemoryCandidateId,
+    selectedSourceRef: state.selectedMemoryCandidateSourceRef,
+    query: state.memoryCandidateQuery,
+    batch: state.memoryCandidateBatch,
+    collection: state.memoryCandidateCollection,
+    status: state.memoryCandidateStatus,
+    floor: state.memoryCandidateFloor,
+    sourcePreview: state.memoryCandidateSourcePreview,
+    loading: state.pageLoading,
+    chatBound: state.overview?.bound,
+    missingSnapshot: !state.pageLoading && !state.memoryCandidateQuery && !state.memoryCandidateBatch && !state.memoryCandidateCollection && !state.memoryCandidateStatus && !state.memoryCandidateFloor && state.memoryCandidates.length === 0 && !state.memoryCandidateStats?.total,
+    virtualized: Boolean(popupUi),
+  } satisfies MemoryCandidatesViewState);
   const renderData = (): string => {
     const sqlite = state.sqlite;
     if (!sqlite) return renderEmpty('暂无存储状态', '点击刷新或稍后重试。');
@@ -2996,6 +3131,7 @@ export function renderMemoryWorkbench(
                 : state.page === 'profiles' ? renderProfiles()
                   : state.page === 'dreams' ? renderDreams()
                     : state.page === 'initialize' ? renderInitialize()
+                      : state.page === 'candidates' ? renderCandidates()
                       : state.page === 'recall' ? `${renderRecall()}<section class="stx-memory-panel stx-memory-graph-inline"><div class="stx-memory-panel-heading"><div><span class="stx-memory-kicker">关系图谱</span><h3>已验证事实关系</h3></div></div>${renderGraph()}</section>`
                         : state.page === 'graph' ? renderGraph()
                           : state.page === 'audit' ? renderAudit() : renderData();
@@ -3003,6 +3139,8 @@ export function renderMemoryWorkbench(
   };
   const render = (): void => {
     traceMemoryStartup('workbench:render-begin');
+    candidateListHandle?.dispose();
+    candidateListHandle = undefined;
     inventoryCardModel = undefined;
     const overview = state.overview;
     const currentPage = PAGES.find((page) => page.id === state.page) ?? INTERNAL_PAGES.find((page) => page.id === state.page) ?? PAGES[0]!;
@@ -3026,6 +3164,44 @@ export function renderMemoryWorkbench(
     const pageHeadingAction = `<div class="stx-memory-heading-actions"><button class='stx-memory-page-refresh' ${uiButton('neutral', 'sm')} type='button' data-action='refresh' ${state.busyAction ? 'disabled' : ''} aria-label='刷新当前页面'><ss-helper-icon name='rotate' decorative></ss-helper-icon>刷新</button>${state.page === 'inventory' ? `<button ${uiButton('primary', 'sm')} type="button" data-action="inventory-create-open" ${!controller.createInventoryItem || state.busyAction ? 'disabled' : ''}><ss-helper-icon name="plus-large" decorative></ss-helper-icon>新增物品</button>` : ''}</div>`;
     root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${renderOverviewRouteStatus('向量模型', overview?.embedding)}${renderOverviewRouteStatus('重排序模型', overview?.rerank)}${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class='stx-memory-nav-meta'>记忆插件 v${escapeHtml(memoryPluginConfig.manifest.version)}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${pageTitle}</h2><p>${escapeHtml(pageDescription)}</p></div>${pageHeadingAction}</header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section><div class="stx-memory-internal-routes" hidden aria-hidden="true">${INTERNAL_PAGES.map((page) => `<button type="button" data-action="navigate-internal" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}">${page.label}</button>`).join('')}</div></main></div>`;
     traceMemoryStartup('workbench:dom-rendered');
+    if (state.page === 'candidates' && popupUi && !state.pageLoading && state.overview?.bound !== false) {
+      const host = root.querySelector<HTMLElement>('[data-memory-candidates-list="true"]');
+      if (host) {
+        candidateListHandle = popupUi.mountList(host, {
+          id: 'memory-candidates',
+          ariaLabel: '记忆候选列表',
+          queryKey: [state.overview?.chatKey ?? '', state.memoryCandidateQuery, state.memoryCandidateBatch, state.memoryCandidateCollection, state.memoryCandidateStatus, state.memoryCandidateFloor].join('|'),
+          loadPage: async request => {
+            const page = controller.listMemoryCandidatesPage
+              ? await controller.listMemoryCandidatesPage(candidatePageRequest(request.limit, { cursor: request.cursor, signal: request.signal }))
+              : controller.loadMemoryPage
+                ? await controller.loadMemoryPage<import('../domain').MemoryCandidateRecord>('memory-candidates', candidatePageRequest(request.limit, { cursor: request.cursor, signal: request.signal }))
+                : { items: [], nextCursor: null };
+            const floor = state.memoryCandidateFloor.trim() === '' ? undefined : Number(state.memoryCandidateFloor);
+            return { ...page, items: sortCandidates(floor === undefined ? page.items : page.items.filter(item => item.evidence.some(span => span.floor === floor))) };
+          },
+          getKey: item => item.id,
+          renderItem: (item, context) => {
+            const wrapper = document.createElement('div');
+            wrapper.innerHTML = renderCandidateRow(item, context.selected);
+            return wrapper.firstElementChild as HTMLElement;
+          },
+          selectable: true,
+          selectedKey: state.selectedMemoryCandidateId,
+          onSelect: item => {
+            state.selectedMemoryCandidateId = item.id;
+            state.selectedMemoryCandidateSourceRef = item.evidence[0]?.sourceRef ?? '';
+            delete state.memoryCandidateSourcePreview;
+            rerender('', true);
+            if (state.selectedMemoryCandidateSourceRef) void loadMemoryCandidateSource(item.id, state.selectedMemoryCandidateSourceRef);
+          },
+          pageSize: 50,
+          overscan: 6,
+          estimatedItemHeight: 84,
+          emptyLabel: '没有符合筛选条件的候选',
+        });
+      }
+    }
     popupUi?.refreshControls(root);
     syncInventorySplitters();
     const inventoryCardPlaceholder = root.querySelector<HTMLElement>('[data-inventory-card-three-host]');
@@ -3631,6 +3807,40 @@ export function renderMemoryWorkbench(
     if (action === 'toggle-filter-menu') { const filter = actionNode.dataset.filterMenu as 'kind' | 'status'; state.openFilter = state.openFilter === filter ? '' : filter; rerender(`#stx-memory-${filter}-filter-trigger`); return; }
     if (action === 'navigate') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (PAGES.some((item) => item.id === page)) void loadPage(page); return; }
     if (action === 'navigate-internal') { const page = actionNode.dataset.page as MemoryWorkbenchPage; if (INTERNAL_PAGES.some((item) => item.id === page)) void loadPage(page); return; }
+    if (action === 'filter-memory-candidates') {
+      state.memoryCandidateStatus = actionNode.dataset.status ?? '';
+      void loadPage('candidates');
+      return;
+    }
+    if (action === 'clear-candidate-filters') {
+      state.memoryCandidateQuery = '';
+      state.memoryCandidateBatch = '';
+      state.memoryCandidateCollection = '';
+      state.memoryCandidateStatus = '';
+      state.memoryCandidateFloor = '';
+      void loadPage('candidates');
+      return;
+    }
+    if (action === 'select-memory-candidate') {
+      const candidateId = actionNode.dataset.candidateId ?? '';
+      const candidate = state.memoryCandidates.find(item => item.id === candidateId);
+      if (!candidate) return;
+      state.selectedMemoryCandidateId = candidate.id;
+      state.selectedMemoryCandidateSourceRef = candidate.evidence[0]?.sourceRef ?? '';
+      delete state.memoryCandidateSourcePreview;
+      rerender('', true);
+      if (state.selectedMemoryCandidateSourceRef) void loadMemoryCandidateSource(candidate.id, state.selectedMemoryCandidateSourceRef);
+      return;
+    }
+    if (action === 'select-memory-candidate-source') {
+      const sourceRef = actionNode.dataset.sourceRef ?? '';
+      if (!sourceRef || !state.selectedMemoryCandidateId) return;
+      state.selectedMemoryCandidateSourceRef = sourceRef;
+      delete state.memoryCandidateSourcePreview;
+      rerender('', true);
+      void loadMemoryCandidateSource(state.selectedMemoryCandidateId, sourceRef);
+      return;
+    }
     if (action === 'resolve-memory-review') {
       if (!controller.resolveMemoryReviewItem) return;
       const id = actionNode.dataset.reviewId ?? '';
@@ -4389,16 +4599,13 @@ export function renderMemoryWorkbench(
       const selectedKinds = [...state.selectedSourceKinds];
       const sourceOptions = initializationOptions();
       const settings = controller.getSettings();
-      const shadowAgent = settings.extractionMode === 'agent'
-        && extractionRuntimeMode() === 'agent'
-        && settings.agentWriteMode === 'shadow';
       if (!selectedKinds.length || state.busyAction || !state.overview?.llmAvailable || (settings.extractionMode === 'agent' && extractionRuntimeMode() !== 'agent')) return;
       void runAction(
         'initialize',
         () => controller.initialize(selectedKinds, sourceOptions),
-        shadowAgent ? 'Agent 影子评估已完成' : '初始化已完成',
-        shadowAgent ? '安全审计与 Single 基线对比已保存；正式记忆没有写入。' : '当前聊天已经可以使用记忆召回。',
-        shadowAgent ? 'MEMORY_AGENT_SHADOW_COMPLETED' : 'MEMORY_INITIALIZE_COMPLETED',
+        '初始化已完成',
+        '当前聊天已经可以使用记忆召回。',
+        'MEMORY_INITIALIZE_COMPLETED',
         async () => { await refreshInitialization(selectedKinds); },
       );
       return;
@@ -4435,16 +4642,13 @@ export function renderMemoryWorkbench(
       if (!selectedKinds.length || state.busyAction || !state.overview?.llmAvailable || Boolean(state.progress && ['queued', 'running', 'repairing'].includes(state.progress.status))) return;
       state.reinitializeOpen = false;
       const settings = controller.getSettings();
-      const shadowAgent = settings.extractionMode === 'agent'
-        && extractionRuntimeMode() === 'agent'
-        && settings.agentWriteMode === 'shadow';
       if (settings.extractionMode === 'agent' && extractionRuntimeMode() !== 'agent') return;
       void runAction(
         'reinitialize',
         () => controller.reinitialize(selectedKinds, sourceOptions),
-        shadowAgent ? 'Agent 影子评估已完成' : '重新初始化已完成',
-        shadowAgent ? '安全审计与 Single 基线对比已保存；正式记忆没有写入。' : '旧 Memory 数据已替换，当前聊天已经可以使用记忆召回。',
-        shadowAgent ? 'MEMORY_AGENT_SHADOW_COMPLETED' : 'MEMORY_REINITIALIZE_COMPLETED',
+        '重新初始化已完成',
+        '旧 Memory 数据已替换，当前聊天已经可以使用记忆召回。',
+        'MEMORY_REINITIALIZE_COMPLETED',
         async () => { await refreshInitialization(selectedKinds); },
       );
       return;
@@ -4502,6 +4706,17 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('input', (event) => {
     const input = event.target as HTMLInputElement;
+    if (input.dataset.candidateFilter) {
+      const field = input.dataset.candidateFilter;
+      if (field === 'query') state.memoryCandidateQuery = input.value;
+      else if (field === 'floor') state.memoryCandidateFloor = input.value;
+      if (candidateFilterTimer) window.clearTimeout(candidateFilterTimer);
+      candidateFilterTimer = window.setTimeout(() => {
+        candidateFilterTimer = undefined;
+        void refreshMemoryCandidates().then(() => rerender('', true)).catch(() => undefined);
+      }, 160);
+      return;
+    }
     if (input.dataset.auditInput === 'query') {
       state.auditQuery = input.value;
       state.auditMobileView = 'list';
@@ -4598,6 +4813,14 @@ export function renderMemoryWorkbench(
   }, { signal: abortController.signal });
   root.addEventListener('change', (event) => {
     const input = event.target as HTMLInputElement | HTMLSelectElement;
+    if (input.dataset.candidateFilter) {
+      const field = input.dataset.candidateFilter;
+      if (field === 'batch') state.memoryCandidateBatch = input.value;
+      else if (field === 'collection') state.memoryCandidateCollection = input.value;
+      else if (field === 'status') state.memoryCandidateStatus = input.value;
+      void refreshMemoryCandidates().then(() => rerender('', true)).catch(() => undefined);
+      return;
+    }
     if (input.dataset.auditSelect === 'status') {
       const value = input.value;
       if (value !== 'all' && value !== 'completed' && value !== 'partial' && value !== 'rolled_back') return;
@@ -4908,7 +5131,11 @@ export function renderMemoryWorkbench(
     }
   });
   return () => {
-    disposed = true; pageRequestId += 1; backgroundPageRequestId += 1; progressRequestId += 1; librarySearchRequestId += 1; overviewRequestId += 1; storageUsageRequestId += 1; auditListRequestId += 1; auditSummaryRequestId += 1; usageRecallRequestId += 1; abortController.abort();
+    disposed = true; pageRequestId += 1; backgroundPageRequestId += 1; progressRequestId += 1; librarySearchRequestId += 1; overviewRequestId += 1; storageUsageRequestId += 1; auditListRequestId += 1; auditSummaryRequestId += 1; usageRecallRequestId += 1; candidateListRequestId += 1; candidateSourceRequestId += 1; abortController.abort();
+    candidateListAbort?.abort();
+    candidateSourceAbort?.abort();
+    candidateListHandle?.dispose();
+    candidateListHandle = undefined;
     stopInventoryResize();
     cancelInventorySelectionTransition();
     if (searchTimer) window.clearTimeout(searchTimer);
@@ -4917,6 +5144,7 @@ export function renderMemoryWorkbench(
     if (progressTimer) window.clearTimeout(progressTimer);
     if (storageUsageTimer) window.clearTimeout(storageUsageTimer);
     if (auditFilterTimer) window.clearTimeout(auditFilterTimer);
+    if (candidateFilterTimer) window.clearTimeout(candidateFilterTimer);
     if (renderFrame !== undefined) window.cancelAnimationFrame(renderFrame);
     if (graphMarqueeResizeFrame !== undefined) window.cancelAnimationFrame(graphMarqueeResizeFrame);
     if (graphListModeFrame !== undefined) window.cancelAnimationFrame(graphListModeFrame);

@@ -38,5 +38,6 @@ export type MemoryPageResource =
   | 'recall-coverage-logs'
   | 'memory-usage-logs'
   | 'change-audits'
+  | 'memory-candidates'
   | 'usage'
   | 'graph-edges';

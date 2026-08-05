@@ -75,11 +75,9 @@ describe('SS-Helper Memory typed adapters', () => {
   it('uses Chinese Agent pipeline labels and routes task configuration to Memory', () => {
     const fields = flattenSettingsFields(MEMORY_SETTINGS_SCHEMA.fields);
     const extractionMode = fields.find((field) => field.id === 'extractionMode');
-    const writeMode = fields.find((field) => field.id === 'agentWriteMode');
     expect(extractionMode?.kind === 'radio' ? extractionMode.options.map((option) => option.label) : []).toEqual(['单次提取', 'Agent 多阶段']);
-    expect(writeMode?.kind === 'radio' ? writeMode.options.map((option) => option.label) : []).toEqual(['影子模式', '正式写入']);
-    expect(['agentRouteSingle', 'agentRouteEntities', 'agentRouteNarrative', 'agentRouteInventory', 'agentRouteRepair'].map((id) => fields.find((field) => field.id === id)?.label)).toEqual([
-      '单次提取', '实体提取', '叙事提取', '库存提取', '结构修复',
+    expect(['agentRouteSingle', 'agentRouteEntities', 'agentRouteContent', 'agentRouteRepair', 'agentRouteCastPlan', 'agentRouteRecallIntent', 'agentRouteEmbed', 'agentRouteRerank'].map((id) => fields.find((field) => field.id === id)?.label)).toEqual([
+      '单次提取', '实体提取', '内容与库存提取', '结构修复', '角色规划', '召回意图', '向量索引', '候选重排',
     ]);
     const route = fields.find((field) => field.id === 'agentRouteSingle');
     expect(route?.kind === 'status' ? route.action?.target : undefined).toEqual({ pluginId: 'ss-helper.memory', tabId: 'routing', fieldId: 'taskRouting' });
@@ -96,7 +94,7 @@ describe('SS-Helper Memory typed adapters', () => {
     const routingGroups = routing?.kind === 'section' ? routing.children : [];
     const taskRouting = routingGroups.find((field) => field.id === 'taskRoutingConfiguration');
     expect(taskRouting?.kind === 'section' ? taskRouting.children.map((field) => field.id) : []).toEqual([
-      'taskRouting', 'agentRouteSingle', 'agentRouteEntities', 'agentRouteNarrative', 'agentRouteInventory', 'agentRouteRepair',
+      'taskRouting', 'agentRouteSingle', 'agentRouteEntities', 'agentRouteContent', 'agentRouteRepair', 'agentRouteCastPlan', 'agentRouteRecallIntent', 'agentRouteEmbed', 'agentRouteRerank',
     ]);
     const castPlanning = MEMORY_SETTINGS_SCHEMA.fields.find((field) => field.id === 'castPlanning');
     expect(castPlanning).toMatchObject({ label: '多角色选角' });
@@ -136,7 +134,7 @@ describe('SS-Helper Memory typed adapters', () => {
     }, liveStatusSource);
     expect(await adapter.loadFieldState?.()).toMatchObject({
       chatMode: { disabled: true, disabledReason: '请先进入角色或群组聊天，再修改当前聊天设置。' },
-      summaryBatchFloors: { disabled: false },
+      summaryBatchFloors: { disabled: true },
       summaryBatchChars: { disabled: false },
       graphWorkbench: { disabled: true, disabledReason: '请先进入角色或群组聊天，再重建关系图谱。' },
     });
@@ -163,7 +161,7 @@ describe('SS-Helper Memory typed adapters', () => {
     };
     const adapter = createMemorySettingsAdapter(controller, liveStatusSource);
     await adapter.save({ ...settings, summaryBatchMode: 'chars', summaryBatchChars: 12_000, summaryIntervalFloors: 5 });
-    expect(settings).toMatchObject({ summaryBatchMode: 'chars', summaryBatchChars: 12_000, summaryIntervalFloors: 5, summaryOverlapFloors: 2 });
+    expect(settings).toMatchObject({ summaryBatchMode: 'chars', summaryBatchChars: 12_000, summaryIntervalFloors: 5, summaryOverlapFloors: 1 });
     expect(await adapter.loadFieldState?.()).toMatchObject({
       summaryBatchFloors: { disabled: true },
       summaryBatchChars: { disabled: false },

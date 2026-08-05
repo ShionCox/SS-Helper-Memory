@@ -246,6 +246,20 @@ export interface StructuredClaim {
 }
 
 /** One-call Claim capture output. Machine times and persistence IDs are server-owned. */
+/** Server-owned normalized candidate snapshot. It is never sent back to the provider. */
+export interface StructuredCandidateAttempt {
+  readonly stage: string;
+  readonly stageAttemptId: string;
+  readonly attemptIndex: number;
+  readonly collections: Readonly<Record<string, readonly {
+    readonly localId: string;
+    readonly sourceRefs: readonly string[];
+    readonly evidenceExcerpts: readonly string[];
+    readonly summary: string;
+    readonly normalizedCandidate: PlainData;
+  }[]>>;
+}
+
 export interface StructuredCaptureResult {
   actorCandidates: StructuredActorCandidate[];
   locationCandidates: StructuredLocationCandidate[];
@@ -265,10 +279,10 @@ export interface StructuredCaptureResult {
     transportMode?: 'native_strict' | 'json_object_validated' | 'prompt_json' | 'unknown';
   };
   audit?: MemoryExtractionAudit;
-  /** Shadow runs persist only their controlled audit and never enter domain materialization. */
-  shadowOnly?: boolean;
   /** Active runs commit review items atomically with the accepted domain subset. */
   reviewItems?: readonly MemoryReviewItem[];
+  /** Internal candidate trace used by the read-only Workbench diagnostics page. */
+  candidateAttempts?: readonly StructuredCandidateAttempt[];
 }
 
 /**
@@ -413,7 +427,6 @@ export interface MemoryExtractionInput {
     extractionMode: 'single' | 'agent';
     agentConcurrency: 1 | 2;
     agentToolPolicy: 'off' | 'read_only';
-    agentWriteMode: 'shadow' | 'active';
   };
   signal?: AbortSignal;
   /** Receives each completed Provider response usage without inventing absent fields. */
@@ -421,7 +434,7 @@ export interface MemoryExtractionInput {
   repair?: RepairAttemptContext & {
     collection: 'actorCandidates' | 'locationCandidates' | 'itemCandidates' | 'episodes' | 'claims' | 'inventoryOperations';
     issues: Array<{ path: string; keyword: string; expected: string }>;
-    /** One to four source-overlapping records reviewed in the same request. */
+    /** Up to eight source-overlapping records reviewed in the same request. */
     targets?: StructuredRepairTarget[];
     parentRequestId?: string;
     resourceId?: string;

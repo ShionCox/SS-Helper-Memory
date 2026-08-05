@@ -29,18 +29,6 @@ function source(overrides: Partial<SourceBlock> = {}): SourceBlock {
 }
 
 describe('Claim-based multi actor capture', () => {
-  it('returns an audit-only marker and performs zero formal writes in Shadow mode', async () => {
-    const commitCapture = vi.fn();
-    const capture = await service('shadow-w', {
-      isShadowMode: () => true,
-      extract: vi.fn(async (): Promise<StructuredCaptureResult> => ({ ...empty(), shadowOnly: true, audit: { pipeline: { pipelineRunId: 'shadow-run' } as any } })),
-    } as any, { commitCapture }).capture({ workspaceId: 'shadow-w', chatKey: 'chat', sources: [source()] });
-    expect(capture.shadowOnly).toBe(true);
-    expect(capture.facts).toEqual([]);
-    expect(capture.inventoryStates).toEqual([]);
-    expect(commitCapture).not.toHaveBeenCalled();
-  });
-
   it('exposes request-local typed refs while keeping persistent IDs out of the model contract', async () => {
     const row = source();
     let seenActorRef = '';

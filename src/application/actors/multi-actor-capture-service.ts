@@ -24,6 +24,9 @@ import {
   type MemoryObservation,
   type MemoryOwner,
   type MemoryPrivacy,
+  type MemoryCandidateCollection,
+  type MemoryCandidateRecord,
+  type MemoryCandidateStatus,
 } from '../../domain';
 import type {
   ExistingMemoryContextItem,
@@ -38,6 +41,7 @@ import type {
   StructuredLocationCandidate,
   StructuredInventoryOperation,
   StructuredItemCandidate,
+  StructuredCandidateAttempt,
   RepairFieldAction,
   MemoryExtractionInput,
 } from '../ingest/types';
@@ -162,9 +166,266 @@ export interface MultiActorCaptureResult {
   readonly resolutionMode?: import('../../domain').RepairResolutionMode;
   readonly fieldActions?: readonly RepairFieldAction[];
   readonly repairDecisions?: StructuredCaptureResult['repairDecisions'];
+  readonly candidateRecords?: readonly MemoryCandidateRecord[];
   readonly changeAudit?: import('../../infrastructure').ChangeAudit;
-  /** Shadow runs are audit-only and must never enter domain finalization. */
-  readonly shadowOnly?: boolean;
+}
+
+function candidateCollectionForRecordType(recordType: AutomaticIngestRejection['recordType']): MemoryCandidateCollection | undefined {
+  return recordType === 'actor' ? 'actorCandidates'
+    : recordType === 'location' ? 'locationCandidates'
+      : recordType === 'item' ? 'itemCandidates'
+        : recordType === 'episode' ? 'episodes'
+          : recordType === 'claim' ? 'claims'
+            : recordType === 'inventory' ? 'inventoryOperations'
+              : undefined;
+}
+
+function candidateSummary(collection: MemoryCandidateCollection, value: Record<string, unknown>, fallback: string): string {
+  const direct = typeof value.summary === 'string' && value.summary.trim() ? value.summary.trim() : '';
+  if (direct) return direct.slice(0, 240);
+  const content = typeof value.content === 'string' ? value.content : '';
+  if (content.trim()) return content.trim().slice(0, 240);
+  const name = typeof value.displayName === 'string' ? value.displayName : typeof value.itemRef === 'string' ? value.itemRef : '';
+  if (name.trim()) return name.trim().slice(0, 240);
+  if (collection === 'inventoryOperations') {
+    const operation = typeof value.operation === 'string' ? value.operation : '';
+    const amount = value.amount === undefined ? '' : String(value.amount);
+    return `${operation} ${name} ${amount}`.trim().slice(0, 240) || fallback;
+  }
+  return fallback.slice(0, 240);
+}
+
+function candidateSourceRefs(value: Record<string, unknown>): string[] {
+  return unique([
+    ...(Array.isArray(value.sourceRefs) ? value.sourceRefs.map(String) : []),
+    ...(typeof value.sourceRef === 'string' && value.sourceRef.trim() ? [value.sourceRef.trim()] : []),
+  ]);
+}
+
+function candidateEvidenceExcerpts(value: Record<string, unknown>): string[] {
+  return unique([
+    ...(Array.isArray(value.evidenceExcerpts) ? value.evidenceExcerpts.map(String) : []),
+    ...(typeof value.evidenceExcerpt === 'string' && value.evidenceExcerpt.trim() ? [value.evidenceExcerpt] : []),
+  ].map(item => item.trim()).filter(Boolean));
+}
+
+function candidateSourceDigest(value: string): string {
+  const normalized = value.normalize('NFKC');
+  const parts: string[] = [];
+  for (let variant = 0; variant < 4; variant += 1) {
+    let result = 2166136261;
+    for (const char of `${variant}\\0${normalized}`) {
+      result ^= char.codePointAt(0) ?? 0;
+      result = Math.imul(result, 16777619);
+    }
+    parts.push((result >>> 0).toString(16).padStart(8, '0'));
+  }
+  return `sha256:${parts.join('')}`;
+}
+
+function buildCandidateEvidence(
+  sourceRefs: readonly string[],
+  excerpts: readonly string[],
+  sources: readonly SourceBlock[],
+): import('../../domain').MemoryCandidateEvidenceSpan[] {
+  const result: import('../../domain').MemoryCandidateEvidenceSpan[] = [];
+  for (const sourceRef of sourceRefs) {
+    const source = sources.find(item => item.id === sourceRef);
+    if (!source) continue;
+    const digest = candidateSourceDigest(source.content);
+    for (const excerpt of excerpts) {
+      const text = excerpt.trim();
+      if (!text) continue;
+      const start = source.content.indexOf(text);
+      if (start < 0) continue;
+      result.push({
+        evidenceSpanId: `candidate-evidence:${hash(`${source.id}:${start}:${start + text.length}:${text}`)}`,
+        sourceRef: source.id,
+        sourceKind: source.kind,
+        ...(source.floor === undefined ? {} : { floor: source.floor }),
+        start,
+        end: start + text.length,
+        text,
+        sourceDigest: digest,
+      });
+    }
+  }
+  return result;
+}
+
+function buildCandidateRecords(
+  structured: StructuredCaptureResult,
+  prepared: PreparedCapture,
+  input: MultiActorCaptureInput,
+  sources: readonly SourceBlock[],
+  auditedRejections: readonly AutomaticIngestRejection[],
+  acceptedLocalIds: Readonly<Record<'actor' | 'location' | 'item' | 'episode' | 'claim' | 'inventory', readonly string[]>>,
+  facts: readonly MemoryFact[],
+  episodes: readonly MemoryEpisode[],
+  observations: readonly MemoryObservation[],
+  inventoryItems: readonly InventoryItem[],
+  inventoryStates: readonly InventoryState[],
+  inventoryEvents: readonly InventoryEvent[],
+): MemoryCandidateRecord[] {
+  type CandidateRow = {
+    readonly collection: MemoryCandidateCollection;
+    readonly localId: string;
+    readonly sourceRefs: readonly string[];
+    readonly evidenceExcerpts: readonly string[];
+    readonly summary: string;
+    readonly normalizedCandidate: import('@ss-helper/sdk').PlainData;
+  };
+  type CandidateAttemptRow = { readonly stage: string; readonly stageAttemptId: string; readonly attemptIndex: number; readonly collection: MemoryCandidateCollection; readonly row: CandidateRow };
+  const pipeline = structured.audit?.pipeline;
+  const pipelineRunId = pipeline?.pipelineRunId ?? `memory-pipeline:${hash(`${input.captureJobId ?? input.chatKey}:${Date.now()}`)}`;
+  const jobId = pipeline?.jobId ?? input.captureJobId;
+  const checkpoint = input.captureJob?.checkpoint && typeof input.captureJob.checkpoint === 'object'
+    ? input.captureJob.checkpoint as Record<string, unknown>
+    : undefined;
+  const batchValue = pipeline?.batchIndex ?? checkpoint?.lastScannedBatch ?? checkpoint?.batchIndex;
+  const batchIndex = Number.isInteger(Number(batchValue)) ? Number(batchValue) : undefined;
+  const allowed = new Set<MemoryCandidateCollection>(['actorCandidates', 'locationCandidates', 'itemCandidates', 'episodes', 'claims', 'inventoryOperations']);
+  const attempts: CandidateAttemptRow[] = [];
+  const candidateAttempts = structured.candidateAttempts ?? [];
+  for (const attempt of candidateAttempts) {
+    for (const [collectionValue, values] of Object.entries(attempt.collections)) {
+      if (!allowed.has(collectionValue as MemoryCandidateCollection) || !Array.isArray(values)) continue;
+      for (const value of values) {
+        const row = value as CandidateRow;
+        if (!row.localId) continue;
+        attempts.push({ stage: attempt.stage, stageAttemptId: attempt.stageAttemptId, attemptIndex: attempt.attemptIndex, collection: collectionValue as MemoryCandidateCollection, row: { ...row, collection: collectionValue as MemoryCandidateCollection } });
+      }
+    }
+  }
+  const finalRows = new Map<string, CandidateRow>();
+  const finalCollections: Readonly<Record<MemoryCandidateCollection, readonly Record<string, unknown>[]>> = {
+    actorCandidates: prepared.actorCandidates as unknown as readonly Record<string, unknown>[],
+    locationCandidates: prepared.locationCandidates as unknown as readonly Record<string, unknown>[],
+    itemCandidates: prepared.itemCandidates as unknown as readonly Record<string, unknown>[],
+    episodes: prepared.episodes as unknown as readonly Record<string, unknown>[],
+    claims: prepared.claims as unknown as readonly Record<string, unknown>[],
+    inventoryOperations: prepared.inventoryOperations as unknown as readonly Record<string, unknown>[],
+  };
+  for (const [collection, values] of Object.entries(finalCollections) as [MemoryCandidateCollection, readonly Record<string, unknown>[]][]) {
+    for (const value of values) {
+      const localId = String(value.localId ?? '').trim();
+      if (!localId) continue;
+      finalRows.set(`${collection}\0${localId}`, {
+        collection,
+        localId,
+        sourceRefs: candidateSourceRefs(value),
+        evidenceExcerpts: candidateEvidenceExcerpts(value),
+        summary: candidateSummary(collection, value, localId),
+        normalizedCandidate: diagnosticValue(value) as import('@ss-helper/sdk').PlainData,
+      });
+    }
+  }
+  const existingAttemptKeys = new Set(attempts.map(item => `${item.collection}\0${item.row.localId}`));
+  for (const [key, row] of finalRows) {
+    if (existingAttemptKeys.has(key)) continue;
+    attempts.push({ stage: row.collection === 'actorCandidates' || row.collection === 'locationCandidates' ? 'entities' : 'content', stageAttemptId: `memory-stage:final:${pipelineRunId}`, attemptIndex: candidateAttempts.length, collection: row.collection, row });
+  }
+  for (const [index, rejection] of auditedRejections.entries()) {
+    const collection = candidateCollectionForRecordType(rejection.recordType) ?? 'claims';
+    const localId = rejection.candidateLocalId ?? rejection.id ?? `rejection-${index}`;
+    const snapshot = rejection.candidateSnapshot && typeof rejection.candidateSnapshot === 'object' && !Array.isArray(rejection.candidateSnapshot)
+      ? rejection.candidateSnapshot as Record<string, unknown>
+      : { localId, sourceRefs: rejection.sourceRefs ?? [] };
+    const key = `${collection}\0${localId}`;
+    if (!attempts.some(item => `${item.collection}\0${item.row.localId}` === key)) {
+      const row: CandidateRow = {
+        collection,
+        localId,
+        sourceRefs: candidateSourceRefs(snapshot).length ? candidateSourceRefs(snapshot) : [...(rejection.sourceRefs ?? [])],
+        evidenceExcerpts: candidateEvidenceExcerpts(snapshot),
+        summary: candidateSummary(collection, snapshot, rejection.message),
+        normalizedCandidate: diagnosticValue(snapshot) as import('@ss-helper/sdk').PlainData,
+      };
+      attempts.push({ stage: collection === 'actorCandidates' || collection === 'locationCandidates' ? 'entities' : 'content', stageAttemptId: `rejection:${rejection.id ?? index}`, attemptIndex: candidateAttempts.length + index, collection, row });
+    }
+  }
+  const latestAttempt = new Map<string, number>();
+  for (const item of attempts) latestAttempt.set(`${item.collection}\0${item.row.localId}`, Math.max(latestAttempt.get(`${item.collection}\0${item.row.localId}`) ?? -1, item.attemptIndex));
+  const decisionByKey = new Map<string, import('../extraction').UpdateDecisionAudit>();
+  for (const decision of pipeline?.updateDecisions ?? []) {
+    const collections = decision.stage === 'entities'
+      ? ['actorCandidates', 'locationCandidates'] as const
+      : ['claims', 'inventoryOperations'] as const;
+    for (const collection of collections) {
+      if (attempts.some(item => item.collection === collection && item.row.localId === decision.candidateLocalId)) {
+        decisionByKey.set(`${collection}\0${decision.candidateLocalId}`, decision);
+      }
+    }
+  }
+  const rejectionByKey = new Map<string, AutomaticIngestRejection>();
+  for (const rejection of auditedRejections) {
+    if (!rejection.candidateLocalId) continue;
+    const collection = candidateCollectionForRecordType(rejection.recordType) ?? 'claims';
+    rejectionByKey.set(`${collection}\0${rejection.candidateLocalId}`, rejection);
+  }
+  const reviewByLocalId = new Map((structured.reviewItems ?? []).map(item => [item.candidateLocalId, item]));
+  const accepted = new Set<string>();
+  const acceptedCollection: Readonly<Record<MemoryCandidateCollection, readonly string[]>> = {
+    actorCandidates: acceptedLocalIds.actor,
+    locationCandidates: acceptedLocalIds.location,
+    itemCandidates: acceptedLocalIds.item,
+    episodes: acceptedLocalIds.episode,
+    claims: acceptedLocalIds.claim,
+    inventoryOperations: acceptedLocalIds.inventory,
+  };
+  for (const [collection, localIds] of Object.entries(acceptedCollection) as [MemoryCandidateCollection, readonly string[]][]) for (const localId of localIds) accepted.add(`${collection}\0${localId}`);
+  const committedBySource = (sourceRefs: readonly string[]): string[] => {
+    const matches = new Set<string>();
+    const hasSource = (refs: readonly string[] | undefined): boolean => Boolean(refs?.some(ref => sourceRefs.includes(ref)));
+    for (const value of facts) if (hasSource(value.sourceRefs)) matches.add(`facts:${value.id}`);
+    for (const value of episodes) if (hasSource(value.sourceRefs)) matches.add(`episodes:${value.id}`);
+    for (const value of observations) if (hasSource([value.sourceRef])) matches.add(`observations:${value.id}`);
+    for (const value of inventoryItems) if (hasSource(value.sourceRefs)) matches.add(`inventory-items:${value.id}`);
+    for (const value of inventoryStates) if (hasSource(value.sourceRefs)) matches.add(`inventory-states:${value.id}`);
+    for (const value of inventoryEvents) if (value.sourceRef && hasSource([value.sourceRef])) matches.add(`inventory-events:${value.id}`);
+    return [...matches];
+  };
+  const createdAt = Date.now();
+  return attempts.map(item => {
+    const key = `${item.collection}\0${item.row.localId}`;
+    const decision = decisionByKey.get(key);
+    const rejection = rejectionByKey.get(key);
+    const review = reviewByLocalId.get(item.row.localId);
+    const superseded = item.attemptIndex < (latestAttempt.get(key) ?? item.attemptIndex);
+    let status: MemoryCandidateStatus;
+    if (superseded) status = 'superseded_attempt';
+    else if (accepted.has(key)) status = 'accepted';
+    else if (decision?.decision === 'duplicate_noop') status = 'duplicate_noop';
+    else if (decision?.decision === 'pending_review' || review) status = 'pending_review';
+    else if (rejection?.status === 'ignored') status = 'ignored';
+    else status = 'rejected';
+    const sourceRefs = [...item.row.sourceRefs];
+    return {
+      id: `memory-candidate:${hash(`${pipelineRunId}:${item.stageAttemptId}:${item.attemptIndex}:${item.collection}:${item.row.localId}`)}`,
+      workspaceId: input.workspaceId,
+      chatKey: input.chatKey,
+      ...(jobId ? { jobId } : {}),
+      ...(batchIndex === undefined ? {} : { batchIndex }),
+      pipelineRunId,
+      stageAttemptId: item.stageAttemptId,
+      attemptIndex: item.attemptIndex,
+      stage: item.stage,
+      collection: item.collection,
+      status,
+      candidateLocalId: item.row.localId,
+      summary: item.row.summary,
+      normalizedCandidate: item.row.normalizedCandidate,
+      ...(decision?.decision ? { decision: decision.decision } : {}),
+      ...(decision?.reasonCode ? { reasonCode: decision.reasonCode } : rejection?.failure?.reasonCode ? { reasonCode: rejection.failure.reasonCode } : {}),
+      ...(rejection?.failure ? { failure: rejection.failure } : {}),
+      ...(rejection?.id ? { rejectionId: rejection.id } : {}),
+      ...(review?.id ? { reviewItemId: review.id } : decision?.reviewItemId ? { reviewItemId: decision.reviewItemId } : {}),
+      committedRecordRefs: status === 'accepted' ? committedBySource(sourceRefs) : [],
+      evidence: buildCandidateEvidence(sourceRefs, item.row.evidenceExcerpts, sources),
+      sourceRefs,
+      createdAt,
+    } satisfies MemoryCandidateRecord;
+  });
 }
 
 export interface MultiActorCaptureInput {
@@ -210,6 +471,8 @@ function rejection(
     id: `capture-rejection:${hash(`${input.captureJobId ?? input.chatKey}:${recordType}:${index}:${fieldPath}:${JSON.stringify(snapshot)}`)}`,
     index,
     code,
+    ...(('localId' in snapshot && String(snapshot.localId ?? '').trim()) ? { candidateLocalId: String(snapshot.localId).trim() } : {}),
+    candidateSnapshot: snapshot as import('@ss-helper/sdk').PlainData,
     message,
     recordType,
     fieldPath,
@@ -719,7 +982,6 @@ export class MultiActorCaptureService {
     readonly locationRegistry: LocationRegistry,
     private readonly extractor: {
       extract(input: MemoryExtractionInput): Promise<StructuredCaptureResult>;
-      isShadowMode?(): boolean;
     },
     private readonly repository?: MultiActorMemoryRepository,
     private readonly projector = new KnowledgeProjector(),
@@ -1500,12 +1762,10 @@ export class MultiActorCaptureService {
       && (captureCheckpoint.extractionMode === 'single' || captureCheckpoint.extractionMode === 'agent')
       && (captureCheckpoint.agentConcurrency === 1 || captureCheckpoint.agentConcurrency === 2)
       && (captureCheckpoint.agentToolPolicy === 'off' || captureCheckpoint.agentToolPolicy === 'read_only')
-      && (captureCheckpoint.agentWriteMode === 'shadow' || captureCheckpoint.agentWriteMode === 'active')
       ? {
           extractionMode: captureCheckpoint.extractionMode,
           agentConcurrency: captureCheckpoint.agentConcurrency,
           agentToolPolicy: captureCheckpoint.agentToolPolicy,
-          agentWriteMode: captureCheckpoint.agentWriteMode,
         }
       : undefined;
     const traceBatchNumber = Number(captureCheckpoint?.batchIndex);
@@ -1536,16 +1796,10 @@ export class MultiActorCaptureService {
       ...(input.onUsage ? { onUsage: input.onUsage } : {}),
     };
     const pipelineOutput = await this.extractor.extract(extractionInput);
-    if (pipelineOutput.shadowOnly) {
-      return {
-        prepared: this.prepare(scopedInput, pipelineOutput, sources, writableSourceRefs, knownActors, knownLocations, knownInventory),
-        structured: pipelineOutput,
-      };
-    }
-    const extracted = input.stage && input.stage !== 'single' && input.stage !== 'inventory'
+    const extracted = input.stage === 'entities'
       ? pipelineOutput
       : mergeDeterministicInventory(pipelineOutput, deterministicInventory, knownInventory);
-    const deterministicClaims = input.stage && input.stage !== 'single' && input.stage !== 'narrative'
+    const deterministicClaims = input.stage === 'entities'
       ? []
       : extractExplicitDirectiveClaims(
         sources,
@@ -1579,8 +1833,7 @@ export class MultiActorCaptureService {
         ? sourceIds
         : input.writableSourceRefs.filter(sourceRef => sourceIds.has(sourceRef)),
     );
-    const shadowRun = !input.repair && this.extractor.isShadowMode?.() === true;
-    if (!shadowRun) this.discoverTrustedDirectories(sources.filter(source => writableSourceRefs.has(source.id)));
+    this.discoverTrustedDirectories(sources.filter(source => writableSourceRefs.has(source.id)));
     const knownActors = this.actorDirectory(sources);
     const knownLocations = this.locationDirectory(sources);
     const inventoryRepository = this.repository as (MultiActorMemoryRepository & {
@@ -1610,35 +1863,6 @@ export class MultiActorCaptureService {
       knownInventory,
       deterministicInventory,
     );
-    if (structured.shadowOnly) {
-      const sceneCast = new ActiveCastResolver(this.registry).resolve(sources, { currentFloor: input.currentFloor, sceneEpoch: input.sceneEpoch }).scene;
-      const acceptedLocalIds = { actor: [], location: [], item: [], episode: [], claim: [], inventory: [] } as const;
-      return {
-        envelope: {
-          workspaceId: input.workspaceId,
-          chatKey: input.chatKey,
-          sourceRefs: [...writableSourceRefs],
-          actorCandidates: [],
-          locationCandidates: [],
-          episodes: [],
-          claimLocalIds: [],
-          capturedAt: Date.now(),
-        },
-        owners: this.registry.listOwners(),
-        pendingCandidates: this.registry.listPending(),
-        locations: this.locationRegistry.listLocations(),
-        locationAliases: this.locationRegistry.listAliases(),
-        pendingLocationCandidates: this.locationRegistry.listPending(),
-        inventoryItems: [], inventoryStates: [], inventoryEvents: [], episodes: [], observations: [], facts: [], traces: [],
-        sceneCast,
-        diagnostics: structured.diagnostics,
-        audit: structured.audit,
-        shadowOnly: true,
-        outcome: (structured.rejections?.length ?? 0) > 0 ? 'partial' : 'complete',
-        rejections: structured.rejections ?? [],
-        acceptedLocalIds,
-      };
-    }
     if (matchedInventory.length > knownInventory.length) {
       prepared.rejections.push(rejection(
         input,
@@ -2185,6 +2409,20 @@ export class MultiActorCaptureService {
     }));
     const unresolved = auditedRejections.filter(item => (item.status ?? 'unresolved') === 'unresolved');
     const outcome = unresolved.length > 0 ? 'partial' as const : 'complete' as const;
+    const candidateRecords = buildCandidateRecords(
+      structured,
+      prepared,
+      input,
+      sources,
+      auditedRejections,
+      acceptedLocalIds,
+      facts,
+      episodes,
+      observations,
+      [...inventoryItemsToCommit.values()],
+      [...inventoryStatesToCommit.values()],
+      inventoryEventsToCommit,
+    );
     let changeAudit: import('../../infrastructure').ChangeAudit | undefined;
     if (this.repository) {
       changeAudit = await this.repository.commitCapture({
@@ -2201,6 +2439,7 @@ export class MultiActorCaptureService {
         ...(structured.reviewItems?.length ? { reviewItems: structured.reviewItems } : {}),
         outcome,
         rejections: auditedRejections,
+        candidateRecords,
         owners: this.registry.listOwners(),
         aliases: this.registry.listAliases(),
         pendingCandidates: this.registry.listPending(),
@@ -2248,6 +2487,7 @@ export class MultiActorCaptureService {
           ? { resolutionMode: 'repaired' as const }
           : {}),
       ...(structured.repairDecisions ? { repairDecisions: structured.repairDecisions } : {}),
+      candidateRecords,
       ...(changeAudit ? { changeAudit } : {}),
     };
   }

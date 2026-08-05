@@ -1,5 +1,5 @@
 import type { MemoryTokenUsage } from '../../domain';
-import { createSSHelperError, describeSSHelperFailure } from '@ss-helper/sdk';
+import { createSSHelperError, describeSSHelperFailure, type SSHelperFailureContext } from '@ss-helper/sdk';
 import {
   MEMORY_PLUGIN_ID,
   MEMORY_RERANK_TASK,
@@ -224,6 +224,7 @@ export class SemanticRecallService {
     const candidatePoolSize = Math.min(120, Math.max(12, query.candidateLimit ?? maxItems * 2));
     let resolvedMode: 'lexical' | 'vector' | 'hybrid' = 'lexical';
     let vectorResult: VectorSearchResult | null = null;
+    let vectorFailure: SSHelperFailureContext | undefined;
     let degradedReason = '';
     let llmCalls = 0;
 
@@ -242,6 +243,7 @@ export class SemanticRecallService {
           reasonCode: 'INTERNAL_ERROR',
           stage: 'memory.recall.vector',
         });
+        vectorFailure = diagnostic;
         degradedReason = `${diagnostic.reasonCode} · ${diagnostic.title}`;
       }
     }
@@ -317,9 +319,12 @@ export class SemanticRecallService {
       const llm = this.getLlm();
       const remainingMs = Math.max(0, deadline - Date.now());
       if (!llm?.rerank || remainingMs === 0) {
-        const error = !llm?.rerank ? 'LLMHub 未加载或不支持 rerank，已保留融合排序。' : '召回总预算已用尽，已跳过重排。';
-        degradedReason = degradedReason || error;
-        rerankDiagnostic = { requested: true, success: false, error };
+        const failure = describeSSHelperFailure(createSSHelperError(
+          !llm?.rerank ? 'LLM_CAPABILITY_UNAVAILABLE' : 'BUS_REQUEST_TIMEOUT',
+          { stage: 'memory.recall.rerank' },
+        ));
+        degradedReason = degradedReason || failure.reason;
+        rerankDiagnostic = { requested: true, success: false, failure };
       } else {
         const routeTimeoutMs = Math.min(RERANK_TIMEOUT_MS, remainingMs);
         const rerankStartedAt = Date.now();
@@ -332,28 +337,30 @@ export class SemanticRecallService {
                 requiredCapabilities: ['rerank'],
               })), routeTimeoutMs, 'memory_rerank_route')
             : null;
-          if (route?.blockedReason) {
-            degradedReason = degradedReason || route.blockedReason;
+          if (route?.failure) {
+            const failure = route.failure;
+            const diagnostic = describeSSHelperFailure(failure, { reasonCode: 'LLM_TASK_ROUTE_UNAVAILABLE', stage: 'memory.recall.rerank.route' });
+            degradedReason = degradedReason || diagnostic.reason;
             rerankDiagnostic = {
               requested: true,
               success: false,
               ...(route.resourceId ? { resourceId: route.resourceId } : {}),
               ...(route.model ? { model: route.model } : {}),
               latencyMs: Date.now() - rerankStartedAt,
-              error: route.blockedReason,
+              failure,
             };
           } else {
             const rerankRemainingMs = Math.max(0, deadline - Date.now());
             if (rerankRemainingMs === 0) {
-              const error = '召回总预算已用尽，已跳过重排。';
-              degradedReason = degradedReason || error;
+              const failure = describeSSHelperFailure(createSSHelperError('BUS_REQUEST_TIMEOUT', { stage: 'memory.recall.rerank' }));
+              degradedReason = degradedReason || failure.reason;
               rerankDiagnostic = {
                 requested: true,
                 success: false,
                 ...(route?.resourceId ? { resourceId: route.resourceId } : {}),
                 ...(route?.model ? { model: route.model } : {}),
                 latencyMs: Date.now() - rerankStartedAt,
-                error,
+                failure,
               };
             } else {
               const rerankTimeoutMs = Math.min(RERANK_TIMEOUT_MS, rerankRemainingMs);
@@ -420,7 +427,7 @@ export class SemanticRecallService {
             requested: true,
             success: false,
             latencyMs: Date.now() - rerankStartedAt,
-            error: message,
+            failure: diagnostic,
           };
         }
       }
@@ -447,7 +454,7 @@ export class SemanticRecallService {
             latencyMs: vectorResult.audit.latencyMs,
             usage: vectorResult.audit.usage,
           }
-        : { requested: true, success: false, error: degradedReason || '向量召回不可用。' };
+        : { requested: true, success: false, ...(vectorFailure ? { failure: vectorFailure } : {}) };
     const diagnostics = Object.freeze({
       ...base.diagnostics,
       selectedCount: items.length,

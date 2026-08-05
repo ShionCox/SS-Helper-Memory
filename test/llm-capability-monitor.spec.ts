@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { LLM_CAPABILITY_STATUS_V0, LLM_TASK_ROUTING_GET_V0, type PluginSession } from '@ss-helper/sdk';
+import { LLM_TASK_STATUS_V0, type LlmTaskStatusSnapshot, type PluginSession, type VerifiedToolCapabilities } from '@ss-helper/sdk';
 import {
   MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS,
   MemoryLlmCapabilityMonitor,
@@ -9,13 +9,10 @@ import {
 const disabled: MemoryCapabilitySettings = { enabled: false, autoOrganize: false, recallMode: 'lexical', rerankMode: 'off', preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto' };
 
 function unavailableMonitor(): MemoryLlmCapabilityMonitor {
-  const response = {
+  const response: LlmTaskStatusSnapshot = {
     revision: 1,
-    checks: [
-      { id: 'generation', available: false, reason: 'no_resource' },
-      { id: 'embedding', available: false, reason: 'no_resource' },
-      { id: 'rerank', available: false, reason: 'no_resource' },
-    ],
+    tasks: taskKeys.map((taskKey) => ({ taskKey, execution: executionOf(taskKey), available: false, failure: { reasonCode: 'LLM_TASK_ROUTE_UNAVAILABLE', stage: 'llm.task.status' } })),
+    defaults: {}, assignments: [], resources: [],
   };
   return new MemoryLlmCapabilityMonitor({
     bus: { request: vi.fn(async () => response), subscribe: vi.fn(() => () => {}) },
@@ -23,32 +20,42 @@ function unavailableMonitor(): MemoryLlmCapabilityMonitor {
   } as unknown as PluginSession, () => disabled);
 }
 
-const agentTaskIds = ['agent_single', 'agent_entities', 'agent_narrative', 'agent_inventory', 'agent_repair'] as const;
+const taskKeys = ['memory_extract_single', 'memory_extract_entities', 'memory_extract_content', 'memory_extract_content', 'memory_extract_repair', 'memory_cast_plan', 'memory_recall_intent', 'memory_embed', 'memory_rerank'] as const;
+const agentTaskIds = ['memory_extract_entities', 'memory_extract_content', 'memory_extract_content'] as const;
+function executionOf(taskKey: string): 'structured' | 'tool_turn' | 'embedding' | 'rerank' {
+  if (taskKey === 'memory_embed') return 'embedding';
+  if (taskKey === 'memory_rerank') return 'rerank';
+  if (agentTaskIds.includes(taskKey as typeof agentTaskIds[number])) return 'tool_turn';
+  return 'structured';
+}
 const agentSettings: MemoryCapabilitySettings = {
   enabled: true, autoOrganize: false, recallMode: 'lexical', rerankMode: 'off',
   preExtractReferenceEnabled: false, preExtractReferenceMode: 'auto', extractionMode: 'agent',
-  agentToolPolicy: 'off', agentWriteMode: 'shadow',
+  agentToolPolicy: 'read_only',
 };
 
-function agentMonitor(options: { status?: 'verified' | 'failed'; expiresAt?: number; entryModel?: string; capabilityModel?: string } = {}): MemoryLlmCapabilityMonitor {
+function agentMonitor(options: { status?: 'verified' | 'failed'; expiresAt?: number; entryModel?: string; routeModel?: string; capabilityModel?: string } = {}): MemoryLlmCapabilityMonitor {
   const model = 'agent-model';
-  const capability = {
+  const capability: VerifiedToolCapabilities = {
     status: options.status ?? 'verified', resourceId: 'agent-resource', model: options.capabilityModel ?? model,
-    dialect: 'openai_chat_compatible', parallelToolCalls: false, streamingToolCalls: false,
-    strictToolSchema: 'none', reasoningReplay: 'none', probeVersion: 2,
+    dialect: 'openai_chat_compatible', parallelToolCalls: false, streamingToolCalls: 'whole_call',
+    strictToolSchema: 'unsupported', reasoningReplay: 'none', probeVersion: 2,
     expiresAt: options.expiresAt ?? Date.now() + 60_000,
   };
-  const statusResponse = {
+  const statusResponse: LlmTaskStatusSnapshot = {
     revision: 1,
-    checks: [
-      { id: 'generation', configured: true, available: true, source: 'custom', resourceId: 'agent-resource', model },
-      ...agentTaskIds.map((id) => ({ id, configured: true, available: true, source: 'custom', resourceId: 'agent-resource', model: options.entryModel ?? model })),
-      { id: 'embedding', configured: false, available: false, reason: 'no_resource' },
-      { id: 'rerank', configured: false, available: false, reason: 'no_resource' },
-    ],
-  };
-  const routingResponse = {
-    revision: 1,
+    tasks: taskKeys.map((taskKey) => ({
+      taskKey,
+      execution: executionOf(taskKey),
+      available: taskKey === 'memory_embed' || taskKey === 'memory_rerank' ? false : true,
+      ...(taskKey === 'memory_embed' || taskKey === 'memory_rerank' ? {} : {
+        resourceId: 'agent-resource',
+        ...(options.entryModel ? { model: options.entryModel } : {}),
+        route: { resourceId: 'agent-resource', source: 'custom', provider: 'openai', model: options.routeModel ?? model, execution: executionOf(taskKey), transport: 'json' },
+      }),
+      ...((options.status === 'failed' && taskKey !== 'memory_embed' && taskKey !== 'memory_rerank') ? { failure: { reasonCode: 'LLM_TASK_ROUTE_UNAVAILABLE', stage: 'llm.task.status' } } : {}),
+    })),
+    defaults: { structured: 'agent-resource', tool_turn: 'agent-resource' },
     assignments: [],
     resources: [{
       resourceId: 'agent-resource', label: 'Agent 模型', type: 'generation', apiType: 'openai',
@@ -56,23 +63,42 @@ function agentMonitor(options: { status?: 'verified' | 'failed'; expiresAt?: num
     }],
   };
   return new MemoryLlmCapabilityMonitor({
-    bus: { request: vi.fn(async (contract: unknown) => contract === LLM_CAPABILITY_STATUS_V0 ? statusResponse : routingResponse), subscribe: vi.fn(() => () => {}) },
+    bus: { request: vi.fn(async (contract: unknown) => contract === LLM_TASK_STATUS_V0 ? statusResponse : statusResponse), subscribe: vi.fn(() => () => {}) },
     host: { events: { subscribe: vi.fn(() => () => {}) } },
   } as unknown as PluginSession, () => agentSettings);
 }
 
 describe('Memory settings capability policy', () => {
-  it('allows Agent with tool policy off only when all resolved default models are verified', async () => {
+  it('allows Agent with read-only tool policy only when all resolved default models are verified', async () => {
     const monitor = agentMonitor();
     await expect(monitor.assess(agentSettings, disabled)).resolves.toEqual({ warnings: [] });
     expect(monitor.isAgentAvailable()).toBe(true);
     monitor.dispose();
   });
 
+  it('blocks Agent when the required tool policy is disabled', async () => {
+    const monitor = agentMonitor();
+    await expect(monitor.assess({ ...agentSettings, agentToolPolicy: 'off' }, disabled)).resolves.toMatchObject({
+      blocked: { code: 'LLM_TOOL_CAPABILITY_UNVERIFIED', message: expect.stringContaining('基础工具调用是硬要求') },
+      warnings: [],
+    });
+    expect(monitor.isAgentAvailable()).toBe(true);
+    monitor.dispose();
+  });
+
+  it('uses canonical route metadata when the optional duplicate task model is absent or stale', async () => {
+    for (const monitor of [agentMonitor(), agentMonitor({ entryModel: 'stale-duplicate-model' })]) {
+      await expect(monitor.assess(agentSettings, disabled)).resolves.toEqual({ warnings: [] });
+      expect(monitor.isAgentAvailable()).toBe(true);
+      expect(monitor.getStatus().agentRouteEntities).toMatchObject({ value: '工具调用已验证', tone: 'success' });
+      monitor.dispose();
+    }
+  });
+
   it.each([
     ['failed capability', { status: 'failed' as const }],
     ['expired capability', { expiresAt: Date.now() - 1 }],
-    ['non-default route model', { entryModel: 'old-model' }],
+    ['non-default route model', { routeModel: 'old-model' }],
     ['mismatched capability model', { capabilityModel: 'old-model' }],
   ])('blocks Agent for %s even when read-only tools are disabled', async (_label, options) => {
     const monitor = agentMonitor(options);
@@ -124,15 +150,13 @@ describe('Memory settings capability policy', () => {
   it('publishes live capability changes, hides internal resource IDs, and stops after disposal', async () => {
     let revision = 1;
     let model = 'embed-a';
-    let eventListener: ((payload: { revision: number }) => void) | undefined;
+    let eventListener: ((payload: { revision: number; taskKeys: readonly string[]; resourceIds: readonly string[] }) => void) | undefined;
     const call = vi.fn(async () => ({
       revision,
-      checks: [
-        { id: 'generation', configured: true, available: true, source: 'tavern', model: 'chat-a' },
-        { id: 'embedding', configured: true, available: true, source: 'custom', resourceId: 'private-resource-id', model },
-        { id: 'rerank', configured: false, available: false, reason: 'no_resource' },
-      ],
-    }));
+      tasks: taskKeys.map((taskKey) => ({ taskKey, execution: executionOf(taskKey), available: taskKey === 'memory_rerank' ? false : true, resourceId: taskKey === 'memory_embed' ? 'private-resource-id' : 'tavern-resource', model: taskKey === 'memory_embed' ? model : 'chat-a', route: { resourceId: taskKey === 'memory_embed' ? 'private-resource-id' : 'tavern-resource', source: taskKey === 'memory_embed' ? 'custom' : 'tavern', provider: 'openai', model: taskKey === 'memory_embed' ? model : 'chat-a', execution: executionOf(taskKey), transport: 'json' } })),
+      defaults: { structured: 'tavern-resource', tool_turn: 'tavern-resource', embedding: 'private-resource-id' }, assignments: [],
+      resources: [{ resourceId: 'tavern-resource', label: '酒馆模型', type: 'generation', apiType: 'openai', defaultModel: 'chat-a', enabled: true, available: true, capabilities: ['chat', 'json', 'tools'], toolCapabilities: { status: 'verified', resourceId: 'tavern-resource', model: 'chat-a', dialect: 'openai_responses', parallelToolCalls: false, streamingToolCalls: 'whole_call', strictToolSchema: 'unsupported', reasoningReplay: 'none', probeVersion: 1 } }, { resourceId: 'private-resource-id', label: '自定义资源', type: 'embedding', apiType: 'openai', defaultModel: model, enabled: true, available: true, capabilities: ['embedding'] }],
+    } as LlmTaskStatusSnapshot));
     const monitor = new MemoryLlmCapabilityMonitor({
       bus: { request: call, subscribe: vi.fn((_token, listener) => { eventListener = listener; return () => { eventListener = undefined; }; }) },
       host: { events: { subscribe: vi.fn(() => () => {}) } },
@@ -145,23 +169,26 @@ describe('Memory settings capability policy', () => {
 
     revision = 2;
     model = 'embed-b';
-    eventListener?.({ revision });
+    eventListener?.({ revision, taskKeys: ['memory_embed'], resourceIds: ['private-resource-id'] });
     await new Promise((resolve) => setTimeout(resolve, 120));
     expect(snapshots.at(-1)?.embeddingStatus.description).toContain('embed-b');
     const count = snapshots.length;
+    const listenerAfterDispose = eventListener;
     monitor.dispose();
-    eventListener?.({ revision: 3 });
+    listenerAfterDispose?.({ revision: 3, taskKeys: ['memory_embed'], resourceIds: ['private-resource-id'] });
     await new Promise((resolve) => setTimeout(resolve, 120));
     expect(snapshots).toHaveLength(count);
   });
 
   it('reports real resource availability even when Memory is globally disabled', async () => {
-    const response = {
+    const response: LlmTaskStatusSnapshot = {
       revision: 1,
-      checks: [
-        { id: 'generation', available: true, source: 'tavern', model: 'chat-a' },
-        { id: 'embedding', available: true, source: 'custom', model: 'embed-a' },
-        { id: 'rerank', available: true, source: 'custom', model: 'rerank-a' },
+      tasks: taskKeys.map((taskKey) => ({ taskKey, execution: executionOf(taskKey), available: true, resourceId: taskKey === 'memory_embed' ? 'embed-resource' : taskKey === 'memory_rerank' ? 'rerank-resource' : 'tavern-resource', model: taskKey === 'memory_embed' ? 'embed-a' : taskKey === 'memory_rerank' ? 'rerank-a' : 'chat-a', route: { resourceId: taskKey === 'memory_embed' ? 'embed-resource' : taskKey === 'memory_rerank' ? 'rerank-resource' : 'tavern-resource', source: taskKey === 'memory_embed' || taskKey === 'memory_rerank' ? 'custom' : 'tavern', provider: 'openai', model: taskKey === 'memory_embed' ? 'embed-a' : taskKey === 'memory_rerank' ? 'rerank-a' : 'chat-a', execution: executionOf(taskKey), transport: 'json' } })),
+      defaults: { structured: 'tavern-resource', tool_turn: 'tavern-resource', embedding: 'embed-resource', rerank: 'rerank-resource' }, assignments: [],
+      resources: [
+        { resourceId: 'tavern-resource', label: '酒馆模型', type: 'generation', apiType: 'openai', defaultModel: 'chat-a', enabled: true, available: true, capabilities: ['chat'] },
+        { resourceId: 'embed-resource', label: '自定义资源', type: 'embedding', apiType: 'openai', defaultModel: 'embed-a', enabled: true, available: true, capabilities: ['embedding'] },
+        { resourceId: 'rerank-resource', label: '自定义资源', type: 'rerank', apiType: 'openai', defaultModel: 'rerank-a', enabled: true, available: true, capabilities: ['rerank'] },
       ],
     };
     const monitor = new MemoryLlmCapabilityMonitor({
@@ -178,9 +205,7 @@ describe('Memory settings capability policy', () => {
   });
 
   it('requests task routing for embedding and rerank alongside extraction tasks', async () => {
-    const call = vi.fn(async (contract: unknown) => contract === LLM_CAPABILITY_STATUS_V0
-      ? { revision: 1, checks: [] }
-      : { revision: 1, resources: [], taskAssignments: {} });
+    const call = vi.fn(async () => unavailableMonitorSnapshot());
     const monitor = new MemoryLlmCapabilityMonitor({
       bus: { request: call, subscribe: vi.fn(() => () => {}) },
       host: { events: { subscribe: vi.fn(() => () => {}) } },
@@ -188,7 +213,7 @@ describe('Memory settings capability policy', () => {
 
     await monitor.start();
 
-    expect(call).toHaveBeenCalledWith(LLM_TASK_ROUTING_GET_V0, expect.objectContaining({
+    expect(call).toHaveBeenCalledWith(LLM_TASK_STATUS_V0, expect.objectContaining({
       taskKeys: expect.arrayContaining(['memory_embed', 'memory_rerank']),
     }), expect.objectContaining({ timeoutMs: MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS }));
     monitor.dispose();
@@ -205,7 +230,7 @@ describe('Memory settings capability policy', () => {
     monitor.dispose();
   });
 
-  it('bounds a stalled LLM capability probe and publishes a safe unavailable state', async () => {
+  it('bounds a stalled LLM capability probe and keeps the state synchronising', async () => {
     vi.useFakeTimers();
     try {
       const monitor = new MemoryLlmCapabilityMonitor({
@@ -217,9 +242,9 @@ describe('Memory settings capability policy', () => {
       await vi.advanceTimersByTimeAsync(MEMORY_LLM_CAPABILITY_STATUS_TIMEOUT_MS);
       await expect(started).resolves.toBeUndefined();
       expect(monitor.getStatus()).toMatchObject({
-        generationStatus: { value: '不可用', tone: 'error' },
-        embeddingStatus: { value: '未配置', tone: 'neutral' },
-        rerankStatus: { value: '未配置', tone: 'neutral' },
+        generationStatus: { value: '正在同步', tone: 'neutral' },
+        embeddingStatus: { value: '正在同步', tone: 'neutral' },
+        rerankStatus: { value: '正在同步', tone: 'neutral' },
       });
       monitor.dispose();
     } finally {
@@ -227,3 +252,7 @@ describe('Memory settings capability policy', () => {
     }
   });
 });
+
+function unavailableMonitorSnapshot(): LlmTaskStatusSnapshot {
+  return { revision: 1, tasks: taskKeys.map((taskKey) => ({ taskKey, execution: executionOf(taskKey), available: false })), defaults: {}, assignments: [], resources: [] };
+}

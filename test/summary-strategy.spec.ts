@@ -66,6 +66,13 @@ describe('Memory 总结策略', () => {
     expect(charBatches.every(batch => batch.reduce((total, source) => total + source.content.length, 0) <= 2_000)).toBe(true);
   });
 
+  it('caps the total body of floor batches instead of only splitting individual messages', () => {
+    const messages = Array.from({ length: 6 }, (_, index) => message(index + 1, index % 2 ? 'assistant' : 'user', '字'.repeat(1_500)));
+    const batches = buildSummaryBatches(messages, { batchMode: 'floors', batchFloors: 6, batchChars: 2_000, overlapFloors: 1 });
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.every(batch => batch.reduce((total, source) => total + source.content.length, 0) <= 2_000)).toBe(true);
+  });
+
   it('marks overlap as read-only while keeping current sources writable', () => {
     const messages = Array.from({ length: 8 }, (_, index) => message(index + 1));
     const plans = buildSummaryBatchPlans(messages, { batchMode: 'floors', batchFloors: 3, overlapFloors: 2 });

@@ -1,5 +1,6 @@
 import { isAppendOnlyFactKind } from '../../domain'
 import { planRecallIntentByRules } from './recall-intent-planner'
+import type { SSHelperFailureContext } from '@ss-helper/sdk'
 
 export type RecallFactStatus = 'active' | 'pending' | 'superseded' | 'invalid'
 
@@ -136,7 +137,7 @@ export interface RecallLlmStageDiagnostic {
     readonly cacheWriteTokens: number | null
     readonly totalTokens: number | null
   } | null
-  readonly error?: string
+  readonly failure?: SSHelperFailureContext
   readonly fallbackUsed?: boolean
 }
 

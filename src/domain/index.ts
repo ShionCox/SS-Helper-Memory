@@ -8,3 +8,4 @@ export * from './scene-state';
 export * from './generation-cast';
 export * from './recall-plan';
 export * from './generation-recall-detail';
+export * from './memory-candidate';

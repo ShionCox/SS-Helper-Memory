@@ -8,9 +8,8 @@ import type { MemoryTokenUsage } from '../../domain';
 import type { SupportedEvidenceDirectory } from '../ingest/types';
 
 export type ExtractionMode = 'single' | 'agent';
-export type ExtractionStageKey = 'single' | 'entities' | 'narrative' | 'inventory' | 'repair';
+export type ExtractionStageKey = 'single' | 'entities' | 'content' | 'repair';
 export type AgentToolPolicy = 'off' | 'read_only';
-export type AgentWriteMode = 'shadow' | 'active';
 export type CaptureCollection =
   | 'actorCandidates'
   | 'locationCandidates'
@@ -29,7 +28,6 @@ export interface AgentPipelineSettings {
   readonly extractionMode: ExtractionMode;
   readonly agentConcurrency: 1 | 2;
   readonly agentToolPolicy: AgentToolPolicy;
-  readonly agentWriteMode: AgentWriteMode;
 }
 
 export interface ExtractionRunContext {
@@ -41,11 +39,9 @@ export interface ExtractionRunContext {
   readonly jobId?: string;
   readonly batchIndex?: number;
   readonly batchCount?: number;
-  readonly shadowBaseline?: boolean;
   readonly mode: ExtractionMode;
   readonly agentConcurrency: 1 | 2;
   readonly agentToolPolicy: AgentToolPolicy;
-  readonly agentWriteMode: AgentWriteMode;
   readonly settingsRevision: number;
   readonly routeRevision: number;
   readonly dataRevision: number;
@@ -62,6 +58,7 @@ export interface ExtractionStageSpec {
   readonly key: ExtractionStageKey;
   readonly taskKey: string;
   readonly description: string;
+  readonly execution: 'structured' | 'tool_turn';
   readonly ownedCollections: readonly CaptureCollection[];
   readonly allowedTools: readonly AgentToolName[];
   readonly maxToolRounds: 0 | 1 | 2;
@@ -161,17 +158,6 @@ export interface UpdateDecisionAudit {
   readonly reviewItemId?: string;
 }
 
-export interface ShadowComparisonSummary {
-  readonly shadowRunId: string;
-  readonly singleCounts: Readonly<Record<CaptureCollection, number>>;
-  readonly agentCounts: Readonly<Record<CaptureCollection, number>>;
-  readonly matchingLocalIds: number;
-  readonly agentOnlyLocalIds: number;
-  readonly singleOnlyLocalIds: number;
-  /** Single is an audit-only comparator and never changes the Agent outcome. */
-  readonly singleStage: ExtractionStageAudit;
-}
-
 export interface ExtractionPipelineAudit {
   readonly pipelineRunId: string;
   readonly workflowLabel: string;
@@ -181,7 +167,6 @@ export interface ExtractionPipelineAudit {
   readonly batchCount?: number;
   readonly mode: ExtractionMode;
   readonly toolPolicy: AgentToolPolicy;
-  readonly writeMode: AgentWriteMode;
   readonly sourceBatchDigest: string;
   readonly evidenceSetHash: string;
   readonly routeSnapshotDigest: string;
@@ -197,7 +182,6 @@ export interface ExtractionPipelineAudit {
   readonly updateDecisions: readonly UpdateDecisionAudit[];
   readonly totalUsage: MemoryTokenUsage | null;
   readonly wallClockLatencyMs: number;
-  readonly shadow?: ShadowComparisonSummary;
 }
 
 export interface TemporalState {

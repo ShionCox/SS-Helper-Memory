@@ -19,10 +19,8 @@ const source = {
 
 const stageOutput = (task: string) => task === MEMORY_EXTRACTION_TASK_KEYS.entities
   ? { actorCandidates: [], locationCandidates: [] }
-  : task === MEMORY_EXTRACTION_TASK_KEYS.narrative
-    ? { episodes: [], claims: [] }
-    : task === MEMORY_EXTRACTION_TASK_KEYS.inventory
-      ? { itemCandidates: [], inventoryOperations: [] }
+  : task === MEMORY_EXTRACTION_TASK_KEYS.content
+    ? { episodes: [], claims: [], itemCandidates: [], inventoryOperations: [] }
       : { actorCandidates: [], locationCandidates: [], itemCandidates: [], episodes: [], claims: [], inventoryOperations: [] };
 
 function llm(calls: string[], options: { singleDelayMs?: number; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } } = {}): MemoryLlmClient {
@@ -32,13 +30,24 @@ function llm(calls: string[], options: { singleDelayMs?: number; usage?: { promp
       if (input.taskKey === MEMORY_EXTRACTION_TASK_KEYS.single && options.singleDelayMs) await new Promise(resolve => setTimeout(resolve, options.singleDelayMs));
       return { ok: true as const, data: stageOutput(input.taskKey), meta: { requestId: `req:${input.taskKey}`, resourceId: 'resource', model: 'model' }, ...(options.usage ? { usage: options.usage } : {}) };
     },
+    async toolTurn(request: Parameters<NonNullable<MemoryLlmClient['toolTurn']>>[0]) {
+      calls.push(request.task);
+      return {
+        requestId: `tool:${request.task}`,
+        state: 'final' as const,
+        output: stageOutput(request.task),
+        route: toolRoute,
+        diagnostics: { ...toolDiagnostics, toolSessionRound: 1, totalCalls: 0 },
+        ...(options.usage ? { usage: options.usage } : {}),
+      };
+    },
   } as unknown as MemoryLlmClient;
 }
 
 const toolDiagnostics = { toolSessionRound: 1, totalCalls: 0, toolSchemaProfile: 'ss_helper_tool_v0' as const, providerAdapterVersion: 1, capabilitySnapshotId: 'capability:1' };
 const toolRoute = { route: 'resource', provider: 'openai', model: 'model', fallback: false };
 
-function emptyRepository(recordShadowExtractionAudit = vi.fn()) {
+function emptyRepository() {
   return {
     boundWorkspaceId: 'workspace',
     listOwners: vi.fn(async () => []),
@@ -48,7 +57,6 @@ function emptyRepository(recordShadowExtractionAudit = vi.fn()) {
     listInventoryEvents: vi.fn(async () => []),
     listFacts: vi.fn(async () => []),
     listSceneStates: vi.fn(async () => []),
-    recordShadowExtractionAudit,
   } as unknown as MultiActorMemoryRepository;
 }
 
@@ -57,9 +65,8 @@ describe('fixed Agent extraction pipeline', () => {
     const base = '最终只返回符合当前固定阶段 Schema 的 JSON 对象。';
     expect(stageSystemPrompt(base, 'single', false)).toContain('且只能包含 actorCandidates、locationCandidates、itemCandidates、episodes、claims、inventoryOperations 六个数组');
     expect(stageSystemPrompt(base, 'entities', false)).toContain('且只能包含 actorCandidates 与 locationCandidates 两个数组');
-    expect(stageSystemPrompt(base, 'narrative', false)).toContain('且只能包含 episodes 与 claims 两个数组');
-    expect(stageSystemPrompt(base, 'narrative', false)).toContain('episodes 最多 8 条、claims 最多 16 条');
-    expect(stageSystemPrompt(base, 'inventory', false)).toContain('且只能包含 itemCandidates 与 inventoryOperations 两个数组');
+    expect(stageSystemPrompt(base, 'content', false)).toContain('且只能包含 episodes、claims、itemCandidates 与 inventoryOperations 四个数组');
+    expect(stageSystemPrompt(base, 'content', false)).toContain('episodes 最多 8 条、claims 最多 16 条');
     expect(stageSystemPrompt(base, 'repair', false)).toContain('且只能包含 decisions 数组');
   });
 
@@ -95,15 +102,14 @@ describe('fixed Agent extraction pipeline', () => {
     ]);
   });
 
-  it('runs entities first and then the two owned sibling stages without the retired task keys', async () => {
+  it('runs entities first and then one merged content stage without retired task keys', async () => {
     const calls: string[] = [];
-    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'off', agentWriteMode: 'active' }), emptyRepository(), () => llm(calls));
+    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'read_only' }), emptyRepository(), () => llm(calls));
     const result = await pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source] });
     expect(calls[0]).toBe(MEMORY_EXTRACTION_TASK_KEYS.entities);
-    expect(new Set(calls.slice(1))).toEqual(new Set([MEMORY_EXTRACTION_TASK_KEYS.narrative, MEMORY_EXTRACTION_TASK_KEYS.inventory]));
+    expect(calls.slice(1)).toEqual([MEMORY_EXTRACTION_TASK_KEYS.content]);
     expect(calls.some(task => task === 'memory' + '_capture')).toBe(false);
-    expect(result.audit?.pipeline?.stages.map(stage => stage.stage)).toEqual(['entities', 'narrative', 'inventory']);
-    expect(result.shadowOnly).not.toBe(true);
+    expect(result.audit?.pipeline?.stages.map(stage => stage.stage)).toEqual(['entities', 'content']);
   });
 
   it('preserves the safe schema issue when a fixed stage is rejected', async () => {
@@ -122,13 +128,13 @@ describe('fixed Agent extraction pipeline', () => {
       },
     } as unknown as MemoryLlmClient;
     const pipeline = new ExtractionPipelineCoordinator(
-      () => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'read_only', agentWriteMode: 'active' }),
+      () => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'read_only' }),
       emptyRepository(),
       () => client,
     );
     const onUsage = vi.fn();
     const result = await pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source], onUsage });
-    expect(result.rejections).toHaveLength(3);
+    expect(result.rejections).toHaveLength(2);
     expect(result.rejections).toEqual(expect.arrayContaining([
       expect.objectContaining({
         fieldPath: '$.claims[0].kind',
@@ -136,7 +142,7 @@ describe('fixed Agent extraction pipeline', () => {
       }),
     ]));
     expect(result.rejections?.[0]?.failure?.reasonCode).toBe('SCHEMA_VALIDATION_FAILED');
-    expect(onUsage).toHaveBeenCalledTimes(3);
+    expect(onUsage).toHaveBeenCalledTimes(2);
     expect(onUsage).toHaveBeenCalledWith({ promptTokens: 10, completionTokens: 2, totalTokens: 12 });
   });
 
@@ -149,12 +155,11 @@ describe('fixed Agent extraction pipeline', () => {
     const toolTurn = vi.fn();
     const client = { runTask, toolTurn } as unknown as MemoryLlmClient;
     const pipeline = new ExtractionPipelineCoordinator(
-      () => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'read_only', agentWriteMode: 'shadow' }),
+      () => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'read_only' }),
       emptyRepository(),
       () => client,
     );
     const result = await pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source], stage: 'single' });
-    expect(result.shadowOnly).not.toBe(true);
     expect(runTask).toHaveBeenCalledTimes(1);
     expect(toolTurn).not.toHaveBeenCalled();
     expect(result.audit?.pipeline?.mode).toBe('single');
@@ -163,66 +168,34 @@ describe('fixed Agent extraction pipeline', () => {
 
   it('reruns a review request through only its owning fixed stage', async () => {
     const calls: string[] = [];
-    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'off', agentWriteMode: 'active' }), emptyRepository(), () => llm(calls));
-    const result = await pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source], stage: 'narrative' });
-    expect(calls).toEqual([MEMORY_EXTRACTION_TASK_KEYS.narrative]);
-    expect(result.audit?.pipeline?.stages.map(stage => stage.stage)).toEqual(['narrative']);
+    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'read_only' }), emptyRepository(), () => llm(calls));
+    const result = await pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source], stage: 'content' });
+    expect(calls).toEqual([MEMORY_EXTRACTION_TASK_KEYS.content]);
+    expect(result.audit?.pipeline?.stages.map(stage => stage.stage)).toEqual(['content']);
     expect(result.inventoryOperations).toEqual([]);
   });
 
-  it('defaults an enabled Agent shadow run to audit-only output and compares it with Single', async () => {
-    const calls: string[] = [];
-    const recordShadow = vi.fn(async () => undefined);
-    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 1, agentToolPolicy: 'off', agentWriteMode: 'shadow' }), emptyRepository(recordShadow), () => llm(calls, { singleDelayMs: 15, usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } }));
-    const result = await pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source] });
-    expect(result.shadowOnly).toBe(true);
-    expect(result.actorCandidates).toEqual([]);
-    expect(result.claims).toEqual([]);
-    expect(calls).toContain(MEMORY_EXTRACTION_TASK_KEYS.single);
-    expect(result.audit?.pipeline?.shadow).toBeDefined();
-    expect(result.audit?.pipeline?.stages.map(stage => stage.stage)).toEqual(['entities', 'narrative', 'inventory']);
-    expect(result.audit?.pipeline?.shadow?.singleStage).toMatchObject({ stage: 'single', status: 'completed' });
-    expect(result.audit?.pipeline?.totalUsage?.totalTokens).toBe(12);
-    expect(result.audit?.pipeline?.wallClockLatencyMs).toBeGreaterThanOrEqual(15);
-    expect(recordShadow).toHaveBeenCalledTimes(1);
-  });
-
-  it('records a failed Shadow baseline without downgrading an otherwise completed Agent batch', async () => {
-    const recordShadow = vi.fn(async () => undefined);
-    const client = {
-      async runTask(input: Parameters<MemoryLlmClient['runTask']>[0]) {
-        if (input.taskKey === MEMORY_EXTRACTION_TASK_KEYS.single) return {
-          ok: false as const,
-          failure: { reasonCode: 'STRUCTURED_OUTPUT_EMPTY' as const, stage: 'llm.response.parse', requestId: 'single:empty' },
-        };
-        return { ok: true as const, data: stageOutput(input.taskKey), meta: { requestId: `req:${input.taskKey}`, resourceId: 'resource', model: 'model' } };
-      },
-    } as unknown as MemoryLlmClient;
-    const pipeline = new ExtractionPipelineCoordinator(
-      () => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'off', agentWriteMode: 'shadow' }),
-      emptyRepository(recordShadow),
-      () => client,
-    );
-
-    const result = await pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source] });
-
-    expect(result.shadowOnly).toBe(true);
-    expect(result.rejections).toEqual([]);
-    expect(result.audit?.pipeline?.stages.map(stage => stage.stage)).toEqual(['entities', 'narrative', 'inventory']);
-    expect(result.audit?.pipeline?.shadow?.singleStage).toMatchObject({ stage: 'single', status: 'failed', reasonCode: 'STRUCTURED_OUTPUT_EMPTY' });
-    expect(recordShadow).toHaveBeenCalledTimes(1);
-  });
-
-  it('threads one workflow through every Agent stage and marks the Shadow baseline in Chinese', async () => {
+  it('threads one workflow through every Agent stage without a Single baseline', async () => {
     const inputs: Array<Parameters<MemoryLlmClient['runTask']>[0]> = [];
+    const toolInputs: Array<Parameters<NonNullable<MemoryLlmClient['toolTurn']>>[0]> = [];
     const client = {
+      async toolTurn(request: Parameters<NonNullable<MemoryLlmClient['toolTurn']>>[0]) {
+        toolInputs.push(request);
+        return {
+          requestId: `tool:${request.task}`,
+          state: 'final' as const,
+          output: stageOutput(request.task),
+          route: toolRoute,
+          diagnostics: { ...toolDiagnostics, toolSessionRound: 1, totalCalls: 0 },
+        };
+      },
       async runTask(input: Parameters<MemoryLlmClient['runTask']>[0]) {
         inputs.push(input);
         return { ok: true as const, data: stageOutput(input.taskKey), meta: { requestId: `req:${input.taskKey}`, resourceId: 'resource', model: 'model' } };
       },
     } as unknown as MemoryLlmClient;
     const pipeline = new ExtractionPipelineCoordinator(
-      () => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'off', agentWriteMode: 'shadow' }),
+      () => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'read_only' }),
       emptyRepository(),
       () => client,
     );
@@ -230,11 +203,11 @@ describe('fixed Agent extraction pipeline', () => {
       workspaceId: 'workspace', chatKey: 'chat', sources: [source],
       workflow: { label: '初始化记忆', kind: 'agent', jobId: 'job-1', batchIndex: 0, batchCount: 2 },
     });
-    expect(inputs).toHaveLength(4);
-    expect(new Set(inputs.map(input => input.trace?.workflowId)).size).toBe(1);
-    expect(inputs.every(input => input.trace?.jobId === 'job-1' && input.trace.batchIndex === 0 && input.trace.batchCount === 2)).toBe(true);
-    expect(inputs.find(input => input.taskKey === MEMORY_EXTRACTION_TASK_KEYS.single)?.trace)
-      .toMatchObject({ workflowLabel: '影子对照基线', workflowKind: 'agent_shadow' });
+    expect(toolInputs).toHaveLength(2);
+    expect(inputs).toHaveLength(0);
+    expect(toolInputs.every(input => input.trace?.jobId === 'job-1' && input.trace.batchIndex === 0 && input.trace.batchCount === 2)).toBe(true);
+    expect(toolInputs.every(input => input.trace?.workflowKind === 'agent')).toBe(true);
+    expect(toolInputs.some(input => input.task === MEMORY_EXTRACTION_TASK_KEYS.single)).toBe(false);
     expect(result.audit?.pipeline).toMatchObject({ workflowLabel: '初始化记忆', workflowKind: 'agent', jobId: 'job-1', batchIndex: 0, batchCount: 2 });
   });
 
@@ -260,7 +233,7 @@ describe('fixed Agent extraction pipeline', () => {
       },
     } as unknown as MemoryLlmClient;
     const pipeline = new ExtractionPipelineCoordinator(
-      () => ({ extractionMode: 'agent', agentConcurrency: 1, agentToolPolicy: 'read_only', agentWriteMode: 'active' }),
+      () => ({ extractionMode: 'agent', agentConcurrency: 1, agentToolPolicy: 'read_only' }),
       emptyRepository(),
       () => client,
     );
@@ -276,14 +249,46 @@ describe('fixed Agent extraction pipeline', () => {
     expect(result.audit?.pipeline?.toolCalls[0]).toMatchObject({
       pipelineRunId, requestId: 'entities:turn:1', toolSessionRound: 1, callId: 'entities:call:1',
     });
-    expect(onUsage).toHaveBeenCalledTimes(4);
-    expect(result.audit?.pipeline?.totalUsage).toMatchObject({ promptTokens: 4, completionTokens: 8, totalTokens: 12 });
+    expect(onUsage).toHaveBeenCalledTimes(3);
+    expect(result.audit?.pipeline?.totalUsage).toMatchObject({ promptTokens: 3, completionTokens: 6, totalTokens: 9 });
+  });
+
+  it('returns a safe tool-argument error to the same session and lets a fixed stage self-correct once', async () => {
+    const requests: Array<Parameters<NonNullable<MemoryLlmClient['toolTurn']>>[0]> = [];
+    const client = {
+      async runTask(request: Parameters<MemoryLlmClient['runTask']>[0]) {
+        return { ok: true as const, data: stageOutput(request.taskKey), meta: { requestId: `single:${request.taskKey}`, resourceId: 'resource', model: 'model' } };
+      },
+      async toolTurn(request: Parameters<NonNullable<MemoryLlmClient['toolTurn']>>[0]) {
+        requests.push(request);
+        if (request.task === MEMORY_EXTRACTION_TASK_KEYS.content && !request.toolSessionId) {
+          return {
+            requestId: 'inventory:turn:1', state: 'tool_calls' as const, toolSessionId: 'inventory:session',
+            calls: [{ callId: 'inventory:bad', name: 'inventory.resolve_context', arguments: { mentions: [], needs: ['identity'], limit: 5 } }],
+            route: toolRoute, diagnostics: { ...toolDiagnostics, toolSessionRound: 1, totalCalls: 1 },
+          };
+        }
+        return {
+          requestId: `${request.task}:final`, state: 'final' as const, output: stageOutput(request.task), route: toolRoute,
+          diagnostics: { ...toolDiagnostics, toolSessionRound: request.toolSessionId ? 2 : 1, totalCalls: request.toolSessionId ? 1 : 0 },
+        };
+      },
+    } as unknown as MemoryLlmClient;
+    const pipeline = new ExtractionPipelineCoordinator(
+      () => ({ extractionMode: 'agent', agentConcurrency: 1, agentToolPolicy: 'read_only' }),
+      emptyRepository(),
+      () => client,
+    );
+    const result = await pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source] });
+    const inventoryRetry = requests.find(request => request.task === MEMORY_EXTRACTION_TASK_KEYS.content && request.toolSessionId);
+    expect(inventoryRetry?.toolResults?.[0]).toMatchObject({ callId: 'inventory:bad', ok: false, content: { failure: { reasonCode: 'MEMORY_AGENT_TOOL_ARGUMENT_INVALID', path: 'mentions' } } });
+    expect(result.rejections).toEqual([]);
   });
 
   it('propagates an already-cancelled signal before any provider call', async () => {
     const calls: string[] = [];
     const controller = new AbortController(); controller.abort();
-    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'off', agentWriteMode: 'active' }), emptyRepository(), () => llm(calls));
+    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'off' }), emptyRepository(), () => llm(calls));
     await expect(pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source], signal: controller.signal })).rejects.toSatisfy(error => readSSHelperFailure(error)?.reasonCode === 'MEMORY_EXTRACTION_PIPELINE_CANCELLED');
     expect(calls).toEqual([]);
   });
@@ -314,33 +319,33 @@ describe('fixed Agent extraction pipeline', () => {
         return { requestId: `final:${request.task}`, state: 'final' as const, output: stageOutput(request.task), route: toolRoute, diagnostics: toolDiagnostics };
       },
     } as unknown as MemoryLlmClient;
-    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'read_only', agentWriteMode: 'active' }), repository, () => client);
+    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 2, agentToolPolicy: 'read_only' }), repository, () => client);
     const result = await pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source] });
     expect(entityStarts).toBe(2);
-    expect(taskCalls.filter(task => task === MEMORY_EXTRACTION_TASK_KEYS.narrative)).toHaveLength(2);
-    expect(taskCalls.filter(task => task === MEMORY_EXTRACTION_TASK_KEYS.inventory)).toHaveLength(2);
-    expect(result.audit?.pipeline?.stages.map(stage => stage.stage)).toEqual(['entities', 'narrative', 'inventory', 'entities', 'narrative', 'inventory']);
+    expect(taskCalls.filter(task => task === MEMORY_EXTRACTION_TASK_KEYS.content)).toHaveLength(2);
+    expect(result.audit?.pipeline?.stages.map(stage => stage.stage)).toEqual(['entities', 'content', 'entities', 'content']);
   });
 
-  it('runs Repair through its fixed task and collection-specific minimal tools', async () => {
-    let startRequest: Parameters<NonNullable<MemoryLlmClient['toolTurn']>>[0] | undefined;
+  it('runs Repair through its fixed structured task without entering the tool chain', async () => {
+    let startRequest: Parameters<MemoryLlmClient['runTask']>[0] | undefined;
     const client = {
-      async toolTurn(request: Parameters<NonNullable<MemoryLlmClient['toolTurn']>>[0]) {
+      async runTask(request: Parameters<MemoryLlmClient['runTask']>[0]) {
         startRequest = request;
         return {
-          requestId: 'repair:final', state: 'final' as const,
-          output: { decisions: [{ repairId: 'repair:1', action: 'drop', items: [] }] },
-          route: toolRoute, diagnostics: toolDiagnostics,
+          ok: true as const,
+          data: { decisions: [{ repairId: 'repair:1', action: 'drop', items: [] }] },
+          meta: { requestId: 'repair:final', resourceId: 'resource', model: 'model' },
         };
       },
     } as unknown as MemoryLlmClient;
-    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 1, agentToolPolicy: 'read_only', agentWriteMode: 'active' }), emptyRepository(), () => client);
+    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentConcurrency: 1, agentToolPolicy: 'read_only' }), emptyRepository(), () => client);
     const result = await pipeline.extract({
       workspaceId: 'workspace', chatKey: 'chat', sources: [source],
       repair: { collection: 'inventoryOperations', issues: [{ path: '$.amount', keyword: 'type', expected: 'number' }], targets: [{ repairId: 'repair:1', issues: [{ path: '$.amount', keyword: 'type', expected: 'number' }] }], maxItems: 1 },
     });
-    expect(startRequest?.task).toBe(MEMORY_EXTRACTION_TASK_KEYS.repair);
-    expect(startRequest?.tools?.map(tool => tool.name)).toEqual(['inventory.resolve_context', 'scene.resolve_context', 'reference.get_details']);
+    expect(startRequest?.taskKey).toBe(MEMORY_EXTRACTION_TASK_KEYS.repair);
+    expect(startRequest?.schema).toBeDefined();
+    expect(startRequest).not.toHaveProperty('tools');
     expect(result.repairDecisions).toEqual([{ repairId: 'repair:1', action: 'drop' }]);
     expect(result.audit?.pipeline?.stages[0]?.stage).toBe('repair');
   });
@@ -355,7 +360,7 @@ describe('Memory review lifecycle', () => {
   it('keeps edits and merges bounded and maps every terminal user action explicitly', async () => {
     const resolve = vi.fn(async (_id, status, resolution) => ({
       id: 'review:1', workspaceId: 'workspace', chatKey: 'chat', pipelineRunId: 'run',
-      stage: 'narrative', candidateLocalId: 'claim:1', reasonCode: 'MEMORY_UPDATE_PENDING_REVIEW',
+      stage: 'content', candidateLocalId: 'claim:1', reasonCode: 'MEMORY_UPDATE_PENDING_REVIEW',
       sourceRefs: ['message:1'], evidenceSpanIds: [], candidateSummary: {}, status, createdAt: 1, resolution,
     }));
     const queue = new MemoryReviewQueue({ resolveMemoryReviewItem: resolve } as unknown as MultiActorMemoryRepository);
@@ -388,7 +393,7 @@ describe('AgentToolGateway trust boundary', () => {
       arguments: { mentions: ['急救包'], needs: ['identity', 'current_state'], category: '', limit: 20 },
     } as const));
     const results = await gateway.executeBatch(calls, {
-      pipelineRunId: 'run', workspaceId: 'workspace', chatKey: 'chat', stage: 'inventory',
+      pipelineRunId: 'run', workspaceId: 'workspace', chatKey: 'chat', stage: 'content',
       allowedTools: new Set(['inventory.resolve_context']), dataRevision: 1, signal: new AbortController().signal,
     });
     expect(results).toHaveLength(6);
@@ -446,7 +451,7 @@ describe('AgentToolGateway trust boundary', () => {
     const result = await gateway.executeBatch([
       { callId: 'details', name: 'reference.get_details', arguments: { refs: ['actor_ziluo', 'loc_warehouse'], fields: ['canonicalName', 'status'] } },
     ], {
-      pipelineRunId: 'run', workspaceId: 'workspace', chatKey: 'chat', stage: 'narrative',
+      pipelineRunId: 'run', workspaceId: 'workspace', chatKey: 'chat', stage: 'content',
       allowedTools: new Set(['reference.get_details']), dataRevision: 1, signal: new AbortController().signal,
     });
     expect(result[0]).toMatchObject({

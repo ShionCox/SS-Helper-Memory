@@ -1,9 +1,9 @@
 import type { AutomaticIngestRejection, MemoryTokenUsage } from '../../domain';
 import {
   createSSHelperError,
-  type LlmTaskRoutingSetRequest,
-  type LlmTaskRoutingSnapshot,
-  type LlmToolCapabilityVerifyResponse,
+  type LlmTaskRouteSetRequest,
+  type LlmTaskStatusSnapshot,
+  type LlmResourceCapabilityVerifyResponse,
   type LlmToolTurnRequest,
   type LlmToolTurnResponse,
   type LlmWorkflowTrace,
@@ -145,7 +145,7 @@ export interface MemoryLlmClient {
     schema: object;
     budget: { maxTokens?: number; maxLatencyMs?: number };
     enqueue: { displayMode: 'compact' | 'silent' };
-    route?: { resourceId?: string; model?: string };
+    route?: { resourceId?: string };
     parentRequestId?: string;
     trace?: LlmWorkflowTrace;
     signal?: AbortSignal;
@@ -169,6 +169,7 @@ export interface MemoryLlmClient {
     budget?: { maxLatencyMs?: number };
     enqueue?: { displayMode: 'compact' | 'silent' };
     trace?: LlmWorkflowTrace;
+    workflowStage?: 'memory_embed_query' | 'memory_embed_index';
   }): Promise<MemoryEmbedResult>;
   rerank?(input: {
     consumer: string;
@@ -189,10 +190,10 @@ export interface MemoryLlmClient {
       taskKey: string;
       taskKind: MemoryLlmTaskKind;
       requiredCapabilities?: string[];
-    }): Promise<{ available?: boolean; resourceId?: string; model?: string; blockedReason?: string }> | { available?: boolean; resourceId?: string; model?: string; blockedReason?: string };
-    getTaskRouting?(taskKeys?: readonly string[]): Promise<LlmTaskRoutingSnapshot>;
-    setTaskRouting?(input: LlmTaskRoutingSetRequest): Promise<LlmTaskRoutingSnapshot>;
-    verifyToolCapability?(resourceId: string, model?: string, force?: boolean): Promise<LlmToolCapabilityVerifyResponse>;
+    }): Promise<{ available?: boolean; resourceId?: string; model?: string; verifiedMaxBatchInputs?: 8 | 16 | 32; failure?: SSHelperFailureContext }> | { available?: boolean; resourceId?: string; model?: string; verifiedMaxBatchInputs?: 8 | 16 | 32; failure?: SSHelperFailureContext };
+    getTaskStatus?(taskKeys?: readonly string[]): Promise<LlmTaskStatusSnapshot>;
+    setTaskRoute?(input: LlmTaskRouteSetRequest): Promise<LlmTaskStatusSnapshot>;
+    verifyResourceCapability?(input: { readonly resourceId: string; readonly taskKeys?: readonly string[]; readonly force?: boolean }): Promise<LlmResourceCapabilityVerifyResponse>;
   };
 }
 
@@ -206,7 +207,10 @@ export interface MemoryLlmRouteDiagnostic {
   available: boolean;
   resourceId?: string;
   model?: string;
-  blockedReason?: string;
+  /** Monotonic LLM task-state revision used to invalidate query caches. */
+  routeRevision?: number;
+  verifiedMaxBatchInputs?: 8 | 16 | 32;
+  failure?: SSHelperFailureContext;
 }
 
 export interface MemoryRecallRouteDiagnostics {
@@ -235,22 +239,33 @@ async function readRouteDiagnostic(
   requiredCapabilities: string[],
 ): Promise<MemoryLlmRouteDiagnostic> {
   const llm = readMemoryLlmClient();
-  if (!llm) return { available: false, blockedReason: 'LLMHub 未加载或版本过旧' };
-  if (!llm.inspect?.previewRoute) return { available: false, blockedReason: '当前 LLM 不支持资源状态检查，请更新 LLM 插件' };
+  if (!llm) return {
+    available: false,
+    failure: { reasonCode: 'MEMORY_LLM_CLIENT_UNAVAILABLE', stage: 'memory.routing.inspect' },
+  };
+  if (!llm.inspect?.previewRoute) return {
+    available: false,
+    failure: { reasonCode: 'LLM_TASK_UNSUPPORTED', stage: 'memory.routing.inspect' },
+  };
   const route = await readRouteWithDeadline(() => llm.inspect!.previewRoute({
     consumer: MEMORY_PLUGIN_ID,
     taskKey,
     taskKind,
     requiredCapabilities,
   }));
-  if (!route || typeof route !== 'object') return { available: false, blockedReason: '暂时无法读取 LLM 资源状态' };
+  if (!route || typeof route !== 'object') return {
+    available: false,
+    failure: { reasonCode: 'BUS_REQUEST_TIMEOUT', stage: 'memory.routing.inspect' },
+  };
   const available = route.available === true
-    || (route.available === undefined && !route.blockedReason && Boolean(route.resourceId || route.model));
+    || (route.available === undefined && !route.failure && Boolean(route.resourceId || route.model));
   return {
     available,
     ...(route.resourceId ? { resourceId: route.resourceId } : {}),
     ...(route.model ? { model: route.model } : {}),
-    ...(route.blockedReason ? { blockedReason: route.blockedReason } : {}),
+    ...(route.verifiedMaxBatchInputs === 8 || route.verifiedMaxBatchInputs === 16 || route.verifiedMaxBatchInputs === 32
+      ? { verifiedMaxBatchInputs: route.verifiedMaxBatchInputs } : {}),
+    ...(route.failure ? { failure: route.failure } : {}),
   };
 }
 
@@ -260,7 +275,22 @@ export async function readMemoryLlmRouteDiagnostic(): Promise<MemoryLlmRouteDiag
 
 export async function readMemoryRecallRouteDiagnostics(): Promise<MemoryRecallRouteDiagnostics> {
   const [embedding, rerank] = await Promise.all([
-    readRouteDiagnostic(MEMORY_EMBED_TASK, 'embedding', ['embeddings']),
+    (async (): Promise<MemoryLlmRouteDiagnostic> => {
+      const base = await readRouteDiagnostic(MEMORY_EMBED_TASK, 'embedding', ['embeddings']);
+      const llm = readMemoryLlmClient();
+      if (!llm?.inspect?.getTaskStatus || !base.available) return base;
+      try {
+        const snapshot = await readRouteWithDeadline(() => llm.inspect!.getTaskStatus!([MEMORY_EMBED_TASK]));
+        const entry = snapshot?.tasks.find(item => item.taskKey === MEMORY_EMBED_TASK);
+        const resource = entry?.resourceId ? snapshot?.resources.find(item => item.resourceId === entry.resourceId) : undefined;
+        return {
+          ...base,
+          ...(typeof snapshot?.revision === 'number' ? { routeRevision: snapshot.revision } : {}),
+          ...(resource?.embeddingCapabilities?.verifiedMaxBatchInputs
+            ? { verifiedMaxBatchInputs: resource.embeddingCapabilities.verifiedMaxBatchInputs } : {}),
+        };
+      } catch { return base; }
+    })(),
     readRouteDiagnostic(MEMORY_RERANK_TASK, 'rerank', ['rerank']),
   ]);
   return { embedding, rerank };
@@ -317,7 +347,6 @@ export function serializeExtractionInput(input: MemoryExtractionInput, evidenceD
       canonicalName: item.canonicalName,
       aliases: item.aliases,
       category: item.category,
-      states: item.states,
     })),
     ...(input.repair?.referenceDirectory ? {
       repairAttempt: {
@@ -1049,10 +1078,10 @@ export class StructuredMemoryCaptureExtractor {
     } : stage === 'single' ? response.data : {
       actorCandidates: stage === 'entities' ? (response.data as { actorCandidates?: unknown }).actorCandidates ?? [] : [],
       locationCandidates: stage === 'entities' ? (response.data as { locationCandidates?: unknown }).locationCandidates ?? [] : [],
-      itemCandidates: stage === 'inventory' ? (response.data as { itemCandidates?: unknown }).itemCandidates ?? [] : [],
-      episodes: stage === 'narrative' ? (response.data as { episodes?: unknown }).episodes ?? [] : [],
-      claims: stage === 'narrative' ? (response.data as { claims?: unknown }).claims ?? [] : [],
-      inventoryOperations: stage === 'inventory' ? (response.data as { inventoryOperations?: unknown }).inventoryOperations ?? [] : [],
+      itemCandidates: stage === 'content' ? (response.data as { itemCandidates?: unknown }).itemCandidates ?? [] : [],
+      episodes: stage === 'content' ? (response.data as { episodes?: unknown }).episodes ?? [] : [],
+      claims: stage === 'content' ? (response.data as { claims?: unknown }).claims ?? [] : [],
+      inventoryOperations: stage === 'content' ? (response.data as { inventoryOperations?: unknown }).inventoryOperations ?? [] : [],
     };
     const capture = normalizeStructuredCapture(
       normalizedData,
