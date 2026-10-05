@@ -57,7 +57,7 @@ vi.mock('../src/ui/scene-cast-pixi', () => ({
 function workbenchController(overrides: Partial<MemoryUiController> = {}): MemoryUiController {
   const facts: MemoryUiFact[] = [{ id: 'fact-1', kind: 'state', status: 'active', content: '当前状态稳定', confidence: 0.9, sourceRefs: ['message:1'], evidence: [{ sourceRef: 'message:1', excerpt: '证据摘录' }], updatedAt: 10 }];
   return {
-    getSettings: () => ({ enabled: true, autoOrganize: true, summaryBatchMode: 'floors' as const, summaryBatchFloors: 5, summaryBatchChars: 12_000, summaryIntervalFloors: 5, summaryOverlapFloors: 2, maxRecallItems: 12, promptMaxChars: 9000, answerMode: 'auto', recallMode: 'hybrid', rerankMode: 'adaptive', preExtractReferenceEnabled: true, preExtractReferenceItems: 8, preExtractReferenceMode: 'auto' as const, preExtractReferenceMaxChars: 2_400, graphEnabled: true, graphLlmRelationEnabled: true, graphMaxHops: 1 as const, graphMaxEdges: 12, chatMode: 'enabled' }),
+    getSettings: () => ({ enabled: true, autoOrganize: true, summaryBatchMode: 'floors' as const, summaryBatchFloors: 5, summaryBatchChars: 12_000, summaryIntervalFloors: 5, summaryOverlapFloors: 2, maxRecallItems: 12, promptMaxChars: 9000, recallMode: 'hybrid', rerankMode: 'adaptive', preExtractReferenceEnabled: true, preExtractReferenceItems: 8, preExtractReferenceMode: 'auto' as const, preExtractReferenceMaxChars: 2_400, graphEnabled: true, graphLlmRelationEnabled: true, graphMaxHops: 1 as const, graphMaxEdges: 12, chatMode: 'enabled' }),
     saveSettings: async () => undefined,
     getOverview: async () => ({ status: 'ready', bound: true, chatName: 'Assistant', chatKey: 'Assistant - 2026-07-18@03h29m55s201ms', factCount: facts.length, currentChatSizeBytes: 2048, currentChatUsageRatio: 0.25, lastOrganizedAt: 10, pendingJobs: 0, llmAvailable: true }),
     getInitializationEstimate: async () => ({ messageCount: 1, batchCount: 1, tokenLow: 10, tokenHigh: 20 }),
@@ -1422,7 +1422,7 @@ describe('Memory UI 展示适配', () => {
     expect(container.textContent).toContain('证据摘录');
     expect(container.textContent).toContain('视觉聚类只用于浏览');
     expect(container.querySelector('[data-action="rebuild-graph"]')?.getAttribute('data-ss-helper-control')).toBe('button');
-    expect(container.querySelector('[data-action="rebuild-graph"]')?.getAttribute('aria-label')).toBe('重建关系图谱');
+    expect(container.querySelector('[data-action="rebuild-graph"]')?.textContent).toBe('重建关系图谱');
     (container.querySelector('[data-action="rebuild-graph"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(rebuildGraph).toHaveBeenCalledOnce();
@@ -1544,6 +1544,12 @@ describe('Memory UI 展示适配', () => {
     expect(secondEdge.getAttribute('aria-selected')).toBe('true');
     expect(container.querySelector('[data-edge-id="edge-a"]')?.getAttribute('aria-selected')).toBe('false');
     expect(detail?.textContent).toContain('艾琳 — 信任 → 月光');
+    expect((detail as HTMLElement).hidden).toBe(false);
+    expect(container.querySelector('[data-graph-inspector-tab="detail"]')?.getAttribute('aria-pressed')).toBe('true');
+    (container.querySelector('[data-graph-inspector-tab="relations"]') as HTMLButtonElement).click();
+    expect((detail as HTMLElement).hidden).toBe(true);
+    expect(container.querySelector('[data-graph-edge-list]')).toBe(edgeList);
+    expect(secondEdge.getAttribute('aria-selected')).toBe('true');
     dispose();
   });
 
@@ -1564,6 +1570,11 @@ describe('Memory UI 展示适配', () => {
       expect(container.querySelectorAll('[data-graph-edge-list] [data-edge-id]')).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(1);
       expect(container.querySelectorAll('[data-graph-edge-list] [data-edge-id]')).toHaveLength(0);
+      expect((container.querySelector('[data-graph-empty]') as HTMLElement).hidden).toBe(false);
+      input.value = '';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      await vi.advanceTimersByTimeAsync(120);
+      expect((container.querySelector('[data-graph-empty]') as HTMLElement).hidden).toBe(true);
     } finally {
       vi.useRealTimers();
       dispose();

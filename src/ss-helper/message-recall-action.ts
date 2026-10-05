@@ -150,7 +150,7 @@ function memoryFormLabel(owner: GenerationRecallOwnerDetail, strength: number): 
   return '模糊印象';
 }
 
-function addFloorButtons(document: Document, host: HTMLElement, floors: readonly number[], ui: ChatMessageActionUiContext, navigate: (floor: number) => Promise<void>): void {
+function addFloorButtons(host: HTMLElement, floors: readonly number[], ui: ChatMessageActionUiContext, navigate: (floor: number) => Promise<void>): void {
   for (const floor of [...new Set(floors)].sort((a, b) => a - b)) {
     const button = ui.createButton({ label: `第 ${floor} 层`, icon: 'arrow-up-right-from-square', size: 'xs' });
     button.addEventListener('click', () => { ui.close(); void navigate(floor); });
@@ -273,7 +273,7 @@ function renderRecallDetail(
           }
           expanded.append(scores);
           const actions = element(document, 'div', 'stx-recall-preview-actions');
-          addFloorButtons(document, actions, row.candidate?.sourceFloors ?? [], ui, navigate);
+          addFloorButtons(actions, row.candidate?.sourceFloors ?? [], ui, navigate);
           const promptButton = ui.createButton({ label: '查看发送内容', icon: 'paper-plane', size: 'xs' }); promptButton.addEventListener('click', () => switchTo('prompt')); actions.append(promptButton); expanded.append(actions);
           card.append(heading, gist, compact, expanded);
           card.addEventListener('click', (event) => {
@@ -334,7 +334,7 @@ function renderRecallDetail(
           badges.append(element(document, 'span', '', sourceLabel(row)));
           heading.append(title, badges);
           card.append(heading, element(document, 'p', 'stx-recall-preview-gist', candidate.summary || '没有可显示的摘要。'), element(document, 'div', 'stx-recall-preview-compact', `${row.attemptLabels.join('、')} · ${scoreSummary(candidate)} · ${[...candidate.reasonCodes, candidate.omittedReason].filter(Boolean).join(' · ') || '无附加原因'}`));
-          const actions = element(document, 'div', 'stx-recall-preview-actions'); addFloorButtons(document, actions, candidate.sourceFloors, ui, navigate); card.append(actions);
+          const actions = element(document, 'div', 'stx-recall-preview-actions'); addFloorButtons(actions, candidate.sourceFloors, ui, navigate); card.append(actions);
           const rowHost = element(document, 'div', 'stx-recall-preview-row');
           rowHost.append(card);
           return rowHost;

@@ -3,6 +3,7 @@ import type {
   NormalizedToolCall,
   NormalizedToolResult,
   PlainData,
+  SSHelperFailureContext,
 } from '@ss-helper/sdk';
 import type { MemoryTokenUsage } from '../../domain';
 import type { SupportedEvidenceDirectory } from '../ingest/types';
@@ -26,7 +27,6 @@ export type AgentToolName =
 
 export interface AgentPipelineSettings {
   readonly extractionMode: ExtractionMode;
-  readonly agentConcurrency: 1 | 2;
   readonly agentToolPolicy: AgentToolPolicy;
 }
 
@@ -40,7 +40,6 @@ export interface ExtractionRunContext {
   readonly batchIndex?: number;
   readonly batchCount?: number;
   readonly mode: ExtractionMode;
-  readonly agentConcurrency: 1 | 2;
   readonly agentToolPolicy: AgentToolPolicy;
   readonly settingsRevision: number;
   readonly routeRevision: number;
@@ -125,6 +124,7 @@ export interface ExtractionStageAudit {
   readonly toolCalls: number;
   readonly latencyMs: number;
   readonly reasonCode?: string;
+  readonly failure?: SSHelperFailureContext;
 }
 
 export interface AgentToolAudit {

@@ -51,12 +51,6 @@ import type { ExtractionPipelineAudit, MemoryReviewItem } from '../application/e
 const COLLECTIONS = MEMORY_WORKSPACE_COLLECTIONS;
 const REPAIRABLE_REJECTION_CODES = new Set<AutomaticIngestRejection['code']>(AI_REPAIRABLE_PROPOSAL_CODES);
 
-function isRepairCaptureAudit(metadata: Record<string, unknown>, captureJobId: string): boolean {
-  const baseTransactionKey = String(metadata.baseTransactionKey ?? metadata.transactionKey ?? '');
-  return metadata.capturePhase === 'repair'
-    || baseTransactionKey.startsWith(`capture:${captureJobId}:repair:`);
-}
-
 function repairCollection(item: AutomaticIngestRejection): CaptureRepairQueueRecord['collection'] {
   return item.recordType === 'actor' ? 'actorCandidates'
     : item.recordType === 'location' ? 'locationCandidates'
@@ -777,224 +771,37 @@ export class MultiActorMemoryRepository {
     }
   }
   private async reconcileCaptureRepairQueueOnce(jobId: string): Promise<CaptureRepairQueueRecord[]> {
-    const existing = await this.listCaptureRepairQueue(jobId);
-    const repairKey = (record: Pick<CaptureRepairQueueRecord, 'jobId' | 'originalRequestId' | 'batchIndex' | 'collection' | 'itemIndex'>): string =>
-      [
-        record.jobId.trim(),
-        record.originalRequestId?.trim() ?? '',
-        Math.max(0, Math.trunc(Number(record.batchIndex) || 0)),
-        record.collection,
-        Math.max(0, Math.trunc(Number(record.itemIndex) || 0)),
-      ].join('\0');
-    const existingGroups = new Map<string, CaptureRepairQueueRecord[]>();
-    for (const record of existing) {
-      const key = repairKey(record);
-      const rows = existingGroups.get(key) ?? [];
-      rows.push(record);
-      existingGroups.set(key, rows);
+    const records = await this.listCaptureRepairQueue(jobId);
+    const resolvedByRejectionId = new Map<string, CaptureRepairQueueRecord>();
+    for (const record of records) {
+      if (record.status !== 'resolved' && record.status !== 'ignored') continue;
+      const ids = record.rejectionIds?.length ? record.rejectionIds : record.rejectionId ? [record.rejectionId] : [];
+      for (const id of ids) resolvedByRejectionId.set(id, record);
     }
-    const groups = new Map<string, {
-      batchIndex: number;
-      collection: CaptureRepairQueueRecord['collection'];
-      itemIndex: number;
-      sourceRefs: Set<string>;
-      fallbackSourceRefs: Set<string>;
-      rejectionIds: Set<string>;
-      issues: Map<string, CaptureRepairQueueRecord['issues'][number]>;
-      repairAttempts: number;
-      originalRequestId?: string;
-      originalResourceId?: string;
-      originalModel?: string;
-    }>();
-    const captureAudits: Array<{ id: string; rejections: AutomaticIngestRejection[] }> = [];
-    const repairAuditRejectionIds = new Set<string>();
     for (const row of await this.listChangeAudits()) {
-      if (String(row.kind ?? '') !== 'capture-change-set-v0' || row.rolledBackAt) continue;
+      if (row.kind !== 'capture-change-set-v0' || row.rolledBackAt) continue;
       const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
         ? row.metadata as Record<string, unknown>
         : {};
-      if (String(metadata.captureJobId ?? '') !== jobId) continue;
-      const fallbackSourceRefs = Array.isArray(metadata.sourceRefs) ? metadata.sourceRefs.map(String) : [];
+      if (metadata.captureJobId !== jobId || metadata.capturePhase === 'repair') continue;
       const rejections = Array.isArray(metadata.rejections)
         ? metadata.rejections.filter((item): item is AutomaticIngestRejection => Boolean(item && typeof item === 'object'))
         : [];
-      if (isRepairCaptureAudit(metadata, jobId)) {
-        for (const item of rejections) {
-          if (!REPAIRABLE_REJECTION_CODES.has(item.code)) continue;
-          if (item.id) repairAuditRejectionIds.add(item.id);
+      await this.updateCaptureAuditRejections(row.id, rejections.map((item) => {
+        const repair = item.id ? resolvedByRejectionId.get(item.id) : undefined;
+        if (repair) {
+          return {
+            ...item,
+            status: repair.status === 'ignored' ? 'ignored' as const : 'repaired' as const,
+            repairAttempts: repair.attemptCount,
+            ...(repair.status === 'ignored'
+              ? { ignoredAt: repair.resolvedAt ?? repair.updatedAt }
+              : { repairedAt: repair.resolvedAt ?? repair.updatedAt }),
+          };
         }
-        continue;
-      }
-      const classifiedRejections = rejections.map((item) => {
         if ((item.status ?? 'unresolved') !== 'unresolved' || REPAIRABLE_REJECTION_CODES.has(item.code)) return item;
-        return {
-          ...item,
-          status: 'ignored' as const,
-          ignoredAt: item.ignoredAt ?? Date.now(),
-          waitingForEvidenceChange: false,
-        };
-      });
-      captureAudits.push({ id: String(row.id ?? ''), rejections: classifiedRejections });
-      for (const item of classifiedRejections) {
-        if ((item.status ?? 'unresolved') !== 'unresolved' || !REPAIRABLE_REJECTION_CODES.has(item.code)) continue;
-        const collection = repairCollection(item);
-        const metadataBatchIndex = Number(metadata.batchIndex);
-        const rejectionBatchIndex = Number((item as AutomaticIngestRejection & { batchIndex?: number }).batchIndex);
-        // Capture checkpoints and queue rows use a zero-based batch index, while
-        // response diagnostics expose a one-based batch number. Prefer the audit
-        // checkpoint and normalize old audits that only persisted the diagnostic.
-        const batchIndex = Number.isInteger(metadataBatchIndex) && metadataBatchIndex >= 0
-          ? metadataBatchIndex
-          : Math.max(0, Number.isInteger(rejectionBatchIndex) ? rejectionBatchIndex - 1 : 0);
-        const originalRequestId = item.requestId?.trim();
-        const key = repairKey({ jobId, originalRequestId, batchIndex, collection, itemIndex: item.index });
-        const group = groups.get(key) ?? {
-          batchIndex,
-          collection,
-          itemIndex: item.index,
-          sourceRefs: new Set<string>(),
-          fallbackSourceRefs: new Set<string>(),
-          rejectionIds: new Set<string>(),
-          issues: new Map<string, CaptureRepairQueueRecord['issues'][number]>(),
-          repairAttempts: 0,
-          ...(originalRequestId ? { originalRequestId } : {}),
-          ...(item.resourceId ? { originalResourceId: item.resourceId } : {}),
-          ...(item.model ? { originalModel: item.model } : {}),
-        };
-        for (const sourceRef of item.sourceRefs ?? []) group.sourceRefs.add(sourceRef);
-        for (const sourceRef of fallbackSourceRefs) group.fallbackSourceRefs.add(sourceRef);
-        if (item.id) group.rejectionIds.add(item.id);
-        group.repairAttempts = Math.max(group.repairAttempts, Math.max(0, Math.trunc(item.repairAttempts ?? 0)));
-        for (const issue of rejectionIssue(item)) {
-          group.issues.set(`${issue.path}\0${issue.keyword}\0${issue.expected}`, issue);
-        }
-        groups.set(key, group);
-      }
-    }
-    // Older builds did not mark repair audits, so reconciliation could create a
-    // fresh queue row from each failed repair response. Those rows are derived
-    // failures, not new source items. Remove them before selecting work.
-    for (const [key, rows] of existingGroups) {
-      const retained: CaptureRepairQueueRecord[] = [];
-      for (const record of rows) {
-        const linkedIds = record.rejectionIds?.length
-          ? record.rejectionIds
-          : record.rejectionId ? [record.rejectionId] : [];
-        if (linkedIds.some(rejectionId => repairAuditRejectionIds.has(rejectionId))) {
-          await this.removeCaptureRepairRecord(record.id);
-        } else {
-          retained.push(record);
-        }
-      }
-      if (retained.length > 0) existingGroups.set(key, retained);
-      else existingGroups.delete(key);
-    }
-    const records: CaptureRepairQueueRecord[] = [];
-    for (const [key, group] of groups) {
-      const matching = [...new Map([
-        ...(existingGroups.get(key) ?? []),
-        ...existing.filter((record) => {
-          const linkedIds = record.rejectionIds?.length
-            ? record.rejectionIds
-            : record.rejectionId ? [record.rejectionId] : [];
-          return linkedIds.some(rejectionId => group.rejectionIds.has(rejectionId));
-        }),
-      ].map(record => [record.id, record] as const)).values()];
-      const previous = [...matching].sort((left, right) => {
-        const terminal = (record: CaptureRepairQueueRecord): number =>
-          record.status === 'resolved' || record.status === 'ignored' ? 1 : 0;
-        return terminal(right) - terminal(left)
-          || right.attemptCount - left.attemptCount
-          || right.updatedAt - left.updatedAt;
-      })[0];
-      const timestamp = Date.now();
-      const policyUpgrade = previous && (previous.repairPolicyVersion ?? 0) < 2;
-      const priorAttemptCount = previous?.attemptCount ?? group.repairAttempts;
-      const legacyNeedsQuarantine = (policyUpgrade || !previous)
-        && previous?.status !== 'resolved'
-        && previous?.status !== 'ignored'
-        && priorAttemptCount > 0;
-      const record: CaptureRepairQueueRecord = {
-        ...(previous ?? {
-          id: `capture-repair:${stableRecordHash(key)}`,
-          workspaceId: this.workspaceId,
-          chatKey: this.chatKey,
-          jobId,
-          batchIndex: group.batchIndex,
-          collection: group.collection,
-          itemIndex: group.itemIndex,
-          status: 'queued',
-          attemptCount: group.repairAttempts,
-          createdAt: timestamp,
-        }),
-        jobId,
-        batchIndex: group.batchIndex,
-        collection: group.collection,
-        itemIndex: group.itemIndex,
-        issues: [...new Map([
-          ...matching.flatMap(candidate => candidate.issues)
-            .map(issue => [`${issue.path}\0${issue.keyword}\0${issue.expected}`, issue] as const),
-          ...group.issues,
-        ]).values()],
-        sourceRefs: [...new Set([...matching.flatMap(candidate => candidate.sourceRefs), ...group.sourceRefs])],
-        fallbackSourceRefs: [...new Set([
-          ...matching.flatMap(candidate => candidate.fallbackSourceRefs),
-          ...group.fallbackSourceRefs,
-        ])],
-        rejectionIds: [...new Set([
-          ...matching.flatMap(candidate => candidate.rejectionIds?.length
-            ? candidate.rejectionIds
-            : candidate.rejectionId ? [candidate.rejectionId] : []),
-          ...group.rejectionIds,
-        ])],
-        ...(group.originalRequestId ? { originalRequestId: group.originalRequestId } : {}),
-        ...(group.originalResourceId ? { originalResourceId: group.originalResourceId } : {}),
-        ...(group.originalModel ? { originalModel: group.originalModel } : {}),
-        repairPolicyVersion: 2,
-        maxAttempts: legacyNeedsQuarantine
-          ? Math.max(1, priorAttemptCount)
-          : policyUpgrade ? Math.max(1, (previous?.attemptCount ?? 0) + 1) : previous?.maxAttempts ?? 1,
-        ...(legacyNeedsQuarantine ? {
-          status: 'unresolved' as const,
-          waitingForEvidenceChange: true,
-          evidenceRetryUsed: false,
-        } : {}),
-        updatedAt: timestamp,
-      };
-      await this.updateCaptureRepairRecord(record);
-      for (const duplicate of matching) {
-        if (duplicate.id !== record.id) await this.removeCaptureRepairRecord(duplicate.id);
-      }
-      records.push(record);
-    }
-    const resolvedQueueByRejectionId = new Map<string, CaptureRepairQueueRecord>();
-    for (const record of records) {
-      if (record.status !== 'resolved' && record.status !== 'ignored') continue;
-      for (const rejectionId of record.rejectionIds?.length
-        ? record.rejectionIds
-        : record.rejectionId ? [record.rejectionId] : []) {
-        resolvedQueueByRejectionId.set(rejectionId, record);
-      }
-    }
-    // Replaying each audit through the normal projection updater makes old jobs,
-    // queue rows and UI counters converge before the application presents state.
-    // It also repairs the legacy split-brain state where the queue was resolved
-    // but its originating Change Audit was never updated.
-    for (const audit of captureAudits) {
-      if (!audit.id) continue;
-      const rejections = audit.rejections.map((rejection) => {
-        const repair = rejection.id ? resolvedQueueByRejectionId.get(rejection.id) : undefined;
-        if (!repair) return rejection;
-        return {
-          ...rejection,
-          status: repair.status === 'ignored' ? 'ignored' as const : 'repaired' as const,
-          repairAttempts: repair.attemptCount,
-          ...(repair.status === 'ignored'
-            ? { ignoredAt: repair.resolvedAt ?? repair.updatedAt }
-            : { repairedAt: repair.resolvedAt ?? repair.updatedAt }),
-        };
-      });
-      await this.updateCaptureAuditRejections(audit.id, rejections);
+        return { ...item, status: 'ignored' as const, ignoredAt: item.ignoredAt ?? Date.now(), waitingForEvidenceChange: false };
+      }));
     }
     return this.listCaptureRepairQueue(jobId);
   }
@@ -1015,22 +822,6 @@ export class MultiActorMemoryRepository {
         recordId: record.id,
         value: asPlain({ ...value, updatedAt: Date.now() }),
         expectedVersion: current?.version ?? 0,
-      });
-    });
-  }
-  private async removeCaptureRepairRecord(recordId: string): Promise<void> {
-    await this.withRepairQueueWrite(recordId, async () => {
-      const current = await this.store.read({
-        workspaceId: this.workspaceId,
-        collection: 'capture-repair-queue',
-        recordId,
-      });
-      if (!current) return;
-      await this.store.remove({
-        workspaceId: this.workspaceId,
-        collection: 'capture-repair-queue',
-        recordId,
-        expectedVersion: current.version,
       });
     });
   }
@@ -1082,7 +873,9 @@ export class MultiActorMemoryRepository {
       ? audit.metadata as Record<string, PlainData>
       : {};
     const unresolvedCount = rejections.filter(item => (item.status ?? 'unresolved') === 'unresolved').length;
-    const outcome = unresolvedCount > 0 ? 'partial' : 'complete';
+    const pipeline = metadata.pipeline as unknown as ExtractionPipelineAudit | undefined;
+    const incompleteStage = Array.isArray(pipeline?.stages) && pipeline.stages.some(stage => stage.status !== 'completed');
+    const outcome = unresolvedCount > 0 || incompleteStage ? 'partial' : 'complete';
     const operations: StoreOperation[] = [{
       action: 'upsert',
       collection: 'change-audits',
@@ -1129,6 +922,9 @@ export class MultiActorMemoryRepository {
       if (captureJob?.value && typeof captureJob.value === 'object') {
         const jobValue = captureJob.value as Record<string, unknown>;
         if (String(jobValue.workspaceId ?? '') !== this.workspaceId || String(jobValue.chatKey ?? '') !== this.chatKey) throw new Error('Capture job 不属于当前聊天。');
+        const checkpoint = jobValue.checkpoint && typeof jobValue.checkpoint === 'object' ? jobValue.checkpoint : {};
+        // Repair projections cannot finish scanning or a failed extraction stage.
+        const captureIncomplete = ['queued', 'running', 'paused', 'failed', 'cancelled'].includes(String(jobValue.status));
         // A job spans many batch ChangeSets. Updating one batch must
         // not erase unresolved rows that still belong to another batch.
         const aggregate = new Map<string, AutomaticIngestRejection>();
@@ -1141,7 +937,7 @@ export class MultiActorMemoryRepository {
           // Repair-attempt audits preserve their own validation history, but
           // they are not new source rejections and must not inflate the parent
           // job's unresolved counters.
-          if (isRepairCaptureAudit(rowMetadata, captureJobId)) continue;
+          if (rowMetadata.capturePhase === 'repair') continue;
           const rows = String(row.id ?? '') === auditId
             ? rejections
             : Array.isArray(rowMetadata.rejections)
@@ -1192,13 +988,13 @@ export class MultiActorMemoryRepository {
           // must count only work that still requires attention.
           value: asPlain({
             ...jobValue,
-            status: retryableRepairCount > 0 ? 'needs_repair' : 'completed',
-            outcome: jobOutcome,
+            status: captureIncomplete ? jobValue.status : retryableRepairCount > 0 ? 'needs_repair' : 'completed',
+            outcome: captureIncomplete ? 'partial' : jobOutcome,
             rejectionCount: jobUnresolvedCount,
             rejections: jobRejections,
             checkpoint: {
-              ...((jobValue.checkpoint && typeof jobValue.checkpoint === 'object') ? jobValue.checkpoint : {}),
-              phase: 'repair',
+              ...checkpoint,
+              ...(captureIncomplete ? {} : { phase: 'repair' }),
               pendingRepairCount: retryableRepairCount,
               retryableRepairCount,
               exhaustedRepairCount,
@@ -1586,7 +1382,7 @@ export class MultiActorMemoryRepository {
     let collisionAttempt = 0;
     let transactionKey = baseTransactionKey;
     let auditId = `change-audit:${stableKey(transactionKey)}`;
-    const auditMatchesRequest = (existingAudit: ChangeAudit, existingAuditId: string): boolean => {
+    const auditMatchesRequest = (existingAudit: ChangeAudit): boolean => {
       if (existingAudit.kind !== 'capture-change-set-v0'
         || existingAudit.workspaceId !== this.workspaceId
         || existingAudit.chatKey !== this.chatKey) return false;
@@ -1611,7 +1407,7 @@ export class MultiActorMemoryRepository {
       });
       const existingAudit = existingRecord?.value as unknown as ChangeAudit | undefined;
       if (!existingAudit) break;
-      if (auditMatchesRequest(existingAudit, auditId)) {
+      if (auditMatchesRequest(existingAudit)) {
         if (!existingAudit.rolledBackAt) {
           const metadata = existingAudit.metadata && typeof existingAudit.metadata === 'object' && !Array.isArray(existingAudit.metadata)
             ? existingAudit.metadata as Record<string, PlainData>
@@ -1901,7 +1697,7 @@ export class MultiActorMemoryRepository {
         id: captureJobId,
         workspaceId: this.workspaceId,
         chatKey: this.chatKey,
-        outcome: unresolvedCount > 0 ? 'partial' : 'complete',
+        outcome: commit.outcome === 'partial' || unresolvedCount > 0 ? 'partial' : 'complete',
         rejectionCount: unresolvedCount,
         checkpoint: {
           ...checkpointValue,
@@ -1952,8 +1748,7 @@ export class MultiActorMemoryRepository {
           rejectionIds: items.flatMap(row => row.id ? [row.id] : []),
           status: 'queued',
           attemptCount: 0,
-          maxAttempts: 2,
-          repairPolicyVersion: 1,
+          maxAttempts: 1,
           failure: {
             reasonCode: item.code === 'schema_validation_failed'
               ? 'SCHEMA_VALIDATION_FAILED'

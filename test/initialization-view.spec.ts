@@ -19,7 +19,6 @@ function model(overrides: Partial<InitializationViewModel> = {}): Initialization
     includeHiddenMessageFloors: true,
     extractionMode: 'single',
     runtimeExtractionMode: 'single',
-    agentConcurrency: 2,
     agentToolPolicy: 'off',
     summaryBatchMode: 'floors',
     summaryBatchFloors: 5,
@@ -121,7 +120,6 @@ describe('initialization view', () => {
     const html = renderInitializationView(model({
       extractionMode: 'agent',
       runtimeExtractionMode: 'agent',
-      agentConcurrency: 2,
       agentToolPolicy: 'read_only',
     }));
 

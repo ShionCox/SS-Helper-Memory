@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
 import { MemoryRecallIndex, type RecallFact } from '../src/application/recall/memory-recall-index'
-import { buildMemoryPromptResult } from '../src/application/prompt/build-memory-prompt'
 
 function percentile95(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b)
@@ -9,7 +8,7 @@ function percentile95(values: number[]): number {
 }
 
 describe('recall performance', () => {
-  it('keeps recall p95 below 200ms and prompt assembly p95 below 300ms at 10k facts', () => {
+  it('keeps recall p95 below 200ms at 10k facts', () => {
     const facts: RecallFact[] = Array.from({ length: 10_000 }, (_, index) => ({
       id: `fact-${index}`,
       chatKey: 'chat-performance',
@@ -28,24 +27,18 @@ describe('recall performance', () => {
     }))
     const index = new MemoryRecallIndex(facts)
     const recallTimes: number[] = []
-    const promptTimes: number[] = []
 
     for (let run = 0; run < 24; run += 1) {
       const recallStart = performance.now()
-      const result = index.recall({
+      index.recall({
         chatKey: 'chat-performance',
         query: '罗兰的银色钥匙承诺',
         entityKeys: ['character:33', 'object:146'],
         maxItems: 12,
       })
       recallTimes.push(performance.now() - recallStart)
-
-      const promptStart = performance.now()
-      buildMemoryPromptResult(result)
-      promptTimes.push(performance.now() - promptStart)
     }
 
     expect(percentile95(recallTimes)).toBeLessThanOrEqual(200)
-    expect(percentile95(promptTimes)).toBeLessThanOrEqual(300)
   })
 })

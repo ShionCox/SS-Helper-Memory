@@ -182,6 +182,7 @@ export interface RepairFieldAction {
 
 export interface MemoryJobCheckpoint {
   batchIndex: number;
+  retryStage?: 'entities' | 'content';
   lastScannedBatch?: number;
   completedBatchCount?: number;
   pendingRepairCount?: number;
@@ -213,7 +214,6 @@ export interface MemoryJobCheckpoint {
   phase?: MemoryInitializationPhase;
   /** Immutable extraction configuration captured when this job starts. */
   extractionMode?: 'single' | 'agent';
-  agentConcurrency?: 1 | 2;
   agentToolPolicy?: 'off' | 'read_only';
   /** Provider-reported usage accumulated across every completed LLM response. */
   actualUsage?: MemoryTokenUsage;
@@ -247,7 +247,6 @@ export interface CaptureRepairQueueRecord {
   waitingForEvidenceChange?: boolean;
   /** The one evidence-change retry has already been released. */
   evidenceRetryUsed?: boolean;
-  repairPolicyVersion?: number;
   /** Deterministic pre-provider classification. Only ai_required enters the LLM. */
   classification?: RepairClassification;
   resolutionMode?: RepairResolutionMode;
@@ -377,17 +376,6 @@ export interface MemoryRecallLog {
   candidates: RecallCandidateLog[];
   selectedFactIds: string[];
   diagnostics?: MemoryRecallDiagnosticsLog;
-  /** 宿主实际注入的完整文本；预览召回不生成该字段。 */
-  injectedPrompt?: string;
-  /** Prompt 构建器对实际注入文本给出的预算与回答模式诊断。 */
-  promptDiagnostics?: {
-    maxChars: number;
-    usedChars: number;
-    includedCount: number;
-    omittedCount: number;
-    omittedReason?: string;
-    answerMode: 'roleplay' | 'diagnostic';
-  };
   createdAt: number;
 }
 

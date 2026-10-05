@@ -436,16 +436,6 @@ function stringArray(maxItems = 24, maxLength = 80): Record<string, unknown> {
   return { type: 'array', maxItems, uniqueItems: true, items: requiredString(maxLength) };
 }
 
-function sourceRefSchema(sourceRefs: readonly string[]): Record<string, unknown> {
-  return {
-    type: 'string',
-    minLength: 1,
-    maxLength: 180,
-    description: '必须逐字复制 allowedSourceRefs 中的一个值。',
-    ...(sourceRefs.length > 0 ? { enum: [...sourceRefs] } : {}),
-  };
-}
-
 /**
  * Small fixed-shape schema. Optional business values are represented by an
  * empty string instead of nullable unions so weak OpenAI-compatible providers
@@ -453,10 +443,8 @@ function sourceRefSchema(sourceRefs: readonly string[]): Record<string, unknown>
  * fields at all.
  */
 export function buildStructuredCaptureSchema(
-  sourceRefs: readonly string[],
   evidenceDirectory?: SupportedEvidenceDirectory,
 ): object {
-  const sourceRef = sourceRefSchema(sourceRefs);
   const evidenceSpanId = {
     type: 'string',
     minLength: 1,
@@ -584,10 +572,9 @@ export function buildStructuredCaptureSchema(
 
 export function buildExtractionStageSchema(
   stage: Exclude<ExtractionStageKey, 'repair'>,
-  sourceRefs: readonly string[],
   evidenceDirectory?: SupportedEvidenceDirectory,
 ): object {
-  const full = buildStructuredCaptureSchema(sourceRefs, evidenceDirectory) as {
+  const full = buildStructuredCaptureSchema(evidenceDirectory) as {
     readonly type: 'object';
     readonly additionalProperties: false;
     readonly properties: Readonly<Record<string, object>>;
@@ -621,14 +608,13 @@ function copyKnowledge(value: StructuredClaimKnowledge & {
 }
 
 export function buildStructuredRepairSchema(
-  sourceRefs: readonly string[],
   collection: 'actorCandidates' | 'locationCandidates' | 'itemCandidates' | 'episodes' | 'claims' | 'inventoryOperations',
   maxItems: number,
   referenceDirectory?: import('./types').SupportedReferenceDirectory,
   evidenceDirectory?: SupportedEvidenceDirectory,
   repairIds: readonly string[] = ['repair-item-1'],
 ): object {
-  const captureSchema = buildStructuredCaptureSchema(sourceRefs, evidenceDirectory) as {
+  const captureSchema = buildStructuredCaptureSchema(evidenceDirectory) as {
     properties: Record<string, { items: object }>;
   };
   const itemSchema = structuredClone(captureSchema.properties[collection]?.items);
@@ -983,7 +969,6 @@ export class StructuredMemoryCaptureExtractor {
     const spec = EXTRACTION_STAGE_SPECS[stage];
     const schema = input.repair
       ? buildStructuredRepairSchema(
-        sourceRefs,
         input.repair.collection,
         input.repair.maxItems,
         input.repair.referenceDirectory,
@@ -991,7 +976,7 @@ export class StructuredMemoryCaptureExtractor {
         (input.repair.targets?.length ? input.repair.targets : [{ repairId: 'repair-item-1', issues: input.repair.issues }])
           .map(target => target.repairId),
       )
-      : buildExtractionStageSchema(stage as Exclude<ExtractionStageKey, 'repair'>, sourceRefs, evidenceDirectory);
+      : buildExtractionStageSchema(stage as Exclude<ExtractionStageKey, 'repair'>, evidenceDirectory);
     const repairTargets = input.repair
       ? (input.repair.targets?.length ? input.repair.targets : [{ repairId: 'repair-item-1', issues: input.repair.issues }])
       : [];

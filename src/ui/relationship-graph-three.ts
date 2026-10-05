@@ -42,6 +42,12 @@ const NODE_LABEL_GAP_PX = 8;
 const MAX_GRAPH_PIXEL_RATIO = 1.5;
 const BLOOM_SETTINGS = Object.freeze({ strength: .58, radius: .9, threshold: .23, vignette: .18 });
 
+export function calculateGraphCameraDistance(radius: number, aspect: number): number {
+  const verticalFov = THREE.MathUtils.degToRad(CAMERA_FOV);
+  const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * aspect);
+  return Math.max(radius / Math.sin(Math.min(verticalFov, horizontalFov) / 2) * 1.1, 24);
+}
+
 /** Internal render invalidation used to keep DOM label work off idle frames. */
 export class RelationshipGraphInvalidation {
   private selectionDirty = true;
@@ -480,6 +486,12 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
     if (!layout.nodes.length) return { center: new THREE.Vector3(), size: 200, radius: 100 };
     const bounds = new THREE.Box3();
     for (const node of layout.nodes) bounds.expandByPoint(new THREE.Vector3(node.x, node.y, node.z));
+    for (const cluster of layout.clusters) {
+      const [x, y, z] = cluster.bounds.center;
+      const [width, height, depth] = cluster.bounds.size;
+      bounds.expandByPoint(new THREE.Vector3(x - width / 2, y - height / 2, z - depth / 2));
+      bounds.expandByPoint(new THREE.Vector3(x + width / 2, y + height / 2, z + depth / 2));
+    }
     const size = bounds.getSize(new THREE.Vector3());
     return {
       center: bounds.getCenter(new THREE.Vector3()),
@@ -496,10 +508,7 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
     // are smaller but can have deep z-extents, so fit the complete 3D bounds
     // rather than just their largest axis. This keeps the auto-orbit view
     // centred instead of clipping a community at particular angles.
-    const verticalFov = THREE.MathUtils.degToRad(CAMERA_FOV);
-    const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
-    const fitFov = Math.min(verticalFov, horizontalFov);
-    const distance = Math.max(bounds.radius / Math.sin(fitFov / 2) * 1.1, 170);
+    const distance = calculateGraphCameraDistance(bounds.radius, camera.aspect);
     graphOrbitDistance = distance;
     controls.target.copy(graphCenter);
     camera.position.set(graphCenter.x + distance / Math.sqrt(3), graphCenter.y + distance / Math.sqrt(3), graphCenter.z + distance / Math.sqrt(3));
@@ -517,7 +526,7 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
       (edge.source.z + edge.target.z) / 2,
     );
     const edgeSpan = Math.hypot(edge.target.x - edge.source.x, edge.target.y - edge.source.y, edge.target.z - edge.source.z);
-    const distance = THREE.MathUtils.clamp(Math.max(72, edgeSpan * 2.2), 72, Math.max(120, graphOrbitDistance * .72));
+    const distance = THREE.MathUtils.clamp(edgeSpan * 2.2, 24, Math.max(24, graphOrbitDistance * .72));
     const direction = camera.position.clone().sub(controls.target);
     if (direction.lengthSq() < .001) direction.set(1, .72, 1);
     direction.normalize();
@@ -545,7 +554,7 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
     if (!node) return;
     stopAutoOrbit();
     const target = new THREE.Vector3(node.x, node.y, node.z);
-    const distance = THREE.MathUtils.clamp(Math.max(84, graphOrbitDistance * .42), 84, Math.max(130, graphOrbitDistance * .68));
+    const distance = Math.max(16, graphOrbitDistance * .42);
     const direction = camera.position.clone().sub(controls.target);
     if (direction.lengthSq() < .001) direction.set(1, .72, 1);
     direction.normalize();
@@ -960,7 +969,7 @@ export function mountRelationshipGraphThree(host: HTMLElement, initial: Relation
       invalidation.invalidateLabels();
       if (progress >= 1) focusAnimation = undefined;
     } else if (!reduceMotion && autoOrbit) {
-      const radius = Math.max(graphOrbitDistance, graphSize * .98, 170);
+      const radius = Math.max(graphOrbitDistance, graphSize * .98, 24);
       const angle = now * .00005;
       controls.target.copy(graphCenter);
       camera.position.set(graphCenter.x + Math.cos(angle) * radius * .93, graphCenter.y + radius * .38, graphCenter.z + Math.sin(angle) * radius * .93);

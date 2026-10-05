@@ -196,7 +196,7 @@ describe('场景与事件 v4 视图模型', () => {
     model.castPlanAudits = [{
       id: 'audit:12', workspaceId: 'workspace:test', chatKey: 'chat:a', planId: 'plan:12',
       plannedOwnerIds: ['owner:a', 'owner:b'], actualOwnerIds: ['owner:a'], unplannedOwnerIds: [], missingOwnerIds: ['owner:b'],
-      result: 'partial', leakageRisk: false, createdAt: 13,
+      result: 'partial', createdAt: 13,
     } satisfies CastPlanAudit];
     const markup = renderSceneEventsPage(model);
     expect(markup).toContain('持续场景');

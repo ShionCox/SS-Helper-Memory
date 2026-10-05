@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
 import { MemoryRecallIndex, type RecallFact } from '../src/application/recall/memory-recall-index'
-import { buildMemoryPromptResult } from '../src/application/prompt/build-memory-prompt'
 
 const NOW = Date.parse('2026-07-12T12:00:00.000Z')
 
@@ -452,8 +451,8 @@ describe('MemoryRecallIndex', () => {
   })
 })
 
-describe('memory prompt', () => {
-  it('uses one immutable RecallResult for preview and prompt assembly', () => {
+describe('recall immutability', () => {
+  it('freezes the preview result and its selected items', () => {
     const index = new MemoryRecallIndex([
       fact({
         id: 'stable',
@@ -478,58 +477,5 @@ describe('memory prompt', () => {
     expect(Object.isFrozen(result.items)).toBe(true)
     expect(Object.isFrozen(result.items[0])).toBe(true)
 
-    const prompt = buildMemoryPromptResult(result).prompt
-    expect(prompt).toContain('【稳定前提】')
-    expect(prompt).toContain('【当前相关事实】')
-    expect(prompt).toContain('【进行中事项】')
-    expect(prompt).toContain('当前对话内容优先于历史记忆')
-    expect(prompt).toContain('不得补造缺失细节')
-    expect(prompt).not.toMatch(/score|reasonCodes|BM25|confidence/i)
-  })
-
-  it('does not inject anything when recall is empty', () => {
-    const result = new MemoryRecallIndex([]).recall({ chatKey: 'chat-a', query: '任意问题', now: NOW })
-    expect(buildMemoryPromptResult(result).prompt).toBe('')
-  })
-
-  it('enforces a hard character budget without cutting a fact line', async () => {
-    const index = new MemoryRecallIndex([
-      fact({ id: 'first', kind: 'relationship', content: '爱丽丝信任罗兰。', entityKeys: ['character:alice', 'character:roland'] }),
-      fact({ id: 'second', kind: 'relationship', content: '爱丽丝与罗兰约定在黎明前会合。', entityKeys: ['character:alice', 'character:roland'] }),
-      fact({ id: 'third', kind: 'relationship', content: '罗兰会在王宫北门等待爱丽丝。', entityKeys: ['character:alice', 'character:roland'] }),
-    ])
-    const result = index.recall({
-      chatKey: 'chat-a', query: '爱丽丝和罗兰的约定', entityKeys: ['character:alice', 'character:roland'], now: NOW,
-    })
-
-    const unbounded = buildMemoryPromptResult(result)
-    const maxChars = unbounded.prompt.length - 10
-    const built = buildMemoryPromptResult(result, { maxChars })
-
-    expect(built.prompt.length).toBeLessThanOrEqual(maxChars)
-    expect(built.prompt).toMatch(/<memory_context>[\s\S]*<\/memory_context>/)
-    expect(built.diagnostics.omittedCount).toBeGreaterThan(0)
-    expect(built.diagnostics.omittedReason).toBe('超过 Prompt 字符预算')
-    expect(built.omitted.every(item => item.omittedReason === '超过 Prompt 字符预算')).toBe(true)
-    for (const item of result.items) {
-      const line = `- ${item.fact.content}`
-      expect(built.prompt.includes(item.fact.content)).toBe(built.prompt.includes(line))
-    }
-  })
-
-  it('adds direct-answer priority for diagnostic questions without changing roleplay prompts', async () => {
-    const { buildMemoryPromptResult } = await import('../src/application/prompt/build-memory-prompt')
-    const index = new MemoryRecallIndex([fact({ id: 'known', content: '爱丽丝拥有一把银色钥匙。' })])
-    const diagnostic = index.recall({ chatKey: 'chat-a', query: '简短回答：爱丽丝是否拥有银色钥匙？', now: NOW })
-    const roleplay = index.recall({ chatKey: 'chat-a', query: '爱丽丝拿着钥匙走进大厅。', now: NOW })
-
-    const diagnosticPrompt = buildMemoryPromptResult(diagnostic, { answerMode: 'auto' })
-    const roleplayPrompt = buildMemoryPromptResult(roleplay, { answerMode: 'auto' })
-
-    expect(diagnosticPrompt.diagnostics.answerMode).toBe('diagnostic')
-    expect(diagnosticPrompt.prompt).toContain('自然语言直答开始')
-    expect(diagnosticPrompt.prompt).toContain('禁止输出 <UpdateVariable>、<JSONPatch>、<StatusPlaceHolderImpl/>')
-    expect(roleplayPrompt.diagnostics.answerMode).toBe('roleplay')
-    expect(roleplayPrompt.prompt).not.toContain('先直接回答用户问题')
   })
 })

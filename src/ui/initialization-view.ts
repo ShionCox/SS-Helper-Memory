@@ -85,7 +85,6 @@ export interface InitializationViewModel {
   includeHiddenMessageFloors: boolean;
   extractionMode: 'single' | 'agent';
   runtimeExtractionMode: 'single' | 'agent';
-  agentConcurrency: 1 | 2;
   agentToolPolicy: 'off' | 'read_only';
   summaryBatchMode: 'floors' | 'chars';
   summaryBatchFloors: number;
@@ -251,7 +250,7 @@ function renderModeSummary(model: InitializationViewModel): string {
   return `<div class="stx-memory-init-mode is-${blocked ? 'blocked' : agent ? 'agent' : 'single'}" role="status">
     <span class="stx-memory-init-mode-icon"><ss-helper-icon name="${icon}" decorative></ss-helper-icon></span>
     <span class="stx-memory-init-mode-copy"><strong>${escapeHtml(extractionModeLabel(model))}</strong><small>${escapeHtml(extractionModeDescription(model))}</small></span>
-    ${statusChip(blocked ? '请先验证路由' : agent ? `并发 ${model.agentConcurrency} · ${model.agentToolPolicy === 'read_only' ? '只读工具' : '无工具'}` : '单阶段', tone)}
+    ${statusChip(blocked ? '请先验证路由' : agent ? (model.agentToolPolicy === 'read_only' ? '只读工具' : '无工具') : '单阶段', tone)}
   </div>`;
 }
 

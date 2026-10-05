@@ -11,8 +11,6 @@
 - 前端插件发布版本的唯一来源是根目录 `plugin.config.json` 的 `manifest.version`，本次断代基线为裸 SemVer `0.0.1`；`manifest.json` 仅是构建产物。设置 UI 负责显示当前版本。
 - 根目录 `package.json` 不得增加 `version` 字段。
 - 公共前端 API、UI、日志、README、测试名称和测试数据标识不得再次硬编码插件发布版本。
-- `server/package.json` 的 `0.0.1` 仅是 SDK 内嵌 Memory 语义 worker 的内部协议版本；插件发布版本仍只来自 `plugin.config.json`。
-- 服务端运行时必须读取 `server/package.json` 的版本，不得再维护第二份硬编码服务端版本常量。
 - 禁止恢复旧标记，包括但不限于旧 MemoryOS/Memory v2/v3 命名、旧 `memory-v2` 数据键、旧 SS-Helper API 版本轴和插件版本 `3.0.0`。
 - 测试探针、示例 manifest 和其他辅助 package 不得新增独立的插件发布版本。
 
@@ -32,7 +30,7 @@
 
 - 修改版本规则前，先更新或补充版本元数据回归测试。
 - 修改完成后至少运行版本元数据测试、受影响测试、TypeScript 类型检查和旧版本标记扫描。
-- 本仓库单独检出时缺少上级系列仓库的 `SDK` 相对路径；全量验证应在提供对应 SDK 的临时镜像或完整系列仓库结构中运行。
+- SDK 公共契约来自本仓库 `vendor` 的当前 SDK 包；修改 SDK 后需同步该包，再运行验证。
 - `test-results`、覆盖率、构建目录和临时验证镜像属于生成物，不得作为版本来源；包含旧版本信息时应删除并重新生成。
 
 ## 设置提示与 Toast

@@ -2,6 +2,31 @@ import { describe, expect, it, vi } from 'vitest';
 import { MemoryRuntime, memoryWorkspaceStatus } from '../src/host/memory-runtime';
 
 describe('Memory runtime status boundaries', () => {
+  it.each(['chat', 'workspace', 'stopped'])('does not inject a delayed prompt after its %s scope changes', async (change) => {
+    let chatKey = 'chat-a';
+    let workspaceId = 'workspace-a';
+    let release!: (result: { prompt: string }) => void;
+    const set = vi.fn();
+    const remove = vi.fn();
+    const runtime = Object.create(MemoryRuntime.prototype) as any;
+    Object.assign(runtime, {
+      promptRevision: 0, stopped: false, lastUserMessageAt: Date.now(), rebindPromise: Promise.resolve(),
+      flushPendingGenerationCompletion: vi.fn(async () => undefined),
+      context: { getChatKey: () => chatKey, getWorkspaceId: () => workspaceId },
+      application: { getEffectiveSettings: () => ({ enabled: true }), buildActorMemoryPrompt: () => new Promise(resolve => { release = resolve; }) },
+      session: { host: { prompt: { set, remove } } },
+    });
+    const pending = runtime.onPromptReady([{ role: 'user', content: 'question' }]);
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    if (change === 'chat') chatKey = 'chat-b';
+    else if (change === 'workspace') workspaceId = 'workspace-b';
+    else runtime.stopped = true;
+    release({ prompt: 'private chat-a memory' });
+    await pending;
+    expect(set).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
   it('does not report the global LLM or memory setting as disabled when no chat is selected', () => {
     expect(memoryWorkspaceStatus({ getCurrentChatInfo: () => ({ available: false, name: '', key: '', mode: 'inherit', effectiveEnabled: false }) })).toMatchObject({
       value: '未选择', tone: 'warning',

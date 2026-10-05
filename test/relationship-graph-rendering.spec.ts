@@ -1,8 +1,17 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
-import { RelationshipGraphInvalidation } from '../src/ui/relationship-graph-three';
+import { calculateGraphCameraDistance, RelationshipGraphInvalidation } from '../src/ui/relationship-graph-three';
 
 describe('relationship graph rendering invalidation', () => {
+  it('fits sparse graphs closely and keeps large graphs inside narrow viewports', () => {
+    expect(calculateGraphCameraDistance(8, 1.7)).toBe(24);
+    expect(calculateGraphCameraDistance(100, 1.7)).toBeCloseTo(220);
+    const portraitDistance = calculateGraphCameraDistance(100, .5);
+    const horizontalHalfFov = Math.atan(Math.tan(Math.PI / 6) * .5);
+    expect(portraitDistance * Math.sin(horizontalHalfFov)).toBeCloseTo(110);
+    expect(portraitDistance).toBeGreaterThan(220);
+  });
+
   it('consumes expensive selection, label and rect work only after invalidation', () => {
     const invalidation = new RelationshipGraphInvalidation();
     expect(invalidation.takeSelection()).toBe(true);

@@ -2,7 +2,6 @@ export type CastRecallPermission = 'full' | 'focused' | 'public_only' | 'identit
 export type CastPlanningMode = 'fast' | 'hybrid' | 'director';
 export type GenerationCastPlannerMode = 'deterministic' | 'llm_assisted' | 'host_selected' | 'manual';
 export type GenerationCastMode = 'single_actor' | 'multi_actor' | 'narrator' | 'mixed';
-export type UnplannedActorPolicy = 'allow_public_only' | 'allow_without_private_memory' | 'regenerate_once';
 
 export type CastPlanReasonCode =
   | 'host_selected'
@@ -95,7 +94,6 @@ export interface CastPlanAudit {
   readonly unplannedOwnerIds: readonly string[];
   readonly missingOwnerIds: readonly string[];
   readonly result: 'matched' | 'partial' | 'diverged';
-  readonly leakageRisk: boolean;
   readonly createdAt: number;
 }
 
@@ -116,10 +114,8 @@ export interface CastPlanningSettings {
   readonly plannerConfidenceThreshold: number;
   readonly likelyActorRecall: 'public_only' | 'identity_only' | 'none';
   readonly backgroundActorRecall: 'public_only' | 'identity_only' | 'none';
-  readonly mentionedActorRecall: 'none';
   readonly provisionalActorEnabled: boolean;
   readonly plannerCanProposeActors: boolean;
-  readonly unplannedActorPolicy: UnplannedActorPolicy;
   readonly maxPlannerCallsPerTurn: 0 | 1;
 }
 
@@ -132,9 +128,7 @@ export const DEFAULT_CAST_SETTINGS: Readonly<CastPlanningSettings> = Object.free
   plannerConfidenceThreshold: 0.72,
   likelyActorRecall: 'public_only',
   backgroundActorRecall: 'identity_only',
-  mentionedActorRecall: 'none',
   provisionalActorEnabled: true,
   plannerCanProposeActors: true,
-  unplannedActorPolicy: 'allow_public_only',
   maxPlannerCallsPerTurn: 1,
 });

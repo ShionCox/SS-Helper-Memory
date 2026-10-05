@@ -39,7 +39,7 @@ describe('SS-Helper Memory typed adapters', () => {
     expect(loaded).toMatchObject({
       enabled: true,
       maxRecallItems: 12,
-      maxPlannerCallsPerTurn: '1',
+      castPlanningMode: 'hybrid',
       preExtractReferenceEnabled: true,
       preExtractReferenceItems: 8,
       preExtractReferenceMode: 'auto',
@@ -66,10 +66,17 @@ describe('SS-Helper Memory typed adapters', () => {
     expect(settings).toMatchObject({ enabled: false, maxRecallItems: 6, promptMaxChars: 8_000 });
     await adapter.save({ ...settings, preExtractReferenceItems: 99, preExtractReferenceMode: 'vector', preExtractReferenceMaxChars: 4_099 });
     expect(settings).toMatchObject({ preExtractReferenceItems: 10, preExtractReferenceMode: 'vector', preExtractReferenceMaxChars: 4_000 });
+    await adapter.save({ preExtractReferenceMode: 'auto' });
+    expect(settings.preExtractReferenceMode).toBe('auto');
     await adapter.save({ ...settings, graphMaxHops: 2, graphMaxEdges: 99 });
     expect(settings).toMatchObject({ graphEnabled: true, graphLlmRelationEnabled: true, graphMaxHops: 2, graphMaxEdges: 24 });
     await adapter.reset();
     expect(settings).toEqual(MEMORY_DEFAULT_SETTINGS);
+    expect((await adapter.loadFieldState?.())?.agentToolPolicy?.disabled).not.toBe(true);
+    await adapter.save({ ...settings, agentToolPolicy: 'read_only' });
+    expect(settings).toMatchObject({ extractionMode: 'single', agentToolPolicy: 'read_only' });
+    await adapter.save({ ...settings, extractionMode: 'agent' });
+    expect(settings).toMatchObject({ extractionMode: 'agent', agentToolPolicy: 'read_only' });
   });
 
   it('uses Chinese Agent pipeline labels and routes task configuration to Memory', () => {
@@ -99,9 +106,7 @@ describe('SS-Helper Memory typed adapters', () => {
     const castPlanning = MEMORY_SETTINGS_SCHEMA.fields.find((field) => field.id === 'castPlanning');
     expect(castPlanning).toMatchObject({ label: '多角色选角' });
     expect(castPlanning?.kind === 'section' ? castPlanning.children.map((field) => field.id) : []).toEqual([
-      'castPlanningMode', 'focusLookbackFloors', 'actorScanLookbackFloors', 'persistPresenceUntilTransition',
-      'plannerCandidateThreshold', 'plannerConfidenceThreshold', 'likelyActorRecall', 'backgroundActorRecall',
-      'provisionalActorEnabled', 'plannerCanProposeActors', 'unplannedActorPolicy', 'maxPlannerCallsPerTurn',
+      'castPlanningMode', 'provisionalActorEnabled', 'castTuning',
     ]);
     const advanced = MEMORY_SETTINGS_SCHEMA.fields.find((field) => field.id === 'advanced');
     expect(advanced).toMatchObject({ label: '高级' });
@@ -134,7 +139,7 @@ describe('SS-Helper Memory typed adapters', () => {
     }, liveStatusSource);
     expect(await adapter.loadFieldState?.()).toMatchObject({
       chatMode: { disabled: true, disabledReason: '请先进入角色或群组聊天，再修改当前聊天设置。' },
-      summaryBatchFloors: { disabled: true },
+      summaryBatchFloors: { disabled: false },
       summaryBatchChars: { disabled: false },
       graphWorkbench: { disabled: true, disabledReason: '请先进入角色或群组聊天，再重建关系图谱。' },
     });
@@ -147,7 +152,7 @@ describe('SS-Helper Memory typed adapters', () => {
     });
   });
 
-  it('uses global summary defaults and switches the active batch control with the batch mode', async () => {
+  it('preserves hidden tuning, merges cast switches and keeps both batch limits active', async () => {
     let settings = { ...MEMORY_DEFAULT_SETTINGS };
     const controller = {
       getSettings: () => ({ ...settings }),
@@ -163,12 +168,19 @@ describe('SS-Helper Memory typed adapters', () => {
     await adapter.save({ ...settings, summaryBatchMode: 'chars', summaryBatchChars: 12_000, summaryIntervalFloors: 5 });
     expect(settings).toMatchObject({ summaryBatchMode: 'chars', summaryBatchChars: 12_000, summaryIntervalFloors: 5, summaryOverlapFloors: 1 });
     expect(await adapter.loadFieldState?.()).toMatchObject({
-      summaryBatchFloors: { disabled: true },
+      summaryBatchFloors: { disabled: false },
       summaryBatchChars: { disabled: false },
     });
     await expect(adapter.loadStatus?.()).resolves.toMatchObject({
       summaryProgress: { value: '已总结至第 60 层', description: expect.stringContaining('下一窗口：第 61–65 层') },
     });
+    settings = { ...settings, maxPlannerCallsPerTurn: 0, plannerCanProposeActors: false, provisionalActorEnabled: true, graphMaxHops: 2, recallMode: 'hybrid', graphEnabled: false };
+    expect(await adapter.load()).toMatchObject({ castPlanningMode: 'fast', provisionalActorEnabled: false });
+    expect(await adapter.loadFieldState?.()).toMatchObject({ graphMaxHops: { hidden: true }, plannerConfidenceThreshold: { hidden: true } });
+    await adapter.save({ enabled: false });
+    expect(settings).toMatchObject({ graphMaxHops: 2, recallMode: 'hybrid', summaryBatchChars: 12_000, maxPlannerCallsPerTurn: 0, plannerCanProposeActors: false });
+    await adapter.save({ castPlanningMode: 'director', provisionalActorEnabled: true });
+    expect(settings).toMatchObject({ maxPlannerCallsPerTurn: 1, plannerCanProposeActors: true, provisionalActorEnabled: true });
   });
 
   it('updates current-chat status live without exposing the internal chat key', async () => {

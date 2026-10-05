@@ -864,7 +864,7 @@ export class MemoryRepository {
         stage: 'memory.repository.usage.scope',
       });
     }
-    const result = await this.store.apply({
+    await this.store.apply({
       workspaceId,
       idempotencyKey: `main-usage:${usage.id}`,
       operations: [{
@@ -1251,7 +1251,8 @@ export class MemoryRepository {
 
   async addRecallLog(log: MemoryRecallLog): Promise<void> {
     this.requireChatKey(log.chatKey);
-    const { injectedPrompt: _sensitivePrompt, ...safeLog } = log;
+    const { id, chatKey, query, maxItems, candidates, selectedFactIds, diagnostics, createdAt } = log;
+    const safeLog = { id, chatKey, query, maxItems, candidates, selectedFactIds, diagnostics, createdAt };
     await this.store.write({ workspaceId: this.requireWorkspaceId(), collection: 'recall-logs', recordId: log.id, value: asPlain(safeLog) });
   }
 

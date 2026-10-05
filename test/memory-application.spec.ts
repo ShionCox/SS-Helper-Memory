@@ -35,14 +35,6 @@ vi.mock('../src/application/ingest/llm-extractor', () => ({
   MEMORY_PLUGIN_ID: 'stx_memory',
   MEMORY_EMBED_TASK: 'memory_embed',
   MEMORY_RERANK_TASK: 'memory_rerank',
-  LlmMemoryExtractor: class {
-    extract(input: { sources: SourceBlock[]; existingMemoryContext?: readonly ExistingMemoryContextItem[] }): Promise<[]> {
-      state.extractCalls += 1;
-      state.lastExtractSources = [...input.sources];
-      state.lastExtractExistingMemoryContext = [...(input.existingMemoryContext ?? [])];
-      return new Promise((resolve) => { state.release = () => resolve([]); });
-    }
-  },
   StructuredMemoryCaptureExtractor: class {
     extract(input: { sources: SourceBlock[]; existingMemoryContext?: readonly ExistingMemoryContextItem[] }): Promise<[]> {
       state.extractCalls += 1;
@@ -689,7 +681,6 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       summaryOverlapFloors: 3,
       maxRecallItems: 6,
       promptMaxChars: 6_000,
-      answerMode: 'diagnostic' as const,
       recallMode: 'lexical' as const,
       rerankMode: 'off' as const,
       preExtractReferenceEnabled: false,
@@ -1230,35 +1221,6 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     app.stop();
   });
 
-  it('把宿主实际注入的完整 Prompt 回写到同一条召回日志', async () => {
-    const { MemoryApplication } = await import('../src/application/memory-application');
-    const repository = new FakeRepository();
-    const app = new MemoryApplication(repository as never);
-    connectHost(app);
-    await app.start();
-
-    const recall = await app.recall.preview({ query: '核验最早储备' });
-    const prompt = '<memory_context>\n真实注入文本\n</memory_context>';
-    await app.recordPromptInjection({
-      injected: true,
-      recall,
-      prompt,
-      promptDiagnostics: {
-        maxChars: 8_000,
-        usedChars: prompt.length,
-        includedCount: 1,
-        omittedCount: 0,
-        answerMode: 'diagnostic',
-      },
-    });
-
-    expect(repository.recallLog).toMatchObject({
-      injectedPrompt: prompt,
-      promptDiagnostics: { usedChars: prompt.length, answerMode: 'diagnostic' },
-    });
-    app.stop();
-  });
-
   it('按 workspace/chatKey 隔离三态覆盖，聊天切换后刷新，并在恢复默认时清空全部覆盖', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const repository = new FakeRepository();
@@ -1388,6 +1350,127 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     expect(repository.settings.get('summaryProgressByChat')).toEqual({
       'chat-b': { completedFloor: 8, completedMessageId: 'message:8', updatedAt: 10 },
     });
+    app.stop();
+  });
+
+  it('Agent 阶段失败保留上一检查点，并在手动重试时只执行失败阶段', async () => {
+    state.sources = [message(1)];
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    await app.start();
+    attachClaimCapture(app, repository);
+    vi.spyOn(app, 'bindCurrentChat').mockResolvedValue();
+    const internal = app as any;
+    const original = internal.actorCapture.capture;
+    const failure = { reasonCode: 'AUTH_FAILED', requestId: 'req:auth', stage: 'llm.provider.http' };
+    let failed = false;
+    const capture = vi.fn(async (input: any) => {
+      const result = await original(input);
+      if (failed) return result;
+      failed = true;
+      return { ...result, audit: { failedStage: { stage: 'content', failure } } };
+    });
+    internal.actorCapture.capture = capture;
+    await expect(app.initialize(['message'])).rejects.toMatchObject({ details: { reasonCode: 'AUTH_FAILED', requestId: 'req:auth' } });
+    expect(repository.jobs.at(-1)).toMatchObject({ status: 'paused', checkpoint: { batchIndex: 0, processedCount: 0, retryStage: 'content' }, failure });
+    await app.retry();
+    expect(capture).toHaveBeenCalledTimes(2);
+    expect(capture.mock.calls[1]![0]).toMatchObject({ stage: 'content', idempotencyKey: expect.stringContaining(':stage:content') });
+    expect(repository.jobs.at(-1)).toMatchObject({ status: 'completed', checkpoint: { batchIndex: 1, processedCount: 1 } });
+    expect(repository.jobs.at(-1)?.checkpoint).not.toHaveProperty('retryStage');
+    app.stop();
+  });
+
+  it('手动 Capture 保留合法阶段的结果，并向调用方传播失败阶段根因', async () => {
+    state.sources = [message(1)];
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    await app.start();
+    attachClaimCapture(app, repository);
+    const internal = app as any;
+    const original = internal.actorCapture.capture;
+    const failure = { reasonCode: 'AUTH_FAILED', requestId: 'req:direct-auth', stage: 'llm.provider.http' };
+    internal.actorCapture.capture = async (input: any) => ({ ...await original(input), audit: { failedStage: { stage: 'content', failure } } });
+    const finalize = vi.spyOn(internal, 'finalizeActorCaptureResults').mockResolvedValue(undefined);
+    await expect(app.captureActors()).rejects.toMatchObject({ details: failure });
+    expect(finalize).toHaveBeenCalledOnce();
+    app.stop();
+  });
+
+  it('清空当前聊天先取消在途 Capture，再删除数据并使生成作用域失效', async () => {
+    state.sources = [message(1)];
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    await app.start();
+    attachClaimCapture(app, new FakeRepository(), { block: true });
+    const internal = app as any;
+    const clear = vi.fn(async () => undefined);
+    internal.multiActorRepository.clearCurrentChatData = clear;
+    const scopeRevision = internal.generationScopeRevision;
+    const pending = app.captureActors().catch(error => error);
+    await vi.waitFor(() => expect(state.release).toBeTypeOf('function'));
+    const controller = internal.captureAbortController;
+    const clearing = app.clearCurrentChatData();
+    expect(controller.signal.aborted).toBe(true);
+    expect(clear).not.toHaveBeenCalled();
+    state.release!();
+    await pending;
+    await clearing;
+    expect(clear).toHaveBeenCalledOnce();
+    expect(internal.generationScopeRevision).toBeGreaterThan(scopeRevision);
+    expect(internal.lastPreparedGeneration).toBeNull();
+    app.stop();
+  });
+
+  it('暴露记录写入期间切换聊天会拒绝已准备的旧聊天 Prompt', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    let chatKey = 'chat-a';
+    app.useHostContext({ getChatKey: () => chatKey, getWorkspaceId: () => 'character:c1', collectSources: async () => [] });
+    const internal = app as any;
+    let release!: () => void;
+    internal.actorRegistry = {};
+    internal.multiActorRepository = { boundWorkspaceId: 'character:c1', boundChatKey: 'chat-a', upsertDerived: () => new Promise<void>(resolve => { release = resolve; }) };
+    internal.generationMemoryCoordinator = { prepareGenerationMemory: async () => ({
+      sceneState: {}, sceneCast: {}, prompt: { prompt: 'private A', includedTraceIds: [] },
+      recalled: { request: { workspaceId: 'character:c1', chatKey: 'chat-a', scene: { floor: 1 } }, world: { packets: [] }, narrator: { packets: [] }, actors: [] },
+    }) };
+    const pending = app.buildActorMemoryPrompt({ query: 'question' });
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    chatKey = 'chat-b';
+    release();
+    await expect(pending).rejects.toMatchObject({ details: { reasonCode: 'MEMORY_STALE_GENERATION_SCOPE' } });
+    app.stop();
+  });
+
+  it('角色事实读取迟到时不会覆盖新聊天的索引和绑定', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const repository = new FakeRepository();
+    const app = new MemoryApplication(repository as never);
+    let chatKey = 'chat-a';
+    app.useHostContext({ getChatKey: () => chatKey, getWorkspaceId: () => 'character:c1', collectSources: async () => [] });
+    await app.start();
+    attachClaimCapture(app, repository);
+    const internal = app as any;
+    (repository as any).workspace = undefined;
+    let release!: (facts: MemoryFact[]) => void;
+    internal.multiActorRepository.listFacts = vi.fn()
+      .mockImplementationOnce(() => new Promise<MemoryFact[]>(resolve => { release = resolve; }))
+      .mockResolvedValueOnce([fact('fact-b', 'B')]);
+    const replace = vi.spyOn(internal.recallIndex, 'replace');
+    const stale = app.bindCurrentChat();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    chatKey = 'chat-b';
+    await app.bindCurrentChat();
+    release([fact('fact-a', 'A')]);
+    await stale;
+    expect(internal.boundChatKey).toBe('chat-b');
+    expect(replace).toHaveBeenLastCalledWith([expect.objectContaining({ id: 'fact-b' })]);
     app.stop();
   });
 
@@ -1548,6 +1631,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       _input: { readonly idempotencyKey: string },
     ) => ({
       acceptedLocalIds: { actor: [], location: [], episode: [], claim: ['claim:fixed'] },
+      repairDecisions: [{ repairId: 'repair:commit-retry', action: 'emit', localId: 'claim:fixed', sourceRefs: ['message:1'] }],
       rejections: [],
       audit: { requestId: 'request:fixed' },
     }));
@@ -1606,6 +1690,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
       .mockRejectedValueOnce(createSSHelperError('HTTP_CONNECT_FAILED', { stage: 'llm.provider.connect' }))
       .mockResolvedValueOnce({
         acceptedLocalIds: { actor: [], location: [], episode: [], claim: ['claim:fixed'] },
+        repairDecisions: [{ repairId: 'repair:cancelled', action: 'emit', localId: 'claim:fixed', sourceRefs: ['message:1'] }],
         rejections: [],
         audit: { requestId: 'request:fixed' },
       });
@@ -1777,6 +1862,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     };
     const executeActorCapture = vi.fn(async () => ({
       acceptedLocalIds: { actor: [], location: [], episode: ['episode:fixed'], claim: [] },
+      repairDecisions: [{ repairId: 'repair:legacy-second', action: 'emit', localId: 'episode:fixed', sourceRefs: ['message:1'] }],
       rejections: [],
       resolutionMode: 'degraded' as const,
       fieldActions: [{ path: 'episodes[0].locationRef', action: 'clear' as const, reason: '无来源支持' }],

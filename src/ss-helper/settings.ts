@@ -21,7 +21,6 @@ import { DEFAULT_CAST_SETTINGS, type CastPlanningSettings, type MemoryGraphStatu
 
 export interface MemorySettings extends MemoryCapabilitySettings, CastPlanningSettings {
   extractionMode: 'single' | 'agent';
-  agentConcurrency: 1 | 2;
   agentToolPolicy: 'off' | 'read_only';
   summaryBatchMode: 'floors' | 'chars';
   summaryBatchFloors: number;
@@ -30,7 +29,6 @@ export interface MemorySettings extends MemoryCapabilitySettings, CastPlanningSe
   summaryOverlapFloors: number;
   maxRecallItems: number;
   promptMaxChars: number;
-  answerMode: 'auto' | 'roleplay' | 'diagnostic';
   preExtractReferenceEnabled: boolean;
   preExtractReferenceItems: number;
   preExtractReferenceMode: 'auto' | 'lexical' | 'vector' | 'hybrid';
@@ -51,7 +49,6 @@ export const MEMORY_DEFAULT_SETTINGS: Readonly<MemorySettings> = Object.freeze({
   enabled: true,
   autoOrganize: true,
   extractionMode: 'single',
-  agentConcurrency: 2,
   agentToolPolicy: 'off',
   summaryBatchMode: 'chars',
   summaryBatchFloors: 16,
@@ -60,7 +57,6 @@ export const MEMORY_DEFAULT_SETTINGS: Readonly<MemorySettings> = Object.freeze({
   summaryOverlapFloors: 1,
   maxRecallItems: 12,
   promptMaxChars: 8_000,
-  answerMode: 'auto',
   recallMode: 'auto',
   rerankMode: 'adaptive',
   preExtractReferenceEnabled: true,
@@ -103,14 +99,12 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
         { kind: 'radio', id: 'extractionMode', label: '提取模式', options: [
           { value: 'single', label: '单次提取' }, { value: 'agent', label: 'Agent 多阶段' },
         ], defaultValue: 'single' },
-        { kind: 'radio', id: 'agentConcurrency', label: 'Agent 并发', options: [
-          { value: '1', label: '1' }, { value: '2', label: '2' },
-        ], defaultValue: '2', description: '实体阶段完成后运行一次内容与库存联合提取；最多 2 轮只读工具。' },
         { kind: 'radio', id: 'agentToolPolicy', label: '只读工具', options: [
           { value: 'off', label: '关闭' }, { value: 'read_only', label: '按需使用' },
-        ], defaultValue: 'off', description: '最多 2 轮、每轮 4 次、总计 6 次；工具结果不是证据。' },
+        ], defaultValue: 'off', description: '开启 Agent 前先选择按需使用；单次提取不调用工具。最多 2 轮、每轮 4 次、总计 6 次；工具结果不是证据。' },
         { kind: 'status', id: 'agentSafetyStatus', label: '安全边界', value: '正在同步', tone: 'neutral' },
       ] },
+      { kind: 'section', id: 'summaryTuning', label: '高级：批次与自动触发', collapsible: true, children: [
       { kind: 'select', id: 'summaryBatchMode', label: '分批方式', options: [
         { value: 'chars', label: '字符优先（推荐）' }, { value: 'floors', label: '楼层优先' },
       ], defaultValue: 'chars' },
@@ -118,11 +112,12 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
       { kind: 'range', id: 'summaryBatchChars', label: '单批字符上限', description: '每次模型请求最多携带的正文字符；超长消息会独立拆分。', min: 2_000, max: 16_000, step: 500, defaultValue: 16_000 },
       { kind: 'range', id: 'summaryIntervalFloors', label: '自动触发间隔', description: '已总结边界后每积累多少楼层形成一个窗口；默认每轮生成后捕获一次。', min: 1, max: 50, step: 1, defaultValue: 1 },
       { kind: 'range', id: 'summaryOverlapFloors', label: '前置重叠层数', description: '每个总结窗口额外携带的只读上下文楼层数，默认 1 层。', min: 0, max: 10, step: 1, defaultValue: 1 },
+      ] },
       { kind: 'status', id: 'summaryProgress', label: '当前聊天总结进度', value: '正在同步', tone: 'neutral' },
     ] },
     { kind: 'section', id: 'routing', label: '模型路由', children: [
-      { kind: 'section', id: 'taskRoutingConfiguration', label: '分任务模型', description: '分别选择八个记忆场景使用的生成资源；每个场景按 execution 进入对应执行链。', children: [
-        { kind: 'action', id: 'taskRouting', label: '配置分任务模型', description: '选择自动路由或为每项任务指定已添加的生成资源。', actionId: 'open-task-routing', popup: MEMORY_TASK_ROUTING_POPUP, placement: 'inline', buttonLabel: '配置' },
+      { kind: 'section', id: 'taskRoutingConfiguration', label: '分任务模型', description: '为提取、规划、召回、向量和重排八个场景分别选择对应类型的资源。', children: [
+        { kind: 'action', id: 'taskRouting', label: '配置分任务模型', description: '选择自动路由或为每项任务指定资源。', actionId: 'open-task-routing', popup: MEMORY_TASK_ROUTING_POPUP, placement: 'inline', buttonLabel: '配置' },
         { kind: 'status', id: 'agentRouteSingle', label: '单次提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
         { kind: 'status', id: 'agentRouteEntities', label: '实体提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
         { kind: 'status', id: 'agentRouteContent', label: '内容与库存提取', value: '正在同步', tone: 'neutral', action: MEMORY_TASK_ROUTING_ACTION },
@@ -137,6 +132,8 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
       { kind: 'select', id: 'castPlanningMode', label: '选角模式', options: [
         { value: 'fast', label: '快速模式' }, { value: 'hybrid', label: '混合模式（推荐）' }, { value: 'director', label: '强导演模式' },
       ], defaultValue: 'hybrid', description: '快速模式零额外模型调用；混合模式按需调用；强导演模式每轮最多调用一次。' },
+      { kind: 'toggle', id: 'provisionalActorEnabled', label: '允许导演提议临时人物', description: '须在正式正文实际出现后才创建待确认人物，不会直接写入正式人物库。', defaultValue: true },
+      { kind: 'section', id: 'castTuning', label: '高级：角色范围与权限', collapsible: true, children: [
       { kind: 'range', id: 'focusLookbackFloors', label: '近焦点窗口', description: '用于判断直接追问、上一发言者与当前对话焦点。', min: 1, max: 12, step: 1, defaultValue: 4 },
       { kind: 'range', id: 'actorScanLookbackFloors', label: '场景线索窗口', description: '只发现新人物、进入离开和地点变化；不会据此让沉默人物自动离场。', min: 4, max: 40, step: 1, defaultValue: 12 },
       { kind: 'toggle', id: 'persistPresenceUntilTransition', label: '持续保持在场', description: '角色只有明确离场或场景切换时才从当前场景移除。', defaultValue: true },
@@ -148,19 +145,9 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
       { kind: 'select', id: 'backgroundActorRecall', label: '背景在场角色权限', options: [
         { value: 'public_only', label: '仅公开信息' }, { value: 'identity_only', label: '仅身份信息' }, { value: 'none', label: '不召回' },
       ], defaultValue: 'identity_only' },
-      { kind: 'toggle', id: 'provisionalActorEnabled', label: '允许临时人物', description: '导演只能提议；必须在正式正文实际出现后才创建待确认人物。', defaultValue: true },
-      { kind: 'toggle', id: 'plannerCanProposeActors', label: '导演可提议新人物', description: '不会直接写入正式人物库。', defaultValue: true },
-      { kind: 'select', id: 'unplannedActorPolicy', label: '意外角色策略', options: [
-        { value: 'allow_public_only', label: '允许出现，仅公开信息' }, { value: 'allow_without_private_memory', label: '允许出现，不提供私密记忆' }, { value: 'regenerate_once', label: '严格模式：重生成一次' },
-      ], defaultValue: 'allow_public_only' },
-      { kind: 'select', id: 'maxPlannerCallsPerTurn', label: '每轮导演调用上限', options: [
-        { value: '0', label: '不调用' }, { value: '1', label: '最多一次' },
-      ], defaultValue: '1' },
+      ] },
     ] },
     { kind: 'section', id: 'recall', label: '召回', children: [
-      { kind: 'select', id: 'answerMode', label: '回答模式', options: [
-        { value: 'auto', label: '自动' }, { value: 'roleplay', label: '角色扮演' }, { value: 'diagnostic', label: '诊断' },
-      ], defaultValue: 'auto' },
       { kind: 'range', id: 'maxRecallItems', label: '召回条数', description: '单次最多注入的记忆数量。', min: 4, max: 30, step: 1, defaultValue: 12 },
       { kind: 'range', id: 'promptMaxChars', label: 'Prompt 字符预算', description: '单次记忆注入可使用的最大字符数。', min: 2_000, max: 16_000, step: 500, defaultValue: 8_000 },
       { kind: 'select', id: 'recallMode', label: '召回模式', options: [
@@ -173,7 +160,7 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
       { kind: 'status', id: 'rerankStatus', label: '重排序模型', value: '正在同步', tone: 'neutral', action: MEMORY_LLM_RESOURCE_ACTION },
     ] },
     { kind: 'section', id: 'advanced', label: '高级', children: [
-      { kind: 'section', id: 'preExtractReference', label: '提取前参考旧记忆', description: '旧记忆只帮助判断重复、补充或状态变化，不能作为新事实的来源证据。', children: [
+      { kind: 'section', id: 'preExtractReference', collapsible: true, label: '提取前参考旧记忆', description: '旧记忆只帮助判断重复、补充或状态变化，不能作为新事实的来源证据。', children: [
         { kind: 'toggle', id: 'preExtractReferenceEnabled', label: '提取前参考旧记忆', description: '每批整理前检索当前聊天中相关的已存事实；检索不可用时仍会按当前聊天内容继续整理。', defaultValue: true },
         { kind: 'range', id: 'preExtractReferenceItems', label: '参考条数', description: '每批最多提供多少条相关旧事实供提取器对照。', min: 1, max: 10, step: 1, defaultValue: 8 },
         { kind: 'select', id: 'preExtractReferenceMode', label: '检索方式', description: '自动优先综合语义和关键词；向量不可用时会回退到关键词。', options: [
@@ -181,13 +168,13 @@ export const MEMORY_SETTINGS_SCHEMA = Object.freeze({
         ], defaultValue: 'auto' },
         { kind: 'range', id: 'preExtractReferenceMaxChars', label: '上下文字符上限', description: '发送给提取器的旧记忆正文总字符数上限；不会截断单条事实。', min: 500, max: 4_000, step: 100, defaultValue: 2_400 },
       ] },
-      { kind: 'section', id: 'structuredRepair', label: '结构化修复', description: '集中处理格式失败项；只发送安全校验位置和相关楼层，不重发整个失败 JSON。', children: [
+      { kind: 'section', id: 'structuredRepair', collapsible: true, label: '结构化修复', description: '集中处理格式失败项；只发送安全校验位置和相关楼层，不重发整个失败 JSON。', children: [
         { kind: 'toggle', id: 'structuredRepairEnabled', label: '自动处理格式失败', description: '普通批次全部扫描后，自动对可定位的失败项进行一次定向修复。', defaultValue: true },
         { kind: 'range', id: 'structuredRepairBeforeFloors', label: '向前补充楼层', description: '定向修复时在来源楼层前附带的上下文层数。', min: 0, max: 10, step: 1, defaultValue: 2 },
         { kind: 'range', id: 'structuredRepairAfterFloors', label: '向后补充楼层', description: '定向修复时在来源楼层后附带的上下文层数。', min: 0, max: 10, step: 1, defaultValue: 2 },
         { kind: 'range', id: 'structuredRepairMaxItems', label: '单次修复项目数', description: '同类型且来源窗口重叠时，每次最多合并 8 个失败项目，并受 8,000 Token 安全上限约束。', min: 1, max: 8, step: 1, defaultValue: 8 },
       ] },
-      { kind: 'section', id: 'relationshipGraph', label: '关系图谱', description: '仅从当前聊天中已验证、带证据的事实派生关系；不会把语义相似度当作实体关系。', children: [
+      { kind: 'section', id: 'relationshipGraph', collapsible: true, label: '关系图谱', description: '仅从当前聊天中已验证、带证据的事实派生关系；不会把语义相似度当作实体关系。', children: [
         { kind: 'toggle', id: 'graphEnabled', label: '启用关系图谱', description: '在后台回填当前聊天的事实关系图；图谱不可用时，整理和普通召回仍会继续。', defaultValue: true },
         { kind: 'toggle', id: 'graphLlmRelationEnabled', label: '提炼明确关系', description: '仅提示同一次事实提取识别来源中明确说出的关系，仍须通过来源证据与归并校验。', defaultValue: true },
         { kind: 'range', id: 'graphMaxHops', label: '关联跳数', description: '召回时最多沿已验证关系扩展一到两跳。', min: 1, max: 2, step: 1, defaultValue: 1 },
@@ -241,11 +228,11 @@ export interface MemorySettingsStatusSource {
 }
 
 function fromValues(values: SettingsValues, fallback: MemorySettings): MemorySettings {
+  values = { ...toValues(fallback), ...values };
   return {
     enabled: values.enabled === undefined ? fallback.enabled : values.enabled === true,
     autoOrganize: values.autoOrganize === undefined ? fallback.autoOrganize : values.autoOrganize === true,
     extractionMode: values.extractionMode === 'agent' ? 'agent' : 'single',
-    agentConcurrency: values.agentConcurrency === '1' ? 1 : 2,
     agentToolPolicy: values.agentToolPolicy === 'read_only' ? 'read_only' : 'off',
     summaryBatchMode: values.summaryBatchMode === 'chars' ? 'chars' : 'floors',
     summaryBatchFloors: typeof values.summaryBatchFloors === 'number' ? Math.min(16, Math.max(1, Math.trunc(values.summaryBatchFloors))) : fallback.summaryBatchFloors,
@@ -254,14 +241,13 @@ function fromValues(values: SettingsValues, fallback: MemorySettings): MemorySet
     summaryOverlapFloors: typeof values.summaryOverlapFloors === 'number' ? Math.min(10, Math.max(0, Math.trunc(values.summaryOverlapFloors))) : fallback.summaryOverlapFloors,
     maxRecallItems: typeof values.maxRecallItems === 'number' ? values.maxRecallItems : fallback.maxRecallItems,
     promptMaxChars: typeof values.promptMaxChars === 'number' ? values.promptMaxChars : fallback.promptMaxChars,
-    answerMode: values.answerMode === 'roleplay' || values.answerMode === 'diagnostic' ? values.answerMode : 'auto',
     recallMode: values.recallMode === 'lexical' || values.recallMode === 'vector' || values.recallMode === 'hybrid' ? values.recallMode : 'auto',
     rerankMode: values.rerankMode === 'off' || values.rerankMode === 'always' ? values.rerankMode : 'adaptive',
     preExtractReferenceEnabled: values.preExtractReferenceEnabled === undefined ? fallback.preExtractReferenceEnabled : values.preExtractReferenceEnabled === true,
     preExtractReferenceItems: typeof values.preExtractReferenceItems === 'number'
       ? Math.min(10, Math.max(1, Math.trunc(values.preExtractReferenceItems)))
       : fallback.preExtractReferenceItems,
-    preExtractReferenceMode: values.preExtractReferenceMode === 'lexical' || values.preExtractReferenceMode === 'vector' || values.preExtractReferenceMode === 'hybrid'
+    preExtractReferenceMode: values.preExtractReferenceMode === 'auto' || values.preExtractReferenceMode === 'lexical' || values.preExtractReferenceMode === 'vector' || values.preExtractReferenceMode === 'hybrid'
       ? values.preExtractReferenceMode
       : fallback.preExtractReferenceMode,
     preExtractReferenceMaxChars: typeof values.preExtractReferenceMaxChars === 'number'
@@ -291,11 +277,9 @@ function fromValues(values: SettingsValues, fallback: MemorySettings): MemorySet
     plannerConfidenceThreshold: typeof values.plannerConfidenceThreshold === 'number' ? Math.min(0.95, Math.max(0.5, values.plannerConfidenceThreshold)) : fallback.plannerConfidenceThreshold,
     likelyActorRecall: values.likelyActorRecall === 'identity_only' || values.likelyActorRecall === 'none' ? values.likelyActorRecall : 'public_only',
     backgroundActorRecall: values.backgroundActorRecall === 'public_only' || values.backgroundActorRecall === 'none' ? values.backgroundActorRecall : 'identity_only',
-    mentionedActorRecall: 'none',
     provisionalActorEnabled: values.provisionalActorEnabled === undefined ? fallback.provisionalActorEnabled : values.provisionalActorEnabled === true,
-    plannerCanProposeActors: values.plannerCanProposeActors === undefined ? fallback.plannerCanProposeActors : values.plannerCanProposeActors === true,
-    unplannedActorPolicy: values.unplannedActorPolicy === 'allow_without_private_memory' || values.unplannedActorPolicy === 'regenerate_once' ? values.unplannedActorPolicy : 'allow_public_only',
-    maxPlannerCallsPerTurn: values.maxPlannerCallsPerTurn === '0' ? 0 : 1,
+    plannerCanProposeActors: values.provisionalActorEnabled === true,
+    maxPlannerCallsPerTurn: values.castPlanningMode === 'fast' ? 0 : 1,
     chatMode: values.chatMode === 'enabled' || values.chatMode === 'disabled' ? values.chatMode : 'inherit',
   };
 }
@@ -310,14 +294,13 @@ function toValues(settings: MemorySettings): SettingsValues {
     enabled: settings.enabled,
     autoOrganize: settings.autoOrganize,
     extractionMode: settings.extractionMode,
-    agentConcurrency: String(settings.agentConcurrency),
     agentToolPolicy: settings.agentToolPolicy,
     summaryBatchMode: settings.summaryBatchMode,
     summaryBatchFloors: settings.summaryBatchFloors,
     summaryBatchChars: settings.summaryBatchChars,
     summaryIntervalFloors: settings.summaryIntervalFloors,
     summaryOverlapFloors: settings.summaryOverlapFloors,
-    castPlanningMode: settings.castPlanningMode,
+    castPlanningMode: settings.maxPlannerCallsPerTurn === 0 ? 'fast' : settings.castPlanningMode,
     focusLookbackFloors: settings.focusLookbackFloors,
     actorScanLookbackFloors: settings.actorScanLookbackFloors,
     persistPresenceUntilTransition: settings.persistPresenceUntilTransition,
@@ -325,11 +308,7 @@ function toValues(settings: MemorySettings): SettingsValues {
     plannerConfidenceThreshold: settings.plannerConfidenceThreshold,
     likelyActorRecall: settings.likelyActorRecall,
     backgroundActorRecall: settings.backgroundActorRecall,
-    provisionalActorEnabled: settings.provisionalActorEnabled,
-    plannerCanProposeActors: settings.plannerCanProposeActors,
-    unplannedActorPolicy: settings.unplannedActorPolicy,
-    maxPlannerCallsPerTurn: String(settings.maxPlannerCallsPerTurn),
-    answerMode: settings.answerMode,
+    provisionalActorEnabled: settings.provisionalActorEnabled && settings.plannerCanProposeActors,
     maxRecallItems: settings.maxRecallItems,
     promptMaxChars: settings.promptMaxChars,
     recallMode: settings.recallMode,
@@ -379,7 +358,7 @@ function chatStatuses(controller: MemorySettingsController, agentAvailable = tru
     graphStatus: !graph
       ? { value: '等待协调', tone: 'neutral', description: '关系图谱会在后台根据已验证事实回填。' }
       : graph.phase === 'degraded'
-        ? { value: '已降级', tone: 'warning', description: graph.lastError ? '图谱本轮不可用，普通整理和召回不受影响。' : '图谱本轮不可用，普通整理和召回不受影响。' }
+        ? { value: '已降级', tone: 'warning', description: '图谱本轮不可用，普通整理和召回不受影响。' }
         : graph.phase === 'disabled'
           ? { value: '已关闭', tone: 'neutral', description: '当前设置未启用关系图谱。' }
           : { value: graph.phase === 'ready' ? `已就绪（${graph.edgeCount} 条边）` : graph.phase === 'rebuilding' ? '重建中' : graph.phase === 'queued' ? '已排队' : '等待协调', tone: graph.phase === 'ready' ? 'success' : 'neutral', description: '仅展示当前聊天中有来源证据的事实关系，不将语义相似度视为实体关系。' },
@@ -394,21 +373,21 @@ function fieldState(controller: MemorySettingsController): SettingsFieldStateMap
     chatMode: chat.available
       ? Object.freeze({ disabled: false })
       : Object.freeze({ disabled: true, disabledReason: '请先进入角色或群组聊天，再修改当前聊天设置。' }),
-    summaryBatchFloors: summary.summaryBatchMode === 'floors'
-      ? Object.freeze({ disabled: false })
-      : Object.freeze({ disabled: true, disabledReason: '当前选择“按字数”分批；此项不会参与总结。' }),
+    summaryBatchFloors: Object.freeze({ disabled: false }),
+    summaryIntervalFloors: { disabled: false, hidden: !summary.autoOrganize },
+    plannerConfidenceThreshold: { disabled: false, hidden: summary.castPlanningMode !== 'hybrid' || summary.maxPlannerCallsPerTurn === 0 },
+    provisionalActorEnabled: { disabled: false, hidden: summary.castPlanningMode === 'fast' || summary.maxPlannerCallsPerTurn === 0 },
+    ...Object.fromEntries([
+      ...(!summary.preExtractReferenceEnabled ? ['preExtractReferenceItems', 'preExtractReferenceMode', 'preExtractReferenceMaxChars'] : []),
+      ...(!summary.structuredRepairEnabled ? ['structuredRepairBeforeFloors', 'structuredRepairAfterFloors', 'structuredRepairMaxItems'] : []),
+      ...(!summary.graphEnabled ? ['graphLlmRelationEnabled', 'graphMaxHops', 'graphMaxEdges', 'graphWorkbench'] : []),
+    ].map((id) => [id, { disabled: false, hidden: true }])),
     summaryBatchChars: Object.freeze({ disabled: false }),
-    graphWorkbench: !chat.available
+    graphWorkbench: !summary.graphEnabled ? { disabled: false, hidden: true } : !chat.available
       ? Object.freeze({ disabled: true, disabledReason: '请先进入角色或群组聊天，再重建关系图谱。' })
       : !chat.effectiveEnabled
         ? Object.freeze({ disabled: true, disabledReason: '当前聊天未启用记忆，不能重建关系图谱。' })
         : Object.freeze({ disabled: false }),
-    agentConcurrency: summary.extractionMode === 'agent'
-      ? Object.freeze({ disabled: false })
-      : Object.freeze({ disabled: true, disabledReason: '仅 Agent 模式使用阶段并发。' }),
-    agentToolPolicy: summary.extractionMode === 'agent'
-      ? Object.freeze({ disabled: false })
-      : Object.freeze({ disabled: true, disabledReason: '仅 Agent 模式配置只读工具。' }),
   });
 }
 

@@ -43,10 +43,10 @@ describe('ActualCastReconciler', () => {
       perspective: { speakerOwnerRef: c.id, presentOwnerRefs: [a.id, c.id] },
       transition: { enteredOwnerRefs: [c.id] },
     });
-    const result = await reconciler.reconcile({ plan: plan(a.id), sources: [generated], generatedSource: generated, currentFloor: 11, unplannedActorPolicy: 'allow_public_only', now: 11 });
+    const result = await reconciler.reconcile({ plan: plan(a.id), sources: [generated], generatedSource: generated, currentFloor: 11, now: 11 });
     expect(result.unplannedOwnerIds).toContain(c.id);
     expect(result.state.presentOwnerIds).toEqual(expect.arrayContaining([a.id, c.id]));
-    expect(result.audit).toMatchObject({ result: 'partial', leakageRisk: false });
+    expect(result.audit).toMatchObject({ result: 'partial' });
     expect(saveAudit).toHaveBeenCalledTimes(1);
   });
 

@@ -1,4 +1,4 @@
-import { FIXED_OWNER_IDS, type CastPlanAudit, type GenerationCastPlan, type SceneState, type SceneTransition, type UnplannedActorPolicy } from '../../domain';
+import { FIXED_OWNER_IDS, type CastPlanAudit, type GenerationCastPlan, type SceneState, type SceneTransition } from '../../domain';
 import type { SourceBlock } from '../ingest/types';
 import { ActiveCastResolver } from './active-cast-resolver';
 import { ActorRegistry } from './actor-registry';
@@ -10,7 +10,6 @@ export interface ActualCastReconcileInput {
   readonly sources: readonly SourceBlock[];
   readonly generatedSource: SourceBlock;
   readonly currentFloor: number;
-  readonly unplannedActorPolicy?: UnplannedActorPolicy;
   readonly now?: number;
 }
 
@@ -72,9 +71,6 @@ export class ActualCastReconciler {
       unplannedOwnerIds,
       missingOwnerIds,
       result,
-      // Regardless of policy, an unplanned actor had no private partition in
-      // this generation. Flag it for inspection rather than claiming it read one.
-      leakageRisk: unplannedOwnerIds.length > 0 && input.unplannedActorPolicy === 'regenerate_once',
       createdAt: now,
     };
     await this.dependencies.saveAudit(audit);

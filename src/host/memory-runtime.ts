@@ -9,6 +9,7 @@ import {
   type GenerationSnapshot,
   type PlainData,
   type PluginSession,
+  type PromptMessageSnapshot,
   type SettingsStatusSnapshot,
 } from '@ss-helper/sdk';
 import {
@@ -18,7 +19,6 @@ import {
 } from '../application/memory-application';
 import { MEMORY_WORKSPACE_RECOVERY_POPUP, registerMemoryContributions, type MemoryHostCapability } from '../ss-helper/plugin';
 import { renderMemoryWorkbench } from '../ui/memory-ui';
-import { buildMemoryPromptContribution } from './prompt-injection';
 import { logger, safeMemoryFailure, traceMemoryStartup } from './runtime-feedback';
 import { captureMainChatUsage } from './main-chat-usage';
 import { SdkMemoryHostContext } from './sdk-host-context';
@@ -51,6 +51,7 @@ export class MemoryRuntime {
   private readonly context: SdkMemoryHostContext;
   private readonly disposers: Array<() => void> = [];
   private lastUserMessageAt = 0;
+  private promptRevision = 0;
   private rebindPromise: Promise<void> = Promise.resolve();
   private rebindPending = false;
   private rebindRequested = false;
@@ -358,6 +359,7 @@ export class MemoryRuntime {
   private bindHostEvents(capabilityMonitor: MemoryLlmCapabilityMonitor): void {
     const events = this.session.host.events;
     this.disposers.push(events.subscribe('chat-changed', (event) => {
+      this.promptRevision += 1;
       this.context.setChatKey(event.chatKey);
       this.lastUserMessageAt = 0;
       this.lastFinalPromptSnapshot = null;
@@ -381,6 +383,8 @@ export class MemoryRuntime {
         ));
     }));
     this.disposers.push(events.subscribe('identity-changed', () => {
+      this.promptRevision += 1;
+      void this.session.host.prompt.remove(MEMORY_PROMPT_ID).catch(() => undefined);
       void this.context.refresh()
         .then(() => {
           this.application.prepareCurrentChatLookupScope();
@@ -691,10 +695,18 @@ export class MemoryRuntime {
     return { messages, ...(latestAssistant === undefined ? {} : { latestAssistant }) };
   }
 
-  private async onPromptReady(messages: Parameters<typeof buildMemoryPromptContribution>[0]): Promise<void> {
+  private async onPromptReady(messages: readonly PromptMessageSnapshot[]): Promise<void> {
+    const revision = ++this.promptRevision;
+    const chatKey = this.context.getChatKey();
+    const workspaceId = this.context.getWorkspaceId();
+    const isCurrent = (): boolean => !this.stopped
+      && this.promptRevision === revision
+      && this.context.getChatKey() === chatKey
+      && this.context.getWorkspaceId() === workspaceId;
     // Retry the previous floor before a new generation plan can replace it.
     await this.flushPendingGenerationCompletion();
     await this.rebindPromise;
+    if (!isCurrent()) return;
     const settings = this.application.getEffectiveSettings();
     if (!settings.enabled || Date.now() - this.lastUserMessageAt > SEND_WINDOW_MS) {
       await this.session.host.prompt.remove(MEMORY_PROMPT_ID).catch(() => undefined);
@@ -702,51 +714,39 @@ export class MemoryRuntime {
     }
     try {
       const latestUser = [...messages].reverse().find((message) => message.role === 'user');
-      const actorBuilder = (this.application as unknown as { buildActorMemoryPrompt?: (input: { query: string; maxItems?: number; maxChars?: number }) => Promise<{ prompt: string }> }).buildActorMemoryPrompt?.bind(this.application);
-      if (actorBuilder) {
-        if (typeof latestUser?.content !== 'string' || !latestUser.content.trim()) {
-          await this.session.host.prompt.remove(MEMORY_PROMPT_ID);
-          return;
-        }
-        let actorInjection: { prompt: string };
-        try {
-          actorInjection = await actorBuilder({ query: latestUser.content.trim(), maxItems: settings.maxRecallItems, maxChars: settings.promptMaxChars });
-        } catch (error) {
-          await this.session.host.prompt.remove(MEMORY_PROMPT_ID).catch(() => undefined);
-          logger.warn(
-            'Prompt 记忆准备失败，已跳过本轮注入（stage=generation_memory_prepare）。',
-            safeMemoryFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.prompt.prepare' }),
-          );
-          return;
-        }
-        if (!actorInjection || typeof actorInjection.prompt !== 'string') {
-          await this.session.host.prompt.remove(MEMORY_PROMPT_ID).catch(() => undefined);
-          logger.warn('Prompt 记忆准备返回了非法结果，已跳过本轮注入（stage=prompt_result_validation）。', { code: 'MEMORY_PROMPT_RESULT_INVALID' });
-          return;
-        }
-        try {
-          if (actorInjection.prompt) await this.session.host.prompt.set({ id: MEMORY_PROMPT_ID, content: actorInjection.prompt, position: 0 });
-          else await this.session.host.prompt.remove(MEMORY_PROMPT_ID);
-        } catch (error) {
-          logger.warn(
-            'Prompt 记忆写入失败，已保留原始 Prompt（stage=host_prompt_set）。',
-            safeMemoryFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.prompt.set' }),
-          );
-        }
+      if (typeof latestUser?.content !== 'string' || !latestUser.content.trim()) {
+        await this.session.host.prompt.remove(MEMORY_PROMPT_ID);
         return;
       }
-      const injection = await buildMemoryPromptContribution(messages, this.application.recall, settings.maxRecallItems, {
-        maxChars: settings.promptMaxChars,
-        answerMode: settings.answerMode,
-        currentIdentity: (await this.session.host.persona.read()) ?? undefined,
-      });
-      if (injection.injected) {
-        await this.session.host.prompt.set({ id: MEMORY_PROMPT_ID, content: injection.prompt, position: 0 });
-      } else {
-        await this.session.host.prompt.remove(MEMORY_PROMPT_ID);
+      let actorInjection: { prompt: string };
+      try {
+        actorInjection = await this.application.buildActorMemoryPrompt({ query: latestUser.content.trim(), maxItems: settings.maxRecallItems, maxChars: settings.promptMaxChars });
+      } catch (error) {
+        if (!isCurrent()) return;
+        await this.session.host.prompt.remove(MEMORY_PROMPT_ID).catch(() => undefined);
+        logger.warn(
+          'Prompt 记忆准备失败，已跳过本轮注入（stage=generation_memory_prepare）。',
+          safeMemoryFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.prompt.prepare' }),
+        );
+        return;
       }
-      await this.application.recordPromptInjection(injection);
+      if (!isCurrent()) return;
+      if (!actorInjection || typeof actorInjection.prompt !== 'string') {
+        await this.session.host.prompt.remove(MEMORY_PROMPT_ID).catch(() => undefined);
+        logger.warn('Prompt 记忆准备返回了非法结果，已跳过本轮注入（stage=prompt_result_validation）。', { code: 'MEMORY_PROMPT_RESULT_INVALID' });
+        return;
+      }
+      try {
+        if (actorInjection.prompt) await this.session.host.prompt.set({ id: MEMORY_PROMPT_ID, content: actorInjection.prompt, position: 0 });
+        else await this.session.host.prompt.remove(MEMORY_PROMPT_ID);
+      } catch (error) {
+        logger.warn(
+          'Prompt 记忆写入失败，已保留原始 Prompt（stage=host_prompt_set）。',
+          safeMemoryFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.prompt.set' }),
+        );
+      }
     } catch (error) {
+      if (!isCurrent()) return;
       logger.warn(
         'Prompt 记忆注入失败，已保留原始 Prompt。',
         safeMemoryFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'memory.prompt.inject' }),

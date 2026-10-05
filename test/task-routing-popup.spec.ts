@@ -43,13 +43,6 @@ function resource(resourceId: string, label: string, available = true, type: 'ge
   };
 }
 
-function execution(taskKey: string): 'structured' | 'tool_turn' | 'embedding' | 'rerank' {
-  if (taskKey === 'memory_embed') return 'embedding';
-  if (taskKey === 'memory_rerank') return 'rerank';
-  if (taskKey === 'memory_extract_entities' || taskKey === 'memory_extract_content' || taskKey === 'memory_extract_content') return 'tool_turn';
-  return 'structured';
-}
-
 function statusSnapshot(
   revision: number,
   assignments: readonly LlmTaskRoutingAssignment[] = [],

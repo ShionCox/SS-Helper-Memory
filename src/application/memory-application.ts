@@ -1,7 +1,6 @@
 import { MemoryRepository, MultiActorMemoryRepository, type ChangeAudit } from '../infrastructure';
 import {
   createSSHelperError,
-  describeSSHelperFailure,
   readSSHelperFailure,
   SS_HELPER_DIAGNOSTICS,
   type SSHelperFailureContext,
@@ -62,7 +61,7 @@ import {
   visibleConversationMessages,
   type SummaryProgress,
 } from './ingest/summary-strategy';
-import type { SourceBlock, StructuredRepairDecision } from './ingest/types';
+import type { SourceBlock } from './ingest/types';
 import { buildEvidenceWindowHash } from './ingest/supported-evidence-directory';
 import { buildMatchedInventoryPrompt } from './inventory';
 import { selectSourceGroups, summarizeSourceGroups } from '../host/source-adapter';
@@ -164,7 +163,6 @@ const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   enabled: true,
   autoOrganize: true,
   extractionMode: 'single',
-  agentConcurrency: 2,
   agentToolPolicy: 'off',
   summaryBatchMode: DEFAULT_SUMMARY_STRATEGY.batchMode,
   summaryBatchFloors: DEFAULT_SUMMARY_STRATEGY.batchFloors,
@@ -173,7 +171,6 @@ const DEFAULT_SETTINGS: Readonly<MemoryGlobalSettings> = Object.freeze({
   summaryOverlapFloors: DEFAULT_SUMMARY_STRATEGY.overlapFloors,
   maxRecallItems: recallLimits.default,
   promptMaxChars: 8_000,
-  answerMode: 'auto',
   recallMode: 'auto',
   rerankMode: 'adaptive',
   preExtractReferenceEnabled: true,
@@ -347,7 +344,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   private boundScopeKey = '';
   private captureStartedAt = 0;
   private activeCaptureProgress: MemoryCaptureProgress | null = null;
-  private activeExtractionSnapshot: Pick<MemoryCaptureProgress, 'extractionMode' | 'agentConcurrency' | 'agentToolPolicy'> | null = null;
+  private activeExtractionSnapshot: Pick<MemoryCaptureProgress, 'extractionMode' | 'agentToolPolicy'> | null = null;
   private cancelRequested = false;
   private captureAbortController: AbortController | null = null;
   private initializationVectorSyncBarrier = false;
@@ -540,7 +537,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         const settings = this.getSettings();
         return {
           extractionMode: this.getExtractionRuntimeMode(),
-          agentConcurrency: settings.agentConcurrency,
           agentToolPolicy: settings.agentToolPolicy,
         };
       }, repository),
@@ -787,7 +783,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   /** Captures the current card/world/chat into the new multi-owner model. */
   async captureActors(): Promise<import('./actors').MultiActorCaptureResult> {
-    this.assertStorageAvailable('Capture');
+    this.assertStorageAvailable();
     if (this.actorCapturePromise) return this.actorCapturePromise;
     this.actorCapturePromise = this.runActorCapture().finally(() => {
       this.actorCapturePromise = null;
@@ -796,7 +792,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return this.actorCapturePromise;
   }
 
-  private assertStorageAvailable(operation: string): void {
+  private assertStorageAvailable(): void {
     if (this.sqliteAvailable) return;
     throw createSSHelperError(
       this.errorDiagnostic?.reasonCode ?? 'WORKSPACE_DATABASE_UNAVAILABLE',
@@ -811,6 +807,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     options: {
       captureJobId?: string;
       captureJob?: MemoryJob;
+      previousCheckpoint?: MemoryJob['checkpoint'];
       writableSourceRefs?: readonly string[];
       existingMemoryContext?: readonly import('./ingest/types').ExistingMemoryContextItem[];
       graphLlmRelationEnabled?: boolean;
@@ -842,6 +839,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         ...(options.includeHiddenMessageFloors === undefined ? {} : { includeHiddenMessageFloors: options.includeHiddenMessageFloors }),
         ...(options.captureJobId ? { captureJobId: options.captureJobId } : {}),
         ...(options.captureJob ? { captureJob: options.captureJob as unknown as Record<string, unknown> } : {}),
+        ...(options.previousCheckpoint ? { previousCheckpoint: options.previousCheckpoint } : {}),
         ...(options.writableSourceRefs === undefined ? {} : { writableSourceRefs: options.writableSourceRefs }),
         ...(options.existingMemoryContext === undefined ? {} : { existingMemoryContext: options.existingMemoryContext }),
         ...(options.graphLlmRelationEnabled === undefined ? {} : { graphLlmRelationEnabled: options.graphLlmRelationEnabled }),
@@ -1435,17 +1433,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           keyword: rejection.code ?? 'validation',
           expected: '符合来源支持规则的结构化字段',
         }]).slice(0, 16);
-      const declaredDecisions = result.repairDecisions ?? [];
-      const compatibilityDecision: StructuredRepairDecision[] = declaredDecisions.length === 0 && group.length === 1
-        && result.acceptedLocalIds[recordType][0]
-        ? [{
-          repairId: group[0]!.id,
-          action: 'emit' as const,
-          localId: result.acceptedLocalIds[recordType][0],
-          sourceRefs: group[0]!.sourceRefs.length > 0 ? group[0]!.sourceRefs : group[0]!.fallbackSourceRefs,
-        }]
-        : [];
-      const decisions = new Map([...declaredDecisions, ...compatibilityDecision]
+      const decisions = new Map((result.repairDecisions ?? [])
         .map(decision => [decision.repairId, decision] as const));
       for (const candidate of group) {
         const decision = decisions.get(candidate.id);
@@ -1727,6 +1715,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ...(stage === undefined ? {} : { stage }),
     });
     await this.finalizeActorCaptureResults([result], sources, captureVersion, chatKey);
+    const failure = result.audit?.failedStage?.failure;
+    if (failure) throw createSSHelperError(failure.reasonCode, failure);
     return result;
   }
 
@@ -2003,6 +1993,18 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   async buildActorMemoryPrompt(input: Omit<ActorRecallRequest, 'workspaceId' | 'chatKey' | 'scene'> & { scene?: SceneCast; chatKey?: string; maxChars?: number }): Promise<ActorMemoryPromptResult> {
+    const initialRepository = this.multiActorRepository;
+    const initialContext = this.hostContext;
+    const scopeRevision = this.generationScopeRevision;
+    const chatKey = this.getChatKey();
+    const workspaceId = initialContext?.getWorkspaceId();
+    const assertCurrent = (): void => {
+      if (this.stopped || this.generationScopeRevision !== scopeRevision
+        || this.multiActorRepository !== initialRepository || this.hostContext !== initialContext
+        || this.getChatKey() !== chatKey || this.hostContext?.getWorkspaceId() !== workspaceId) {
+        throw createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', { stage: 'memory.generation.prepare.scope' });
+      }
+    };
     const settings = this.getEffectiveSettings();
     let response: ActorRecallResponse;
     let built: ActorMemoryPromptResult;
@@ -2013,11 +2015,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       const repository = this.multiActorRepository;
       const registry = this.actorRegistry;
       const scopeRevision = this.generationScopeRevision;
-      const isCurrent = (): boolean => this.generationScopeRevision === scopeRevision
+      const isCurrent = (): boolean => !this.stopped && this.generationScopeRevision === scopeRevision
         && this.generationMemoryCoordinator === coordinator
         && this.hostContext === context
         && this.multiActorRepository === repository
-        && this.actorRegistry === registry;
+        && this.actorRegistry === registry
+        && context.getChatKey() === chatKey
+        && context.getWorkspaceId() === workspaceId;
       const staleScopeError = (): Error => createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', {
         stage: 'memory.generation.prepare.scope',
       });
@@ -2048,6 +2052,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       built = buildActorMemoryPromptResult(response, { maxChars: input.maxChars ?? settings.promptMaxChars, sceneLabel: response.request.chatKey, castPlan: response.request.castPlan });
       exposureRepository = this.multiActorRepository;
     }
+    assertCurrent();
     this.lastIncludedTraceIds = [...built.includedTraceIds];
     if (exposureRepository
       && exposureRepository.boundWorkspaceId === response.request.workspaceId
@@ -2072,6 +2077,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       await exposureRepository.upsertDerived('recall-exposures', exposures.map(exposure => ({ ...exposure })))
         .catch(error => logger.warn('RecallExposure 派生记录写入失败，继续使用已生成的记忆 Prompt。', error));
     }
+    assertCurrent();
     return built;
   }
 
@@ -2096,7 +2102,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       sources,
       generatedSource,
       currentFloor: generatedSource.floor ?? prepared.castPlan.basedOnFloor,
-      unplannedActorPolicy: this.getEffectiveSettings().unplannedActorPolicy,
     });
     this.lastSceneState = result.state;
     const metadata = { castPlanId: prepared.castPlan.id, castPlanAuditId: result.audit.id, operation: 'actual-cast-reconcile' };
@@ -2268,6 +2273,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const item = (await queue.list('pending')).find(candidate => candidate.id === id);
     if (!item) throw createSSHelperError('MEMORY_UPDATE_PENDING_REVIEW', { stage: 'memory.review.lookup', resourceId: id });
     if (action !== 'reject') {
+      await this.capturePromise;
+      await this.actorCapturePromise;
       const context = this.hostContext;
       if (!context || item.chatKey !== this.getChatKey()) throw createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', { stage: 'memory.review.scope' });
       const allSources = await context.collectSources(item.chatKey);
@@ -2276,9 +2283,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       if (sources.length === 0) throw createSSHelperError('MEMORY_CAPTURE_EVIDENCE_MISMATCH', { stage: 'memory.review.sources' });
       const reviewOverride = action === 'reextract' ? undefined : { candidateLocalId: item.candidateLocalId, action, ...(payload === undefined ? {} : { payload }) } as const;
       const stage = item.stage === 'repair' ? undefined : item.stage;
-      const capture = await this.runActorCapture(sources, undefined, reviewOverride, stage);
-      const accepted = Object.values(capture.acceptedLocalIds).some(localIds => localIds.includes(item.candidateLocalId));
-      if (action !== 'reextract' && !accepted) throw createSSHelperError('MEMORY_UPDATE_PENDING_REVIEW', { stage: 'memory.review.commit-guard' });
+      const pending = this.runActorCapture(sources, undefined, reviewOverride, stage);
+      this.actorCapturePromise = pending;
+      try {
+        await pending;
+      } finally {
+        if (this.actorCapturePromise === pending) this.actorCapturePromise = null;
+      }
     }
     const result = await queue.resolve(id, action, payload);
     this.emitOverviewChanged();
@@ -2731,6 +2742,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
             this.multiActorRepository.listTraces(),
           ])
         : [[], []];
+      if (!isCurrent()) return;
       if (this.multiActorRepository && chatKey) {
         this.actorExposureTracker = new RecallExposureTracker(traces);
         const dreamRepository = this.multiActorRepository;
@@ -2794,16 +2806,14 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       enabled: settings.enabled === true,
       autoOrganize: settings.autoOrganize === true,
       extractionMode: settings.extractionMode === 'agent' ? 'agent' : 'single',
-      agentConcurrency: settings.agentConcurrency === 1 ? 1 : 2,
       agentToolPolicy: settings.agentToolPolicy === 'read_only' ? 'read_only' : 'off',
       summaryBatchMode: settings.summaryBatchMode === 'chars' ? 'chars' : 'floors',
-      summaryBatchFloors: Math.min(20, Math.max(1, Math.trunc(settings.summaryBatchFloors))),
+      summaryBatchFloors: Math.min(16, Math.max(1, Math.trunc(settings.summaryBatchFloors))),
       summaryBatchChars: Math.min(16_000, Math.max(2_000, Math.round(settings.summaryBatchChars / 500) * 500)),
       summaryIntervalFloors: Math.min(50, Math.max(1, Math.trunc(settings.summaryIntervalFloors))),
       summaryOverlapFloors: Math.min(10, Math.max(0, Math.trunc(settings.summaryOverlapFloors))),
       maxRecallItems: clampMaxItems(settings.maxRecallItems),
       promptMaxChars: clampPromptMaxChars(settings.promptMaxChars),
-      answerMode: settings.answerMode === 'diagnostic' || settings.answerMode === 'roleplay' ? settings.answerMode : 'auto',
       recallMode: settings.recallMode === 'lexical' || settings.recallMode === 'vector' || settings.recallMode === 'hybrid'
         ? settings.recallMode
         : 'auto',
@@ -2830,12 +2840,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       plannerConfidenceThreshold: clampPlannerConfidenceThreshold(settings.plannerConfidenceThreshold),
       likelyActorRecall: settings.likelyActorRecall === 'identity_only' || settings.likelyActorRecall === 'none' ? settings.likelyActorRecall : 'public_only',
       backgroundActorRecall: settings.backgroundActorRecall === 'public_only' || settings.backgroundActorRecall === 'none' ? settings.backgroundActorRecall : 'identity_only',
-      mentionedActorRecall: 'none',
       provisionalActorEnabled: settings.provisionalActorEnabled !== false,
       plannerCanProposeActors: settings.plannerCanProposeActors !== false,
-      unplannedActorPolicy: settings.unplannedActorPolicy === 'allow_without_private_memory' || settings.unplannedActorPolicy === 'regenerate_once'
-        ? settings.unplannedActorPolicy
-        : 'allow_public_only',
       maxPlannerCallsPerTurn: settings.maxPlannerCallsPerTurn === 0 ? 0 : 1,
     };
     const scopeKey = this.getCurrentScopeKey();
@@ -2944,7 +2950,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   async retry(): Promise<void> {
     this.clearRuntimeError();
     const paused = (await this.listCaptureJobs(this.requireChatKey()))
-      .filter((job) => job.status === 'paused' || job.status === 'needs_repair')
+      .filter((job) => job.status === 'paused' || job.status === 'needs_repair' || job.status === 'failed')
       .sort((left, right) => right.updatedAt - left.updatedAt)[0];
     await this.flushCapture(paused?.type ?? 'incremental', paused);
   }
@@ -3163,7 +3169,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       totalBatches: latest.checkpoint.totalBatches ?? latest.checkpoint.batchIndex,
       ...(latest.checkpoint.completedBatchCount === undefined ? {} : { completedBatchCount: latest.checkpoint.completedBatchCount }),
       ...(latest.checkpoint.extractionMode === undefined ? {} : { extractionMode: latest.checkpoint.extractionMode }),
-      ...(latest.checkpoint.agentConcurrency === undefined ? {} : { agentConcurrency: latest.checkpoint.agentConcurrency }),
       ...(latest.checkpoint.agentToolPolicy === undefined ? {} : { agentToolPolicy: latest.checkpoint.agentToolPolicy }),
       ...(latest.checkpoint.batchRangeStart === undefined ? {} : { batchRangeStart: latest.checkpoint.batchRangeStart }),
       ...(latest.checkpoint.batchRangeEnd === undefined ? {} : { batchRangeEnd: latest.checkpoint.batchRangeEnd }),
@@ -3896,12 +3901,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   async cancelCapture(): Promise<void> {
-    if (!this.capturePromise && !this.actorCapturePromise) return;
-    if (!this.capturePromise && this.actorCapturePromise) {
-      await this.actorCapturePromise.catch(() => undefined);
-      this.emitOverviewChanged();
-      return;
-    }
+    if (!this.capturePromise && !this.actorCapturePromise && !this.captureAbortController) return;
     this.cancelRequested = true;
     this.captureAbortController?.abort();
     this.captureVersion += 1;
@@ -4145,7 +4145,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   async getMemoryCandidateStats(filters: Readonly<Record<string, string | number>> = {}): Promise<MemoryCandidateStats> {
-    const chatKey = this.requireChatKey();
+    this.requireChatKey();
     const floorFilter = filters.floor === undefined || filters.floor === '' ? undefined : Number(filters.floor);
     const filter = Object.fromEntries(Object.entries(filters).filter(([key, value]) => key !== 'floor' && value !== '' && value !== undefined));
     const rows: MemoryCandidateRecord[] = [];
@@ -4317,24 +4317,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     return this.lastRecall ?? await this.repository.getLastRecall(this.requireChatKey()) ?? null;
   }
 
-  /** 将宿主真正注入的 Prompt 回写到同一条召回日志，供真实链路审计。 */
-  async recordPromptInjection(input: {
-    injected: boolean;
-    recall: RecallResult | null;
-    prompt: string;
-    promptDiagnostics: MemoryRecallLog['promptDiagnostics'] | null;
-  }): Promise<void> {
-    if (!input.recall || input.recall !== this.lastRecall || !this.lastRecallLogId) return;
-    const recallLogId = this.lastRecallLogId;
-    const log = await this.repository.getLastRecall(this.requireChatKey());
-    if (!log || log.id !== recallLogId) return;
-    await this.repository.addRecallLog({
-      ...log,
-      ...(input.injected ? { injectedPrompt: input.prompt } : {}),
-      ...(input.promptDiagnostics ? { promptDiagnostics: structuredClone(input.promptDiagnostics) } : {}),
-    });
-  }
-
   async getSqliteStatus(options: { readonly detailed?: boolean } = {}): Promise<MemorySqliteStatus> {
     try {
       traceMemoryStartup('application:sqlite-status-begin');
@@ -4440,8 +4422,22 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
 
   async clearCurrentChatData(): Promise<void> {
     const chatKey = this.requireChatKey();
-    if (this.multiActorRepository) await this.multiActorRepository.clearCurrentChatData();
+    const repository = this.multiActorRepository;
+    await this.cancelCapture();
+    if (this.getChatKey() !== chatKey || this.multiActorRepository !== repository) {
+      throw createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', { stage: 'memory.clear.scope' });
+    }
+    this.captureVersion += 1;
+    this.captureAbortController?.abort();
+    this.generationScopeRevision += 1;
+    this.bindVersion += 1;
+    this.clearAutomaticDreamTimers();
+    this.dreamCoordinator.reset();
+    if (repository) await repository.clearCurrentChatData();
     else await this.repository.clearCurrentChatData(chatKey);
+    if (this.getChatKey() !== chatKey || this.multiActorRepository !== repository) {
+      throw createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', { stage: 'memory.clear.scope' });
+    }
     this.actorRegistry?.hydratePending([]);
     this.actorRegistry?.clearAudits();
     this.actorCorrectionChangeSets.clear();
@@ -4449,6 +4445,9 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       const next = { ...this.summaryProgressByChat };
       delete next[chatKey];
       await this.repository.setSettings({ summaryProgressByChat: next });
+      if (this.getChatKey() !== chatKey || this.multiActorRepository !== repository) {
+        throw createSSHelperError('MEMORY_STALE_GENERATION_SCOPE', { stage: 'memory.clear.scope' });
+      }
       this.summaryProgressByChat = next;
       this.summaryWaitingByChat.delete(chatKey);
       this.emitSettingsChanged();
@@ -4499,11 +4498,10 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
   }
 
   private async loadSettings(): Promise<void> {
-    const [enabled, autoOrganize, extractionMode, agentConcurrency, agentToolPolicy, summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors, maxRecallItems, promptMaxChars, answerMode, recallMode, rerankMode, preExtractReferenceEnabled, preExtractReferenceItems, preExtractReferenceMode, preExtractReferenceMaxChars, structuredRepairEnabled, structuredRepairBeforeFloors, structuredRepairAfterFloors, structuredRepairMaxItems, graphEnabled, graphLlmRelationEnabled, graphMaxHops, graphMaxEdges, chatOverrides, summaryProgressByChat] = await Promise.all([
+    const [enabled, autoOrganize, extractionMode, agentToolPolicy, summaryBatchMode, summaryBatchFloors, summaryBatchChars, summaryIntervalFloors, summaryOverlapFloors, maxRecallItems, promptMaxChars, recallMode, rerankMode, preExtractReferenceEnabled, preExtractReferenceItems, preExtractReferenceMode, preExtractReferenceMaxChars, structuredRepairEnabled, structuredRepairBeforeFloors, structuredRepairAfterFloors, structuredRepairMaxItems, graphEnabled, graphLlmRelationEnabled, graphMaxHops, graphMaxEdges, chatOverrides, summaryProgressByChat] = await Promise.all([
       this.repository.getSetting<boolean>('enabled'),
       this.repository.getSetting<boolean>('autoOrganize'),
       this.repository.getSetting<MemoryGlobalSettings['extractionMode']>('extractionMode'),
-      this.repository.getSetting<number>('agentConcurrency'),
       this.repository.getSetting<MemoryGlobalSettings['agentToolPolicy']>('agentToolPolicy'),
       this.repository.getSetting<MemoryGlobalSettings['summaryBatchMode']>('summaryBatchMode'),
       this.repository.getSetting<number>('summaryBatchFloors'),
@@ -4512,7 +4510,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.repository.getSetting<number>('summaryOverlapFloors'),
       this.repository.getSetting<number>('maxRecallItems'),
       this.repository.getSetting<number>('promptMaxChars'),
-      this.repository.getSetting<MemoryUiSettings['answerMode']>('answerMode'),
       this.repository.getSetting<MemoryUiSettings['recallMode']>('recallMode'),
       this.repository.getSetting<MemoryUiSettings['rerankMode']>('rerankMode'),
       this.repository.getSetting<boolean>('preExtractReferenceEnabled'),
@@ -4530,7 +4527,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.repository.getSetting<Record<string, boolean>>('chatOverrides'),
       this.repository.getSetting<Record<string, SummaryProgress>>('summaryProgressByChat'),
     ]);
-    const [castPlanningMode, focusLookbackFloors, actorScanLookbackFloors, persistPresenceUntilTransition, plannerCandidateThreshold, plannerConfidenceThreshold, likelyActorRecall, backgroundActorRecall, provisionalActorEnabled, plannerCanProposeActors, unplannedActorPolicy, maxPlannerCallsPerTurn] = await Promise.all([
+    const [castPlanningMode, focusLookbackFloors, actorScanLookbackFloors, persistPresenceUntilTransition, plannerCandidateThreshold, plannerConfidenceThreshold, likelyActorRecall, backgroundActorRecall, provisionalActorEnabled, plannerCanProposeActors, maxPlannerCallsPerTurn] = await Promise.all([
       this.repository.getSetting<MemoryGlobalSettings['castPlanningMode']>('castPlanningMode'),
       this.repository.getSetting<number>('focusLookbackFloors'),
       this.repository.getSetting<number>('actorScanLookbackFloors'),
@@ -4541,23 +4538,20 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       this.repository.getSetting<MemoryGlobalSettings['backgroundActorRecall']>('backgroundActorRecall'),
       this.repository.getSetting<boolean>('provisionalActorEnabled'),
       this.repository.getSetting<boolean>('plannerCanProposeActors'),
-      this.repository.getSetting<MemoryGlobalSettings['unplannedActorPolicy']>('unplannedActorPolicy'),
       this.repository.getSetting<number>('maxPlannerCallsPerTurn'),
     ]);
     this.settings = {
       enabled: enabled ?? DEFAULT_SETTINGS.enabled,
       autoOrganize: autoOrganize ?? DEFAULT_SETTINGS.autoOrganize,
       extractionMode: extractionMode === 'agent' ? 'agent' : 'single',
-      agentConcurrency: agentConcurrency === 1 ? 1 : 2,
       agentToolPolicy: agentToolPolicy === 'read_only' ? 'read_only' : 'off',
       summaryBatchMode: summaryBatchMode === 'chars' ? 'chars' : 'floors',
-      summaryBatchFloors: Math.min(20, Math.max(1, Math.trunc(summaryBatchFloors ?? DEFAULT_SETTINGS.summaryBatchFloors))),
+      summaryBatchFloors: Math.min(16, Math.max(1, Math.trunc(summaryBatchFloors ?? DEFAULT_SETTINGS.summaryBatchFloors))),
       summaryBatchChars: Math.min(16_000, Math.max(2_000, Math.round((summaryBatchChars ?? DEFAULT_SETTINGS.summaryBatchChars) / 500) * 500)),
       summaryIntervalFloors: Math.min(50, Math.max(1, Math.trunc(summaryIntervalFloors ?? DEFAULT_SETTINGS.summaryIntervalFloors))),
       summaryOverlapFloors: Math.min(10, Math.max(0, Math.trunc(summaryOverlapFloors ?? DEFAULT_SETTINGS.summaryOverlapFloors))),
       maxRecallItems: clampMaxItems(maxRecallItems ?? DEFAULT_SETTINGS.maxRecallItems),
       promptMaxChars: clampPromptMaxChars(promptMaxChars ?? DEFAULT_SETTINGS.promptMaxChars),
-      answerMode: answerMode === 'diagnostic' || answerMode === 'roleplay' ? answerMode : 'auto',
       recallMode: recallMode === 'lexical' || recallMode === 'vector' || recallMode === 'hybrid' ? recallMode : 'auto',
       rerankMode: rerankMode === 'off' || rerankMode === 'always' ? rerankMode : 'adaptive',
       preExtractReferenceEnabled: preExtractReferenceEnabled ?? DEFAULT_SETTINGS.preExtractReferenceEnabled,
@@ -4582,12 +4576,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       plannerConfidenceThreshold: clampPlannerConfidenceThreshold(plannerConfidenceThreshold ?? DEFAULT_SETTINGS.plannerConfidenceThreshold),
       likelyActorRecall: likelyActorRecall === 'identity_only' || likelyActorRecall === 'none' ? likelyActorRecall : 'public_only',
       backgroundActorRecall: backgroundActorRecall === 'public_only' || backgroundActorRecall === 'none' ? backgroundActorRecall : 'identity_only',
-      mentionedActorRecall: 'none',
       provisionalActorEnabled: provisionalActorEnabled ?? DEFAULT_SETTINGS.provisionalActorEnabled,
       plannerCanProposeActors: plannerCanProposeActors ?? DEFAULT_SETTINGS.plannerCanProposeActors,
-      unplannedActorPolicy: unplannedActorPolicy === 'allow_without_private_memory' || unplannedActorPolicy === 'regenerate_once'
-        ? unplannedActorPolicy
-        : 'allow_public_only',
       maxPlannerCallsPerTurn: maxPlannerCallsPerTurn === 0 ? 0 : 1,
     };
     this.chatOverrides = chatOverrides && typeof chatOverrides === 'object' && !Array.isArray(chatOverrides)
@@ -4779,6 +4769,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const createdAt = resumeJob?.createdAt ?? Date.now();
     const baseCheckpoint: MemoryJob['checkpoint'] = {
       batchIndex: resumeBatchIndex,
+      ...(resumeJob?.checkpoint.retryStage ? { retryStage: resumeJob.checkpoint.retryStage } : {}),
       lastScannedBatch: resumeJob?.checkpoint.lastScannedBatch ?? Math.max(0, batchRangeStart - 1),
       completedBatchCount: resumeJob?.checkpoint.completedBatchCount ?? resumeBatchIndex,
       pendingRepairCount: resumeJob?.checkpoint.pendingRepairCount ?? 0,
@@ -4795,7 +4786,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       ...(target === undefined ? {} : { summaryStartFloor: target.startFloor, summaryEndFloor: target.endFloor, summaryEndMessageId: target.endMessageId }),
       phase: 'capture',
       extractionMode: resumeJob?.checkpoint.extractionMode ?? captureSettings.extractionMode,
-      agentConcurrency: resumeJob?.checkpoint.agentConcurrency ?? captureSettings.agentConcurrency,
       agentToolPolicy: resumeJob?.checkpoint.agentToolPolicy ?? captureSettings.agentToolPolicy,
       ...(resumeJob?.checkpoint.actualUsage ? { actualUsage: resumeJob.checkpoint.actualUsage } : {}),
       ...(resumeJob?.checkpoint.usageRequestCount === undefined ? {} : { usageRequestCount: resumeJob.checkpoint.usageRequestCount }),
@@ -4803,7 +4793,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     };
     this.activeExtractionSnapshot = {
       extractionMode: baseCheckpoint.extractionMode,
-      agentConcurrency: baseCheckpoint.agentConcurrency,
       agentToolPolicy: baseCheckpoint.agentToolPolicy,
     };
     const persistJob = (job: MemoryJob): Promise<void> => actorRepository.upsertCaptureJob({
@@ -5038,11 +5027,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           overlapSourceRefs: plan.sources.filter((source) => !writableRefs.has(source.id)).map((source) => source.id),
           metadataSourceRefs: [...nextMetadataRefs],
         };
+        delete nextCheckpoint.retryStage;
         pendingCaptureCheckpoint = nextCheckpoint;
         let result: import('./actors').MultiActorCaptureResult;
         try {
           result = await this.executeActorCapture(plan.sources, {
             captureJobId: jobId,
+            previousCheckpoint: checkpoint,
             captureJob: {
               id: jobId,
               chatKey,
@@ -5056,7 +5047,8 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
             writableSourceRefs: plan.writableSourceRefs,
             existingMemoryContext,
             graphLlmRelationEnabled: captureSettings.graphEnabled && captureSettings.graphLlmRelationEnabled,
-            idempotencyKey: `capture:${jobId}:batch:${sourceBatchIndex}`,
+            idempotencyKey: `capture:${jobId}:batch:${sourceBatchIndex}${checkpoint.retryStage ? `:stage:${checkpoint.retryStage}` : ''}`,
+            ...(checkpoint.retryStage ? { stage: checkpoint.retryStage } : {}),
             includeHiddenMessageFloors,
             onUsage: recordUsage,
           });
@@ -5064,11 +5056,18 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
           pendingCaptureCheckpoint = undefined;
         }
         captureResults.push(result);
-        aggregatedRejections = replaceRejectionsForSources(
+        aggregatedRejections = checkpoint.retryStage
+          ? [...aggregatedRejections, ...(result.rejections ?? [])]
+          : replaceRejectionsForSources(
           aggregatedRejections,
           plan.writableSourceRefs,
           result.rejections ?? [],
         );
+        const failedStage = result.audit?.failedStage;
+        if (failedStage?.failure && (failedStage.stage === 'entities' || failedStage.stage === 'content')) {
+          checkpoint = { ...checkpoint, lastScannedBatch: sourceBatchIndex, retryStage: failedStage.stage };
+          throw createSSHelperError(failedStage.failure.reasonCode, failedStage.failure);
+        }
         processedCount = nextCheckpoint.processedCount;
         for (const ref of nextMetadataRefs) processedMetadataRefs.add(ref);
         checkpoint = nextCheckpoint;
@@ -5328,7 +5327,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         return;
       }
       this.setRuntimeError(error, 'INTERNAL_ERROR', 'operation');
-      const pauseForRetry = isRetryableCaptureError(error);
+      const pauseForRetry = Boolean(checkpoint.retryStage) || isRetryableCaptureError(error);
       const contextualFailure: SSHelperFailureContext = {
         ...failure,
         batchIndex: checkpoint.batchIndex,
@@ -5339,6 +5338,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         type: mode,
         status: pauseForRetry ? 'paused' : 'failed',
         checkpoint,
+        ...(aggregatedRejections.length ? { rejections: aggregatedRejections } : {}),
         failure: contextualFailure,
         createdAt,
         updatedAt: Date.now(),
@@ -5368,7 +5368,7 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     selectedSourceGroups?: string[],
     options?: MemoryInitializationOptions,
   ): Promise<void> {
-    this.assertStorageAvailable('初始化');
+    this.assertStorageAvailable();
     const settings = this.getEffectiveSettings();
     if (!settings.enabled) return;
     if (!this.actorCapture || !this.multiActorRepository) {

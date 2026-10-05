@@ -43,14 +43,14 @@ describe('Claim capture schema', () => {
     expect(directory.allowedEpisodeRefs).toEqual([]);
     expect(directory.candidateSetHash).toMatch(/^[a-f0-9]{32}$/u);
 
-    const episodeSchema = buildStructuredRepairSchema([source.id], 'episodes', 1, directory) as any;
+    const episodeSchema = buildStructuredRepairSchema('episodes', 1, directory) as any;
     const episodeDecision = episodeSchema.properties.decisions.items.properties;
     const episode = episodeDecision.items.items.properties;
     expect(episodeDecision.action.enum).toEqual(['emit', 'drop']);
     expect(episode.participantRefs.items.enum).toEqual(['A01', 'player', 'world', 'narrator']);
     expect(episode.locationRef.enum).toEqual(['', 'L01']);
 
-    const claimSchema = buildStructuredRepairSchema([source.id], 'claims', 1, directory) as any;
+    const claimSchema = buildStructuredRepairSchema('claims', 1, directory) as any;
     const claim = claimSchema.properties.decisions.items.properties.items.items.properties;
     expect(claim.subjectRef.enum).toEqual(['', 'A01', 'player', 'world', 'narrator', 'L01']);
     expect(claim.episodeLocalId.enum).toEqual(['']);
@@ -58,7 +58,7 @@ describe('Claim capture schema', () => {
   });
 
   it('uses a small fixed shape and never asks the model for machine time or derived records', () => {
-    const schema = buildStructuredCaptureSchema([source.id]) as Record<string, any>;
+    const schema = buildStructuredCaptureSchema() as Record<string, any>;
     expect(schema).toMatchObject({
       type: 'object',
       additionalProperties: false,
@@ -83,7 +83,7 @@ describe('Claim capture schema', () => {
     expect(LLM_STRUCTURED_TASK_V0.validateRequest!({
       task: 'memory_capture',
       input: { messages: [{ role: 'user', content: source.content }] },
-      outputSchema: buildStructuredCaptureSchema([source.id]) as Record<string, never>,
+      outputSchema: buildStructuredCaptureSchema() as Record<string, never>,
     })).toBe(true);
   });
 

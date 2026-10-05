@@ -29,6 +29,24 @@ function source(overrides: Partial<SourceBlock> = {}): SourceBlock {
 }
 
 describe('Claim-based multi actor capture', () => {
+  it('rejects a changed review target before committing any regenerated records', async () => {
+    const commitCapture = vi.fn();
+    const row = source();
+    const extractor = { extract: async (): Promise<StructuredCaptureResult> => ({
+      ...empty(), actorCandidates: [{ localId: 'new-local-id', displayName: '白夕琴乃', aliases: [], sourceRef: row.id, evidenceExcerpt: '白夕琴乃', confidence: 0.95 }],
+    }) };
+    await expect(service('w', extractor, { listFacts: async () => [], commitCapture }).capture({ workspaceId: 'w', chatKey: 'chat', sources: [row], reviewOverride: { candidateLocalId: 'old-local-id', action: 'accept' } })).rejects.toMatchObject({ details: { reasonCode: 'MEMORY_UPDATE_PENDING_REVIEW', stage: 'memory.review.commit-guard' } });
+    expect(commitCapture).not.toHaveBeenCalled();
+  });
+
+  it('commits a successful sibling with the previous checkpoint and original failed-stage diagnosis', async () => {
+    const commitCapture = vi.fn();
+    const failure = { reasonCode: 'AUTH_FAILED', requestId: 'req:auth', stage: 'llm.provider.http' } as const;
+    const extractor = { extract: async (): Promise<StructuredCaptureResult> => ({ ...empty(), audit: { failedStage: { stage: 'content', taskKey: 'memory_extract_content', status: 'failed', toolRounds: 0, toolCalls: 0, latencyMs: 1, failure } } }) };
+    await service('w', extractor, { listFacts: async () => [], commitCapture }).capture({ workspaceId: 'w', chatKey: 'chat', sources: [source()], previousCheckpoint: { batchIndex: 0, processedCount: 0 }, captureJob: { id: 'job', status: 'running', checkpoint: { batchIndex: 1, processedCount: 1 } } });
+    expect(commitCapture).toHaveBeenCalledWith(expect.objectContaining({ captureJob: { id: 'job', status: 'paused', failure, checkpoint: { batchIndex: 0, processedCount: 0, retryStage: 'content' } }, rejections: [] }));
+  });
+
   it('exposes request-local typed refs while keeping persistent IDs out of the model contract', async () => {
     const row = source();
     let seenActorRef = '';

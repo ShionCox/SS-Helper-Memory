@@ -1,3 +1,4 @@
+import { createSSHelperError } from '@ss-helper/sdk';
 import {
   isAutoIgnoredProposalCode,
   createCanonicalKey,
@@ -41,7 +42,6 @@ import type {
   StructuredLocationCandidate,
   StructuredInventoryOperation,
   StructuredItemCandidate,
-  StructuredCandidateAttempt,
   RepairFieldAction,
   MemoryExtractionInput,
 } from '../ingest/types';
@@ -440,6 +440,7 @@ export interface MultiActorCaptureInput {
   readonly sceneEpoch?: string;
   readonly captureJobId?: string;
   readonly captureJob?: Record<string, unknown>;
+  readonly previousCheckpoint?: import('../../domain').MemoryJobCheckpoint;
   readonly idempotencyKey?: string;
   readonly repair?: import('../ingest/types').MemoryExtractionInput['repair'];
   readonly reviewOverride?: import('../ingest/types').MemoryExtractionInput['reviewOverride'];
@@ -1760,11 +1761,9 @@ export class MultiActorCaptureService {
       : undefined;
     const runtimeExtraction: import('../ingest/types').MemoryExtractionInput['runtimeExtraction'] = captureCheckpoint
       && (captureCheckpoint.extractionMode === 'single' || captureCheckpoint.extractionMode === 'agent')
-      && (captureCheckpoint.agentConcurrency === 1 || captureCheckpoint.agentConcurrency === 2)
       && (captureCheckpoint.agentToolPolicy === 'off' || captureCheckpoint.agentToolPolicy === 'read_only')
       ? {
           extractionMode: captureCheckpoint.extractionMode,
-          agentConcurrency: captureCheckpoint.agentConcurrency,
           agentToolPolicy: captureCheckpoint.agentToolPolicy,
         }
       : undefined;
@@ -2408,7 +2407,7 @@ export class MultiActorCaptureService {
       ...(!item.model && structured.audit?.model ? { model: structured.audit.model } : {}),
     }));
     const unresolved = auditedRejections.filter(item => (item.status ?? 'unresolved') === 'unresolved');
-    const outcome = unresolved.length > 0 ? 'partial' as const : 'complete' as const;
+    const outcome = unresolved.length > 0 || structured.audit?.failedStage ? 'partial' as const : 'complete' as const;
     const candidateRecords = buildCandidateRecords(
       structured,
       prepared,
@@ -2424,12 +2423,27 @@ export class MultiActorCaptureService {
       inventoryEventsToCommit,
     );
     let changeAudit: import('../../infrastructure').ChangeAudit | undefined;
+    if (input.signal?.aborted) throw createSSHelperError('MEMORY_EXTRACTION_PIPELINE_CANCELLED', { stage: 'memory.capture.commit' });
+    if (input.reviewOverride && ![...acceptedLocalIds.claim, ...acceptedLocalIds.inventory].includes(input.reviewOverride.candidateLocalId)) {
+      throw createSSHelperError('MEMORY_UPDATE_PENDING_REVIEW', { stage: 'memory.review.commit-guard' });
+    }
+    const failedStage = structured.audit?.failedStage;
+    const captureJob = failedStage && input.captureJob && input.previousCheckpoint
+      ? { ...input.captureJob, status: 'paused', failure: failedStage.failure, checkpoint: {
+          ...input.previousCheckpoint,
+          retryStage: failedStage.stage,
+          ...(checkpoint?.lastScannedBatch === undefined ? {} : { lastScannedBatch: checkpoint.lastScannedBatch }),
+          ...(checkpoint?.actualUsage === undefined ? {} : { actualUsage: checkpoint.actualUsage }),
+          ...(checkpoint?.usageRequestCount === undefined ? {} : { usageRequestCount: checkpoint.usageRequestCount }),
+          ...(checkpoint?.usageReportedCount === undefined ? {} : { usageReportedCount: checkpoint.usageReportedCount }),
+        } }
+      : input.captureJob;
     if (this.repository) {
       changeAudit = await this.repository.commitCapture({
         envelope,
         capturePhase: input.repair ? 'repair' : 'capture',
         ...(input.captureJobId ? { captureJobId: input.captureJobId } : {}),
-        ...(input.captureJob ? { captureJob: input.captureJob } : {}),
+        ...(captureJob ? { captureJob } : {}),
         ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
         ...(structured.audit?.requestId ? { requestId: structured.audit.requestId } : {}),
         ...(structured.audit?.resourceId ? { resourceId: structured.audit.resourceId } : {}),

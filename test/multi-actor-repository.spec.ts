@@ -191,7 +191,7 @@ describe('multi-actor repository transaction semantics', () => {
     await repository.recordCastPlanAudit({
       id: 'audit:plan:1', workspaceId: 'w', chatKey: 'chat', planId: plan.id,
       plannedOwnerIds: ['owner:actor:a'], actualOwnerIds: ['owner:actor:a'], unplannedOwnerIds: [], missingOwnerIds: [],
-      result: 'matched', leakageRisk: false, createdAt: 3,
+      result: 'matched', createdAt: 3,
     });
     await repository.recordRecallCoverage({
       id: 'coverage:1', workspaceId: 'w', chatKey: 'chat', planId: plan.id, covered: true,
@@ -272,7 +272,8 @@ describe('multi-actor repository transaction semantics', () => {
   });
 
   it('commits repair descriptors with the batch checkpoint and closes them when ignored', async () => {
-    const repository = new MultiActorMemoryRepository(port());
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
     repository.bind('w', 'chat');
     await repository.open();
     const rejection = {
@@ -295,7 +296,7 @@ describe('multi-actor repository transaction semantics', () => {
         id: 'capture-job:repair',
         workspaceId: 'w',
         chatKey: 'chat',
-        status: 'running',
+        status: 'needs_repair',
         checkpoint: {
           batchIndex: 1,
           lastScannedBatch: 1,
@@ -321,6 +322,7 @@ describe('multi-actor repository transaction semantics', () => {
         rejectionId: rejection.id,
         status: 'queued',
         attemptCount: 0,
+        maxAttempts: 1,
       }),
     ]);
     expect((await repository.listCaptureJobs())[0]).toMatchObject({
@@ -329,6 +331,11 @@ describe('multi-actor repository transaction semantics', () => {
       checkpoint: { pendingRepairCount: 1 },
     });
     expect(audit.entries.some(entry => entry.collection === 'capture-repair-queue')).toBe(true);
+
+    const rebound = new MultiActorMemoryRepository(workspace);
+    rebound.bind('w', 'chat');
+    await rebound.open();
+    expect(await rebound.reconcileCaptureRepairQueue('capture-job:repair')).toEqual(queue);
 
     await repository.updateCaptureAuditRejections(audit.id, [{
       ...rejection,
@@ -391,7 +398,7 @@ describe('multi-actor repository transaction semantics', () => {
     });
   });
 
-  it('reconciliation writes legacy resolved queue state back to its Change Audit and job', async () => {
+  it('reconciliation writes resolved queue state back to its Change Audit and finished job', async () => {
     const workspace = port();
     const repository = new MultiActorMemoryRepository(workspace);
     repository.bind('w', 'chat');
@@ -415,8 +422,8 @@ describe('multi-actor repository transaction semantics', () => {
         id: 'capture-job:legacy-resolved',
         workspaceId: 'w',
         chatKey: 'chat',
-        status: 'running',
-        checkpoint: { batchIndex: 1, processedCount: 1, phase: 'capture' },
+        status: 'needs_repair',
+        checkpoint: { batchIndex: 1, processedCount: 1, phase: 'repair' },
       },
       outcome: 'partial',
       rejections: [rejection],
@@ -425,6 +432,7 @@ describe('multi-actor repository transaction semantics', () => {
     const [repair] = await repository.listCaptureRepairQueue('capture-job:legacy-resolved');
     await repository.updateCaptureRepairRecord({
       ...repair!,
+      rejectionIds: [],
       status: 'resolved',
       attemptCount: 1,
       resolutionMode: 'repaired',
@@ -444,47 +452,48 @@ describe('multi-actor repository transaction semantics', () => {
     });
   });
 
-  it('reconciliation quarantines a historical attempted repair until evidence changes', async () => {
+  it.each(['queued', 'running', 'paused', 'failed', 'cancelled'])('keeps a %s Capture checkpoint and root failure when repairs synchronize after rebind', async (status) => {
     const workspace = port();
     const repository = new MultiActorMemoryRepository(workspace);
     repository.bind('w', 'chat');
     await repository.open();
-    await repository.commitCapture({
+    const failure = { reasonCode: 'AUTH_FAILED', stage: 'llm.provider.http', requestId: 'request:failed-stage' } as const;
+    const checkpoint = { batchIndex: 0, totalBatches: 2, processedCount: 0, phase: 'capture', retryStage: 'content' };
+    const audit = await repository.commitCapture({
       ...commit(43, 0),
-      captureJobId: 'capture-job:legacy-attempt',
+      captureJobId: 'capture-job:unfinished',
       captureJob: {
-        id: 'capture-job:legacy-attempt',
+        id: 'capture-job:unfinished',
         workspaceId: 'w',
         chatKey: 'chat',
-        status: 'running',
-        checkpoint: { batchIndex: 1, processedCount: 1, phase: 'capture' },
+        status,
+        failure,
+        checkpoint,
       },
       outcome: 'partial',
-      rejections: [{
-        id: 'legacy:attempt',
-        index: 0,
-        code: 'invalid_reference',
-        message: 'safe issue',
-        recordType: 'claim',
-        fieldPath: 'subjectRef',
-        sourceRefs: ['source:s'],
-        requestId: 'request:legacy-attempt',
-        status: 'unresolved',
-        repairAttempts: 1,
-      }],
-      idempotencyKey: 'capture:legacy-attempt',
+      rejections: [],
+      pipelineAudit: {
+        pipelineRunId: 'pipeline:unfinished', workflowLabel: '初始化', workflowKind: 'initialize',
+        mode: 'agent', toolPolicy: 'off', sourceBatchDigest: 'sources', evidenceSetHash: 'evidence',
+        routeSnapshotDigest: 'routes', settingsSnapshotDigest: 'settings', promptVersion: 1,
+        stageSchemaVersion: 1, toolDefinitionVersion: 1, toolResultSchemaVersion: 1, providerAdapterVersion: 0,
+        stages: [{ stage: 'content', taskKey: 'memory_extract_content', status: 'failed', toolRounds: 0, toolCalls: 0, latencyMs: 1, failure }],
+        toolCalls: [], updateDecisions: [], totalUsage: null, wallClockLatencyMs: 1,
+      },
+      idempotencyKey: 'capture:unfinished',
     });
-    const [created] = await repository.listCaptureRepairQueue('capture-job:legacy-attempt');
-    await workspace.delete({ collection: 'capture-repair-queue', recordId: created!.id });
-
-    const [rebuilt] = await repository.reconcileCaptureRepairQueue('capture-job:legacy-attempt');
-    expect(rebuilt).toMatchObject({
-      attemptCount: 1,
-      maxAttempts: 1,
-      status: 'unresolved',
-      waitingForEvidenceChange: true,
-      evidenceRetryUsed: false,
+    const rebound = new MultiActorMemoryRepository(workspace);
+    rebound.bind('w', 'chat');
+    await rebound.open();
+    await rebound.reconcileCaptureRepairQueue('capture-job:unfinished');
+    await rebound.updateCaptureAuditRejections(audit.id, []);
+    expect((await rebound.listCaptureJobs())[0]).toMatchObject({
+      status,
+      failure,
+      outcome: 'partial',
+      checkpoint,
     });
+    expect((await rebound.getChangeAudit(audit.id))?.metadata).toMatchObject({ outcome: 'partial' });
   });
 
   it('reconciliation coalesces one-based rejection diagnostics with the zero-based queue batch', async () => {
@@ -529,7 +538,7 @@ describe('multi-actor repository transaction semantics', () => {
     });
   });
 
-  it('does not turn repair-attempt audits into new work and removes their legacy queue rows', async () => {
+  it('does not turn repair-attempt audits into new work or parent rejections', async () => {
     const workspace = port();
     const repository = new MultiActorMemoryRepository(workspace);
     repository.bind('w', 'chat');
@@ -554,8 +563,8 @@ describe('multi-actor repository transaction semantics', () => {
         id: jobId,
         workspaceId: 'w',
         chatKey: 'chat',
-        status: 'running',
-        checkpoint: { batchIndex: 1, processedCount: 1, phase: 'capture' },
+        status: 'needs_repair',
+        checkpoint: { batchIndex: 1, processedCount: 1, phase: 'repair' },
       },
       outcome: 'partial',
       rejections: [originalRejection],
@@ -570,36 +579,11 @@ describe('multi-actor repository transaction semantics', () => {
     };
     await repository.commitCapture({
       ...commit(45, 0),
+      capturePhase: 'repair',
       captureJobId: jobId,
       outcome: 'partial',
       rejections: [repairRejection],
-      // Simulates an audit written before capturePhase was persisted. The
-      // stable repair transaction namespace remains available for recovery.
       idempotencyKey: `capture:${jobId}:repair:queue-record:1`,
-    });
-    await workspace.upsert({
-      workspaceId: 'w',
-      collection: 'capture-repair-queue',
-      recordId: 'legacy-derived-repair-row',
-      value: {
-        id: 'legacy-derived-repair-row',
-        workspaceId: 'w',
-        chatKey: 'chat',
-        jobId,
-        batchIndex: 0,
-        collection: 'claims',
-        itemIndex: 0,
-        issues: [{ path: 'subjectRef', keyword: 'validation', expected: 'supported ref' }],
-        sourceRefs: ['source:s'],
-        fallbackSourceRefs: ['source:s'],
-        originalRequestId: 'request:original',
-        rejectionIds: ['rejection:repair-attempt'],
-        status: 'queued',
-        attemptCount: 0,
-        maxAttempts: 2,
-        createdAt: 1,
-        updatedAt: 1,
-      },
     });
 
     const queue = await repository.reconcileCaptureRepairQueue(jobId);
@@ -609,11 +593,6 @@ describe('multi-actor repository transaction semantics', () => {
       originalRequestId: 'request:original',
       rejectionIds: ['rejection:original'],
     });
-    expect(await workspace.get({
-      workspaceId: 'w',
-      collection: 'capture-repair-queue',
-      recordId: 'legacy-derived-repair-row',
-    })).toBeNull();
     await repository.updateCaptureAuditRejections(originalAudit.id, [{
       ...originalRejection,
       status: 'repaired',

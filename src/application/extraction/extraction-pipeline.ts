@@ -1,5 +1,5 @@
 import { createSSHelperError, readSSHelperFailure, type PlainData } from '@ss-helper/sdk';
-import type { AutomaticIngestRejection, InventoryState, MemoryFact } from '../../domain';
+import type { InventoryState, MemoryFact } from '../../domain';
 import type { MultiActorMemoryRepository } from '../../infrastructure';
 import {
   readMemoryLlmClient,
@@ -69,38 +69,18 @@ function usageFromStages(stages: readonly StageRunResult[]) {
   return { promptTokens: sum('promptTokens'), completionTokens: sum('completionTokens'), cacheReadTokens: sum('cacheReadTokens'), cacheWriteTokens: sum('cacheWriteTokens'), totalTokens: sum('totalTokens') };
 }
 
-function stageFailure(stage: ExtractionStageKey, error: unknown, latencyMs: number): { result: StageRunResult; rejection: AutomaticIngestRejection } {
+function stageFailure(stage: ExtractionStageKey, error: unknown, latencyMs: number): StageRunResult {
   const failure = readSSHelperFailure(error, { reasonCode: 'MEMORY_EXTRACTION_STAGE_FAILED', stage: `memory.extraction.${stage}` })!;
-  const issue = {
-    path: failure.path ?? '$',
-    keyword: failure.keyword ?? 'stage',
-    expected: failure.expected ?? 'a validated fixed-stage result',
-  };
   const audit: ExtractionStageAudit = {
     stage, stageAttemptId: `memory-stage:${stage}:${crypto.randomUUID()}`, taskKey: EXTRACTION_STAGE_SPECS[stage].taskKey,
     status: failure.reasonCode === 'MEMORY_EXTRACTION_PIPELINE_CANCELLED' || failure.reasonCode === 'CANCELLED' ? 'cancelled' : 'failed',
-    toolRounds: 0, toolCalls: 0, latencyMs, reasonCode: failure.reasonCode,
+    toolRounds: 0, toolCalls: 0, latencyMs, reasonCode: failure.reasonCode, failure,
     ...(failure.requestId ? { requestId: failure.requestId } : {}),
   };
-  return {
-    result: { output: { ...EMPTY_CAPTURE }, audit },
-    rejection: {
-      id: `pipeline:${stage}:${crypto.randomUUID()}`,
-      index: 0,
-      code: 'schema_validation_failed',
-      message: `固定阶段 ${stage} 未返回可提交结果。`,
-      recordType: 'batch',
-      fieldPath: issue.path,
-      issues: [issue],
-      failure,
-      status: 'unresolved',
-      repairAttempts: 0,
-      ...(failure.requestId ? { requestId: failure.requestId } : {}),
-    },
-  };
+  return { output: { ...EMPTY_CAPTURE }, audit };
 }
 
-function mergeStages(stages: readonly StageRunResult[], rejections: readonly AutomaticIngestRejection[]): StructuredCaptureResult {
+function mergeStages(stages: readonly StageRunResult[]): StructuredCaptureResult {
   return {
     actorCandidates: stages.flatMap(item => item.output.actorCandidates),
     locationCandidates: stages.flatMap(item => item.output.locationCandidates),
@@ -108,7 +88,7 @@ function mergeStages(stages: readonly StageRunResult[], rejections: readonly Aut
     episodes: stages.flatMap(item => item.output.episodes),
     claims: stages.flatMap(item => item.output.claims),
     inventoryOperations: stages.flatMap(item => item.output.inventoryOperations ?? []),
-    rejections: [...stages.flatMap(item => item.output.rejections ?? []), ...rejections],
+    rejections: stages.flatMap(item => item.output.rejections ?? []),
     diagnostics: {
       parser: 'fixed-stage-v0',
       deterministicRepairs: stages.reduce((total, item) => total + (item.output.diagnostics?.deterministicRepairs ?? 0), 0),
@@ -210,7 +190,6 @@ export class ExtractionPipelineCoordinator {
       ...(input.workflow?.batchIndex === undefined ? {} : { batchIndex: input.workflow.batchIndex }),
       ...(input.workflow?.batchCount === undefined ? {} : { batchCount: input.workflow.batchCount }),
       mode: settings.extractionMode,
-      agentConcurrency: settings.agentConcurrency,
       agentToolPolicy: settings.agentToolPolicy,
       settingsRevision: this.#settingsRevision,
       routeRevision: routeSnapshot?.revision ?? 0,
@@ -308,7 +287,6 @@ export class ExtractionPipelineCoordinator {
     const gateways: AgentToolGateway[] = [];
     let gateway = new AgentToolGateway(prefetched.input, this.repository);
     gateways.push(gateway);
-    const rejections: AutomaticIngestRejection[] = [];
     const allAttempts: StageRunResult[] = [];
     const safeRun = async (stage: 'entities' | 'content', stageInput: MemoryExtractionInput, stageContext: ExtractionRunContext, stageGateway: AgentToolGateway): Promise<StageRunResult> => {
       const began = Date.now();
@@ -318,10 +296,11 @@ export class ExtractionPipelineCoordinator {
         return result;
       }
       catch (error) {
+        if (signal.aborted) throw error;
         const failed = stageFailure(stage, error, Date.now() - began);
-        rejections.push(failed.rejection);
-        allAttempts.push(failed.result);
-        return failed.result;
+        if (failed.audit.status === 'cancelled') throw error;
+        allAttempts.push(failed);
+        return failed;
       }
     };
     let entities = await safeRun('entities', prefetched.input, context, gateway);
@@ -366,11 +345,16 @@ export class ExtractionPipelineCoordinator {
       };
     }
     const finalStages = [entities, content];
-    const merged = mergeStages(finalStages, rejections);
+    const failedStage = finalStages.find(result => result.audit.status !== 'completed')?.audit;
+    if (finalStages.every(result => result.audit.status !== 'completed')) {
+      const failure = failedStage!.failure!;
+      throw createSSHelperError(failure.reasonCode, failure);
+    }
+    const merged = mergeStages(finalStages);
     const staleStages = stagesRequiringRerun(guard.staleEntries);
     const planned = await this.planUpdates(merged, finalInput, finalContext, staleStages.length === 0, staleStages, guard.staleEntries, gateways);
     const audit = this.buildAudit(context, allAttempts, gateways, planned.decisions, startedAt);
-    return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, allAttempts), audit: { ...planned.output.audit, pipeline: audit } };
+    return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, allAttempts), audit: { ...planned.output.audit, pipeline: audit, ...(failedStage ? { failedStage } : {}) } };
   }
 
   private buildAudit(

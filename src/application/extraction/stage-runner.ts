@@ -222,8 +222,8 @@ export class ExtractionStageRunner {
     const sourceRefs = input.writableSourceRefs ?? input.sources.map(source => source.id);
     const evidenceDirectory = buildSupportedEvidenceDirectory(input.sources, sourceRefs);
     const schema = stage === 'repair'
-      ? buildStructuredRepairSchema(sourceRefs, input.repair!.collection, input.repair!.maxItems, input.repair!.referenceDirectory, evidenceDirectory, repairTargets(input).map(target => target.repairId))
-      : buildExtractionStageSchema(stage, sourceRefs, evidenceDirectory);
+      ? buildStructuredRepairSchema(input.repair!.collection, input.repair!.maxItems, input.repair!.referenceDirectory, evidenceDirectory, repairTargets(input).map(target => target.repairId))
+      : buildExtractionStageSchema(stage, evidenceDirectory);
     const messages = [
       { role: 'system' as const, content: `${stageSystemPrompt(systemPrompt(input), stage, true)}${stage === 'repair' ? `\n${repairPrompt(input)}` : ''}` },
       { role: 'user' as const, content: serializeExtractionInput(input, evidenceDirectory) },
@@ -256,10 +256,8 @@ export class ExtractionStageRunner {
       responseUsage = mergeMemoryLlmUsage(responseUsage, firstUsage);
       await input.onUsage?.(firstUsage);
       parentRequestId = turn.requestId;
-      let schemaRepairAttempted = false;
       let toolArgumentRepairAttempted = false;
-      while (true) {
-        while (turn.state === 'tool_calls') {
+      while (turn.state === 'tool_calls') {
         sessionId = turn.toolSessionId;
         rounds += 1;
         callCount += turn.calls.length;
@@ -300,25 +298,6 @@ export class ExtractionStageRunner {
         const turnUsage = memoryLlmUsageFromProvider(turn.usage);
         responseUsage = mergeMemoryLlmUsage(responseUsage, turnUsage);
         await input.onUsage?.(turnUsage);
-        }
-        if (turn.state === 'final' && turn.validationIssues?.length && !schemaRepairAttempted && validationCollections.length > 0) {
-          schemaRepairAttempted = true;
-          sessionId = undefined;
-          const repairMessages = [
-            {
-              role: 'system' as const,
-              content: `${messages[0].content}\n【固定阶段校验重试】上一轮有单项未通过 Schema。只重新输出一个完整且合法的 JSON 根对象；数组中每一项都必须满足 Schema，尤其 operation 只能使用枚举值。不要解释、不要 Markdown。安全问题：${JSON.stringify(turn.validationIssues.slice(0, 16))}`,
-            },
-            messages[1],
-          ];
-          turn = await llm.toolTurn(startRequest(repairMessages), context.signal);
-          const retryUsage = memoryLlmUsageFromProvider(turn.usage);
-          responseUsage = mergeMemoryLlmUsage(responseUsage, retryUsage);
-          await input.onUsage?.(retryUsage);
-          parentRequestId = turn.requestId;
-          continue;
-        }
-        break;
       }
       sessionId = undefined;
       const meta: MemoryLlmMeta = {
@@ -340,17 +319,6 @@ export class ExtractionStageRunner {
         ? normalizeRepairOutput(turn.output, input, evidenceDirectory, meta)
         : normalizeStructuredCapture(normalizedInput, input.sources.filter(source => writable.has(source.id)), evidenceDirectory, meta);
       const schemaRejections: AutomaticIngestRejection[] = (turn.itemRejections ?? []).map((item, index) => ({
-        ...(() => {
-          const rawItems = (turn.output as Record<string, unknown> | undefined)?.[item.collection];
-          const raw = Array.isArray(rawItems) ? rawItems[item.itemIndex] : undefined;
-          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
-          const snapshot = JSON.parse(JSON.stringify(raw)) as PlainData;
-          const localId = typeof (raw as Record<string, unknown>).localId === 'string' ? String((raw as Record<string, unknown>).localId).trim() : '';
-          return {
-            candidateSnapshot: snapshot,
-            ...(localId ? { candidateLocalId: localId } : {}),
-          };
-        })(),
         id: `schema:${turn.requestId}:${item.collection}:${item.itemIndex}:${index}`,
         index: item.itemIndex,
         code: 'schema_validation_failed',
@@ -369,7 +337,7 @@ export class ExtractionStageRunner {
         ...(turn.route.resourceId ? { resourceId: turn.route.resourceId } : {}),
         ...(turn.route.model ? { model: turn.route.model } : {}),
         status: 'unresolved',
-        repairAttempts: schemaRepairAttempted ? 1 : 0,
+        repairAttempts: 0,
       }));
       output.rejections = [...(output.rejections ?? []), ...schemaRejections];
       output.audit = auditFromResponse({ meta, usage: responseUsage });

@@ -1,6 +1,5 @@
 import {
   stableMemoryRecordKey,
-  type InventoryAvailability,
   type InventoryCommand,
   type InventoryItem,
   type InventoryItemCategory,
