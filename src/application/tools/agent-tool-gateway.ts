@@ -161,8 +161,8 @@ export class AgentToolGateway implements AgentToolGatewayPort {
     if (calls.length < 1 || calls.length > MAX_CALLS_PER_ROUND) {
       throw createSSHelperError('LLM_TOOL_CALL_LIMIT_EXCEEDED', { stage: 'memory.agent.tool.batch' });
     }
-    await this.seedPrefetchedReferences();
     const validated = calls.map(call => this.validate(call, context));
+    await this.seedPrefetchedReferences();
     const unique = new Map<string, Promise<ToolResultEnvelope>>();
     const results = await Promise.all(validated.map(async ({ call, name }) => {
       const key = `${name}\0${JSON.stringify(call.arguments)}`;
@@ -216,7 +216,7 @@ export class AgentToolGateway implements AgentToolGatewayPort {
     const args = record(call.arguments);
     if (name === 'reference.get_details') {
       exactKeys(args, ['refs', 'fields']);
-      for (const ref of stringList(args.refs, 'refs')) if (!this.#issued.has(ref)) {
+      for (const ref of stringList(args.refs, 'refs')) if (!this.#issued.has(ref) && ![...(this.input.knownActorContext ?? []), ...(this.input.knownLocationContext ?? []), ...(this.input.knownInventoryContext ?? []), ...(this.input.existingMemoryContext ?? [])].some(item => item.referenceId === ref)) {
         throw createSSHelperError('MEMORY_AGENT_TOOL_ARGUMENT_INVALID', { stage: 'memory.agent.tool.validate', path: 'refs', keyword: 'enum', expected: 'references issued in this pipeline' });
       }
       if (args.fields !== undefined) for (const field of stringList(args.fields, 'fields')) if (!DETAIL_FIELDS.has(field)) {
@@ -309,14 +309,14 @@ export class AgentToolGateway implements AgentToolGatewayPort {
     const owners = this.repository ? await this.repository.listOwners() : [];
     const locations = this.repository ? await this.repository.listLocations() : [];
     const candidates = [
-      ...(this.input.knownActorContext ?? []).map(item => ({ kind: 'actor' as const, id: item.ownerId ?? item.referenceId, preferredRef: item.referenceId, tracked: Boolean(item.ownerId), value: { canonicalName: item.canonicalName, aliases: item.aliases, status: item.status } })),
+      ...(this.input.knownActorContext ?? []).map(item => ({ kind: 'actor' as const, id: item.ownerId ?? item.referenceId, preferredRef: item.referenceId, tracked: Boolean(item.ownerId && item.recordRevision !== undefined), value: { canonicalName: item.canonicalName, aliases: item.aliases, status: item.status, revision: item.recordRevision } })),
       ...owners.map(item => ({ kind: 'actor' as const, id: item.id, tracked: true, value: { canonicalName: item.canonicalName ?? item.displayName, aliases: item.aliases ?? [], status: item.status, updatedAt: item.updatedAt } })),
-      ...(this.input.knownLocationContext ?? []).map(item => ({ kind: 'location' as const, id: item.locationId ?? item.referenceId, preferredRef: item.referenceId, tracked: Boolean(item.locationId), value: { canonicalName: item.canonicalName, aliases: item.aliases, status: item.status } })),
+      ...(this.input.knownLocationContext ?? []).map(item => ({ kind: 'location' as const, id: item.locationId ?? item.referenceId, preferredRef: item.referenceId, tracked: Boolean(item.locationId && item.recordRevision !== undefined), value: { canonicalName: item.canonicalName, aliases: item.aliases, status: item.status, revision: item.recordRevision } })),
       ...locations.map(item => ({ kind: 'location' as const, id: item.id, tracked: true, value: { canonicalName: item.canonicalName, aliases: item.aliases ?? [], status: item.status, updatedAt: item.updatedAt } })),
     ].filter(item => [normalized(item.value.canonicalName), ...(item.value.aliases as string[]).map(normalized)].some(name => wanted.includes(name)))
       .sort((left, right) => `${left.kind}:${left.id}`.localeCompare(`${right.kind}:${right.id}`));
     const selected = candidates.slice(0, limit);
-    const refs = await Promise.all(selected.map(item => this.issue(item.kind, item.id, item.value, 'preferredRef' in item && typeof item.preferredRef === 'string' ? item.preferredRef : undefined, item.tracked)));
+    const refs = await Promise.all(selected.map(item => this.issue(item.kind, item.id, plain(item.value), 'preferredRef' in item && typeof item.preferredRef === 'string' ? item.preferredRef : undefined, item.tracked)));
     const fields = [...new Set(needs.flatMap(need => need === 'identity' ? ['canonicalName', 'status'] : need === 'aliases' ? ['aliases'] : need === 'presence' ? ['status'] : []))];
     return { data: { items: refs.map(item => project(item.value, fields)) }, refs, truncated: candidates.length > selected.length };
   }
@@ -324,7 +324,7 @@ export class AgentToolGateway implements AgentToolGatewayPort {
   private async queryScenes(query: string, needs: readonly string[], limit: number) {
     const states = this.repository ? await this.repository.listSceneStates() : [];
     const selected = states.filter(item => !query.trim() || normalized(JSON.stringify(item)).includes(normalized(query))).sort((a, b) => Number(b.updatedAtFloor) - Number(a.updatedAtFloor) || a.id.localeCompare(b.id)).slice(0, limit);
-    const refs = await Promise.all(selected.map(item => this.issue('scene', item.id, this.safeSummary('scene', record(item)))));
+    const refs = await Promise.all(selected.map(item => this.issue('scene', item.id, plain(item))));
     const fields = [...new Set(needs.flatMap(need => need === 'presence' ? ['presentOwnerIds'] : ['sceneId', 'locationId', 'presentOwnerIds', 'updatedAtFloor', 'revision']))];
     return { data: { items: refs.map(item => project(item.value, fields)) }, refs, truncated: states.length > selected.length };
   }
@@ -332,26 +332,26 @@ export class AgentToolGateway implements AgentToolGatewayPort {
   private async queryInventory(mentions: readonly string[], needs: readonly string[], limit: number, category?: string) {
     const wanted = mentions.map(normalized);
     const [items, states, events] = this.repository ? await Promise.all([this.repository.listInventoryItems(), this.repository.listInventoryStates(), this.repository.listInventoryEvents()]) : [[], [], []];
-    const known = (this.input.knownInventoryContext ?? []).map(item => ({ id: item.itemId ?? item.referenceId, preferredRef: item.referenceId, tracked: Boolean(item.itemId), canonicalName: item.canonicalName, aliases: item.aliases, category: item.category, states: item.states }));
+    const known = (this.input.knownInventoryContext ?? []).map(item => ({ id: item.itemId ?? item.referenceId, preferredRef: item.referenceId, tracked: Boolean(item.itemId && item.recordRevision !== undefined), revision: item.recordRevision, canonicalName: item.canonicalName, aliases: item.aliases, category: item.category, states: item.states }));
     const merged = [...known, ...items.map(item => ({ id: item.id, tracked: true, canonicalName: item.canonicalName, aliases: item.aliases ?? [], category: item.category, states: states.filter(state => state.itemId === item.id), history: events.filter(event => event.itemId === item.id).slice(-20) }))]
       .filter(item => [normalized(item.canonicalName), ...item.aliases.map(normalized)].some(name => wanted.includes(name)) && (!category || normalized(item.category) === normalized(category)))
       .sort((a, b) => a.id.localeCompare(b.id));
     const selected = merged.slice(0, limit);
-    const refs = await Promise.all(selected.map(item => this.issue('inventory', item.id, this.safeSummary('inventory', record(item)), 'preferredRef' in item ? item.preferredRef : undefined, item.tracked)));
+    const refs = await Promise.all(selected.map(item => this.issue('inventory', item.id, plain(item), 'preferredRef' in item ? item.preferredRef : undefined, item.tracked)));
     const fields = [...new Set(needs.flatMap(need => need === 'identity' ? ['canonicalName', 'category'] : need === 'aliases' ? ['aliases'] : need === 'current_state' ? ['states'] : need === 'recent_history' ? ['history'] : []))];
     return { data: { items: refs.map(item => project(item.value, fields)) }, refs, truncated: merged.length > selected.length };
   }
 
   private async queryMemory(subject: string, predicate: string, needs: readonly string[], limit: number, object?: string, content?: string) {
     const facts = this.repository ? await this.repository.listFacts() : [];
-    const existing = (this.input.existingMemoryContext ?? []).map(item => ({ id: item.factId ?? item.referenceId, tracked: Boolean(item.factId), ...item }));
+    const existing = (this.input.existingMemoryContext ?? []).map(item => ({ id: item.factId ?? item.referenceId, tracked: Boolean(item.factId && item.recordRevision !== undefined), ...item, revision: item.recordRevision }));
     const candidates = [...existing, ...facts].filter(item => normalized(item.subjectKey) === normalized(subject)
       && (!predicate.trim() || normalized(item.predicateKey) === normalized(predicate))
       && (!object || normalized(record(item).objectKey) === normalized(object))
       && (!content || normalized(record(item).content).includes(normalized(content))))
       .sort((a, b) => Number(record(b).updatedAt ?? record(b).validFrom ?? 0) - Number(record(a).updatedAt ?? record(a).validFrom ?? 0) || a.id.localeCompare(b.id));
     const selected = candidates.slice(0, limit);
-    const refs = await Promise.all(selected.map(item => this.issue('fact', item.id, this.safeSummary('fact', record(item)), String(record(item).referenceId ?? '') || undefined, Boolean(record(item).tracked ?? true))));
+    const refs = await Promise.all(selected.map(item => this.issue('fact', item.id, plain(item), String(record(item).referenceId ?? '') || undefined, Boolean(record(item).tracked ?? true))));
     const fields = [...new Set(needs.flatMap(need => need === 'entity' ? ['subjectKey', 'objectKey'] : ['kind', 'subjectKey', 'predicateKey', 'objectKey', 'content', 'status', 'validFrom', 'validUntil', 'revision']))];
     return { data: { items: refs.map(item => project(item.value, fields)) }, refs, truncated: candidates.length > selected.length };
   }
@@ -364,7 +364,8 @@ export class AgentToolGateway implements AgentToolGatewayPort {
     return plain({ kind: value.kind, subjectKey: value.subjectKey, predicateKey: value.predicateKey, objectKey: value.objectKey, content: value.content, status: value.status, validFrom: value.validFrom, validUntil: value.validUntil, revision: value.revision });
   }
 
-  private async issue(kind: IssuedReference['kind'], recordId: string, raw: PlainData, preferredRef?: string, tracked = true): Promise<IssuedReference> {
+  private async issue(kind: IssuedReference['kind'], recordId: string, raw: PlainData, preferredRef?: string, tracked = true, expectedRevision = revisionOf(record(raw))): Promise<IssuedReference> {
+    tracked = tracked && expectedRevision > 0;
     const key = `${kind}:${recordId}`;
     const existingRef = this.#refByRecord.get(key);
     if (existingRef) {
@@ -372,7 +373,7 @@ export class AgentToolGateway implements AgentToolGatewayPort {
       if (!tracked || existing.tracked) return existing;
       const summary = record(raw);
       const safe = this.safeSummary(kind, summary);
-      const upgraded: IssuedReference = { kind, recordId, ref: existing.ref, revision: revisionOf(summary), contentDigest: await digest(safe), value: plain({ ref: existing.ref, ...record(safe) }), tracked: true };
+      const upgraded: IssuedReference = { kind, recordId, ref: existing.ref, revision: expectedRevision, contentDigest: await digest(safe), value: plain({ ref: existing.ref, ...record(safe) }), tracked: true };
       this.#issued.set(existing.ref, upgraded);
       return upgraded;
     }
@@ -390,7 +391,7 @@ export class AgentToolGateway implements AgentToolGatewayPort {
     const summary = record(raw);
     const safe = this.safeSummary(kind, summary);
     const value = plain({ ref, ...record(safe) });
-    const issued: IssuedReference = { kind, recordId, ref, revision: revisionOf(summary), contentDigest: await digest(safe), value, tracked };
+    const issued: IssuedReference = { kind, recordId, ref, revision: expectedRevision, contentDigest: await digest(safe), value, tracked };
     this.#issued.set(ref, issued); this.#refByRecord.set(key, ref);
     return issued;
   }
@@ -405,11 +406,12 @@ export class AgentToolGateway implements AgentToolGatewayPort {
   private async seedPrefetchedReferences(): Promise<void> {
     if (this.#prefetchedSeeded) return;
     this.#prefetchedSeeded = true;
+    const current = await this.loadCurrentRecords();
     await Promise.all([
-      ...(this.input.knownActorContext ?? []).map(item => this.issue('actor', item.ownerId ?? item.referenceId, plain({ canonicalName: item.canonicalName, aliases: item.aliases, status: item.status, revision: item.recordRevision }), item.referenceId, Boolean(item.ownerId && item.recordRevision !== undefined))),
-      ...(this.input.knownLocationContext ?? []).map(item => this.issue('location', item.locationId ?? item.referenceId, plain({ canonicalName: item.canonicalName, aliases: item.aliases, status: item.status, revision: item.recordRevision }), item.referenceId, Boolean(item.locationId && item.recordRevision !== undefined))),
-      ...(this.input.knownInventoryContext ?? []).map(item => this.issue('inventory', item.itemId ?? item.referenceId, plain({ canonicalName: item.canonicalName, aliases: item.aliases, category: item.category, states: item.states, revision: item.recordRevision }), item.referenceId, Boolean(item.itemId && item.recordRevision !== undefined))),
-      ...(this.input.existingMemoryContext ?? []).map(item => this.issue('fact', item.factId ?? item.referenceId, plain({ ...item, revision: item.recordRevision }), item.referenceId, Boolean(item.factId && item.recordRevision !== undefined))),
+      ...(this.input.knownActorContext ?? []).map(item => this.issue('actor', item.ownerId ?? item.referenceId, plain(current.get(`actor:${item.ownerId}`) ?? item), item.referenceId, Boolean(item.ownerId && item.recordRevision !== undefined), item.recordRevision)),
+      ...(this.input.knownLocationContext ?? []).map(item => this.issue('location', item.locationId ?? item.referenceId, plain(current.get(`location:${item.locationId}`) ?? item), item.referenceId, Boolean(item.locationId && item.recordRevision !== undefined), item.recordRevision)),
+      ...(this.input.knownInventoryContext ?? []).map(item => this.issue('inventory', item.itemId ?? item.referenceId, plain(current.get(`inventory:${item.itemId}`) ?? item), item.referenceId, Boolean(item.itemId && item.recordRevision !== undefined), item.recordRevision)),
+      ...(this.input.existingMemoryContext ?? []).map(item => this.issue('fact', item.factId ?? item.referenceId, plain(current.get(`fact:${item.factId}`) ?? item), item.referenceId, Boolean(item.factId && item.recordRevision !== undefined), item.recordRevision)),
     ]);
   }
 

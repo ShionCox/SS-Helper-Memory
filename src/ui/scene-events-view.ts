@@ -643,10 +643,6 @@ export function sceneGraphOwnerConfidence(scene: SceneCast, ownerId: string): nu
   return sceneOwnerConfidence(scene, ownerId);
 }
 
-export function sceneGraphOwnerSources(scene: SceneCast, ownerId: string): string[] {
-  return sceneOwnerSources(scene, ownerId);
-}
-
 export function sceneGraphOwnerIds(scene: SceneCast): string[] {
   return sceneOwnerIds(scene);
 }

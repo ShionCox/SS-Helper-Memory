@@ -329,6 +329,8 @@ export interface RepairAttemptContext {
 }
 
 export interface MemoryExtractionInput {
+  /** Safe format diagnostics for the one bounded stage recovery. */
+  formatRecovery?: Pick<import('@ss-helper/sdk').SSHelperFailureContext, 'reasonCode' | 'path' | 'keyword' | 'expected'>;
   workspaceId?: string;
   chatKey: string;
   /** Capture/job metadata used to build one LLM workflow trace per pipeline. */

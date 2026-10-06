@@ -93,7 +93,8 @@ function mergeStages(stages: readonly StageRunResult[]): StructuredCaptureResult
       parser: 'fixed-stage-v0',
       deterministicRepairs: stages.reduce((total, item) => total + (item.output.diagnostics?.deterministicRepairs ?? 0), 0),
       schemaRepairCalls: stages.reduce((total, item) => total + (item.output.diagnostics?.schemaRepairCalls ?? 0), 0),
-      transportMode: stages.some(item => item.output.diagnostics?.transportMode === 'native_strict') ? 'native_strict' : 'json_object_validated',
+      transportMode: stages.every(item => item.output.diagnostics?.transportMode === 'native_strict') ? 'native_strict'
+        : stages.every(item => ['native_strict', 'json_object_validated'].includes(item.output.diagnostics?.transportMode ?? '')) ? 'json_object_validated' : 'prompt_json',
     },
   };
 }
@@ -203,60 +204,74 @@ export class ExtractionPipelineCoordinator {
       signal,
     };
     if (signal.aborted) throw createSSHelperError('MEMORY_EXTRACTION_PIPELINE_CANCELLED', { stage: 'memory.extraction.start' });
+    const stageAttempts: StageRunResult[] = [];
+    const counts = new Map<ExtractionStageKey, number>();
+    const canRetry = (stage: ExtractionStageKey): boolean => (counts.get(stage) ?? 0) < 2;
+    const runStage = async (stage: ExtractionStageKey, stageInput: MemoryExtractionInput, stageContext: ExtractionRunContext, gateway: AgentToolGateway): Promise<StageRunResult> => {
+      let currentInput = stageInput;
+      for (;;) {
+        counts.set(stage, (counts.get(stage) ?? 0) + 1);
+        const began = Date.now();
+        try {
+          const result = await this.#runner.run(stage, currentInput, stageContext, gateway);
+          stageAttempts.push(result);
+          return result;
+        } catch (error) {
+          stageAttempts.push(stageFailure(stage, error, Date.now() - began));
+          const failure = readSSHelperFailure(error);
+          const formatFailure = failure && (failure.reasonCode === 'STRUCTURED_OUTPUT_EMPTY' || failure.reasonCode === 'INVALID_JSON' || failure.reasonCode === 'SCHEMA_VALIDATION_FAILED' && !/\[\d+\]/u.test(failure.path ?? ''));
+          if (signal.aborted || !formatFailure || !canRetry(stage)) throw error;
+          currentInput = { ...stageInput, formatRecovery: { reasonCode: failure.reasonCode, ...(failure.path ? { path: failure.path } : {}), ...(failure.keyword ? { keyword: failure.keyword } : {}), ...(failure.expected ? { expected: failure.expected } : {}) } };
+        }
+      }
+    };
     if (input.repair) {
       const gateways: AgentToolGateway[] = [];
-      const attempts: StageRunResult[] = [];
       let repairInput = prefetched.input;
       let repairContext = context;
       let gateway = new AgentToolGateway(repairInput, this.repository);
       gateways.push(gateway);
-      let result = await this.#runner.run('repair', repairInput, repairContext, gateway);
-      attempts.push(result);
+      let result = await runStage('repair', repairInput, repairContext, gateway);
       let guard = await gateway.verifyReadSet();
-      if (stagesRequiringRerun(guard.staleEntries).includes('repair')) {
+      if (stagesRequiringRerun(guard.staleEntries).includes('repair') && canRetry('repair')) {
         const refreshed = await this.#prefetcher.prefetch(input);
         repairInput = refreshed.input;
         repairContext = { ...context, dataRevision: refreshed.dataRevision };
         gateway = new AgentToolGateway(repairInput, this.repository);
         gateways.push(gateway);
-        result = await this.#runner.run('repair', repairInput, repairContext, gateway);
-        attempts.push(result);
+        result = await runStage('repair', repairInput, repairContext, gateway);
         guard = await gateway.verifyReadSet();
       }
       if (stagesRequiringRerun(guard.staleEntries).includes('repair')) {
         throw createSSHelperError('MEMORY_AGENT_TOOL_STALE_REVISION', { stage: 'memory.extraction.repair.read-set' });
       }
-      const audit = this.buildAudit(context, attempts, gateways, [], startedAt);
-      return { ...attachCandidateAttempts(result.output, attempts), audit: { ...result.output.audit, pipeline: audit } };
+      const audit = this.buildAudit(context, stageAttempts, gateways, [], startedAt);
+      return { ...attachCandidateAttempts(result.output, stageAttempts), audit: { ...result.output.audit, pipeline: audit } };
     }
     if (input.stage && input.stage !== 'single') {
       const gateways: AgentToolGateway[] = [];
-      const attempts: StageRunResult[] = [];
       let finalInput = prefetched.input;
       let finalContext = { ...context, mode: 'single' as const, agentToolPolicy: 'off' as const };
       let gateway = new AgentToolGateway(finalInput, this.repository);
       gateways.push(gateway);
-      let stageResult = await this.#runner.run(input.stage, finalInput, finalContext, gateway);
-      attempts.push(stageResult);
+      let stageResult = await runStage(input.stage, finalInput, finalContext, gateway);
       let guard = await gateway.verifyReadSet();
-      if (stagesRequiringRerun(guard.staleEntries).includes(input.stage)) {
+      if (stagesRequiringRerun(guard.staleEntries).includes(input.stage) && canRetry(input.stage)) {
         const refreshed = await this.#prefetcher.prefetch(input);
         finalInput = refreshed.input;
         finalContext = { ...finalContext, dataRevision: refreshed.dataRevision };
         gateway = new AgentToolGateway(finalInput, this.repository);
         gateways.push(gateway);
-        stageResult = await this.#runner.run(input.stage, finalInput, finalContext, gateway);
-        attempts.push(stageResult);
+        stageResult = await runStage(input.stage, finalInput, finalContext, gateway);
         guard = await gateway.verifyReadSet();
       }
       const staleStages = stagesRequiringRerun(guard.staleEntries);
       const planned = await this.planUpdates(stageResult.output, finalInput, finalContext, staleStages.length === 0, staleStages, guard.staleEntries, gateways);
-      const audit = this.buildAudit(finalContext, attempts, gateways, planned.decisions, startedAt);
-      return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, attempts), audit: { ...stageResult.output.audit, pipeline: audit } };
+      const audit = this.buildAudit(finalContext, stageAttempts, gateways, planned.decisions, startedAt);
+      return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, stageAttempts), audit: { ...stageResult.output.audit, pipeline: audit } };
     }
     if (input.stage === 'single' || settings.extractionMode === 'single') {
       const gateways: AgentToolGateway[] = [];
-      const attempts: StageRunResult[] = [];
       let finalInput = prefetched.input;
       let finalContext = {
         ...context,
@@ -265,41 +280,36 @@ export class ExtractionPipelineCoordinator {
       };
       let gateway = new AgentToolGateway(finalInput, this.repository);
       gateways.push(gateway);
-      let single = await this.#runner.run('single', finalInput, finalContext, gateway);
-      attempts.push(single);
+      let single = await runStage('single', finalInput, finalContext, gateway);
       let guard = await gateway.verifyReadSet();
-      if (stagesRequiringRerun(guard.staleEntries).includes('single')) {
+      if (stagesRequiringRerun(guard.staleEntries).includes('single') && canRetry('single')) {
         const refreshed = await this.#prefetcher.prefetch(input);
         finalInput = refreshed.input;
         finalContext = { ...finalContext, dataRevision: refreshed.dataRevision };
         gateway = new AgentToolGateway(finalInput, this.repository);
         gateways.push(gateway);
-        single = await this.#runner.run('single', finalInput, finalContext, gateway);
-        attempts.push(single);
+        single = await runStage('single', finalInput, finalContext, gateway);
         guard = await gateway.verifyReadSet();
       }
       const staleStages = stagesRequiringRerun(guard.staleEntries);
       const planned = await this.planUpdates(single.output, finalInput, finalContext, staleStages.length === 0, staleStages, guard.staleEntries, gateways);
-      const audit = this.buildAudit(finalContext, attempts, gateways, planned.decisions, startedAt);
-      return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, attempts), audit: { ...single.output.audit, pipeline: audit } };
+      const audit = this.buildAudit(finalContext, stageAttempts, gateways, planned.decisions, startedAt);
+      return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, stageAttempts), audit: { ...single.output.audit, pipeline: audit } };
     }
 
     const gateways: AgentToolGateway[] = [];
     let gateway = new AgentToolGateway(prefetched.input, this.repository);
     gateways.push(gateway);
-    const allAttempts: StageRunResult[] = [];
     const safeRun = async (stage: 'entities' | 'content', stageInput: MemoryExtractionInput, stageContext: ExtractionRunContext, stageGateway: AgentToolGateway): Promise<StageRunResult> => {
       const began = Date.now();
       try {
-        const result = await this.#runner.run(stage, stageInput, stageContext, stageGateway);
-        allAttempts.push(result);
+        const result = await runStage(stage, stageInput, stageContext, stageGateway);
         return result;
       }
       catch (error) {
         if (signal.aborted) throw error;
         const failed = stageFailure(stage, error, Date.now() - began);
         if (failed.audit.status === 'cancelled') throw error;
-        allAttempts.push(failed);
         return failed;
       }
     };
@@ -329,18 +339,19 @@ export class ExtractionPipelineCoordinator {
       finalContext = { ...context, dataRevision: refreshed.dataRevision };
       gateway = new AgentToolGateway(finalInput, this.repository);
       gateways.push(gateway);
-      if (rerunStages.includes('entities')) entities = await safeRun('entities', finalInput, finalContext, gateway);
+      const retriedStages = rerunStages.filter(canRetry);
+      if (retriedStages.includes('entities')) entities = await safeRun('entities', finalInput, finalContext, gateway);
       downstream = downstreamInput(finalInput, entities);
       await gateway.registerPendingReferences(downstream);
-      const rerunContent = rerunStages.includes('content');
+      const rerunContent = retriedStages.includes('content');
       if (rerunContent) content = await safeRun('content', downstream, finalContext, gateway);
       const [unaffectedGuard, retryGuard] = await Promise.all([
-        initialGateway.verifyReadSet(rerunStages),
+        initialGateway.verifyReadSet(retriedStages),
         gateway.verifyReadSet(),
       ]);
       guard = {
-        valid: unaffectedGuard.valid && retryGuard.valid,
-        staleStages: uniqueStages([...unaffectedGuard.staleStages, ...retryGuard.staleStages]),
+        valid: unaffectedGuard.valid && retryGuard.valid && retriedStages.length === rerunStages.length,
+        staleStages: uniqueStages([...unaffectedGuard.staleStages, ...retryGuard.staleStages, ...rerunStages.filter(stage => !retriedStages.includes(stage))]),
         staleEntries: [...unaffectedGuard.staleEntries, ...retryGuard.staleEntries],
       };
     }
@@ -351,10 +362,10 @@ export class ExtractionPipelineCoordinator {
       throw createSSHelperError(failure.reasonCode, failure);
     }
     const merged = mergeStages(finalStages);
-    const staleStages = stagesRequiringRerun(guard.staleEntries);
+    const staleStages = uniqueStages([...stagesRequiringRerun(guard.staleEntries), ...guard.staleStages]);
     const planned = await this.planUpdates(merged, finalInput, finalContext, staleStages.length === 0, staleStages, guard.staleEntries, gateways);
-    const audit = this.buildAudit(context, allAttempts, gateways, planned.decisions, startedAt);
-    return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, allAttempts), audit: { ...planned.output.audit, pipeline: audit, ...(failedStage ? { failedStage } : {}) } };
+    const audit = this.buildAudit(context, stageAttempts, gateways, planned.decisions, startedAt);
+    return { ...attachCandidateAttempts({ ...planned.output, reviewItems: planned.reviewItems }, stageAttempts), audit: { ...planned.output.audit, pipeline: audit, ...(failedStage ? { failedStage } : {}) } };
   }
 
   private buildAudit(

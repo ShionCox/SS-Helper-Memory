@@ -21,6 +21,7 @@ export const MEMORY_WORKSPACE_COLLECTIONS = Object.freeze({
   'memory-review-items': ['workspaceId', 'chatKey', 'pipelineRunId', 'stage', 'status', 'createdAt'],
   'memory-candidates': ['workspaceId', 'chatKey', 'jobId', 'batchIndex', 'collection', 'status', 'stage', 'createdAt'],
   'change-audits': ['workspaceId', 'chatKey', 'createdAt'],
+  'change-audit-chunks': ['workspaceId', 'chatKey', 'auditId', 'index'],
   'memory-details': ['workspaceId', 'chatKey', 'ownerId', 'traceId'],
   'memory-links': ['workspaceId', 'chatKey', 'ownerId', 'updatedAt'],
   'vector-index': ['workspaceId', 'chatKey', 'recordId', 'updatedAt'],

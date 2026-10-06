@@ -929,7 +929,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     app.stop();
   });
 
-  it('初始化只有不可修复低质量项时自动忽略并正常完成', async () => {
+  it('初始化只有重复候选时自动忽略并正常完成', async () => {
     state.sources = [{ ...message(1), floor: 1, content: '白夕小时确认地下储油库仍有约百分之四十五燃油。' }];
     const { MemoryApplication } = await import('../src/application/memory-application');
     const repository = new FakeRepository();
@@ -958,7 +958,7 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
         owners: [], pendingCandidates: [], episodes: [], observations: [], facts: [], traces: [],
         sceneCast: { id: 'scene:failed', workspaceId: 'character:c1', chatKey: 'chat-a', floor: 1, members: [], viewpointOwnerId: 'owner:unknown', speakerOwnerIds: [], presentOwnerIds: [], mentionedOwnerIds: [], createdAt: now },
         outcome: 'partial' as const,
-        rejections: [{ index: 0, recordType: 'claim' as const, code: 'quality_below_threshold' as const, message: '质量不足', status: 'unresolved' as const }],
+        rejections: [{ index: 0, recordType: 'claim' as const, code: 'duplicate_proposal' as const, message: '重复候选', status: 'unresolved' as const }],
         acceptedLocalIds: { actor: [], episode: [], observation: [], fact: [] },
         changeAudit: { id: 'change-audit:empty-facts' },
       })),

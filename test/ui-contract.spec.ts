@@ -27,8 +27,6 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(styles).toMatch(/\.stx-memory-page-content\s*\{[^}]*background:\s*var\(--stx-memory-content-surface\)/u);
     expect(styles).toMatch(/\.stx-memory-statusbar\s+\[data-ss-helper-control="status"\][^}]*justify-self:\s*start/u);
     expect(styles).toMatch(/\.stx-memory-statusbar\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1\.35fr\)\s+repeat\(6,/u);
-    expect(styles).toMatch(/\.stx-memory-panel\s*>\s*p\.stx-memory-estimate-note\s*\{[^}]*margin:\s*14px\s+0\s+0/u);
-    expect(styles).toContain('.stx-memory-workbench .stx-memory-panel > p.stx-memory-estimate-note { margin: 14px 0 0; }');
     expect(styles).toMatch(/\.stx-memory-chat-storage\s*\{[^}]*border-radius:\s*7px/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-maintenance-action\[data-ss-helper-control="button"\][^}]*display:\s*grid[^}]*grid-template-columns:\s*34px\s+minmax\(0,\s*1fr\)\s+20px/u);
     expect(styles).toMatch(/\.stx-memory-maintenance-icon\s*\{[^}]*width:\s*34px[^}]*height:\s*34px[^}]*place-items:\s*center/u);
@@ -54,17 +52,9 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(styles).toMatch(/\.stx-memory-audit-split\s*\{[^}]*grid-template-columns:\s*minmax\(18rem,\s*\.78fr\)\s+minmax\(28rem,\s*1\.22fr\)/u);
     expect(styles).toMatch(/\.stx-memory-audit-shell\[data-audit-mobile-view="list"\]\s+\.stx-memory-audit-detail\s*\{[^}]*display:\s*none/u);
     expect(styles).toMatch(/\.stx-memory-usage-chart-stage\s*\{[^}]*position:\s*relative[^}]*height:\s*220px/u);
-    expect(styles).toMatch(/\.stx-memory-page-content:has\(> \.stx-memory-card-grid\)[^}]*grid-template-rows/u);
-    expect(styles).toMatch(/\.stx-memory-multi-filter-menu\s*\{[^}]*position:\s*absolute[^}]*max-height:/u);
-    expect(styles).toMatch(/\.stx-memory-multi-filter-option\s*\{[^}]*display:\s*flex/u);
-    expect(styles).toMatch(/\.stx-memory-multi-filter-menu\s*\{[^}]*display:\s*grid[^}]*gap:\s*4px/u);
-    expect(styles).toMatch(/\.stx-memory-multi-filter-option\.is-selected,\s*\.stx-memory-multi-filter-option\.is-partial\s*\{[^}]*border-color:\s*transparent[^}]*background:\s*transparent/u);
-    expect(styles).not.toMatch(/\.stx-memory-multi-filter-option\.is-selected[^,{]*\{[^}]*border-left-color:/u);
-    expect(styles).toMatch(/input\.stx-memory-multi-filter-native\[data-ss-helper-control="checkbox"\]\s*\{[^}]*clip-path:\s*inset\(50%\)[^}]*opacity:\s*0/u);
     expect(source).toContain('<ss-helper-icon name="check" decorative>');
     expect(source).not.toContain('fa-square-check');
     expect(source).not.toContain('fa-regular');
-    expect(styles).toMatch(/\.stx-memory-card-grid\s*\{[^}]*min-height:\s*100%/u);
     expect(styles).toMatch(/\.stx-memory-reinitialize-drawer\s*\{[^}]*background-color:\s*var\(--ss-theme-surface,\s*#1b1b1a\)[^}]*animation:\s*stx-memory-reinitialize-drawer-in/u);
     expect(styles).toMatch(/\.stx-memory-drawer-backdrop\s*\{[^}]*background:\s*rgba\(0,\s*0,\s*0,\s*\.62\)[^}]*animation:\s*stx-memory-reinitialize-backdrop-in/u);
     expect(styles).toContain('@keyframes stx-memory-reinitialize-drawer-in');
@@ -72,7 +62,6 @@ describe('Memory 工作台公共 UI 契约门禁', () => {
     expect(initializationStyles).toMatch(/\.stx-memory-workbench \.stx-memory-init-source-card\s*\{[^}]*height:\s*60px/u);
     expect(initializationStyles).toMatch(/\.stx-memory-workbench \.stx-memory-init-option\.is-selected\s*\{[^}]*background:/u);
     expect(initializationStyles).toMatch(/\.stx-memory-workbench \.stx-memory-init-source-card\.is-selected\s*\{[^}]*background:/u);
-    expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-multi-filter-trigger\[data-ss-helper-control="button"\]\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+24px[^}]*justify-content:\s*stretch/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-fact-row\[data-ss-helper-control="button"\]\s*\{[^}]*min-height:\s*116px[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)[^}]*align-items:\s*stretch[^}]*border-color:\s*transparent/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-library-fact-list\s*\{[^}]*grid-auto-rows:\s*max-content/u);
     expect(styles).toMatch(/\.stx-memory-workbench\s+\.stx-memory-library-fact-row\[data-ss-helper-control="button"\]\s*\{[^}]*min-height:\s*116px/u);

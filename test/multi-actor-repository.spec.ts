@@ -162,6 +162,61 @@ function currentStableKey(value: string): string {
 }
 
 describe('multi-actor repository transaction semantics', () => {
+  it('atomically chunks a large audit, hydrates it, replays it and rolls it back without losing Unicode', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    const data = commit(0.8, 0);
+    const excerpt = '证据😀"\\'.repeat(60_000);
+    const large = { ...data, captureJobId: 'large-job', captureJob: { id: 'large-job', status: 'running', checkpoint: { completedBatchCount: 1 } }, evidence: [...data.evidence.map(item => ({ ...item, excerpt })), { ...data.evidence[0]!, id: 'evidence:second', excerpt }] };
+    const transaction = vi.spyOn(workspace, 'transaction');
+    const audit = await repository.commitCapture(large);
+    const persisted = (await workspace.get({ collection: 'change-audits', recordId: audit.id }))!.value as any;
+    expect(persisted.snapshot.chunkCount).toBeGreaterThan(1);
+    const chunks = (await workspace.query({ collection: 'change-audit-chunks' })).records;
+    for (const row of chunks) expect(new TextEncoder().encode(JSON.stringify(row.value)).byteLength).toBeLessThanOrEqual(512 * 1024);
+    expect(transaction).toHaveBeenCalledTimes(1);
+    const operations = transaction.mock.calls[0][0].operations;
+    expect(operations.some(item => item.collection === 'capture-jobs')).toBe(true);
+    expect(operations.some(item => item.collection === 'change-audit-chunks')).toBe(true);
+    expect(await repository.getChangeAudit(audit.id)).toEqual(audit);
+    expect((await repository.page('change-audits', { limit: 10 }, { chatKey: 'chat' })).items).toEqual([audit]);
+    expect(await repository.commitCapture(large)).toEqual(audit);
+    expect(transaction).toHaveBeenCalledTimes(1);
+    await repository.updateCaptureAuditRejections(audit.id, [{ recordType: 'claim', index: 0, candidateLocalId: 'ignored', code: 'duplicate_proposal', message: '重复候选', status: 'ignored' }]);
+    const updated = await repository.getChangeAudit(audit.id);
+    expect((updated!.metadata as any).rejections[0].candidateLocalId).toBe('ignored');
+    expect((await repository.page('change-audits', { limit: 10 }, { chatKey: 'chat' })).items).toEqual([updated]);
+    const updatedChunks = (await workspace.query({ collection: 'change-audit-chunks' })).records;
+    expect(updatedChunks.every(row => !chunks.some(old => old.recordId === row.recordId))).toBe(true);
+    const first = updatedChunks[0]!;
+    await workspace.delete({ collection: 'change-audit-chunks', recordId: first.recordId });
+    await expect(repository.rollbackChangeSet(audit.id)).rejects.toMatchObject({ details: { reasonCode: 'INVALID_PAYLOAD', stage: 'memory.repository.audit.integrity' } });
+    expect(await repository.listFacts()).toHaveLength(1);
+    await workspace.upsert({ collection: 'change-audit-chunks', recordId: first.recordId, value: { ...(first.value as any), content: `x${(first.value as any).content.slice(1)}` } });
+    await expect(repository.getChangeAudit(audit.id)).rejects.toMatchObject({ details: { stage: 'memory.repository.audit.integrity' } });
+    await workspace.upsert({ collection: 'change-audit-chunks', recordId: first.recordId, value: first.value });
+    await repository.rollbackChangeSet(audit.id);
+    expect(await repository.listFacts()).toEqual([]);
+    expect(await repository.getChangeAudit(audit.id)).toMatchObject({ rolledBackAt: expect.any(Number) });
+    await repository.clearCurrentChatData();
+    expect((await workspace.query({ collection: 'change-audit-chunks' })).records).toEqual([]);
+  });
+
+  it('leaves no progress or memory rows when an atomic chunk transaction fails', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    vi.spyOn(workspace, 'transaction').mockRejectedValueOnce(createSSHelperError('WORKSPACE_RECORD_TOO_LARGE', { stage: 'server.workspace.write', collection: 'change-audit-chunks' }));
+    const data = commit(0.8, 0);
+    await expect(repository.commitCapture({ ...data, captureJobId: 'failed-job', captureJob: { id: 'failed-job', status: 'running' }, evidence: data.evidence.map(item => ({ ...item, excerpt: '证据'.repeat(120_000) })) })).rejects.toMatchObject({ details: { reasonCode: 'WORKSPACE_RECORD_TOO_LARGE' } });
+    expect(await repository.listFacts()).toEqual([]);
+    expect(await repository.listChangeAudits()).toEqual([]);
+    expect(await workspace.get({ collection: 'capture-jobs', recordId: 'failed-job' })).toBeNull();
+  });
+
   it('persists and clears the additive scene, cast, coverage and usage records', async () => {
     const workspace = port();
     const repository = new MultiActorMemoryRepository(workspace);

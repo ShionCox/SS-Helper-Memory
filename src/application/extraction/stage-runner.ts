@@ -225,7 +225,7 @@ export class ExtractionStageRunner {
       ? buildStructuredRepairSchema(input.repair!.collection, input.repair!.maxItems, input.repair!.referenceDirectory, evidenceDirectory, repairTargets(input).map(target => target.repairId))
       : buildExtractionStageSchema(stage, evidenceDirectory);
     const messages = [
-      { role: 'system' as const, content: `${stageSystemPrompt(systemPrompt(input), stage, true)}${stage === 'repair' ? `\n${repairPrompt(input)}` : ''}` },
+      { role: 'system' as const, content: `${stageSystemPrompt(systemPrompt({ ...input, ...(stage === 'entities' || stage === 'content' ? { stage } : {}) }), stage, true)}${stage === 'repair' ? `\n${repairPrompt(input)}` : ''}` },
       { role: 'user' as const, content: serializeExtractionInput(input, evidenceDirectory) },
     ];
     const validationCollections = stage === 'entities'
@@ -341,7 +341,7 @@ export class ExtractionStageRunner {
       }));
       output.rejections = [...(output.rejections ?? []), ...schemaRejections];
       output.audit = auditFromResponse({ meta, usage: responseUsage });
-      output.diagnostics = { ...output.diagnostics, transportMode: 'native_strict' };
+      output.diagnostics = { ...output.diagnostics, transportMode: turn.diagnostics.jsonOutputMode === 'json_object' ? 'json_object_validated' : turn.diagnostics.jsonOutputMode === 'json_schema' ? 'native_strict' : 'prompt_json' };
       return {
         output,
         audit: {

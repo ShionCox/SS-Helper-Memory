@@ -1,4 +1,5 @@
 import type { AutomaticIngestRejection, MemoryTokenUsage } from '../../domain';
+import { CAPTURE_LIMITS } from './capture-limits';
 import {
   createSSHelperError,
   type LlmTaskRouteSetRequest,
@@ -456,7 +457,7 @@ export function buildStructuredCaptureSchema(
   const localId = { type: 'string', minLength: 1, maxLength: 80, pattern: '^[A-Za-z0-9_.:-]+$' };
   const actorCandidate = {
     type: 'object', additionalProperties: false,
-    required: ['localId', 'displayName', 'aliases', 'evidenceSpanId', 'confidence'],
+    required: ['localId', 'displayName', 'evidenceSpanId', 'confidence'],
     properties: {
       localId,
       displayName: requiredString(80),
@@ -467,7 +468,7 @@ export function buildStructuredCaptureSchema(
   };
   const locationCandidate = {
     type: 'object', additionalProperties: false,
-    required: ['localId', 'displayName', 'aliases', 'evidenceSpanId', 'confidence'],
+    required: ['localId', 'displayName', 'evidenceSpanId', 'confidence'],
     properties: {
       localId,
       displayName: requiredString(120),
@@ -478,7 +479,7 @@ export function buildStructuredCaptureSchema(
   };
   const itemCandidate = {
     type: 'object', additionalProperties: false,
-    required: ['localId', 'displayName', 'aliases', 'category', 'evidenceSpanId', 'confidence'],
+    required: ['localId', 'displayName', 'category', 'evidenceSpanId', 'confidence'],
     properties: {
       localId,
       displayName: requiredString(120),
@@ -490,7 +491,7 @@ export function buildStructuredCaptureSchema(
   };
   const episode = {
     type: 'object', additionalProperties: false,
-    required: ['localId', 'evidenceSpanIds', 'participantRefs', 'presentRefs', 'mentionedRefs', 'locationRef', 'storyTimeText', 'summary'],
+    required: ['localId', 'evidenceSpanIds', 'participantRefs', 'presentRefs', 'mentionedRefs', 'locationRef', 'summary'],
     properties: {
       localId,
       evidenceSpanIds: { type: 'array', minItems: 1, maxItems: 12, uniqueItems: true, items: evidenceSpanId },
@@ -519,8 +520,7 @@ export function buildStructuredCaptureSchema(
   const claim = {
     type: 'object', additionalProperties: false,
     required: [
-      'localId', 'episodeLocalId', 'kind', 'subjectRef', 'subjectText',
-      'predicateKey', 'objectRef', 'objectText', 'content', 'evidenceSpanId', 'knowledge', 'confidence', 'stableAnchor',
+      'localId', 'kind', 'predicateKey', 'content', 'evidenceSpanId', 'knowledge', 'confidence',
     ],
     properties: {
       localId,
@@ -560,12 +560,12 @@ export function buildStructuredCaptureSchema(
     additionalProperties: false,
     required: ['actorCandidates', 'locationCandidates', 'itemCandidates', 'episodes', 'claims', 'inventoryOperations'],
     properties: {
-      actorCandidates: { type: 'array', maxItems: 24, items: actorCandidate },
-      locationCandidates: { type: 'array', maxItems: 24, items: locationCandidate },
-      itemCandidates: { type: 'array', maxItems: 40, items: itemCandidate },
-      episodes: { type: 'array', maxItems: 16, items: episode },
-      claims: { type: 'array', maxItems: 32, items: claim },
-      inventoryOperations: { type: 'array', maxItems: 48, items: inventoryOperation },
+      actorCandidates: { type: 'array', maxItems: CAPTURE_LIMITS.actors, items: actorCandidate },
+      locationCandidates: { type: 'array', maxItems: CAPTURE_LIMITS.locations, items: locationCandidate },
+      itemCandidates: { type: 'array', maxItems: CAPTURE_LIMITS.items, items: itemCandidate },
+      episodes: { type: 'array', maxItems: CAPTURE_LIMITS.episodes, items: episode },
+      claims: { type: 'array', maxItems: CAPTURE_LIMITS.claims, items: claim },
+      inventoryOperations: { type: 'array', maxItems: CAPTURE_LIMITS.inventoryOperations, items: inventoryOperation },
     },
   };
 }
@@ -786,7 +786,7 @@ export function normalizeStructuredCapture(
     actorCandidates.push({
       localId: item.localId,
       displayName: item.displayName,
-      aliases: [...item.aliases],
+      aliases: [...(item.aliases ?? [])],
       sourceRef: span.sourceRef,
       evidenceExcerpt: span.text,
       confidence: item.confidence,
@@ -802,7 +802,7 @@ export function normalizeStructuredCapture(
     locationCandidates.push({
       localId: item.localId,
       displayName: item.displayName,
-      aliases: [...item.aliases],
+      aliases: [...(item.aliases ?? [])],
       sourceRef: span.sourceRef,
       evidenceExcerpt: span.text,
       confidence: item.confidence,
@@ -818,7 +818,7 @@ export function normalizeStructuredCapture(
     itemCandidates.push({
       localId: item.localId,
       displayName: item.displayName,
-      aliases: [...item.aliases],
+      aliases: [...(item.aliases ?? [])],
       category: item.category,
       sourceRef: span.sourceRef,
       evidenceExcerpt: span.text,
@@ -846,7 +846,7 @@ export function normalizeStructuredCapture(
       evidenceExcerpt: span.text,
       knowledge: copyKnowledge(item.knowledge),
       confidence: item.confidence,
-      stableAnchor: item.stableAnchor,
+      stableAnchor: item.stableAnchor ?? false,
     });
   }
   const inventoryOperations: StructuredInventoryOperation[] = [];
@@ -930,11 +930,15 @@ export function auditFromResponse(response: { meta?: MemoryLlmMeta; usage?: Memo
 export function systemPrompt(input: MemoryExtractionInput): string {
   return [
     '你是 SS-Helper 的多角色长期记忆 Claim 捕获器。只提取已经发生或已经明确成立、且对未来剧情有检索价值的内容。',
+    ...(input.formatRecovery ? [`上一轮格式未通过校验。仅依据本批来源重新生成 JSON，不复用失败输出。安全诊断：${JSON.stringify(input.formatRecovery)}`] : []),
     '最终只返回一个符合当前固定阶段 Schema 的 JSON 对象；顶层字段以后续“固定阶段”规则为准。不要 Markdown，不要解释。',
     '只有 allowedSourceRefs 可以成为新记录证据；contextOnlySourceRefs 与 existingMemoryContext 只用于理解和去重。',
     'knownActors 与 knownLocations 是系统目录。所有人物和地点引用必须优先使用其中的 ref；简称、昵称、繁简写法不得创建重复候选。',
-    '新人物必须具有持续身份、能独立行动、说话、思考或知情；“重构体”“表情的话”、物品、材料、食物、地点、状态和抽象概念都不是人物。',
-    '新地点必须是可持续定位的场所，普通方位词“这里、外面、前方”不是地点。',
+    ...(input.stage === 'content' ? [] : [
+      '新人物必须具有持续身份、能独立行动、说话、思考或知情；物品、材料、地点、状态和抽象概念都不是人物。',
+      '新地点必须是可持续定位的场所，普通方位词“这里、外面、前方”不是地点。',
+    ]),
+    ...(input.stage === 'entities' ? [] : [
     'knownInventory 是只读的当前物品目录，只用于识别与去重，绝不能作为新数量证据。只有来源明确命名的物品才能输出操作。',
     '物品获得、消耗、盘点和移除写入 inventoryOperations，不要再输出重复的库存数量 Claim。新物品先输出 itemCandidates，并由 inventoryOperations.itemRef 引用其 localId。',
     'inventoryOperations.rawAmount 必须逐字出现在 evidenceSpanId 对应片段中；set 是绝对快照，increase/decrease 只用于明确增减，remove 只用于明确丢弃、耗尽或不再持有。',
@@ -950,8 +954,10 @@ export function systemPrompt(input: MemoryExtractionInput): string {
     'actorCandidate、locationCandidate 和 claim 只选择 sourceBlocks 中已有的 evidenceSpanId，不得输出 sourceRef，不得复制、概括、翻译或自行补写证据。服务器会由 evidenceSpanId 确定性回填来源和原始证据正文。',
     '公开发言用 self_reported；明确在场的听者使用 observerRefs；内心独白仅归属 speakerRef 且 privacy 为 private/secret；传闻使用 believed/suspected。',
     '重复旧记忆不要输出；状态变化输出新的 Claim，服务器负责 supersede，不要删除或修改旧事实。',
-    '无法确定的可选字符串必须输出空字符串，数组输出空数组；不得输出 null，不得新增字段。',
-    ...(input.graphLlmRelationEnabled === true ? [
+    ]),
+    '只选择 sourceBlocks 中已有的 evidenceSpanId；不得复制、改写或补写证据，证据正文由服务器回填。',
+    '允许缺省的字段可以省略；未知事实不得用 0、false 或 null 补写。没有可提取内容时返回空数组，不得新增字段。',
+    ...(input.stage !== 'entities' && input.graphLlmRelationEnabled === true ? [
       '明确的主体—关系—客体应输出 relationship/location/world_rule/goal/commitment/capability/event Claim；不得只凭共现推断关系。',
     ] : []),
   ].join('\n');

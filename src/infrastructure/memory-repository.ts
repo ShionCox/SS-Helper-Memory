@@ -43,6 +43,7 @@ import {
   stableMemoryRecordKey,
 } from '../domain';
 import { float32ArrayToArrayBuffer, sha256Content } from './vector/vector-utils';
+import { splitUtf8, textBytes } from './json-snapshot';
 import { startMemoryPerformanceSpan, traceMemoryStartup } from '../host/runtime-feedback';
 import {
   memoryStoreFor,
@@ -149,29 +150,6 @@ function dataChatKey(value: PlainData | undefined): string | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const candidate = (value as { chatKey?: unknown }).chatKey;
   return typeof candidate === 'string' && candidate.trim() ? candidate : undefined;
-}
-
-const textEncoder = new TextEncoder();
-function textBytes(value: string | undefined): number {
-  return value ? textEncoder.encode(value).byteLength : 0;
-}
-
-function splitUtf8(value: string, maximumBytes = PROMPT_SNAPSHOT_CHUNK_BYTES): string[] {
-  const chunks: string[] = [];
-  let current = '';
-  let bytes = 0;
-  for (const character of value) {
-    const size = textEncoder.encode(character).byteLength;
-    if (bytes > 0 && bytes + size > maximumBytes) {
-      chunks.push(current);
-      current = '';
-      bytes = 0;
-    }
-    current += character;
-    bytes += size;
-  }
-  if (current || value.length === 0) chunks.push(current);
-  return chunks;
 }
 
 function containsExactText(value: unknown, expected: string): boolean {
@@ -903,7 +881,7 @@ export class MemoryRepository {
       : prompt?.kind === 'text' ? prompt.prompt.includes(memoryInjection) : false;
     const captureStatus = prompt === undefined ? 'unavailable' as const
       : byteLength > PROMPT_SNAPSHOT_MAX_BYTES ? 'too_large' as const : 'available' as const;
-    const texts = captureStatus === 'available' ? splitUtf8(serialized) : [];
+    const texts = captureStatus === 'available' ? splitUtf8(serialized, PROMPT_SNAPSHOT_CHUNK_BYTES) : [];
     const metadata: GenerationPromptSnapshotMetadata = {
       snapshotId, kind, ...(messageCount === undefined ? {} : { messageCount }), byteLength, sha256,
       chunkCount: texts.length, captureStatus, verifiedIncludesMemory,
@@ -1265,8 +1243,8 @@ export class MemoryRepository {
   async clearCurrentChatData(chatKey: string): Promise<void> {
     chatKey = this.requireChatKey(chatKey);
     const workspaceId = this.requireWorkspaceId();
-    const [evidenceRecords, jobRecords, auditRecords, candidateRecords, usageRecords, logRecords, recallDetailRecords, promptSnapshotRecords, promptChunkRecords, factRecords, slotRecords, graphNodeRecords, graphEdgeRecords] = await Promise.all([
-      this.listAllRecordRows('evidence', { chatKey }), this.listAllRecordRows('capture-jobs', { chatKey }), this.listAllRecordRows('change-audits', { chatKey }),
+    const [evidenceRecords, jobRecords, auditRecords, auditChunkRecords, candidateRecords, usageRecords, logRecords, recallDetailRecords, promptSnapshotRecords, promptChunkRecords, factRecords, slotRecords, graphNodeRecords, graphEdgeRecords] = await Promise.all([
+      this.listAllRecordRows('evidence', { chatKey }), this.listAllRecordRows('capture-jobs', { chatKey }), this.listAllRecordRows('change-audits', { chatKey }), this.listAllRecordRows('change-audit-chunks', { chatKey }),
       this.listAllRecordRows('memory-candidates', { chatKey }),
       this.listAllRecordRows('usage', { chatKey }), this.listAllRecordRows('recall-logs', { chatKey }),
       this.listAllRecordRows('generation-recall-details', { chatKey }),
@@ -1276,7 +1254,7 @@ export class MemoryRepository {
       this.listAllRecordRows('graph-nodes', { chatKey }), this.listAllRecordRows('graph-edges', { chatKey }),
     ]);
     const collections = [
-      ['evidence', evidenceRecords], ['capture-jobs', jobRecords], ['change-audits', auditRecords], ['memory-candidates', candidateRecords],
+      ['evidence', evidenceRecords], ['capture-jobs', jobRecords], ['change-audits', auditRecords], ['change-audit-chunks', auditChunkRecords], ['memory-candidates', candidateRecords],
       ['usage', usageRecords], ['recall-logs', logRecords], ['generation-recall-details', recallDetailRecords],
       ['generation-prompt-snapshots', promptSnapshotRecords], ['generation-prompt-snapshot-chunks', promptChunkRecords],
       ['facts', factRecords], ['fact-heads', slotRecords],

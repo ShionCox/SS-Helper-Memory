@@ -1,4 +1,5 @@
 import type { ExtractionStageKey } from './extraction-types';
+import { CAPTURE_LIMITS } from '../ingest/capture-limits';
 
 const SHARED_TOOL_RULES = [
   '【只读工具规则】',
@@ -10,9 +11,9 @@ const SHARED_TOOL_RULES = [
 ].join('\n');
 
 const STAGE_RULES: Readonly<Record<ExtractionStageKey, string>> = Object.freeze({
-  single: '顶层必须且只能包含 actorCandidates、locationCandidates、itemCandidates、episodes、claims、inventoryOperations 六个数组；每条输出必须由本批 evidenceSpanId 直接支持。只输出互不重复、对未来剧情确有检索价值的最小集合，episodes 最多 8 条、claims 最多 16 条；直接生成 JSON，不要先复述来源或展开分析。',
+  single: `顶层必须且只能包含 actorCandidates、locationCandidates、itemCandidates、episodes、claims、inventoryOperations 六个数组；每条输出必须由本批 evidenceSpanId 直接支持。只输出互不重复、对未来剧情确有检索价值的最小集合，episodes 最多 ${CAPTURE_LIMITS.episodes} 条、claims 最多 ${CAPTURE_LIMITS.claims} 条；直接生成 JSON，不要先复述来源或展开分析。`,
   entities: '顶层必须且只能包含 actorCandidates 与 locationCandidates 两个数组；不得输出其他顶层字段，也不得输出物品、事件、事实或库存操作。',
-  content: '顶层必须且只能包含 episodes、claims、itemCandidates 与 inventoryOperations 四个数组；不得输出其他顶层字段。人物和地点只能引用已提供或实体阶段发放的短引用。旧库存只能用于比较，不能作为新数量证据。inventoryOperations.operation 只能逐字使用 set、increase、decrease 或 remove；获得/拿到也必须写 increase，失去/消耗/丢弃分别写 decrease 或 remove。只输出互不重复、对未来剧情确有检索价值的最小集合，episodes 最多 8 条、claims 最多 16 条；直接生成 JSON，不要先复述来源或展开分析。',
+  content: `顶层必须且只能包含 episodes、claims、itemCandidates 与 inventoryOperations 四个数组；不得输出其他顶层字段。人物和地点只能引用已提供或实体阶段发放的短引用。旧库存只能用于比较，不能作为新数量证据。inventoryOperations.operation 只能逐字使用 set、increase、decrease 或 remove；获得/拿到也必须写 increase，失去/消耗/丢弃分别写 decrease 或 remove。只输出互不重复、对未来剧情确有检索价值的最小集合，episodes 最多 ${CAPTURE_LIMITS.episodes} 条、claims 最多 ${CAPTURE_LIMITS.claims} 条；直接生成 JSON，不要先复述来源或展开分析。`,
   repair: '顶层必须且只能包含 decisions 数组。只处理指定集合和 repairId；只可使用系统按失败集合提供的最小只读工具子集，不扩大来源窗口。',
 });
 

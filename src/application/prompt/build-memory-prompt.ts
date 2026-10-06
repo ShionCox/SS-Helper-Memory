@@ -147,7 +147,3 @@ export function buildActorMemoryPromptResult(response: ActorRecallResponse, opti
   if (prompt.length > maxChars) prompt = ''
   return Object.freeze({ prompt, includedTraceIds: Object.freeze(includedTraceIds), omittedTraceIds: Object.freeze(omittedTraceIds), diagnostics: Object.freeze({ maxChars, usedChars: prompt.length, partitionBudgets: Object.freeze(budgets), includedCount: includedTraceIds.length, omittedCount: omittedTraceIds.length, mode: response.request.mode ?? 'multi_actor' }) })
 }
-
-export function buildActorMemoryPrompt(response: ActorRecallResponse, options: ActorMemoryPromptOptions = {}): string {
-  return buildActorMemoryPromptResult(response, options).prompt
-}

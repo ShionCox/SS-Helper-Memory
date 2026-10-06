@@ -11,6 +11,7 @@ import type { MemoryLlmClient } from '../src/application/ingest/llm-extractor';
 import type { MultiActorMemoryRepository } from '../src/infrastructure';
 import { stageSystemPrompt } from '../src/application/extraction/extraction-stage-prompts';
 import { buildSupportedEvidenceDirectory } from '../src/application/ingest/supported-evidence-directory';
+import { DeterministicContextPrefetcher } from '../src/application/extraction/context-prefetcher';
 
 const source = {
   id: 'message:1', chatKey: 'chat', kind: 'message' as const, role: 'assistant' as const,
@@ -45,7 +46,7 @@ function llm(calls: string[], options: { singleDelayMs?: number; usage?: { promp
 }
 
 const toolDiagnostics = { toolSessionRound: 1, totalCalls: 0, toolSchemaProfile: 'ss_helper_tool_v0' as const, providerAdapterVersion: 1, capabilitySnapshotId: 'capability:1' };
-const toolRoute = { route: 'resource', provider: 'openai', model: 'model', fallback: false };
+const toolRoute = { resourceId: 'resource', source: 'custom', provider: 'openai', model: 'model', execution: 'tool_turn', transport: 'openai_responses' };
 
 function emptyRepository() {
   return {
@@ -61,6 +62,77 @@ function emptyRepository() {
 }
 
 describe('fixed Agent extraction pipeline', () => {
+  it('compares persisted inventory and facts consistently despite reduced prefetched fields', async () => {
+    let historyRevision = 200;
+    const repository = { ...emptyRepository(),
+      listInventoryItems: async () => [{ id: 'item:1', canonicalName: '急救包', aliases: [], category: 'medicine', status: 'confirmed', updatedAt: 100 }],
+      listInventoryStates: async () => [{ id: 'state:1', itemId: 'item:1', measureKind: 'quantity', amount: 2, unit: '个', precision: 'exact', availability: 'active', updatedAt: 120, revision: 1 }],
+      listInventoryEvents: async () => [{ id: 'event:1', itemId: 'item:1', createdAt: historyRevision }],
+      listFacts: async () => [{ id: 'fact:1', subjectKey: '紫罗', predicateKey: '进入', content: '紫罗进入仓库', kind: 'event', status: 'active', validFrom: 50, updatedAt: 180 }],
+    } as any;
+    const context = await new DeterministicContextPrefetcher(repository).prefetch({ workspaceId: 'workspace', chatKey: 'chat', sources: [source] });
+    const gateway = new AgentToolGateway(context.input, repository);
+    await gateway.executeBatch([
+      { callId: 'inventory', name: 'inventory.resolve_context', arguments: { mentions: ['急救包'], needs: ['current_state', 'recent_history'], limit: 5 } },
+      { callId: 'memory', name: 'memory.resolve_update_context', arguments: { subject: '紫罗', predicate: '进入', needs: ['current'], limit: 5 } },
+    ], { pipelineRunId: 'persisted', workspaceId: 'workspace', chatKey: 'chat', stage: 'content', allowedTools: new Set(['inventory.resolve_context', 'memory.resolve_update_context']), dataRevision: context.dataRevision, signal: new AbortController().signal });
+    expect(gateway.readSet()).toHaveLength(2);
+    expect((await gateway.verifyReadSet()).valid).toBe(true);
+    historyRevision += 1;
+    expect(await gateway.verifyReadSet()).toMatchObject({ valid: false, staleStages: ['content'], staleEntries: [expect.objectContaining({ kind: 'inventory' })] });
+  });
+
+  it('keeps source-only persistent-looking IDs out of the read set for every context kind', async () => {
+    const gateway = new AgentToolGateway({ chatKey: 'chat', sources: [source],
+      knownActorContext: [{ referenceId: 'A01', ownerId: 'owner:temporary', canonicalName: '紫罗', aliases: [], status: 'confirmed' }],
+      knownLocationContext: [{ referenceId: 'L01', locationId: 'location:temporary', canonicalName: '仓库', aliases: [], status: 'confirmed' }],
+      knownInventoryContext: [{ referenceId: 'O01', itemId: 'item:temporary', canonicalName: '急救包', aliases: [], category: 'medicine', status: 'confirmed', states: [] }],
+      existingMemoryContext: [{ referenceId: 'F01', factId: 'fact:temporary', subjectKey: '紫罗', predicateKey: '进入', content: '紫罗进入仓库', kind: 'event', status: 'active', confidence: 0.9, sourceRefs: [] }],
+    } as any, emptyRepository());
+    await gateway.executeBatch([
+      { callId: 'entities', name: 'entity.resolve_context', arguments: { mentions: ['紫罗', '仓库'], needs: ['identity'], limit: 10 } },
+      { callId: 'inventory', name: 'inventory.resolve_context', arguments: { mentions: ['急救包'], needs: ['identity'], limit: 10 } },
+      { callId: 'memory', name: 'memory.resolve_update_context', arguments: { subject: '紫罗', predicate: '进入', needs: ['current'], limit: 10 } },
+    ], { pipelineRunId: 'run', workspaceId: 'workspace', chatKey: 'chat', stage: 'entities', allowedTools: new Set(['entity.resolve_context', 'inventory.resolve_context', 'memory.resolve_update_context']), dataRevision: 1, signal: new AbortController().signal });
+    expect(gateway.readSet()).toEqual([]);
+    expect(await gateway.verifyReadSet()).toEqual({ valid: true, staleStages: [], staleEntries: [] });
+  });
+
+  it.each(['STRUCTURED_OUTPUT_EMPTY', 'INVALID_JSON', 'SCHEMA_VALIDATION_FAILED'] as const)('recovers %s once at the stage boundary', async reasonCode => {
+    let entitiesCalls = 0;
+    const api = llm([]);
+    api.toolTurn = vi.fn(async request => {
+      if (request.task === MEMORY_EXTRACTION_TASK_KEYS.entities && ++entitiesCalls === 1) throw createSSHelperError(reasonCode, { stage: 'llm.tools.final', requestId: 'failed:first', path: '$' });
+      return { requestId: 'recovered', state: 'final', output: stageOutput(request.task), route: toolRoute, diagnostics: toolDiagnostics } as any;
+    });
+    const pipeline = new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentToolPolicy: 'read_only' }), emptyRepository(), () => api);
+    const result = await pipeline.extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source] });
+    expect(entitiesCalls).toBe(2);
+    expect(result.audit?.pipeline?.stages.map(stage => stage.status)).toEqual(['failed', 'completed', 'completed']);
+    expect((api.toolTurn as any).mock.calls[1][0].input.messages[0].content).toContain('上一轮格式未通过校验');
+  });
+
+  it('shares the two-attempt budget between format recovery and stale reads', async () => {
+    let revision = 1;
+    const repository = { ...emptyRepository(), listOwners: async () => [{ id: 'owner:1', canonicalName: '紫罗', displayName: '紫罗', aliases: [], status: 'confirmed', updatedAt: revision }] } as any;
+    let entitiesCalls = 0;
+    const api = llm([]);
+    api.toolTurn = vi.fn(async request => {
+      if (request.task === MEMORY_EXTRACTION_TASK_KEYS.entities) {
+        if (!request.toolSessionId) {
+          entitiesCalls += 1;
+          if (entitiesCalls === 1) throw createSSHelperError('INVALID_JSON', { stage: 'llm.tools.final' });
+          return { requestId: 'read', state: 'tool_calls', toolSessionId: 'session', calls: [{ callId: 'read', name: 'entity.resolve_context', arguments: { mentions: ['紫罗'], needs: ['identity'], limit: 5 } }], route: toolRoute, diagnostics: toolDiagnostics } as any;
+        }
+        revision = 2;
+      }
+      return { requestId: 'final', state: 'final', output: stageOutput(request.task), route: toolRoute, diagnostics: toolDiagnostics } as any;
+    });
+    const result = await new ExtractionPipelineCoordinator(() => ({ extractionMode: 'agent', agentToolPolicy: 'read_only' }), repository, () => api).extract({ workspaceId: 'workspace', chatKey: 'chat', sources: [source] });
+    expect(entitiesCalls).toBe(2);
+    expect(result.audit?.pipeline?.stages.filter(stage => stage.stage === 'entities')).toHaveLength(2);
+  });
+
   it('keeps every fixed-stage top-level output contract aligned with its strict schema', () => {
     const base = '最终只返回符合当前固定阶段 Schema 的 JSON 对象。';
     expect(stageSystemPrompt(base, 'single', false)).toContain('且只能包含 actorCandidates、locationCandidates、itemCandidates、episodes、claims、inventoryOperations 六个数组');

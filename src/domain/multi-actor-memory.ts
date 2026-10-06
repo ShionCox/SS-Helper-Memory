@@ -510,10 +510,6 @@ export const FIXED_OWNER_IDS = Object.freeze({
   unknown: 'owner:unknown',
 } as const);
 
-export function isFixedOwnerId(value: string): boolean {
-  return Object.values(FIXED_OWNER_IDS).includes(value as never);
-}
-
 export function actorOwnerId(workspaceId: string, canonicalName: string): string {
   const normalized = canonicalName.normalize('NFKC').trim().toLocaleLowerCase();
   const parts: string[] = [];

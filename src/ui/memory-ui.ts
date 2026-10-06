@@ -482,7 +482,6 @@ export const MEMORY_CAPABILITY_BOUNDARIES = Object.freeze([
   { name: '世界风格', status: '保留来源', detail: '不再复制为独立配置；角色卡和已启用世界书会作为可选择、可追溯的初始化来源。' },
 ] as const);
 
-export interface FactViewOptions { kind: string | readonly string[]; status: string | readonly string[]; sort: 'updated_desc' | 'confidence_desc' | 'kind_asc' }
 export type MemoryInitializationEstimate = SummaryInitializationEstimate;
 
 const FACT_KIND_LABELS: Readonly<Record<string, string>> = Object.freeze({
@@ -569,16 +568,6 @@ export function parseMessageSourceReference(value: string): ChatNavigationTarget
   return { messageId, ...(index === undefined || !Number.isSafeInteger(index) || index < 0 ? {} : { index }) };
 }
 export function translateRecallMode(value: MemoryRecallStatus['resolvedMode']): string { return RECALL_MODE_LABELS[value]; }
-
-export function filterAndSortFacts(facts: readonly MemoryUiFact[], options: FactViewOptions): MemoryUiFact[] {
-  const matches = (value: string, selected: string | readonly string[]): boolean => Array.isArray(selected) ? selected.includes(value) : !selected || value === selected;
-  const filtered = facts.filter((fact) => matches(fact.kind, options.kind) && matches(fact.status, options.status));
-  return [...filtered].sort((left, right) => {
-    if (options.sort === 'confidence_desc') return right.confidence - left.confidence || right.updatedAt - left.updatedAt;
-    if (options.sort === 'kind_asc') return left.kind.localeCompare(right.kind, 'zh-CN') || right.updatedAt - left.updatedAt;
-    return right.updatedAt - left.updatedAt;
-  });
-}
 
 export interface SafeLlmErrorDetails { code: string; resource: string; model: string }
 export function readSafeLlmErrorDetails(overview: MemoryUiOverview): SafeLlmErrorDetails {

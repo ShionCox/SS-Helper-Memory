@@ -38,13 +38,14 @@ export class DeterministicContextPrefetcher {
       counts: { actors: input.knownActorContext?.length ?? 0, locations: input.knownLocationContext?.length ?? 0, inventory: input.knownInventoryContext?.length ?? 0, facts: input.existingMemoryContext?.length ?? 0, scenes: 0 },
     };
     const corpus = input.sources.map(source => source.content).join('\n');
-    const [owners, locations, items, states, facts, scenes] = await Promise.all([
+    const [owners, locations, items, states, facts, scenes, events] = await Promise.all([
       this.repository.listOwners(),
       this.repository.listLocations(),
       this.repository.listInventoryItems(),
       this.repository.listInventoryStates(),
       this.repository.listFacts(),
       this.repository.listSceneStates(),
+      this.repository.listInventoryEvents(),
     ]);
     const actors: KnownActorContextItem[] = owners
       .filter(owner => textContains(corpus, [owner.canonicalName ?? owner.displayName, owner.displayName, ...(owner.aliases ?? [])]))
@@ -60,7 +61,7 @@ export class DeterministicContextPrefetcher {
       .filter(item => textContains(corpus, [item.canonicalName, ...(item.aliases ?? [])]))
       .sort((left, right) => left.id.localeCompare(right.id))
       .slice(0, 50)
-      .map((item, index) => ({ referenceId: `O${String(index + 1).padStart(2, '0')}`, itemId: item.id, recordRevision: Math.max(revision(item), ...states.filter(state => state.itemId === item.id).map(revision)), canonicalName: item.canonicalName, aliases: [...(item.aliases ?? [])], category: item.category, states: states.filter(state => state.itemId === item.id).map(state => ({ measureKind: state.measureKind, amount: state.amount, unit: state.unit, precision: state.precision, availability: state.availability, updatedAtFloor: state.updatedAtFloor })) }));
+      .map((item, index) => ({ referenceId: `O${String(index + 1).padStart(2, '0')}`, itemId: item.id, recordRevision: Math.max(revision(item), ...states.filter(state => state.itemId === item.id).map(revision), ...events.filter(event => event.itemId === item.id).slice(-20).map(revision)), canonicalName: item.canonicalName, aliases: [...(item.aliases ?? [])], category: item.category, states: states.filter(state => state.itemId === item.id).map(state => ({ measureKind: state.measureKind, amount: state.amount, unit: state.unit, precision: state.precision, availability: state.availability, updatedAtFloor: state.updatedAtFloor })) }));
     const existing: ExistingMemoryContextItem[] = facts
       .filter(fact => textContains(corpus, [fact.subjectKey, fact.objectKey ?? '', fact.content]))
       .sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))

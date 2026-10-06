@@ -45,10 +45,13 @@ import {
   sceneStateRecordId,
 } from '../domain';
 import { MEMORY_WORKSPACE_COLLECTIONS } from './memory-workspace-schema';
+import { splitUtf8, textBytes } from './json-snapshot';
+import { sha256Content } from './vector/vector-utils';
 import type { MemoryPage, MemoryPageRequest } from '../ui/memory-page';
 import type { ExtractionPipelineAudit, MemoryReviewItem } from '../application/extraction/extraction-types';
 
 const COLLECTIONS = MEMORY_WORKSPACE_COLLECTIONS;
+const AUDIT_RECORD_BYTES = 512 * 1024;
 const REPAIRABLE_REJECTION_CODES = new Set<AutomaticIngestRejection['code']>(AI_REPAIRABLE_PROPOSAL_CODES);
 
 function repairCollection(item: AutomaticIngestRejection): CaptureRepairQueueRecord['collection'] {
@@ -240,6 +243,8 @@ function migrationTooLargeError(operationCount: number): Error {
 }
 interface ChangeEntry { collection: string; recordId: string; before?: PlainData; after?: PlainData; }
 export interface ChangeAudit { id: string; workspaceId: string; chatKey: string; kind: 'capture-change-set-v0' | 'derived-change-set-v0' | 'actor-registry-change-set-v0' | 'dream-change-set-v0'; createdAt: number; entries: readonly ChangeEntry[]; metadata?: PlainData; rolledBackAt?: number; }
+interface AuditSnapshot { readonly chunkCount: number; readonly byteLength: number; readonly sha256: string; }
+type StoredChangeAudit = ChangeAudit | (Omit<ChangeAudit, 'entries' | 'metadata'> & { readonly snapshot: AuditSnapshot });
 
 function manualFactId(chatKey: string): string { return `fact:${encodeURIComponent(chatKey)}:manual:${crypto.randomUUID()}`; }
 function factHeadId(chatKey: string, slotKey: string): string { return `fact-head:${encodeURIComponent(chatKey)}:${encodeURIComponent(slotKey)}`; }
@@ -753,8 +758,11 @@ export class MultiActorMemoryRepository {
       includeTotal: request.includeTotal === true,
     });
     if (request.signal?.aborted) throw request.signal.reason;
+    const items = collection === 'change-audits'
+      ? (await Promise.all(rows(page).map(record => this.readAudit(record)))).filter((audit): audit is ChangeAudit => audit !== undefined)
+      : rows(page).map(record => record.value);
     return {
-      items: rows(page).map(record => record.value as unknown as T),
+      items: items as unknown as T[],
       nextCursor: page.nextCursor,
       ...(page.total === undefined ? {} : { total: page.total }),
     };
@@ -858,15 +866,64 @@ export class MultiActorMemoryRepository {
       expectedVersion: current?.version ?? 0,
     });
   }
-  async listChangeAudits(): Promise<ChangeAudit[]> { return (await this.list('change-audits', { workspaceId: this.workspaceId, chatKey: this.chatKey })).map(record => record.value as unknown as ChangeAudit); }
+  private async readAudit(record: WorkspaceRecord | null): Promise<ChangeAudit | undefined> {
+    const stored = record?.value as unknown as StoredChangeAudit | undefined;
+    if (!stored || stored.workspaceId !== this.workspaceId || stored.chatKey !== this.chatKey) return undefined;
+    if (!('snapshot' in stored)) return stored;
+    const { snapshot, ...header } = stored;
+    const invalid = (): never => { throw createSSHelperError('INVALID_PAYLOAD', { stage: 'memory.repository.audit.integrity', collection: 'change-audit-chunks' }); };
+    if (!Number.isSafeInteger(snapshot.chunkCount) || snapshot.chunkCount < 1 || !Number.isSafeInteger(snapshot.byteLength) || snapshot.byteLength < 1 || !/^[a-f0-9]{64}$/u.test(snapshot.sha256)) invalid();
+    const rows = await this.list('change-audit-chunks', { workspaceId: this.workspaceId, chatKey: this.chatKey, auditId: header.id });
+    const chunks = rows.map(row => row.value as unknown as { index: number; content: string; sha256: string }).sort((a, b) => a.index - b.index);
+    if (chunks.length !== snapshot.chunkCount || chunks.some((chunk, index) => chunk.index !== index || chunk.sha256 !== snapshot.sha256 || typeof chunk.content !== 'string')) invalid();
+    const serialized = chunks.map(chunk => chunk.content).join('');
+    if (textBytes(serialized) !== snapshot.byteLength || await sha256Content(serialized) !== snapshot.sha256) invalid();
+    let payload: { entries: ChangeAudit['entries']; metadata?: PlainData };
+    try { payload = JSON.parse(serialized); }
+    catch { throw createSSHelperError('INVALID_JSON', { stage: 'memory.repository.audit.parse' }); }
+    if (!payload || !Array.isArray(payload.entries)) invalid();
+    return { ...header, entries: payload.entries, ...(payload.metadata === undefined ? {} : { metadata: payload.metadata }) };
+  }
+
+  private async auditOperations(audit: ChangeAudit, expectedVersion?: number, previous?: WorkspaceRecord): Promise<StoreOperation[]> {
+    const { entries, metadata, ...header } = audit;
+    const old = previous?.value as unknown as StoredChangeAudit | undefined;
+    const oldSnapshot = old && 'snapshot' in old ? old.snapshot : undefined;
+    const operations: StoreOperation[] = [];
+    let value: PlainData = asPlain(audit);
+    let snapshot: AuditSnapshot | undefined;
+    if (textBytes(JSON.stringify(value)) > AUDIT_RECORD_BYTES) {
+      const serialized = JSON.stringify({ entries, ...(metadata === undefined ? {} : { metadata }) });
+      const sha256 = await sha256Content(serialized);
+      // The envelope and JSON escaping are included in the per-record ceiling.
+      const chunkHeader = { workspaceId: audit.workspaceId, chatKey: audit.chatKey, auditId: audit.id, sha256, index: 5000, content: '' };
+      const maximumBytes = AUDIT_RECORD_BYTES - textBytes(JSON.stringify(chunkHeader)) - 256;
+      if (maximumBytes < 16) throw createSSHelperError('WORKSPACE_RECORD_TOO_LARGE', { stage: 'memory.repository.audit.chunk', collection: 'change-audit-chunks', expected: `serialized UTF-8 value <= ${AUDIT_RECORD_BYTES} bytes` });
+      const chunks = splitUtf8(serialized, maximumBytes, true);
+      snapshot = { chunkCount: chunks.length, byteLength: textBytes(serialized), sha256 };
+      value = asPlain({ ...header, snapshot });
+      if (oldSnapshot?.sha256 !== sha256) chunks.forEach((content, index) => operations.push({ action: 'upsert', collection: 'change-audit-chunks', recordId: `${audit.id}:${sha256}:${index}`, value: asPlain({ ...chunkHeader, index, content }), expectedVersion: 0 }));
+    }
+    if (oldSnapshot && oldSnapshot.sha256 !== snapshot?.sha256) {
+      for (let index = 0; index < oldSnapshot.chunkCount; index += 1) operations.push({ action: 'delete', collection: 'change-audit-chunks', recordId: `${audit.id}:${oldSnapshot.sha256}:${index}` });
+    }
+    operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value, ...(expectedVersion === undefined ? {} : { expectedVersion }) });
+    return operations;
+  }
+
+  async listChangeAudits(): Promise<ChangeAudit[]> {
+    const rows = await this.list('change-audits', { workspaceId: this.workspaceId, chatKey: this.chatKey });
+    const audits = await Promise.all(rows.map(record => this.readAudit(record)));
+    return audits.filter((audit): audit is ChangeAudit => audit !== undefined);
+  }
   async getChangeAudit(auditId: string): Promise<ChangeAudit | undefined> {
     const record = await this.store.read({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
-    const audit = record?.value as unknown as ChangeAudit | undefined;
+    const audit = await this.readAudit(record);
     return audit?.workspaceId === this.workspaceId && audit.chatKey === this.chatKey ? audit : undefined;
   }
   async updateCaptureAuditRejections(auditId: string, rejections: readonly AutomaticIngestRejection[]): Promise<void> {
     const current = await this.store.read({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
-    const audit = current?.value as unknown as ChangeAudit | undefined;
+    const audit = await this.readAudit(current);
     if (!current || !audit || audit.kind !== 'capture-change-set-v0' || audit.workspaceId !== this.workspaceId || audit.chatKey !== this.chatKey) throw new Error('找不到当前聊天的 Capture 审计记录。');
     if (audit.rolledBackAt) throw new Error('不能修改已回滚 Capture 的失败项。');
     const metadata = audit.metadata && typeof audit.metadata === 'object' && !Array.isArray(audit.metadata)
@@ -876,13 +933,8 @@ export class MultiActorMemoryRepository {
     const pipeline = metadata.pipeline as unknown as ExtractionPipelineAudit | undefined;
     const incompleteStage = Array.isArray(pipeline?.stages) && pipeline.stages.some(stage => stage.status !== 'completed');
     const outcome = unresolvedCount > 0 || incompleteStage ? 'partial' : 'complete';
-    const operations: StoreOperation[] = [{
-      action: 'upsert',
-      collection: 'change-audits',
-      recordId: auditId,
-      value: asPlain({ ...audit, metadata: { ...metadata, outcome, rejections: [...rejections] } }),
-      expectedVersion: current.version,
-    }];
+    const operations: StoreOperation[] = [];
+    const previousValues = new Map<string, PlainData>();
     const captureJobId = String(metadata.captureJobId ?? '').trim();
     if (captureJobId) {
       const rejectionStatusById = new Map(
@@ -902,6 +954,7 @@ export class MultiActorMemoryRepository {
           recordId: repair.id,
         });
         if (!repairRecord) continue;
+        previousValues.set(`capture-repair-queue:${repair.id}`, repairRecord.value);
         const { failure: _failure, ...repairWithoutFailure } = repair;
         operations.push({
           action: 'upsert',
@@ -920,6 +973,7 @@ export class MultiActorMemoryRepository {
       }
       const captureJob = await this.store.read({ workspaceId: this.workspaceId, collection: 'capture-jobs', recordId: captureJobId });
       if (captureJob?.value && typeof captureJob.value === 'object') {
+        previousValues.set(`capture-jobs:${captureJobId}`, captureJob.value);
         const jobValue = captureJob.value as Record<string, unknown>;
         if (String(jobValue.workspaceId ?? '') !== this.workspaceId || String(jobValue.chatKey ?? '') !== this.chatKey) throw new Error('Capture job 不属于当前聊天。');
         const checkpoint = jobValue.checkpoint && typeof jobValue.checkpoint === 'object' ? jobValue.checkpoint : {};
@@ -1011,6 +1065,12 @@ export class MultiActorMemoryRepository {
         });
       }
     }
+    const entries = audit.entries.map(entry => {
+      const operation = operations.find(item => item.collection === entry.collection && item.recordId === entry.recordId);
+      return operation?.action === 'upsert' && samePlain(entry.after, previousValues.get(`${entry.collection}:${entry.recordId}`))
+        ? { ...entry, after: operation.value } : entry;
+    });
+    operations.push(...await this.auditOperations({ ...audit, entries, metadata: asPlain({ ...metadata, outcome, rejections: [...rejections] }) }, current.version, current));
     await this.store.apply({ workspaceId: this.workspaceId, idempotencyKey: `capture-rejections:${auditId}:${crypto.randomUUID()}`, operations });
   }
   async recordKnowledgeLeakageAudit(audit: {
@@ -1035,7 +1095,7 @@ export class MultiActorMemoryRepository {
         violations: audit.violations.map(item => ({ ownerId: item.ownerId, leakedFromOwnerId: item.leakedFromOwnerId, marker: item.marker })),
       }),
     };
-    await this.store.write({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: id, value: asPlain(value) });
+    await this.store.apply({ workspaceId: this.workspaceId, idempotencyKey: id, operations: await this.auditOperations(value, 0) });
   }
   async listObservations(): Promise<MemoryObservation[]> {
     // Observation history is a workspace-level diagnostic view. Chat-scoped
@@ -1246,7 +1306,7 @@ export class MultiActorMemoryRepository {
       operations,
     );
     const audit: ChangeAudit = { id: `change-audit:${crypto.randomUUID()}`, workspaceId: this.workspaceId, chatKey, kind: 'derived-change-set-v0', createdAt: timestamp, entries, metadata: asPlain({ operation: 'manual-fact-upsert', factId: fact.id }) };
-    operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value: asPlain(audit), expectedVersion: 0 });
+    operations.push(...await this.auditOperations(audit, 0));
     await this.store.apply({ workspaceId: this.workspaceId, idempotencyKey: audit.id, operations });
     await this.deleteFactVectors([fact.id, ...(conflicting ? [conflicting.id] : [])]);
     return fact;
@@ -1301,7 +1361,7 @@ export class MultiActorMemoryRepository {
       operations,
     );
     const audit: ChangeAudit = { id: `change-audit:${crypto.randomUUID()}`, workspaceId: this.workspaceId, chatKey, kind: 'derived-change-set-v0', createdAt: Date.now(), entries, metadata: asPlain({ operation: 'manual-fact-remove', factId }) };
-    operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
+    operations.push(...await this.auditOperations(audit, 0));
     await this.store.apply({ workspaceId: this.workspaceId, idempotencyKey: audit.id, operations });
     await this.deleteFactVectors([factId, ...relatedIds]);
     return true;
@@ -1405,7 +1465,7 @@ export class MultiActorMemoryRepository {
         collection: 'change-audits',
         recordId: auditId,
       });
-      const existingAudit = existingRecord?.value as unknown as ChangeAudit | undefined;
+      const existingAudit = await this.readAudit(existingRecord);
       if (!existingAudit) break;
       if (auditMatchesRequest(existingAudit)) {
         if (!existingAudit.rolledBackAt) {
@@ -1818,14 +1878,14 @@ export class MultiActorMemoryRepository {
         },
       }),
     };
-    operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
+    operations.push(...await this.auditOperations(audit, 0));
     await this.store.apply({ workspaceId: this.workspaceId, idempotencyKey: transactionKey, operations });
     return audit;
   }
 
   private async rollbackOrder(auditId: string): Promise<ChangeAudit[]> {
     const rootRecord = await this.store.read({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
-    const root = rootRecord?.value as unknown as ChangeAudit | undefined;
+    const root = await this.readAudit(rootRecord);
     const allowedKinds = new Set<ChangeAudit['kind']>(['capture-change-set-v0', 'derived-change-set-v0', 'actor-registry-change-set-v0', 'dream-change-set-v0']);
     if (!root || root.workspaceId !== this.workspaceId || root.chatKey !== this.chatKey || !allowedKinds.has(root.kind)) {
       throw createSSHelperError('WORKSPACE_NOT_FOUND', { stage: 'memory.repository.rollback.lookup' });
@@ -1946,13 +2006,7 @@ export class MultiActorMemoryRepository {
     }
     const currentAudit = await this.store.read({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: audit.id });
     if (!currentAudit) throw createSSHelperError('WORKSPACE_NOT_FOUND', { stage: 'memory.repository.rollback.audit' });
-    operations.push({
-      action: 'upsert',
-      collection: 'change-audits',
-      recordId: audit.id,
-      value: asPlain({ ...audit, rolledBackAt: Date.now() }),
-      expectedVersion: currentAudit.version,
-    });
+    operations.push(...await this.auditOperations({ ...audit, rolledBackAt: Date.now() }, currentAudit.version, currentAudit));
     await this.store.apply({ workspaceId: this.workspaceId, idempotencyKey: `rollback:${audit.id}`, operations });
     // A rollback may restore an existing fact as well as delete a newly
     // captured one. In both cases the external vector must be invalidated;
@@ -2028,7 +2082,7 @@ export class MultiActorMemoryRepository {
       }
     }
     const audit: ChangeAudit = { id: auditId, workspaceId: this.workspaceId, chatKey: this.chatKey, kind, createdAt: Date.now(), entries, ...(metadata ? { metadata: asPlain(metadata) } : {}) };
-    operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
+    operations.push(...await this.auditOperations(audit, 0));
     await this.store.apply({ workspaceId: this.workspaceId, idempotencyKey: audit.id, operations });
     return audit;
   }
@@ -2040,7 +2094,7 @@ export class MultiActorMemoryRepository {
     recordsByCollection: readonly { readonly collection: 'profiles' | 'profile-claims' | 'relationship-claims' | 'memory-details' | 'memory-links' | 'vector-index' | 'graph-nodes' | 'graph-edges' | 'recall-exposures' | 'dream-jobs' | 'dream-audits' | 'dream-narratives'; readonly records: readonly Record<string, unknown>[] }[],
   ): Promise<void> {
     const auditRecord = await this.store.read({ workspaceId: this.workspaceId, collection: 'change-audits', recordId: auditId });
-    const audit = auditRecord?.value as unknown as ChangeAudit | undefined;
+    const audit = await this.readAudit(auditRecord);
     if (!audit || audit.workspaceId !== this.workspaceId || audit.chatKey !== this.chatKey) throw new Error('找不到当前聊天要附加派生记录的 ChangeSet。');
     if (audit.rolledBackAt) throw new Error('不能向已回滚的 Capture ChangeSet 附加派生记录。');
 
@@ -2169,6 +2223,18 @@ export class MultiActorMemoryRepository {
         ...traceIdReplacements.entries(),
       ]);
       const queueRecordMigration = async (collection: string, record: WorkspaceRecord): Promise<void> => {
+        if (collection === 'change-audits') {
+          const audit = await this.readAudit(record);
+          if (!audit) return;
+          const migrated = remapPlainData(asPlain(audit), replacements) as unknown as ChangeAudit;
+          if (samePlain(asPlain(audit), asPlain(migrated))) return;
+          for (const operation of await this.auditOperations(migrated, record.version, record)) {
+            const before = await this.store.read({ workspaceId: this.workspaceId, collection: operation.collection!, recordId: operation.recordId });
+            entries.push({ collection: operation.collection!, recordId: operation.recordId, ...(before ? { before: before.value } : {}), ...(operation.action === 'upsert' ? { after: operation.value } : {}) });
+            operations.push(operation);
+          }
+          return;
+        }
         const migratedValue = remapPlainData(record.value, replacements);
         const migratedRecordId = replaceMigrationIdentifiers(record.recordId, replacements);
         if (migratedRecordId === record.recordId && JSON.stringify(migratedValue) === JSON.stringify(record.value)) return;
@@ -2215,14 +2281,14 @@ export class MultiActorMemoryRepository {
       }
     }
     const audit: ChangeAudit = { id: `change-audit:${crypto.randomUUID()}`, workspaceId: this.workspaceId, chatKey: this.chatKey, kind: 'actor-registry-change-set-v0', createdAt: Date.now(), entries, ...(metadata ? { metadata: asPlain(metadata) } : {}) };
-    operations.push({ action: 'upsert', collection: 'change-audits', recordId: audit.id, value: asPlain(audit) });
+    operations.push(...await this.auditOperations(audit, 0));
     if (operations.length > ATOMIC_TRANSACTION_MAX_OPERATIONS) throw migrationTooLargeError(operations.length);
     await this.store.apply({ workspaceId: this.workspaceId, idempotencyKey: audit.id, operations });
     return audit;
   }
 
   async clearCurrentChatData(): Promise<void> {
-    const chatScopedCollections = ['actor-candidates', 'location-candidates', 'memory-candidates', 'inventory-states', 'inventory-events', 'episodes', 'observations', 'facts', 'evidence', 'fact-heads', 'memory-traces', 'scene-casts', 'scene-states', 'scene-transitions', 'generation-cast-plans', 'cast-plan-audits', 'recall-coverage-logs', 'memory-usage-logs', 'capture-jobs', 'capture-repair-queue', 'change-audits', 'memory-details', 'memory-links', 'vector-index', 'graph-nodes', 'graph-edges', 'recall-exposures', 'dream-jobs', 'dream-audits', 'dream-narratives', 'usage', 'recall-logs', 'generation-recall-details', 'generation-prompt-snapshots', 'generation-prompt-snapshot-chunks'] as const;
+    const chatScopedCollections = ['actor-candidates', 'location-candidates', 'memory-candidates', 'inventory-states', 'inventory-events', 'episodes', 'observations', 'facts', 'evidence', 'fact-heads', 'memory-traces', 'scene-casts', 'scene-states', 'scene-transitions', 'generation-cast-plans', 'cast-plan-audits', 'recall-coverage-logs', 'memory-usage-logs', 'capture-jobs', 'capture-repair-queue', 'change-audits', 'change-audit-chunks', 'memory-details', 'memory-links', 'vector-index', 'graph-nodes', 'graph-edges', 'recall-exposures', 'dream-jobs', 'dream-audits', 'dream-narratives', 'usage', 'recall-logs', 'generation-recall-details', 'generation-prompt-snapshots', 'generation-prompt-snapshot-chunks'] as const;
     const operations: StoreOperation[] = [];
     // Observations intentionally point at an Episode instead of duplicating
     // chat metadata. Resolve the current chat's episode ids before deleting so

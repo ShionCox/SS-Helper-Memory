@@ -8,6 +8,10 @@ import {
 } from '../src/application/ingest/llm-extractor';
 import { buildSupportedReferenceDirectory } from '../src/application/actors/supported-reference-directory';
 import type { MemoryExtractionInput, SourceBlock } from '../src/application/ingest/types';
+import { validateJsonSchema } from '../../SS-Helper-LLM/src/schema/json-schema-validator';
+import { buildStructuredOutputSystemInstruction } from '../../SS-Helper-LLM/src/schema/structured-output';
+import { normalizeStructuredCapture } from '../src/application/ingest/llm-extractor';
+import { buildSupportedEvidenceDirectory } from '../src/application/ingest/supported-evidence-directory';
 
 const source: SourceBlock = {
   id: 'message:1',
@@ -20,6 +24,35 @@ const source: SourceBlock = {
 };
 
 describe('Claim capture schema', () => {
+  it('accepts omitted harmless fields, applies declared defaults and rejects their wrong types', () => {
+    const directory = buildSupportedEvidenceDirectory([source]);
+    const evidenceSpanId = directory.spans[0]!.evidenceSpanId;
+    const claim = { localId: 'claim', kind: 'state', subjectText: '加油站', predicateKey: '储量', content: source.content, evidenceSpanId,
+      knowledge: { mode: 'asserted', privacy: 'public', ownerRefs: [], speakerRef: '', viewpointRef: '', observerRefs: [], presentRefs: [], mentionedRefs: [] }, confidence: 0.6 };
+    const value = { actorCandidates: [{ localId: 'actor', displayName: '白夕琴乃', evidenceSpanId, confidence: 0.8 }], locationCandidates: [], itemCandidates: [], episodes: [], claims: [claim], inventoryOperations: [] };
+    const schema = buildStructuredCaptureSchema();
+    expect(validateJsonSchema(value, schema).valid).toBe(true);
+    const normalized = normalizeStructuredCapture(value, [source], directory);
+    expect(normalized.actorCandidates[0]?.aliases).toEqual([]);
+    expect(normalized.claims[0]).toMatchObject({ stableAnchor: false, subjectText: '加油站' });
+    for (const field of ['episodeLocalId', 'subjectRef', 'subjectText', 'objectRef', 'objectText', 'stableAnchor']) {
+      expect(validateJsonSchema({ ...value, claims: [{ ...claim, [field]: null }] }, schema).valid, field).toBe(false);
+    }
+    expect(validateJsonSchema({ ...value, actorCandidates: [{ ...value.actorCandidates[0], aliases: false }] }, schema).valid).toBe(false);
+  });
+
+  it('injects only examples that pass the real Schema for every capture stage', () => {
+    const complete = buildStructuredCaptureSchema() as any;
+    const stages = [complete, ...[['actorCandidates', 'locationCandidates'], ['itemCandidates', 'episodes', 'claims', 'inventoryOperations']].map(keys => ({ type: 'object', additionalProperties: false, required: keys, properties: Object.fromEntries(keys.map(key => [key, complete.properties[key]])) })), buildStructuredRepairSchema('claims', 1)];
+    for (const schema of stages) {
+      const prompt = buildStructuredOutputSystemInstruction({ schema });
+      const example = prompt.match(/最小合法 JSON 格式示例：\n([^\n]+)/u)?.[1];
+      expect(example).toBeDefined();
+      expect(validateJsonSchema(JSON.parse(example!), schema).valid).toBe(true);
+      expect(prompt.match(/JSON Schema：/gu)).toHaveLength(1);
+    }
+  });
+
   it('builds a source-supported closed set and applies it to every repair reference field', () => {
     const repairSource: SourceBlock = {
       ...source,

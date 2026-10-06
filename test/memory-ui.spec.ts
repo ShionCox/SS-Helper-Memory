@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest';
 import {
-  filterAndSortFacts,
   formatAuditResource,
   formatChatIdentity,
   formatSourceReference,
@@ -651,19 +650,6 @@ describe('Memory UI 展示适配', () => {
     click.mockRestore();
   });
 
-  it('按类型与状态筛选，并支持确定性排序', () => {
-    const facts: MemoryUiFact[] = [
-      { id: 'a', kind: 'state', status: 'active', content: 'a', confidence: 0.8, sourceRefs: [], evidence: [], updatedAt: 10 },
-      { id: 'b', kind: 'event', status: 'active', content: 'b', confidence: 0.95, sourceRefs: [], evidence: [], updatedAt: 20 },
-      { id: 'c', kind: 'state', status: 'superseded', content: 'c', confidence: 0.9, sourceRefs: [], evidence: [], updatedAt: 30 },
-    ];
-
-    expect(filterAndSortFacts(facts, { kind: '', status: 'active', sort: 'confidence_desc' }).map((fact) => fact.id)).toEqual(['b', 'a']);
-    expect(filterAndSortFacts(facts, { kind: 'state', status: '', sort: 'updated_desc' }).map((fact) => fact.id)).toEqual(['c', 'a']);
-    expect(filterAndSortFacts(facts, { kind: ['state', 'event'], status: ['active'], sort: 'updated_desc' }).map((fact) => fact.id)).toEqual(['b', 'a']);
-    expect(filterAndSortFacts(facts, { kind: [], status: ['active'], sort: 'updated_desc' })).toEqual([]);
-    expect(facts.map((fact) => fact.id)).toEqual(['a', 'b', 'c']);
-  });
 
   it('鉴权错误只提取安全诊断字段且不会要求展示密钥', () => {
     expect(readSafeLlmErrorDetails({

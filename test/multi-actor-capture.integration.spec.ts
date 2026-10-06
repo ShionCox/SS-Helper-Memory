@@ -29,6 +29,21 @@ function source(overrides: Partial<SourceBlock> = {}): SourceBlock {
 }
 
 describe('Claim-based multi actor capture', () => {
+  it('activates new facts at 0.6 and links each candidate only to its own generated records', async () => {
+    const row = source({ content: '琴乃站在门口。琴乃拿着地图。', actorRefs: [], locationRefs: [] });
+    const capture = await service('relaxed-w', { extract: async () => ({ ...empty(), claims: [
+      { localId: 'first', sourceRef: row.id, kind: 'state', subjectText: '琴乃', predicateKey: '位置', content: '琴乃站在门口。', evidenceExcerpt: '琴乃站在门口', knowledge: { mode: 'asserted', privacy: 'public', ownerRefs: [], observerRefs: [], presentRefs: [], mentionedRefs: [] }, confidence: 0.6, stableAnchor: false },
+      { localId: 'second', sourceRef: row.id, kind: 'state', subjectText: '琴乃', predicateKey: '携带', content: '琴乃拿着地图。', evidenceExcerpt: '琴乃拿着地图', knowledge: { mode: 'asserted', privacy: 'public', ownerRefs: [], observerRefs: [], presentRefs: [], mentionedRefs: [] }, confidence: 0.6, stableAnchor: false },
+    ] }) }).capture({ workspaceId: 'relaxed-w', chatKey: 'chat', sources: [row] });
+    expect(capture.rejections).toEqual([]);
+    expect(capture.facts.map(fact => fact.status)).toEqual(['active', 'active']);
+    const first = capture.candidateRecords!.find(candidate => candidate.candidateLocalId === 'first')!;
+    const second = capture.candidateRecords!.find(candidate => candidate.candidateLocalId === 'second')!;
+    expect(first.committedRecordRefs.filter(ref => ref.startsWith('facts:'))).toEqual([`facts:${capture.facts[0]!.id}`]);
+    expect(second.committedRecordRefs.filter(ref => ref.startsWith('facts:'))).toEqual([`facts:${capture.facts[1]!.id}`]);
+    expect(first.committedRecordRefs).not.toContain(`facts:${capture.facts[1]!.id}`);
+  });
+
   it('rejects a changed review target before committing any regenerated records', async () => {
     const commitCapture = vi.fn();
     const row = source();
@@ -481,7 +496,7 @@ describe('Claim-based multi actor capture', () => {
     expect(capture.diagnostics?.deterministicRepairs).toBeGreaterThanOrEqual(1);
   });
 
-  it('quarantines low-quality Claims instead of polluting long-term memory', async () => {
+  it('keeps low-confidence Claims pending without rejecting them by quality score', async () => {
     const row = source({ content: '也许吧。', actorRefs: [], locationRefs: [] });
     const extractor = { extract: async (): Promise<StructuredCaptureResult> => ({
       ...empty(),
@@ -493,11 +508,9 @@ describe('Claim-based multi actor capture', () => {
       }],
     }) };
     const capture = await service('quality-w', extractor).capture({ workspaceId: 'quality-w', chatKey: 'chat', sources: [row] });
-    expect(capture.facts).toEqual([]);
+    expect(capture.facts).toEqual([expect.objectContaining({ status: 'pending', confidence: 0.05 })]);
     expect(capture.outcome).toBe('complete');
-    expect(capture.rejections).toEqual(expect.arrayContaining([
-      expect.objectContaining({ recordType: 'claim', code: 'quality_below_threshold', status: 'ignored' }),
-    ]));
+    expect(capture.rejections).toEqual([]);
   });
 
   it('does not let a weak object candidate self-prove actorhood through its own Claim reference', async () => {

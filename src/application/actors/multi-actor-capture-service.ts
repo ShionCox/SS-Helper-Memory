@@ -260,12 +260,7 @@ function buildCandidateRecords(
   sources: readonly SourceBlock[],
   auditedRejections: readonly AutomaticIngestRejection[],
   acceptedLocalIds: Readonly<Record<'actor' | 'location' | 'item' | 'episode' | 'claim' | 'inventory', readonly string[]>>,
-  facts: readonly MemoryFact[],
-  episodes: readonly MemoryEpisode[],
-  observations: readonly MemoryObservation[],
-  inventoryItems: readonly InventoryItem[],
-  inventoryStates: readonly InventoryState[],
-  inventoryEvents: readonly InventoryEvent[],
+  committedRecords: ReadonlyMap<string, readonly string[]>,
 ): MemoryCandidateRecord[] {
   type CandidateRow = {
     readonly collection: MemoryCandidateCollection;
@@ -374,17 +369,6 @@ function buildCandidateRecords(
     inventoryOperations: acceptedLocalIds.inventory,
   };
   for (const [collection, localIds] of Object.entries(acceptedCollection) as [MemoryCandidateCollection, readonly string[]][]) for (const localId of localIds) accepted.add(`${collection}\0${localId}`);
-  const committedBySource = (sourceRefs: readonly string[]): string[] => {
-    const matches = new Set<string>();
-    const hasSource = (refs: readonly string[] | undefined): boolean => Boolean(refs?.some(ref => sourceRefs.includes(ref)));
-    for (const value of facts) if (hasSource(value.sourceRefs)) matches.add(`facts:${value.id}`);
-    for (const value of episodes) if (hasSource(value.sourceRefs)) matches.add(`episodes:${value.id}`);
-    for (const value of observations) if (hasSource([value.sourceRef])) matches.add(`observations:${value.id}`);
-    for (const value of inventoryItems) if (hasSource(value.sourceRefs)) matches.add(`inventory-items:${value.id}`);
-    for (const value of inventoryStates) if (hasSource(value.sourceRefs)) matches.add(`inventory-states:${value.id}`);
-    for (const value of inventoryEvents) if (value.sourceRef && hasSource([value.sourceRef])) matches.add(`inventory-events:${value.id}`);
-    return [...matches];
-  };
   const createdAt = Date.now();
   return attempts.map(item => {
     const key = `${item.collection}\0${item.row.localId}`;
@@ -420,7 +404,7 @@ function buildCandidateRecords(
       ...(rejection?.failure ? { failure: rejection.failure } : {}),
       ...(rejection?.id ? { rejectionId: rejection.id } : {}),
       ...(review?.id ? { reviewItemId: review.id } : decision?.reviewItemId ? { reviewItemId: decision.reviewItemId } : {}),
-      committedRecordRefs: status === 'accepted' ? committedBySource(sourceRefs) : [],
+      committedRecordRefs: status === 'accepted' ? [...(committedRecords.get(key) ?? [])] : [],
       evidence: buildCandidateEvidence(sourceRefs, item.row.evidenceExcerpts, sources),
       sourceRefs,
       createdAt,
@@ -1879,6 +1863,7 @@ export class MultiActorCaptureService {
     const acceptedLocalIds: Record<'actor' | 'location' | 'item' | 'episode' | 'claim' | 'inventory', string[]> = {
       actor: [], location: [], item: [], episode: [], claim: [], inventory: [],
     };
+    const committedRecords = new Map<string, string[]>();
     const ownerIdByRef = new Map(actorIdByPromptRef);
     const locationIdByRef = new Map(locationIdByPromptRef);
     const acceptedActorCandidates: ActorCandidate[] = [];
@@ -1906,6 +1891,7 @@ export class MultiActorCaptureService {
           status: 'pending',
         });
       ownerIdByRef.set(candidate.localId, resolution.owner.id);
+      committedRecords.set(`actorCandidates\0${candidate.localId}`, [`actors:${resolution.owner.id}`]);
       acceptedLocalIds.actor.push(candidate.localId);
       if (resolution.method === 'pending' || resolution.owner.status === 'pending') {
         acceptedActorCandidates.push({
@@ -1932,6 +1918,7 @@ export class MultiActorCaptureService {
         status: 'pending',
       });
       locationIdByRef.set(candidate.localId, resolution.location.id);
+      committedRecords.set(`locationCandidates\0${candidate.localId}`, [`locations:${resolution.location.id}`]);
       acceptedLocalIds.location.push(candidate.localId);
       if (resolution.location.status === 'pending') {
         acceptedLocationCandidates.push({
@@ -1976,6 +1963,7 @@ export class MultiActorCaptureService {
       inventoryItemsById.set(id, item);
       inventoryItemsToCommit.set(id, item);
       itemIdByRef.set(candidate.localId, id);
+      committedRecords.set(`itemCandidates\0${candidate.localId}`, [`inventory-items:${id}`]);
       acceptedLocalIds.item.push(candidate.localId);
     }
 
@@ -2020,6 +2008,7 @@ export class MultiActorCaptureService {
         createdAt: Date.now(),
       };
       episodeEntries.set(episode.localId, row);
+      committedRecords.set(`episodes\0${episode.localId}`, [`episodes:${row.id}`]);
       acceptedLocalIds.episode.push(episode.localId);
     }
 
@@ -2056,20 +2045,6 @@ export class MultiActorCaptureService {
       const locationSubject = resolveLocation(claim.subjectRef);
       const subjectResolved = Boolean(actorSubjectId || locationSubject || claim.subjectText);
       const qualityScore = claimQuality(claim, subjectResolved);
-      if (qualityScore < 0.55) {
-        prepared.rejections.push(rejection(
-          input,
-          'claim',
-          index,
-          'quality_below_threshold',
-          `Claim 质量分 ${qualityScore.toFixed(3)} 低于 0.55，已自动忽略且未写入长期记忆。`,
-          'qualityScore',
-          claim,
-          undefined,
-          'ignored',
-        ));
-        continue;
-      }
       const actorSubject = actorSubjectId ? this.registry.getOwner(actorSubjectId) : undefined;
       const subjectKey = actorSubject?.canonicalName ?? actorSubject?.displayName ?? locationSubject?.canonicalName ?? claim.subjectText?.trim() ?? '';
       if (!subjectKey) {
@@ -2105,7 +2080,7 @@ export class MultiActorCaptureService {
         ...ownerIds,
       ]);
       const stableAnchor = claim.stableAnchor || ['identity', 'world_rule', 'capability'].includes(claim.kind);
-      const status: MemoryFact['status'] = claim.reviewApproved || qualityScore >= 0.75 ? 'active' : 'pending';
+      const status: MemoryFact['status'] = claim.reviewApproved || claim.confidence >= 0.6 && claim.knowledge.mode !== 'unknown' ? 'active' : 'pending';
       const fact: MemoryFact = {
         id: factId,
         chatKey: input.chatKey,
@@ -2207,6 +2182,7 @@ export class MultiActorCaptureService {
         createdAt: Date.now(),
       });
       observationRows.set(item.observation.id, { ...item.observation, factLocalIds: [fact.id] });
+      committedRecords.set(`claims\0${item.localId}`, [`facts:${fact.id}`, `evidence:${evidenceId}`, `observations:${item.observation.id}`, `episodes:${item.observation.episodeId}`]);
     };
     for (const item of materialized) {
       const slotKey = item.fact.slotKey
@@ -2352,6 +2328,7 @@ export class MultiActorCaptureService {
       };
       existingInventoryEventIds.add(eventId);
       inventoryEventsToCommit.push(event);
+      committedRecords.set(`inventoryOperations\0${operation.localId}`, [`inventory-events:${event.id}`, ...(!appendHistoryOnly ? [`inventory-states:${state.id}`] : [])]);
       if (appendHistoryOnly) {
         acceptedLocalIds.inventory.push(operation.localId);
         continue;
@@ -2415,12 +2392,7 @@ export class MultiActorCaptureService {
       sources,
       auditedRejections,
       acceptedLocalIds,
-      facts,
-      episodes,
-      observations,
-      [...inventoryItemsToCommit.values()],
-      [...inventoryStatesToCommit.values()],
-      inventoryEventsToCommit,
+      committedRecords,
     );
     let changeAudit: import('../../infrastructure').ChangeAudit | undefined;
     if (input.signal?.aborted) throw createSSHelperError('MEMORY_EXTRACTION_PIPELINE_CANCELLED', { stage: 'memory.capture.commit' });

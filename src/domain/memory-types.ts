@@ -126,34 +126,6 @@ export interface MemorySourceBlock {
   title?: string;
 }
 
-export interface FactEvidenceInput {
-  sourceRef: string;
-  excerpt: string;
-}
-
-export interface AutomaticFactProposal {
-  kind: MemoryFactKind;
-  subjectKey: string;
-  predicateKey: string;
-  objectKey?: string;
-  content: string;
-  entityKeys: string[];
-  confidence: number;
-  evidence: FactEvidenceInput[];
-  validFrom?: number;
-  validUntil?: number;
-  stableAnchor?: boolean;
-  scope?: FactScope;
-}
-
-export interface ValidatedAutomaticFact extends AutomaticFactProposal {
-  canonicalKey: string;
-  slotKey: string;
-  status: 'active' | 'pending';
-  sourceRefs: string[];
-  freshestEvidenceAt: number;
-}
-
 export interface MemoryEvidence {
   id: string;
   factId: string;
@@ -440,8 +412,7 @@ export type AutomaticProposalErrorCode =
   | 'empty_excerpt'
   | 'excerpt_mismatch'
   | 'non_chinese_key'
-  | 'duplicate_proposal'
-  | 'quality_below_threshold';
+  | 'duplicate_proposal';
 
 /** Source-locatable validation failures that an independent AI review may re-extract. */
 export const AI_REPAIRABLE_PROPOSAL_CODES = Object.freeze([
@@ -466,7 +437,6 @@ export const AUTO_IGNORED_PROPOSAL_CODES = Object.freeze([
   'missing_source',
   'cross_chat_source',
   'duplicate_proposal',
-  'quality_below_threshold',
 ] satisfies readonly AutomaticProposalErrorCode[]);
 
 export function isAiRepairableProposalCode(code: AutomaticProposalErrorCode): boolean {
@@ -476,10 +446,6 @@ export function isAiRepairableProposalCode(code: AutomaticProposalErrorCode): bo
 export function isAutoIgnoredProposalCode(code: AutomaticProposalErrorCode): boolean {
   return (AUTO_IGNORED_PROPOSAL_CODES as readonly AutomaticProposalErrorCode[]).includes(code);
 }
-
-export type AutomaticProposalValidation =
-  | { ok: true; value: ValidatedAutomaticFact }
-  | { ok: false; code: AutomaticProposalErrorCode; message: string };
 
 export type ReconciliationDecision = 'insert' | 'duplicate' | 'supersede' | 'pending';
 
