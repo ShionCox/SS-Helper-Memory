@@ -301,12 +301,10 @@ function isRetryableCaptureError(error: unknown): boolean {
 }
 
 function classifyRepairRecord(record: CaptureRepairQueueRecord, sources: readonly SourceBlock[]): RepairClassification {
-  if (record.classification) return record.classification;
+  if (record.classification === 'locally_fixed') return record.classification;
   if (record.issues.some(issue => issue.keyword === 'duplicate_proposal' || issue.keyword === 'duplicate_noop')) return 'duplicate_noop';
-  if (record.issues.some(issue => ['excerpt_mismatch', 'invalid_shape', 'invalid_reference', 'entity_ref_unsupported'].includes(issue.keyword))
-    && !record.issues.some(issue => /ambiguous|multiple|候选/u.test(issue.expected))) return 'unsupported_evidence';
-  const refs = [...record.sourceRefs, ...record.fallbackSourceRefs];
-  if (refs.length === 0 || !refs.some(ref => sources.some(source => source.id === ref))) return 'unsupported_evidence';
+  const refs = record.sourceRefs.length > 0 ? record.sourceRefs : record.fallbackSourceRefs;
+  if (!refs.some(ref => sources.some(source => source.id === ref && source.content.trim()))) return 'unsupported_evidence';
   return 'ai_required';
 }
 
@@ -1114,14 +1112,6 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       const writableSourceRefs = [...new Set(record.sourceRefs.length > 0 ? record.sourceRefs : record.fallbackSourceRefs)]
         .filter(ref => sources.some(source => source.id === ref));
       if (sources.length === 0 || writableSourceRefs.length === 0) {
-        await this.resolveCaptureRepairAudit(repository, record.jobId, {
-          ...record,
-          status: 'ignored',
-          resolutionMode: 'ignored',
-          waitingForEvidenceChange: false,
-          resolvedAt: Date.now(),
-          updatedAt: Date.now(),
-        }, record.attemptCount, 'ignored');
         continue;
       }
       const evidenceSetHash = buildEvidenceWindowHash(sources, writableSourceRefs);
@@ -1181,18 +1171,18 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
     const classifiedQueue = await repository.listCaptureRepairQueue(jobId);
     for (const record of classifiedQueue) {
       const classification = classifyRepairRecord(record, allSources);
-      if (record.classification === classification || record.status === 'resolved' || record.status === 'ignored') continue;
+      if (record.status === 'resolved' || record.status === 'ignored' || record.waitingForEvidenceChange) continue;
       if (classification === 'ai_required') {
-        await repository.updateCaptureRepairRecord({ ...record, classification, updatedAt: Date.now() });
+        if (record.classification !== classification) await repository.updateCaptureRepairRecord({ ...record, classification, updatedAt: Date.now() });
         continue;
       }
+      const quarantined = classification === 'unsupported_evidence';
       const nextRecord: CaptureRepairQueueRecord = {
         ...record,
         classification,
-        status: 'ignored',
-        resolutionMode: 'ignored',
-        waitingForEvidenceChange: false,
-        resolvedAt: Date.now(),
+        status: quarantined ? 'unresolved' : 'ignored',
+        ...(quarantined ? { evidenceSetHash: buildEvidenceWindowHash([], []) } : { resolutionMode: 'ignored' as const, resolvedAt: Date.now() }),
+        waitingForEvidenceChange: quarantined,
         failure: {
           reasonCode: classification === 'duplicate_noop' ? 'MEMORY_UPDATE_DUPLICATE' : 'MEMORY_REPAIR_SOURCE_UNAVAILABLE',
           stage: 'memory.repair.deterministic',
@@ -1202,23 +1192,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
         updatedAt: Date.now(),
       };
       await repository.updateCaptureRepairRecord(nextRecord);
-      await this.resolveCaptureRepairAudit(repository, jobId, nextRecord, record.attemptCount, 'ignored');
+      await this.resolveCaptureRepairAudit(repository, jobId, nextRecord, record.attemptCount, quarantined ? 'quarantined' : 'ignored');
     }
     const rank = (collection: CaptureRepairQueueRecord['collection']): number =>
       ({ actorCandidates: 0, locationCandidates: 1, itemCandidates: 2, episodes: 3, claims: 4, inventoryOperations: 5, batch: 6 })[collection];
     if (!settings.structuredRepairEnabled) {
       const queue = await repository.listCaptureRepairQueue(jobId);
-      for (const record of queue.filter(item => item.status !== 'resolved' && item.status !== 'ignored')) {
-        await this.resolveCaptureRepairAudit(repository, jobId, {
-          ...record,
-          status: 'ignored',
-          resolutionMode: 'ignored',
-          waitingForEvidenceChange: false,
-          resolvedAt: Date.now(),
-          updatedAt: Date.now(),
-        }, record.attemptCount, 'ignored');
-      }
-      return { results: [], resolvedRejectionIds: new Set(), remaining: 0, degraded: 0 };
+      return { results: [], resolvedRejectionIds: new Set(), remaining: this.captureRepairQueueCounts(queue).retryable, degraded: 0 };
     }
     const isActive = (record: CaptureRepairQueueRecord): boolean =>
       record.waitingForEvidenceChange !== true
@@ -4182,16 +4162,13 @@ export class MemoryApplication implements MemoryPluginApi, MemoryUiController {
       byStatus,
       ...(jobIds.length === 1 ? { jobId: jobIds[0] } : {}),
       batchCount: batchIndexes.size,
+      batchIndices: [...batchIndexes].sort((left, right) => left - right),
     };
   }
 
   async getMemoryCandidateSourcePreview(candidateId: string, sourceRef: string): Promise<MemoryCandidateSourcePreview> {
     const chatKey = this.requireChatKey();
-    const page = await this.loadMemoryPage<MemoryCandidateRecord>('memory-candidates', {
-      limit: 1,
-      filter: { id: candidateId },
-    });
-    const candidate = page.items[0];
+    const candidate = await this.repository.getMemoryCandidate(chatKey, candidateId);
     if (!candidate || candidate.chatKey !== chatKey) throw createSSHelperError('WORKSPACE_NOT_FOUND', { stage: 'memory.ui.memory-candidates.lookup' });
     const saved = candidate.evidence.filter(span => span.sourceRef === sourceRef);
     const sources = await this.collectSources(chatKey);

@@ -186,12 +186,13 @@ export function deriveInitializationStage(
   initialized: boolean,
 ): InitializationStage {
   if (initialized) return { activeIndex: -1, allDone: true, halted: false };
-  if (progress?.status === 'running' || progress?.status === 'repairing' || progress?.status === 'needs_repair' || progress?.status === 'needs_review' || progress?.status === 'paused') {
-    if (progress.phase === 'repair') return { activeIndex: 2, allDone: false, halted: progress.status === 'needs_repair' || progress.status === 'needs_review' || progress.status === 'paused' };
+  if (progress?.status === 'running' || progress?.status === 'repairing' || progress?.status === 'needs_repair' || progress?.status === 'needs_review' || progress?.status === 'paused' || progress?.status === 'failed') {
+    const halted = progress.status === 'paused' || progress.status === 'failed';
+    if (progress.phase === 'repair') return { activeIndex: 2, allDone: false, halted: progress.status === 'needs_repair' || progress.status === 'needs_review' || halted };
     if (progress.totalBatches > 0 && progress.batchIndex >= progress.totalBatches) {
-      return { activeIndex: 2, allDone: false, halted: progress.status === 'paused' };
+      return { activeIndex: 2, allDone: false, halted };
     }
-    return { activeIndex: progress.batchIndex > 0 ? 1 : 0, allDone: false, halted: progress.status === 'paused' };
+    return { activeIndex: progress.batchIndex > 0 ? 1 : 0, allDone: false, halted };
   }
   if (progress?.status === 'completed') return { activeIndex: 3, allDone: false, halted: false };
   if (submitting || progress?.status === 'queued') return { activeIndex: 0, allDone: false, halted: false };
@@ -255,24 +256,12 @@ function renderModeSummary(model: InitializationViewModel): string {
 }
 
 function renderPipeline(stage: InitializationStage, model: InitializationViewModel): string {
-  const steps = runningAgentMode(model)
-    ? [
-        ['确定性预取', '清洗来源、建立短引用并锁定数据修订', 'filter'],
-        ['实体优先与联合提取', model.agentToolPolicy === 'read_only' ? '实体完成后联合提取内容与库存；歧义时按需调用只读工具' : '实体完成后联合提取内容与库存；当前关闭工具回合', 'wand-magic-sparkles'],
-        ['本地合并、强校验与裁决 · 不调用模型', '程序合并、Read Set 守卫与更新规划；只提交已经完成校验的结果', 'shield-halved'],
-        ['原子提交并召回', '裁决结果同批写入并开放记忆召回', 'database'],
-      ] as const
-    : [
-        ['读取与确定性预取', '清洗选中来源并锁定当前数据修订', 'filter'],
-        ['单阶段结构化提取', '提取人物、事件、观察、事实和主体痕迹', 'wand-magic-sparkles'],
-        ['硬校验与定向修复', '验证来源证据、字段契约和写入边界', 'shield-halved'],
-        ['原子提交并召回', '事实、证据和派生索引同批提交', 'database'],
-      ] as const;
-  return `<div class="stx-memory-init-pipeline">${steps.map(([title, detail, icon], index) => {
+  const steps = [['读取来源', 'filter'], ['提取记忆', 'wand-magic-sparkles'], ['校验整理', 'shield-halved'], ['保存记忆', 'database']] as const;
+  return `<div class="stx-memory-init-pipeline" aria-label="${runningAgentMode(model) ? 'Agent' : '单次'}初始化阶段">${steps.map(([title, icon], index) => {
     const done = stage.allDone || (stage.activeIndex >= 0 && index < stage.activeIndex);
     const active = !stage.allDone && index === stage.activeIndex;
     const stopped = active && stage.halted;
-    return `<article class="stx-memory-init-pipeline-step${done ? ' is-done' : ''}${active && !stopped ? ' is-active' : ''}${stopped ? ' is-stopped' : ''}"><span class="stx-memory-init-step-icon"><ss-helper-icon name="${done ? 'check' : stopped ? 'stop' : icon}" decorative></ss-helper-icon></span><span><strong>${title}</strong><small>${detail}</small></span>${active && !stopped ? '<span class="stx-memory-init-step-working" aria-hidden="true"><i></i><i></i><i></i></span>' : ''}</article>`;
+    return `<article class="stx-memory-init-pipeline-step${done ? ' is-done' : ''}${active && !stopped ? ' is-active' : ''}${stopped ? ' is-stopped' : ''}"${active ? ' aria-current="step"' : ''}><span class="stx-memory-init-step-icon"><ss-helper-icon name="${done ? 'check' : stopped ? 'stop' : icon}" decorative></ss-helper-icon></span><span><strong>${title}</strong><small>${done ? '已完成' : stopped ? '已暂停' : active ? '进行中' : '等待中'}</small></span></article>`;
   }).join('')}</div>`;
 }
 
@@ -286,19 +275,17 @@ function renderSourceCards(model: InitializationViewModel, kinds: readonly strin
     const checked = selected.has(source.kind);
     const disabled = locked || source.count === 0;
     const excluded = Math.max(0, source.excludedCount);
-    return `<label class="stx-memory-init-source-card${checked ? ' is-selected' : ''}${disabled ? ' is-disabled' : ''}">
+    return `<div class="stx-memory-init-source-card${checked ? ' is-selected' : ''}${disabled ? ' is-disabled' : ''}"><label class="stx-memory-init-source-main">
       <span class="stx-memory-init-source-icon"><ss-helper-icon name="${sourceIcon(source.kind)}" decorative></ss-helper-icon></span>
-      <span class="stx-memory-init-source-copy"><strong>${escapeHtml(source.label)}</strong><small>${escapeHtml(sourceDetail(source))}${excluded ? ` · 当前排除 ${formatNumber(excluded)} 项` : ''}</small></span>
-      <span class="stx-memory-init-source-count"><b>${formatNumber(source.count)} / ${formatNumber(source.rawCount)}</b><small>项</small></span>
+      <span class="stx-memory-init-source-copy" title="${escapeHtml(sourceDetail(source))}${excluded ? ` · 当前排除 ${formatNumber(excluded)} 项` : ''}"><strong>${escapeHtml(source.label)}</strong><small>${formatNumber(source.count)} ${source.kind === 'message' ? '条' : '项'}${excluded ? ` · 已排除 ${formatNumber(excluded)} 项` : ''}</small></span>
       <input class="stx-memory-init-source-checkbox" ${uiControl('checkbox')} type="checkbox" data-source-kind="${escapeHtml(source.kind)}" aria-label="${escapeHtml(`选择${source.label}`)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
-    </label>`;
+    </label>${source.kind === 'message' ? renderHiddenFloorOption(model, locked) : ''}</div>`;
   }).join('')}</div>`;
 }
 
 function renderHiddenFloorOption(model: InitializationViewModel, locked: boolean): string {
   return `<label class="stx-memory-init-option${model.includeHiddenMessageFloors ? ' is-selected' : ''}${locked ? ' is-disabled' : ''}">
-    <span class="stx-memory-init-option-icon"><ss-helper-icon name="eye-slash" decorative></ss-helper-icon></span>
-    <span class="stx-memory-init-option-copy"><strong>处理隐藏楼层</strong><small>包含酒馆中已隐藏的用户与助手聊天正文</small></span>
+    <span class="stx-memory-init-option-copy"><strong>包含隐藏楼层</strong></span>
     <input class="stx-memory-init-option-checkbox" ${uiControl('checkbox')} type="checkbox" data-option="include-hidden-message-floors" aria-label="处理隐藏楼层" ${model.includeHiddenMessageFloors ? 'checked' : ''} ${locked ? 'disabled' : ''}>
   </label>`;
 }
@@ -359,12 +346,12 @@ function renderBatchExplanation(model: InitializationViewModel): string {
 function renderBatchRange(model: InitializationViewModel, locked: boolean): string {
   const range = selectedBatchRange(model);
   const disabled = locked || range.available === 0;
-  return `<div class="stx-memory-init-batch-range" role="group" aria-labelledby="stx-memory-init-batch-range-title">
-    <span class="stx-memory-init-batch-range-copy"><strong id="stx-memory-init-batch-range-title">初始化批次范围</strong><small id="stx-memory-init-batch-range-note">选择本次要处理的连续批次，共 ${formatNumber(range.available)} 批。</small></span>
-    <label><span>从</span><input id="stx-memory-init-batch-start" ${uiControl('input')} type="number" inputmode="numeric" min="1" max="${range.available || 1}" value="${range.start || 1}" data-option="batch-range-start" aria-describedby="stx-memory-init-batch-range-note" ${disabled ? 'disabled' : ''}></label>
-    <span class="stx-memory-init-batch-separator" aria-hidden="true">至</span>
-    <label><span>到</span><input id="stx-memory-init-batch-end" ${uiControl('input')} type="number" inputmode="numeric" min="1" max="${range.available || 1}" value="${range.end || 1}" data-option="batch-range-end" aria-describedby="stx-memory-init-batch-range-note" ${disabled ? 'disabled' : ''}></label>
-    ${statusChip(`${formatNumber(range.count)} 个`)}
+  const id = locked ? 'stx-memory-init-locked-batch' : 'stx-memory-init-batch';
+  return `<div class="stx-memory-init-batch-range" role="group" aria-labelledby="${id}-range-title">
+    <span class="stx-memory-init-batch-range-copy"><strong id="${id}-range-title">初始化批次范围</strong><small id="${id}-range-note">选择本次要处理的连续批次，共 ${formatNumber(range.available)} 批。</small></span>
+    <label><span>从</span><input id="${id}-start" ${uiControl('input')} type="number" inputmode="numeric" min="1" max="${range.available || 1}" value="${range.start || 1}" data-option="batch-range-start" aria-describedby="${id}-range-note" ${disabled ? 'disabled' : ''}></label>
+    <label><span>至</span><input id="${id}-end" ${uiControl('input')} type="number" inputmode="numeric" min="1" max="${range.available || 1}" value="${range.end || 1}" data-option="batch-range-end" aria-describedby="${id}-range-note" ${disabled ? 'disabled' : ''}></label>
+    ${statusChip(`${formatNumber(range.count)} 批次`)}
   </div>`;
 }
 
@@ -375,7 +362,7 @@ function renderSection(title: string, description: string, content: string, badg
 function renderActivities(model: InitializationViewModel): string {
   const items = model.attempts.slice(0, 5);
   if (!items.length) {
-    return '<div class="stx-memory-init-empty is-activity"><ss-helper-icon name="clock-rotate-left" decorative></ss-helper-icon><strong>暂无初始化记录</strong><p>完成初始化后会在这里保留最近 5 次活动。</p></div>';
+    return '<div class="stx-memory-init-empty is-activity"><ss-helper-icon name="clock-rotate-left" decorative></ss-helper-icon><span>暂无初始化记录</span></div>';
   }
   return items.map((attempt, index) => {
     const pendingCount = index === 0 || model.progress?.jobId === attempt.jobId
@@ -388,27 +375,15 @@ function renderActivities(model: InitializationViewModel): string {
     return `<article class="stx-memory-init-activity is-${status}">
       <span class="stx-memory-init-activity-icon"><ss-helper-icon name="${icon}" decorative></ss-helper-icon></span>
       <div><div class="stx-memory-init-activity-head"><strong>${recordStatusLabel(status)}</strong><time datetime="${new Date(attempt.updatedAt).toISOString()}">${escapeHtml(formatTime(attempt.updatedAt))}</time></div>
-      <p>${batchScopeLabel(attempt.batchRangeStart, attempt.batchRangeEnd, attempt.availableBatchCount, attempt.totalBatches)} · ${escapeHtml(sourceNames(model, attempt.selectedSourceKinds).join('、') || '全部可用来源')} · ${attempt.includeHiddenMessageFloors === false ? '仅可见聊天正文' : '聊天正文含隐藏楼层'}</p>
+      <p>${batchScopeLabel(attempt.batchRangeStart, attempt.batchRangeEnd, attempt.availableBatchCount, attempt.totalBatches)} · ${escapeHtml(sourceNames(model, attempt.selectedSourceKinds).join('、') || '全部可用来源')}</p>
       ${attempt.failure ? `<small>${escapeHtml(describeSSHelperFailure(attempt.failure).reasonCode)}</small>` : ''}</div>
     </article>`;
   }).join('');
 }
 
 function renderReadiness(model: InitializationViewModel): string {
-  const selectedItems = totalSelectedItems(model);
-  const selectedCount = model.selectedSourceKinds.length;
-  const workspaceTone = model.workspaceAvailable ? 'success' : 'error';
-  const llmTone = model.llmAvailable ? 'success' : 'error';
-  return `<section class="stx-memory-init-readiness" aria-label="初始化准备状态">
-    <div class="stx-memory-init-ready-item"><span class="stx-memory-init-ready-icon is-${model.chatBound ? 'success' : 'warning'}"><ss-helper-icon name="comments" decorative></ss-helper-icon></span><span><strong>${model.chatBound ? '当前聊天已绑定' : '尚未进入聊天'}</strong><small>${escapeHtml(model.chatLabel)} · ${model.chatBound ? '可读取来源' : '等待选择聊天'}</small></span></div>
-    <div class="stx-memory-init-ready-item"><span class="stx-memory-init-ready-icon is-${workspaceTone}"><ss-helper-icon name="${model.workspaceAvailable ? 'database' : 'triangle-exclamation'}" decorative></ss-helper-icon></span><span><strong>记忆工作区${model.workspaceAvailable ? '可用' : '不可用'}</strong><small>${escapeHtml(model.workspaceAvailable ? '可安全写入当前聊天' : model.workspaceReason ?? '请先恢复工作区连接')}</small></span></div>
-    <div class="stx-memory-init-ready-item"><span class="stx-memory-init-ready-icon is-${llmTone}"><ss-helper-icon name="${model.llmAvailable ? 'sparkles' : 'triangle-exclamation'}" decorative></ss-helper-icon></span><span><strong>大语言模型${model.llmAvailable ? '可用' : '不可用'}</strong><small>${escapeHtml(model.llmAvailable ? '可执行结构化捕获' : model.llmReason ?? '初始化操作已禁用')}</small></span></div>
-    <div class="stx-memory-init-ready-item"><span class="stx-memory-init-ready-icon is-warning"><ss-helper-icon name="layer-group" decorative></ss-helper-icon></span><span><strong>${formatNumber(model.sources.length)} 组来源</strong><small>${formatNumber(selectedCount)} 组已选择 · ${formatNumber(selectedItems)} 项</small></span></div>
-  </section>`;
-}
-
-function renderActionBar(summary: string, detail: string, actions: string): string {
-  return `<div class="stx-memory-init-action-bar"><div class="stx-memory-init-action-summary"><strong>${escapeHtml(summary)}</strong><small>${escapeHtml(detail)}</small></div><div class="stx-memory-init-actions">${actions}</div></div>`;
+  const ready = model.chatBound && model.workspaceAvailable && model.llmAvailable && !agentModeBlocked(model);
+  return `<div class="stx-memory-init-readiness" aria-label="初始化准备状态"><span>当前聊天 · ${escapeHtml(model.chatLabel)}</span>${statusChip(ready ? '系统就绪' : '需要处理', ready ? 'success' : 'warning')}</div>`;
 }
 
 function renderUnavailable(model: InitializationViewModel): string {
@@ -425,17 +400,23 @@ function renderSetup(model: InitializationViewModel): string {
   const failed = latest?.status === 'failed';
   const cancelled = latest?.status === 'cancelled';
   const unavailable = !model.chatBound || !model.workspaceAvailable || !model.llmAvailable;
-  const selectedNames = sourceNames(model, model.selectedSourceKinds);
   const range = selectedBatchRange(model);
-  const modeBlocked = agentModeBlocked(model);
-  const startDisabled = unavailable || modeBlocked || !model.selectedSourceKinds.length || range.count === 0 || model.busy;
-  const startLabel = runningAgentMode(model) ? '开始 Agent 初始化' : '开始初始化';
-  return `<div class="stx-memory-init-scroll"><div class="stx-memory-init-panel-head"><div><span class="stx-memory-kicker">${failed ? '需要重试' : cancelled ? '任务已取消' : '首次使用'}</span><h2>${failed ? '当前未初始化' : '初始化当前聊天'}</h2><p>选择用于建立记忆的来源。系统只读取内容，不会改写聊天原文、角色卡或世界书。</p></div>${statusChip(unavailable ? '暂不可用' : `${formatNumber(model.estimate?.messageCount ?? 0)} 条消息`, unavailable ? 'error' : 'neutral')}</div>
-    ${unavailable ? renderUnavailable(model) : failed ? '<div class="stx-memory-init-alert is-danger" role="alert"><span><ss-helper-icon name="circle-xmark" decorative></ss-helper-icon></span><div><strong>上一次初始化未完成</strong><p>请选择来源后重新尝试；活动记录会保留安全错误码。</p></div></div>' : ''}
-    ${renderSection('选择记忆来源', '世界书按书名分组；没有内容的来源会自动禁用。', `${renderHiddenFloorOption(model, unavailable)}${renderSourceCards(model, model.selectedSourceKinds, unavailable)}`, statusChip(`${model.selectedSourceKinds.length} / ${model.sources.length}`))}
-    ${renderSection('成本与分批估算', '批次范围与模型调用、进度统计使用同一口径。', `${renderEstimate(model)}${renderBatchRange(model, unavailable || modeBlocked)}<p class="stx-memory-init-estimate-note">${escapeHtml(renderBatchExplanation(model))}</p>`)}
-    ${renderSection('初始化流程', extractionModeDescription(model), `${renderModeSummary(model)}${renderPipeline({ activeIndex: -1, allDone: false, halted: false }, model)}`, statusChip(extractionModeLabel(model), modeBlocked ? 'warning' : runningAgentMode(model) ? 'success' : 'neutral'))}</div>
-    ${renderActionBar(`${model.selectedSourceKinds.length} 组来源 · ${range.count} 批`, `${selectedNames.join('、') || '尚未选择来源'} · ${range.start}–${range.end} / ${range.available}`, `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-start" ${startDisabled ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>${failed && !runningAgentMode(model) ? '重新尝试初始化' : startLabel}</button>`)}`;
+  return `<div class="stx-memory-init-task-head"><div><h2>${failed ? '上次初始化未完成' : cancelled ? '任务已取消' : '准备初始化'}</h2><p>${failed ? '检查来源后可重新开始。' : '选好来源，开始建立当前聊天的记忆。'}</p></div></div>
+    ${unavailable ? renderUnavailable(model) : ''}
+    ${agentModeBlocked(model) ? renderModeSummary(model) : ''}
+    <div class="stx-memory-init-task-summary"><span><small>已选来源</small><strong>${model.selectedSourceKinds.length} 组 · ${formatNumber(totalSelectedItems(model))} 项</strong></span><span><small>本次批次</small><strong>${range.start}–${range.end} / ${range.available}</strong></span></div>
+    ${renderPipeline({ activeIndex: -1, allDone: false, halted: false }, model)}`;
+}
+
+function renderConfiguration(model: InitializationViewModel, locked: boolean, actions: string): string {
+  const unavailable = !model.chatBound || !model.workspaceAvailable || !model.llmAvailable;
+  const kinds = model.initialized && model.successfulSourceKinds.length ? model.successfulSourceKinds : model.selectedSourceKinds;
+  return `<aside class="stx-memory-init-configuration" aria-label="初始化配置"><div class="stx-memory-init-scroll" data-init-scroll="configuration">
+    <h3>本次来源</h3>${locked ? '<p class="stx-memory-init-config-note">已锁定来源</p>' : ''}
+    ${renderSourceCards(model, kinds, locked || unavailable, locked)}
+    ${renderBatchRange(model, locked || unavailable || agentModeBlocked(model))}
+    <details class="stx-memory-init-details" data-init-details="estimate"><summary>估算与高级选项</summary><div>${renderEstimate(model)}<p class="stx-memory-init-estimate-note">${escapeHtml(renderBatchExplanation(model))}</p>${renderModeSummary(model)}</div></details>
+    </div><div class="stx-memory-init-actions">${actions}</div></aside>`;
 }
 
 function renderProgress(model: InitializationViewModel, paused: boolean, needsRepair = false): string {
@@ -457,21 +438,18 @@ function renderProgress(model: InitializationViewModel, paused: boolean, needsRe
   const incompleteBatch = paused && completedBatches < totalBatches ? completedBatches + 1 : undefined;
   const percent = repairing && repairTotal > 0
     ? Math.max(0, Math.min(100, Math.round(repairCompleted / repairTotal * 100)))
-    : totalBatches > 0 ? Math.max(0, Math.min(100, Math.round(completedBatches / totalBatches * 100))) : model.submitting ? 4 : 0;
+    : totalBatches > 0 ? Math.max(0, Math.min(100, Math.round(completedBatches / totalBatches * 100))) : 0;
   const queued = progress?.status === 'queued' || !progress || progress.status === 'idle';
   const stage = deriveInitializationStage(progress, model.submitting, false);
   const lockedKinds = model.selectedSourceKinds.length ? model.selectedSourceKinds : model.attempts[0]?.selectedSourceKinds ?? [];
-  const halted = paused || needsRepair;
-  const heading = needsRepair ? '部分记忆已可召回' : paused ? '初始化已暂停' : repairing ? '正在修复格式失败项' : queued ? '正在提交模型请求' : runningAgentMode(model) ? '正在运行 Agent 多阶段提取' : '正在提取并写入结构化记忆';
+  const heading = needsRepair ? '部分记忆已可召回' : paused ? progress?.status === 'failed' ? '初始化未完成' : '初始化已暂停' : repairing ? '正在修复失败项' : queued ? '正在准备来源' : '正在提取记忆';
   const heroCopy = needsRepair
     ? '正常批次已经保存；未解决项将由 AI 自动复核，仍不合法的内容会被隔离。'
       : paused
         ? '已保留完成批次和整理进度，无需重复提取。'
         : repairing
           ? '仅发送安全校验位置和相关来源楼层，不会重发整个失败 JSON。'
-        : runningAgentMode(model)
-          ? '固定阶段结果会经过合并、Read Set 守卫和更新裁决，再原子提交。'
-          : '人物、事件、观察、事实和主体痕迹会在同一事务中提交。';
+        : '从所选来源中提取并整理可用记忆。';
   const pendingCount = Math.max(0, progress?.retryableRepairCount ?? progress?.pendingRepairCount ?? 0);
   const repairedCount = Math.max(0, progress?.repairedCount ?? 0);
   const degradedCount = Math.max(0, progress?.degradedCount ?? 0);
@@ -484,17 +462,18 @@ function renderProgress(model: InitializationViewModel, paused: boolean, needsRe
   const repairSummary = needsRepair
     ? `<dl class="stx-memory-init-estimate"><div><dt>可继续处理</dt><dd>${formatNumber(pendingCount)}</dd></div><div><dt>已直接修复</dt><dd>${formatNumber(repairedCount)}</dd></div><div><dt>已安全降级</dt><dd>${formatNumber(degradedCount)}</dd></div><div><dt>已达上限</dt><dd>${formatNumber(exhaustedCount)}</dd></div><div><dt>已隔离</dt><dd>${formatNumber(quarantinedCount)}</dd></div><div><dt>已忽略</dt><dd>${formatNumber(ignoredCount)}</dd></div></dl>`
     : '';
-  const progressBar = repairing
-    ? '<div class="stx-memory-init-progress-loop" role="progressbar" aria-label="修复进行中" aria-valuemin="0" aria-valuemax="100" aria-valuetext="正在修复格式失败项"><span></span></div>'
-    : `<progress ${uiControl('progress')} max="100" value="${percent}">${percent}%</progress>`;
-  const hasActualUsage = actualTotalTokens(progress) !== undefined;
-  return `<div class="stx-memory-init-scroll"><div class="stx-memory-init-progress-hero"><span class="stx-memory-init-progress-icon is-${halted ? 'paused' : 'running'}"><ss-helper-icon name="${needsRepair ? 'triangle-exclamation' : paused ? 'pause' : repairing ? 'screwdriver-wrench' : 'wand-magic-sparkles'}" decorative></ss-helper-icon></span><div><span class="stx-memory-kicker">${needsRepair ? '待处理' : paused ? '可继续' : repairing ? '部分记忆已可召回' : '正在捕获记忆'}</span><h2>${heading}</h2><p>${heroCopy}</p></div>${statusChip(needsRepair ? '待修复' : paused ? '断点已保留' : repairing ? '定向修复中' : '任务进行中', halted ? 'warning' : 'neutral')}</div>
-    ${needsRepair ? `<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><div><strong>部分可召回 · 仍有 ${formatNumber(pendingCount)} 项待修复</strong><p>合法记忆已持久化；继续处理不会重复扫描已经完成的批次。</p></div></div>` : paused ? '<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><div><strong>任务因可重试错误暂停</strong><p>继续后会从断点恢复，并沿用本次来源范围。</p></div></div>' : ''}
+  const progressBar = repairing || queued
+    ? `<div class="stx-memory-init-progress-loop" role="progressbar" aria-label="${repairing ? '修复进行中' : '准备来源中'}" aria-valuetext="${repairing ? '正在修复格式失败项' : '正在准备来源'}"><span></span></div>`
+    : `<progress ${uiControl('progress')} aria-label="初始化批次进度" max="100" value="${percent}">${percent}%</progress>`;
+  const seconds = Math.max(0, Math.floor((progress?.elapsedMs ?? 0) / 1000));
+  return `<div class="stx-memory-init-task-head"><div><h2>${heading}</h2><p>${heroCopy}</p></div><div class="stx-memory-init-percent"><strong>${queued || repairing ? '处理中' : `${percent}%`}</strong><small>${paused ? '断点已保留' : needsRepair ? `待修复 ${formatNumber(pendingCount)} 项` : `已完成批次 ${formatNumber(completedBatches)} / ${formatNumber(totalBatches)}`}</small></div></div>
+    ${needsRepair ? `<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><div><strong>部分可召回 · 仍有 ${formatNumber(pendingCount)} 项待修复</strong><p>合法记忆已持久化；继续处理不会重复扫描已经完成的批次。</p></div></div>` : paused ? '<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><div><strong>初始化断点已保留</strong><p>继续后会从断点恢复，并沿用本次来源范围。</p></div></div>' : ''}
     ${degradedNotice}
     ${repairSummary}
-    ${renderActualUsage(progress)}
-    <div class="stx-memory-init-progress-copy"><span>${needsRepair ? `已扫描批次 ${formatNumber(completedBatches)} / ${formatNumber(totalBatches)}` : `已完成批次 ${formatNumber(completedBatches)} / ${formatNumber(totalBatches)}${incompleteBatch === undefined ? '' : ` · 第 ${formatNumber(incompleteBatch)} 批未完成`}`} · ${batchScope}</span><span>${needsRepair ? `待修复 ${formatNumber(pendingCount)} 项` : repairing ? `修复任务 ${formatNumber(repairCompleted)} / ${formatNumber(repairTotal)} · ${Math.round((progress?.elapsedMs ?? 0) / 1000)} 秒` : `${formatNumber(progress?.processedCount ?? 0)} 项 · ${Math.round((progress?.elapsedMs ?? 0) / 1000)} 秒`}</span></div>
     ${progressBar}
+    ${repairing ? `<p class="stx-memory-init-config-note">已完成批次 ${completedBatches} / ${totalBatches} · ${batchScope}<br>修复任务 ${repairCompleted} / ${repairTotal} · ${Math.round((progress?.elapsedMs ?? 0) / 1000)} 秒</p>` : ''}
+    <div class="stx-memory-init-task-summary"><span><small>已用时</small><strong>${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}</strong></span><span><small>${lockedKinds.length} 组来源</small><strong>${escapeHtml(sourceNames(model, lockedKinds).join('、') || '无')}</strong></span></div>
+    ${incompleteBatch === undefined ? '' : `<p class="stx-memory-init-config-note">已完成批次 ${completedBatches} / ${totalBatches} · 第 ${incompleteBatch} 批未完成</p>`}
     ${progress?.failure ? (() => {
       const diagnostic = describeSSHelperFailure(progress.failure);
       const safeDetails = [
@@ -507,12 +486,8 @@ function renderProgress(model: InitializationViewModel, paused: boolean, needsRe
       ].filter((item): item is string[] => item !== undefined);
       return `<div class="stx-memory-init-alert is-danger stx-memory-init-failure" role="alert"><span><ss-helper-icon name="circle-xmark" decorative></ss-helper-icon></span><div class="stx-memory-init-error-copy"><div class="stx-memory-init-error-head"><strong>${escapeHtml(diagnostic.title)}</strong><code>${escapeHtml(diagnostic.reasonCode)}</code></div><div class="stx-memory-init-error-detail"><p>${escapeHtml(diagnostic.reason)} ${escapeHtml(diagnostic.action)}</p>${safeDetails.map(([label, value]) => `<small><span>${escapeHtml(label)}</span><code>${escapeHtml(value)}</code></small>`).join('')}</div></div></div>`;
     })() : ''}
-    <div class="stx-memory-init-locked"><span>已锁定来源</span><strong>${escapeHtml(sourceNames(model, lockedKinds).join('、') || '无')}</strong></div>
-    ${renderSection('处理阶段', extractionModeDescription(model), `${renderModeSummary(model)}${renderPipeline(stage, model)}`, statusChip(`${percent}%`))}
-    ${renderSection(hasActualUsage ? '本次任务用量' : '本次任务估算', hasActualUsage ? '实际值按 Provider 返回的所有请求用量累计。' : '来源在任务开始后锁定；执行前估算不包含输出、工具回合、重试和修复。', renderEstimate(model, lockedKinds))}</div>
-    ${renderActionBar(needsRepair ? `部分可召回 · ${formatNumber(pendingCount)} 项待修复` : paused ? '可以安全继续' : '正在后台处理当前聊天', needsRepair ? '继续时只处理未解决的修复队列' : paused ? '继续后从现有断点恢复' : '关闭页面不会改变聊天原文', halted
-      ? `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-resume" ${model.busy || !model.llmAvailable || !model.workspaceAvailable ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>${needsRepair ? '继续处理' : '继续初始化'}</button>${needsRepair || paused ? `<button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${model.busy || !model.llmAvailable || !model.workspaceAvailable ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>重新初始化</button>` : ''}`
-      : `<button ${uiControl('button', 'danger')} type="button" data-action="initialize-cancel"><ss-helper-icon name="stop" decorative></ss-helper-icon>取消任务</button>`)}`;
+    ${renderPipeline(stage, model)}
+    <details class="stx-memory-init-details" data-init-details="usage"><summary>本次用量与详情</summary><div><p>${batchScope} · 已处理 ${formatNumber(progress?.processedCount ?? 0)} 项</p>${renderActualUsage(progress)}</div></details>`;
 }
 
 function renderCompleted(model: InitializationViewModel, partial = false): string {
@@ -528,15 +503,12 @@ function renderCompleted(model: InitializationViewModel, partial = false): strin
   const completedTitle = '当前聊天已初始化';
   const completedCopy = `完成于 ${formatTime(completedAt)}，记忆召回已经可用。`;
   const completedStatus = partial ? '部分完成 · 召回可用' : '召回可用';
-  return `<div class="stx-memory-init-scroll"><div class="stx-memory-init-success-hero"><span class="stx-memory-init-success-icon"><ss-helper-icon name="check" decorative></ss-helper-icon></span><div><span class="stx-memory-kicker">初始化状态</span><h2>${completedTitle}</h2><p>${escapeHtml(completedCopy)}</p></div>${statusChip(completedStatus, 'success')}</div>
+  return `<div class="stx-memory-init-success-hero"><span class="stx-memory-init-success-icon"><ss-helper-icon name="check" decorative></ss-helper-icon></span><div><h2>${completedTitle}</h2><p>${escapeHtml(completedCopy)}</p></div>${statusChip(completedStatus, 'success')}</div>
     <dl class="stx-memory-init-estimate is-completed"><div><dt>来源覆盖</dt><dd>${successfulKinds.length} / ${model.sources.length}</dd></div><div><dt>记忆事实</dt><dd>${formatNumber(model.factCount)}</dd></div><div><dt>占用空间</dt><dd>${escapeHtml(formatBytes(model.storageBytes))}</dd></div><div><dt>完成批次</dt><dd>${completedBatchScope}</dd></div></dl>
-    ${renderActualUsage(model.progress)}
-    <div class="stx-memory-init-success-note"><ss-helper-icon name="circle-check" decorative></ss-helper-icon><span>最近失败的初始化任务只会保留在右侧活动记录，不会覆盖这次有效初始化。</span></div>
-    ${partial || quarantinedCount > 0 || ignoredCount > 0 ? `<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="shield-halved" decorative></ss-helper-icon></span><div><strong>自动复核已完成</strong><p>已隔离 ${formatNumber(quarantinedCount)} 项等待证据变化，已忽略 ${formatNumber(ignoredCount)} 项；它们不会进入召回或 Prompt，也不需要人工处理。</p></div></div>` : ''}
+    ${partial || quarantinedCount > 0 || ignoredCount > 0 ? `<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="shield-halved" decorative></ss-helper-icon></span><div><strong>未采纳项处理结果</strong><p>已隔离 ${formatNumber(quarantinedCount)} 项等待证据变化，已忽略 ${formatNumber(ignoredCount)} 项。以上仅统计未采纳项，不代表全部记忆；不会进入召回或 Prompt。</p></div></div>` : ''}
     ${degradedCount > 0 ? `<div class="stx-memory-init-alert is-paused" role="status"><span><ss-helper-icon name="shield-halved" decorative></ss-helper-icon></span><div><strong>已安全降级 ${formatNumber(degradedCount)} 项</strong><p>仅省略缺少来源支持的可选引用；核心记忆已通过完整校验，没有猜测或改绑实体。</p></div></div>` : ''}
-    ${renderSection('已完成的处理流程', extractionModeDescription(model), `${renderModeSummary(model)}${renderPipeline({ activeIndex: -1, allDone: true, halted: false }, model)}`)}
-    ${renderSection('已使用来源', '重新初始化时会优先恢复这次成功使用的来源范围。', renderSourceCards(model, successfulKinds, true, true), statusChip(`${successfulKinds.length} 组`, 'success'))}</div>
-    ${renderActionBar('当前聊天可以使用记忆召回', '人物、场景、事件、观察和事实已经写入工作区', `<button ${uiControl('button', 'primary')} type="button" data-action="view-library"><ss-helper-icon name="book-open" decorative></ss-helper-icon>查看记忆库</button><button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${model.busy || !model.llmAvailable || !model.workspaceAvailable ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>重新初始化</button>`)}`;
+    ${renderPipeline({ activeIndex: -1, allDone: true, halted: false }, model)}
+    <details class="stx-memory-init-details" data-init-details="usage"><summary>本次用量与详情</summary><div>${renderActualUsage(model.progress)}<p>当前聊天可以使用记忆召回。</p></div></details>`;
 }
 
 function renderDrawer(model: InitializationViewModel): string {
@@ -549,7 +521,7 @@ function renderDrawer(model: InitializationViewModel): string {
       <header><div><span class="stx-memory-kicker">危险操作确认</span><h3 id="stx-memory-reinitialize-title">重新初始化当前聊天</h3></div><button ${uiButton('neutral', 'sm', true)} type="button" data-action="cancel-reinitialize" aria-label="关闭"><ss-helper-icon name="xmark" decorative></ss-helper-icon></button></header>
       <div class="stx-memory-drawer-body">
         <div class="stx-memory-init-alert is-danger"><span><ss-helper-icon name="triangle-exclamation" decorative></ss-helper-icon></span><div><strong id="stx-memory-reinitialize-description">这会清空当前聊天的全部记忆派生数据</strong><p>清空后立即按下方来源重新开始初始化。如果新任务失败，旧数据无法恢复。</p></div></div>
-        ${renderSection('选择重新整理的来源', '估算会随勾选结果实时更新。', `${renderHiddenFloorOption(model, false)}${renderSourceCards(model, model.selectedSourceKinds, false)}`, statusChip(`${model.selectedSourceKinds.length} / ${model.sources.length}`))}
+        ${renderSection('选择重新整理的来源', '估算会随勾选结果实时更新。', renderSourceCards(model, model.selectedSourceKinds, false), statusChip(`${model.selectedSourceKinds.length} / ${model.sources.length}`))}
         ${renderSection('重新初始化估算', '范围按当前分批设置计算。', `${renderModeSummary(model)}${renderEstimate(model)}${renderBatchRange(model, agentModeBlocked(model))}`)}
         <section class="stx-memory-init-section"><div class="stx-memory-init-scope-grid"><div class="stx-memory-init-scope is-clear"><h3>将清理</h3><ul><li>事实、证据和角色记忆痕迹</li><li>即时场景、事件、观察和派生索引</li><li>当前聊天的捕获任务与审计记录</li></ul></div><div class="stx-memory-init-scope is-safe"><h3>不会影响</h3><ul><li>聊天原文与消息</li><li>角色卡、世界书和用户 Persona</li><li>其他聊天与工作区</li></ul></div></div></section>
       </div>
@@ -566,7 +538,9 @@ export function renderInitializationView(model: InitializationViewModel): string
   const completedWithIsolation = legacyRepairTerminal && pendingRepairCount === 0;
   const completedRepair = model.progress?.status === 'completed' && model.progress.phase === 'repair';
   const completedPartial = model.progress?.status === 'completed' && model.progress.outcome === 'partial';
-  const paused = model.progress?.status === 'paused'
+  const failedWithCheckpoint = !model.initialized && model.progress?.status === 'failed'
+    && (model.progress.completedBatchCount ?? model.progress.batchIndex) > 0;
+  const paused = failedWithCheckpoint || model.progress?.status === 'paused'
     || (!model.initialized && model.attempts[0]?.status === 'paused');
   const running = model.submitting || Boolean(model.progress && ['queued', 'running', 'repairing'].includes(model.progress.status));
   const primary = running ? renderProgress(model, false)
@@ -576,13 +550,23 @@ export function renderInitializationView(model: InitializationViewModel): string
       : completedRepair ? renderCompleted(model, completedPartial)
       : model.initialized ? renderCompleted(model, completedPartial)
         : renderSetup(model);
-  return `<div class="stx-memory-initialize-shell">
+  const completed = !running && !needsRepair && !paused && (model.initialized || completedWithIsolation || completedRepair);
+  const unavailable = model.busy || !model.chatBound || !model.llmAvailable || !model.workspaceAvailable || agentModeBlocked(model);
+  const restart = `<button id="stx-memory-reinitialize-trigger" ${uiControl('button', 'neutral')} type="button" data-action="open-reinitialize" ${unavailable ? 'disabled' : ''}><ss-helper-icon name="rotate" decorative></ss-helper-icon>重新初始化</button>`;
+  const actions = running
+    ? `<button ${uiControl('button', 'primary')} type="button" disabled><ss-helper-icon name="spinner" decorative></ss-helper-icon>初始化中</button><button ${uiControl('button', 'neutral')} type="button" data-action="initialize-cancel">取消任务</button>`
+    : needsRepair || paused
+      ? `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-resume" ${unavailable ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>${needsRepair ? '继续处理' : '继续初始化'}</button>${restart}`
+      : completed
+        ? `<button ${uiControl('button', 'primary')} type="button" data-action="view-library"><ss-helper-icon name="book-open" decorative></ss-helper-icon>查看记忆库</button>${restart}`
+        : `<button ${uiControl('button', 'primary')} type="button" data-action="initialize-start" ${unavailable || !model.selectedSourceKinds.length || selectedBatchRange(model).count === 0 ? 'disabled' : ''}><ss-helper-icon name="play" decorative></ss-helper-icon>开始初始化</button>`;
+  return `<div class="stx-memory-initialize-shell" data-running="${running}" data-job-id="${escapeHtml(model.progress?.jobId ?? '')}">
     ${renderReadiness(model)}
-    <div class="stx-memory-init-layout">
-      <section class="stx-memory-init-panel stx-memory-init-primary" aria-live="polite">${primary}</section>
-      <aside class="stx-memory-init-panel stx-memory-init-aside">
-        <div class="stx-memory-init-activity-area"><div class="stx-memory-init-panel-head"><div><span class="stx-memory-kicker">最近活动</span><h3>初始化记录</h3><p>最多保留最近 5 次初始化任务。</p></div>${statusChip(`${Math.min(model.attempts.length, 5)} / 5`)}</div><div class="stx-memory-init-activity-list">${renderActivities(model)}</div></div>
-      </aside>
+    <div class="stx-memory-init-layout" data-init-scroll="layout">
+      ${renderConfiguration(model, running || paused || needsRepair || completed, actions)}
+      <section class="stx-memory-init-primary stx-memory-init-scroll" data-init-scroll="task" aria-label="当前任务与记录"><div class="stx-memory-init-current" aria-live="polite">${primary}</div>
+        <div class="stx-memory-init-activity-area"><div class="stx-memory-init-panel-head"><h3>最近记录</h3><span>${model.attempts.length ? `${Math.min(model.attempts.length, 5)} 条` : ''}</span></div><div class="stx-memory-init-activity-list">${renderActivities(model)}</div></div>
+      </section>
     </div>
     ${renderDrawer(model)}
   </div>`;

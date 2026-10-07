@@ -291,6 +291,18 @@ function asPlain(value: unknown): PlainData {
   return structuredClone(value) as PlainData;
 }
 
+function captureJobValue(record: unknown): PlainData {
+  const value = asPlain(record) as Record<string, PlainData>;
+  // Full candidates remain in the chunked per-batch audits. Jobs only need
+  // rejection identities, statuses and provenance for progress and resuming.
+  if (Array.isArray(value.rejections)) value.rejections = value.rejections.map(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+    const { candidateSnapshot: _snapshot, ...summary } = item;
+    return summary;
+  });
+  return value;
+}
+
 function canonicalPlain(value: PlainData): PlainData {
   if (Array.isArray(value)) return value.map(canonicalPlain);
   if (value && typeof value === 'object') {
@@ -795,7 +807,7 @@ export class MultiActorMemoryRepository {
       const rejections = Array.isArray(metadata.rejections)
         ? metadata.rejections.filter((item): item is AutomaticIngestRejection => Boolean(item && typeof item === 'object'))
         : [];
-      await this.updateCaptureAuditRejections(row.id, rejections.map((item) => {
+      const nextRejections = rejections.map((item) => {
         const repair = item.id ? resolvedByRejectionId.get(item.id) : undefined;
         if (repair) {
           return {
@@ -809,7 +821,12 @@ export class MultiActorMemoryRepository {
         }
         if ((item.status ?? 'unresolved') !== 'unresolved' || REPAIRABLE_REJECTION_CODES.has(item.code)) return item;
         return { ...item, status: 'ignored' as const, ignoredAt: item.ignoredAt ?? Date.now(), waitingForEvidenceChange: false };
-      }));
+      });
+      // Reconciliation is also run on page reload. Unchanged batches must not
+      // rewrite their snapshots or re-aggregate every other batch's audit.
+      if (!samePlain(asPlain(rejections), asPlain(nextRejections))) {
+        await this.updateCaptureAuditRejections(row.id, nextRejections);
+      }
     }
     return this.listCaptureRepairQueue(jobId);
   }
@@ -862,7 +879,7 @@ export class MultiActorMemoryRepository {
       workspaceId: this.workspaceId,
       collection: 'capture-jobs',
       recordId: id,
-      value: asPlain({ ...record, id, workspaceId, chatKey, updatedAt: Number(record.updatedAt ?? Date.now()) }),
+      value: captureJobValue({ ...record, id, workspaceId, chatKey, updatedAt: Number(record.updatedAt ?? Date.now()) }),
       expectedVersion: current?.version ?? 0,
     });
   }
@@ -1038,9 +1055,8 @@ export class MultiActorMemoryRepository {
           action: 'upsert',
           collection: 'capture-jobs',
           recordId: captureJobId,
-          // Keep the full history for audit display, but the progress badge
-          // must count only work that still requires attention.
-          value: asPlain({
+          // Keep every rejection status; full snapshots remain in the audit.
+          value: captureJobValue({
             ...jobValue,
             status: captureIncomplete ? jobValue.status : retryableRepairCount > 0 ? 'needs_repair' : 'completed',
             outcome: captureIncomplete ? 'partial' : jobOutcome,
@@ -1579,7 +1595,8 @@ export class MultiActorMemoryRepository {
     const add = async (collection: string, value: Persistable | Record<string, unknown>): Promise<void> => {
       const recordId = idOf(value);
       if (!recordId) throw new Error(`多角色记录缺少 id：${collection}`);
-      const persisted = collection === 'facts' || collection === 'evidence'
+      const persisted = collection === 'capture-jobs' ? captureJobValue(value)
+        : collection === 'facts' || collection === 'evidence'
           ? { ...value, workspaceId: this.workspaceId }
           : value;
       const existing = mutationSlots.get(`${collection}\0${recordId}`);

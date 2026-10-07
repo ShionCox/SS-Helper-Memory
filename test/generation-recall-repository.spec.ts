@@ -86,6 +86,43 @@ function workspaceFixture() {
 }
 
 describe('generation recall persistence', () => {
+  it('reads a candidate by its native key and checks workspace/chat ownership without an id index', async () => {
+    const fixture = workspaceFixture();
+    const repository = new MemoryRepository(fixture.port);
+    repository.bind('character:test', 'chat');
+    await repository.open();
+    const session = fixture.sessions.get('character:test')!;
+    const candidate = { id: 'candidate:1', workspaceId: 'character:test', chatKey: 'chat' };
+    vi.mocked(session.get).mockResolvedValue({ id: candidate.id, value: candidate, revision: 1, updatedAt: 1 });
+    vi.mocked(session.query).mockClear();
+    await expect(repository.getMemoryCandidate('chat', candidate.id)).resolves.toEqual(candidate);
+    expect(session.get).toHaveBeenCalledWith('memory-candidates', candidate.id);
+    expect(session.query).not.toHaveBeenCalled();
+    for (const otherScope of [{ chatKey: 'other-chat' }, { workspaceId: 'other-workspace' }]) {
+      vi.mocked(session.get).mockResolvedValue({ id: candidate.id, value: { ...candidate, ...otherScope }, revision: 1, updatedAt: 1 });
+      await expect(repository.getMemoryCandidate('chat', candidate.id)).resolves.toBeUndefined();
+    }
+  });
+
+  it('shares concurrent usage scans without caching later refreshes or failures', async () => {
+    const fixture = workspaceFixture();
+    const repository = new MemoryRepository(fixture.port);
+    repository.bind('character:test', 'chat');
+    await repository.open();
+    const session = fixture.sessions.get('character:test')!;
+    vi.mocked(session.query).mockClear();
+    const results = await Promise.all([repository.refreshHealth(), repository.refreshHealth(), repository.refreshHealth()]);
+    expect(results[0]).toEqual(results[1]);
+    const collections = vi.mocked(session.query).mock.calls.map(([collection]) => collection);
+    expect(collections.length).toBeGreaterThan(1);
+    expect(new Set(collections).size).toBe(collections.length);
+    await repository.refreshHealth();
+    expect(vi.mocked(session.query).mock.calls.length).toBe(collections.length * 2);
+    vi.mocked(fixture.port.admin.health).mockRejectedValueOnce(new Error('offline'));
+    await expect(repository.refreshHealth()).rejects.toThrow('offline');
+    await expect(repository.refreshHealth()).resolves.toMatchObject({ connected: true });
+  });
+
   it('never carries a previous chat usage number into a newly bound chat', async () => {
     const fixture = workspaceFixture();
     const repository = new MemoryRepository(fixture.port);

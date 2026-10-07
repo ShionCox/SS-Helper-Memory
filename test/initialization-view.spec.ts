@@ -51,7 +51,7 @@ describe('initialization view', () => {
 
   it('renders setup with SDK controls and a real estimate without redundant safety copy', () => {
     const html = renderInitializationView(model());
-    expect(html).toContain('初始化当前聊天');
+    expect(html).toContain('准备初始化');
     expect(html).toContain('来源项目');
     expect(html).not.toContain('初始化不会改写');
     expect(html).toContain('stx-memory-init-scroll');
@@ -66,7 +66,7 @@ describe('initialization view', () => {
     expect(html).toContain('楼层分组</dt><dd>4');
     expect(html).toContain('本次批次</dt><dd>4 / 4');
     expect(html).toContain('预计输入 Token</dt><dd>900–1,400');
-    expect(html).toContain('<b>18 / 20</b><small>项</small>');
+    expect(html).toContain('18 条 · 已排除 2 项');
     expect(html).toContain('data-ss-helper-control="checkbox"');
     expect(html).toContain('class="stx-memory-init-source-checkbox"');
     expect(html).toContain('aria-label="选择聊天消息"');
@@ -91,6 +91,7 @@ describe('initialization view', () => {
     expect(html).toContain('max="11" value="1" data-option="batch-range-start"');
     expect(html).toContain('max="11" value="3" data-option="batch-range-end"');
     expect(html).toContain('本次批次</dt><dd>3 / 11');
+    expect(html).toContain('>3 批次</span>');
     expect(html).toContain('1–3 / 11');
   });
 
@@ -124,11 +125,9 @@ describe('initialization view', () => {
     }));
 
     expect(html).toContain('Agent · 正式写入');
-    expect(html).toContain('开始 Agent 初始化');
-    expect(html).toContain('确定性预取');
-    expect(html).toContain('实体优先与联合提取');
-    expect(html).toContain('本地合并、强校验与裁决');
-    expect(html).toContain('原子提交并召回');
+    expect(html).toContain('开始初始化');
+    expect(html).toContain('aria-label="Agent初始化阶段"');
+    for (const stage of ['读取来源', '提取记忆', '校验整理', '保存记忆']) expect(html).toContain(stage);
     expect(html).not.toContain('影子');
   });
 
@@ -148,9 +147,11 @@ describe('initialization view', () => {
     const running = renderInitializationView(model({
       progress: { status: 'running', jobId: 'job-1', batchIndex: 2, totalBatches: 4, processedCount: 9, elapsedMs: 5000 },
     }));
-    expect(running).toContain('正在提取并写入结构化记忆');
+    expect(running).toContain('正在提取记忆');
     expect(running).toContain('已锁定来源');
-    expect(running).toContain('stx-memory-init-step-working');
+    expect(running).toContain('is-active" aria-current="step"');
+    expect(running).toMatch(/data-source-kind="message"[^>]*disabled/u);
+    expect(running).not.toContain('data-action="initialize-start"');
     expect(running).toContain('data-action="initialize-cancel"');
     expect(running).toContain('已完成批次 2 / 4');
 
@@ -161,7 +162,7 @@ describe('initialization view', () => {
     expect(paused).toContain('断点已保留');
     expect(paused).toContain('stx-memory-init-alert is-paused');
     expect(paused).toContain('stx-memory-init-pipeline-step is-stopped');
-    expect(paused).not.toContain('stx-memory-init-step-working');
+    expect(paused).not.toContain('is-active" aria-current="step"');
     expect(paused).toContain('data-action="initialize-resume"');
     expect(paused).toContain('data-action="open-reinitialize"');
     expect(paused).toContain('已完成批次 2 / 4 · 第 3 批未完成');
@@ -252,7 +253,8 @@ describe('initialization view', () => {
     }));
     expect(html).toContain('部分完成 · 召回可用');
     expect(html).toContain('已隔离 22 项等待证据变化');
-    expect(html).toContain('也不需要人工处理');
+    expect(html).toContain('以上仅统计未采纳项，不代表全部记忆');
+    expect(html).not.toContain('自动复核已完成');
     expect(html).toContain('stx-memory-init-activity is-completed');
     expect(html).toContain('1970/1/1');
     expect(html).not.toContain('尚未完成');
@@ -305,7 +307,7 @@ describe('initialization view', () => {
     expect(html).toContain('当前聊天已初始化');
     expect(html).toContain('记忆事实');
     expect(html).toContain('2.00 KB');
-    expect(html).toContain('已使用来源');
+    expect(html).toContain('本次来源');
     expect(html).toContain('data-action="open-reinitialize"');
     expect((html.match(/stx-memory-init-activity is-/g) ?? [])).toHaveLength(5);
     expect(html).toContain('已安全降级 2 项');

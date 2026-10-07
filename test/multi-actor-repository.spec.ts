@@ -217,6 +217,36 @@ describe('multi-actor repository transaction semantics', () => {
     expect(await workspace.get({ collection: 'capture-jobs', recordId: 'failed-job' })).toBeNull();
   });
 
+  it('keeps large candidate snapshots in audits without duplicating them into capture progress', async () => {
+    const workspace = port();
+    const repository = new MultiActorMemoryRepository(workspace);
+    repository.bind('w', 'chat');
+    await repository.open();
+    const rejections = Array.from({ length: 64 }, (_, index) => ({
+      id: `rejection:${index}`, index, recordType: 'claim' as const,
+      code: 'duplicate_proposal' as const, message: '重复候选', status: 'ignored' as const,
+      sourceRefs: ['source:s'], candidateSnapshot: { content: '候选😀'.repeat(3000) },
+    }));
+    expect(new TextEncoder().encode(JSON.stringify(rejections)).byteLength).toBeGreaterThan(1024 * 1024);
+    const summaries = rejections.map(({ candidateSnapshot: _snapshot, ...summary }) => summary);
+    const job = { id: 'large-progress', workspaceId: 'w', chatKey: 'chat', status: 'running', checkpoint: { batchIndex: 13, completedBatchCount: 13, totalBatches: 16 } };
+    const audit = await repository.commitCapture({ ...commit(0.8, 0), captureJobId: job.id, captureJob: job, rejections });
+    const expectCompactJob = async () => {
+      const persisted = (await workspace.get({ collection: 'capture-jobs', recordId: job.id }))!.value as any;
+      expect(persisted.rejections).toEqual(summaries);
+      expect(persisted.checkpoint).toMatchObject(job.checkpoint);
+      expect(new TextEncoder().encode(JSON.stringify(persisted)).byteLength).toBeLessThan(128 * 1024);
+    };
+    await expectCompactJob();
+    expect((await repository.getChangeAudit(audit.id))!.metadata).toMatchObject({ rejections });
+    await repository.updateCaptureAuditRejections(audit.id, rejections);
+    await expectCompactJob();
+    expect((await repository.getChangeAudit(audit.id))!.metadata).toMatchObject({ rejections });
+    await repository.upsertCaptureJob({ ...job, rejections });
+    await expectCompactJob();
+    expect(rejections[0]!.candidateSnapshot.content).toBe('候选😀'.repeat(3000));
+  });
+
   it('persists and clears the additive scene, cast, coverage and usage records', async () => {
     const workspace = port();
     const repository = new MultiActorMemoryRepository(workspace);
@@ -390,7 +420,11 @@ describe('multi-actor repository transaction semantics', () => {
     const rebound = new MultiActorMemoryRepository(workspace);
     rebound.bind('w', 'chat');
     await rebound.open();
+    const unchangedUpdate = vi.spyOn(rebound, 'updateCaptureAuditRejections');
+    const auditReads = vi.spyOn(rebound, 'listChangeAudits');
     expect(await rebound.reconcileCaptureRepairQueue('capture-job:repair')).toEqual(queue);
+    expect(unchangedUpdate).not.toHaveBeenCalled();
+    expect(auditReads).toHaveBeenCalledTimes(1);
 
     await repository.updateCaptureAuditRejections(audit.id, [{
       ...rejection,

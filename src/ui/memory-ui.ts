@@ -326,6 +326,7 @@ export interface MemoryCandidateStats {
   readonly byStatus: Readonly<Record<string, number>>;
   readonly jobId?: string;
   readonly batchCount: number;
+  readonly batchIndices?: readonly number[];
 }
 
 export interface MemoryCandidateSourcePreview {
@@ -669,6 +670,7 @@ interface WorkbenchState {
   selectedMemoryCandidateId: string;
   selectedMemoryCandidateSourceRef: string;
   memoryCandidateSourcePreview?: MemoryCandidateSourcePreview;
+  memoryCandidateSourceError?: MemoryErrorDiagnostic;
   actorView: 'people' | 'pending';
   actorQuery: string;
   actorStatus: '' | import('../domain').ActorResolutionStatus;
@@ -1018,6 +1020,7 @@ export function renderMemoryWorkbench(
     state.selectedMemoryCandidateId = '';
     state.selectedMemoryCandidateSourceRef = '';
     delete state.memoryCandidateSourcePreview;
+    delete state.memoryCandidateSourceError;
   };
   const renderSourceReference = (value: string, mode: 'chip' | 'evidence' = 'chip'): string => {
     const label = escapeHtml(formatSourceReference(value));
@@ -1450,6 +1453,7 @@ export function renderMemoryWorkbench(
         state.selectedMemoryCandidateId = state.memoryCandidates[0]?.id ?? '';
         state.selectedMemoryCandidateSourceRef = state.memoryCandidates[0]?.evidence[0]?.sourceRef ?? '';
         delete state.memoryCandidateSourcePreview;
+        delete state.memoryCandidateSourceError;
       }
       return true;
     } finally {
@@ -1465,10 +1469,12 @@ export function renderMemoryWorkbench(
       const preview = await controller.getMemoryCandidateSourcePreview(candidateId, sourceRef);
       if (disposed || requestId !== candidateSourceRequestId || state.selectedMemoryCandidateId !== candidateId || state.selectedMemoryCandidateSourceRef !== sourceRef) return;
       state.memoryCandidateSourcePreview = preview;
+      delete state.memoryCandidateSourceError;
       rerender('', true);
-    } catch {
+    } catch (error) {
       if (disposed || requestId !== candidateSourceRequestId) return;
       delete state.memoryCandidateSourcePreview;
+      state.memoryCandidateSourceError = describeMemoryError(error, 'INTERNAL_ERROR', 'workbench-page');
       rerender('', true);
     }
   };
@@ -3152,6 +3158,7 @@ export function renderMemoryWorkbench(
     status: state.memoryCandidateStatus,
     floor: state.memoryCandidateFloor,
     sourcePreview: state.memoryCandidateSourcePreview,
+    sourceError: state.memoryCandidateSourceError,
     loading: state.pageLoading,
     chatBound: state.overview?.bound,
     missingSnapshot: !state.pageLoading && !state.memoryCandidateQuery && !state.memoryCandidateBatch && !state.memoryCandidateCollection && !state.memoryCandidateStatus && !state.memoryCandidateFloor && state.memoryCandidates.length === 0 && !state.memoryCandidateStats?.total,
@@ -3189,8 +3196,22 @@ export function renderMemoryWorkbench(
   };
   const render = (): void => {
     traceMemoryStartup('workbench:render-begin');
-    candidateListHandle?.dispose();
-    candidateListHandle = undefined;
+    const previousInit = root.querySelector<HTMLElement>('.stx-memory-initialize-shell');
+    const initDetails = Array.from(previousInit?.querySelectorAll<HTMLDetailsElement>('[data-init-details]') ?? []).map(node => [node.dataset.initDetails, node.open] as const);
+    const initScroll = Array.from(previousInit?.querySelectorAll<HTMLElement>('[data-init-scroll]') ?? []).map(node => [node.dataset.initScroll, node.scrollTop] as const);
+    const previousProgress = previousInit?.querySelector<HTMLProgressElement>('progress');
+    const sweepStart = previousInit?.querySelector('.stx-memory-init-progress-loop > span')?.getAnimations?.()[0]?.startTime;
+    const previousCandidates = root.querySelector<HTMLElement>('.stx-memory-candidates-page');
+    const candidatePageScrollTop = previousCandidates?.parentElement?.scrollTop;
+    const candidateScroll = Array.from(previousCandidates?.querySelectorAll<HTMLElement>('[data-candidate-scroll]') ?? []).map(node => [node.dataset.candidateScroll, node.scrollTop] as const);
+    const candidateDetails = Array.from(previousCandidates?.querySelectorAll<HTMLDetailsElement>('details') ?? []).map(node => node.open);
+    const previousCandidateId = previousCandidates?.dataset.selectedId;
+    const previousSourceRef = previousCandidates?.dataset.sourceRef;
+    const previousSourceReady = previousCandidates?.querySelector<HTMLElement>('[data-source-ready]')?.dataset.sourceReady === 'true';
+    if (state.page !== 'candidates' || state.overview?.bound === false) {
+      candidateListHandle?.dispose();
+      candidateListHandle = undefined;
+    }
     inventoryCardModel = undefined;
     const overview = state.overview;
     const currentPage = PAGES.find((page) => page.id === state.page) ?? INTERNAL_PAGES.find((page) => page.id === state.page) ?? PAGES[0]!;
@@ -3209,11 +3230,41 @@ export function renderMemoryWorkbench(
     const chatStorageLabel = !overview?.bound ? '—' : state.storageUsageStatus === 'loading' ? '计算中' : state.storageUsageStatus === 'error' ? '暂不可用' : formatBytes(overview.currentChatSizeBytes ?? 0);
     const chatStorageRatio = !overview?.bound ? '—' : state.storageUsageStatus === 'loading' ? '计算中' : state.storageUsageStatus === 'error' ? '暂不可用' : formatPercent(overview.currentChatUsageRatio ?? 0);
     const sceneHeader = state.page === 'scenes' ? getSceneEventsHeader(sceneEventsState()) : undefined;
-    const pageDescription = sceneHeader?.description ?? currentPage.description;
+    const pageDescription = state.page === 'candidates' ? '对照候选内容与聊天原文' : sceneHeader?.description ?? currentPage.description;
     const pageTitle = state.page === 'initialize' ? '初始化记忆' : currentPage.label;
     const pageHeadingAction = `<div class="stx-memory-heading-actions"><button class='stx-memory-page-refresh' ${uiButton('neutral', 'sm')} type='button' data-action='refresh' ${state.busyAction ? 'disabled' : ''} aria-label='刷新当前页面'><ss-helper-icon name='rotate' decorative></ss-helper-icon>刷新</button>${state.page === 'inventory' ? `<button ${uiButton('primary', 'sm')} type="button" data-action="inventory-create-open" ${!controller.createInventoryItem || state.busyAction ? 'disabled' : ''}><ss-helper-icon name="plus-large" decorative></ss-helper-icon>新增物品</button>` : ''}</div>`;
     root.innerHTML = `<div class="stx-memory-statusbar"><div class="stx-memory-chat-identity"><span class="stx-memory-kicker">当前聊天</span><strong>${escapeHtml(chatIdentity.label)}</strong></div><div><span class="stx-memory-kicker">运行状态</span>${renderStatusChip(overview ? translateOverviewStatus(overview.status) : '读取中', statusTone)}</div><div><span class="stx-memory-kicker">记忆数量</span><strong>${overview ? formatNumber(overview.factCount) : '—'}</strong></div><div class="stx-memory-status-storage"><span class="stx-memory-kicker">本聊天记忆占用</span><strong>${escapeHtml(chatStorageLabel)}</strong><small>占角色记忆 ${escapeHtml(chatStorageRatio)}</small></div><div><span class="stx-memory-kicker">大语言模型</span>${renderStatusChip(overview ? (overview.llmAvailable ? '可用' : '不可用') : '读取中', overview?.llmAvailable ? 'success' : overview ? 'warning' : 'neutral')}</div>${renderOverviewRouteStatus('向量模型', overview?.embedding)}${renderOverviewRouteStatus('重排序模型', overview?.rerank)}${alertMarkup}</div><div class="stx-memory-workspace-layout"><nav class="stx-memory-nav" aria-label="记忆工作台页面"><span class="stx-memory-nav-label">工作区</span>${PAGES.map((page) => `<button class="stx-memory-nav-item" type="button" data-action="navigate" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}"><ss-helper-icon name="${page.icon}" decorative></ss-helper-icon><span><strong>${page.label}</strong><small>${page.description}</small></span></button>`).join('')}<div class='stx-memory-nav-meta'>记忆插件 v${escapeHtml(memoryPluginConfig.manifest.version)}</div></nav><main class="stx-memory-main"><header class="stx-memory-page-heading"><div><h2>${pageTitle}</h2><p>${escapeHtml(pageDescription)}</p></div>${pageHeadingAction}</header><section class="stx-memory-page-content" tabindex="-1">${renderPage()}</section><div class="stx-memory-internal-routes" hidden aria-hidden="true">${INTERNAL_PAGES.map((page) => `<button type="button" data-action="navigate-internal" data-page="${page.id}" aria-current="${page.id === state.page ? 'page' : 'false'}">${page.label}</button>`).join('')}</div></main></div>`;
     traceMemoryStartup('workbench:dom-rendered');
+    const nextInit = root.querySelector<HTMLElement>('.stx-memory-initialize-shell');
+    const nextCandidates = root.querySelector<HTMLElement>('.stx-memory-candidates-page');
+    if (nextCandidates && previousCandidateId === state.selectedMemoryCandidateId) {
+      for (const [key, top] of candidateScroll) {
+        if (key === 'source' && previousSourceRef !== state.selectedMemoryCandidateSourceRef) continue;
+        const node = nextCandidates.querySelector<HTMLElement>(`[data-candidate-scroll="${key}"]`);
+        if (node) node.scrollTop = top;
+      }
+      nextCandidates.querySelectorAll<HTMLDetailsElement>('details').forEach((node, index) => { node.open = candidateDetails[index] ?? false; });
+    }
+    // Polling replaces the DOM faster than a sweep completes; keep its timeline.
+    if (sweepStart != null && previousInit?.dataset.jobId === nextInit?.dataset.jobId) {
+      const sweep = nextInit?.querySelector('.stx-memory-init-progress-loop > span')?.getAnimations?.()[0];
+      if (sweep) sweep.startTime = sweepStart;
+    }
+    for (const [key, open] of initDetails) {
+      const node = nextInit?.querySelector<HTMLDetailsElement>(`[data-init-details="${key}"]`);
+      if (node) node.open = open;
+    }
+    for (const [key, top] of initScroll) {
+      const node = nextInit?.querySelector<HTMLElement>(`[data-init-scroll="${key}"]`);
+      if (node) node.scrollTop = top;
+    }
+    const nextProgress = nextInit?.querySelector<HTMLProgressElement>('progress');
+    if (previousProgress && nextProgress && previousInit?.dataset.jobId === nextInit?.dataset.jobId) {
+      const value = nextProgress.value;
+      nextProgress.replaceWith(previousProgress);
+      previousProgress.value = value;
+      previousProgress.textContent = `${value}%`;
+    }
     if (state.page === 'candidates' && popupUi && !state.pageLoading && state.overview?.bound !== false) {
       const host = root.querySelector<HTMLElement>('[data-memory-candidates-list="true"]');
       if (host) {
@@ -3239,20 +3290,29 @@ export function renderMemoryWorkbench(
           selectable: true,
           selectedKey: state.selectedMemoryCandidateId,
           onSelect: item => {
+            if (!state.memoryCandidates.some(candidate => candidate.id === item.id)) state.memoryCandidates.push(item);
             state.selectedMemoryCandidateId = item.id;
             state.selectedMemoryCandidateSourceRef = item.evidence[0]?.sourceRef ?? '';
             delete state.memoryCandidateSourcePreview;
+            delete state.memoryCandidateSourceError;
             rerender('', true);
             if (state.selectedMemoryCandidateSourceRef) void loadMemoryCandidateSource(item.id, state.selectedMemoryCandidateSourceRef);
           },
           pageSize: 50,
           overscan: 6,
-          estimatedItemHeight: 84,
+          estimatedItemHeight: 96,
+          itemGap: 6,
           emptyLabel: '没有符合筛选条件的候选',
         });
       }
     }
     popupUi?.refreshControls(root);
+    const sourcePanel = nextCandidates?.querySelector<HTMLElement>('[data-source-ready="true"]');
+    if (sourcePanel && (!previousSourceReady || previousCandidateId !== state.selectedMemoryCandidateId || previousSourceRef !== state.selectedMemoryCandidateSourceRef)) {
+      const evidence = sourcePanel.querySelector<HTMLElement>('.stx-memory-candidate-evidence-mark');
+      if (evidence) sourcePanel.scrollTop += evidence.getBoundingClientRect().top - sourcePanel.getBoundingClientRect().top - 24;
+    }
+    if (nextCandidates?.parentElement && candidatePageScrollTop !== undefined) nextCandidates.parentElement.scrollTop = candidatePageScrollTop;
     syncInventorySplitters();
     const inventoryCardPlaceholder = root.querySelector<HTMLElement>('[data-inventory-card-three-host]');
     const cardModel = inventoryCardModel as InventoryCardViewModel | undefined;
@@ -3556,7 +3616,7 @@ export function renderMemoryWorkbench(
           pageSize: 20,
           overscan: 6,
           maxCachedPages: 6,
-          itemHeight: 116,
+          estimatedItemHeight: 104,
           itemGap: 8,
           selectable: true,
           selectedKey: state.sceneCategory === 'event' ? state.selectedEpisodeId : state.sceneCategory === 'observation' ? state.selectedObservationId : state.selectedSceneId,
@@ -3878,7 +3938,9 @@ export function renderMemoryWorkbench(
       state.selectedMemoryCandidateId = candidate.id;
       state.selectedMemoryCandidateSourceRef = candidate.evidence[0]?.sourceRef ?? '';
       delete state.memoryCandidateSourcePreview;
+      delete state.memoryCandidateSourceError;
       rerender('', true);
+      void candidateListHandle?.scrollToKey(candidate.id, { align: 'center' });
       if (state.selectedMemoryCandidateSourceRef) void loadMemoryCandidateSource(candidate.id, state.selectedMemoryCandidateSourceRef);
       return;
     }
@@ -3887,6 +3949,7 @@ export function renderMemoryWorkbench(
       if (!sourceRef || !state.selectedMemoryCandidateId) return;
       state.selectedMemoryCandidateSourceRef = sourceRef;
       delete state.memoryCandidateSourcePreview;
+      delete state.memoryCandidateSourceError;
       rerender('', true);
       void loadMemoryCandidateSource(state.selectedMemoryCandidateId, sourceRef);
       return;

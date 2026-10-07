@@ -219,6 +219,20 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     state.recallRouteRelease = null;
   });
 
+  it('原文对照通过候选主键读取并唯一定位证据，不依赖 id 查询索引', async () => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const getMemoryCandidate = vi.fn(async () => ({
+      id: 'candidate:1', chatKey: 'chat-a', evidence: [{ sourceRef: 'message:12', sourceKind: 'message', floor: 12, start: 0, end: 2, text: '铜钥匙', sourceDigest: 'older' }],
+    }));
+    const repository = Object.assign(new FakeRepository(), { getMemoryCandidate });
+    const app = new MemoryApplication(repository as never);
+    connectHost(app);
+    state.sources = [{ ...message(12), floor: 12, content: '她把铜钥匙放在门旁。' }];
+    const preview = await app.getMemoryCandidateSourcePreview('candidate:1', 'message:12');
+    expect(getMemoryCandidate).toHaveBeenCalledWith('chat-a', 'candidate:1');
+    expect(preview).toMatchObject({ text: state.sources[0]!.content, sourceChanged: true, highlights: [{ start: 2, end: 5, text: '铜钥匙' }] });
+  });
+
   it('把 Capture change audit 与 repair queue 合并为安全必填读模型', async () => {
     const { MemoryApplication } = await import('../src/application/memory-application');
     const app = new MemoryApplication(new FakeRepository() as never);
@@ -1839,6 +1853,46 @@ describe('MemoryApplication 初始化范围与可取消进度', () => {
     );
 
     expect(queue[0]).toMatchObject({ status: 'ignored', attemptCount: 1, waitingForEvidenceChange: false, resolutionMode: 'ignored' });
+  });
+
+  it.each([
+    ['excerpt_mismatch', true, 'unresolved', 1],
+    ['invalid_shape', true, 'unresolved', 1],
+    ['invalid_reference', true, 'unresolved', 1],
+    ['entity_ref_unsupported', true, 'unresolved', 1],
+    ['duplicate_proposal', true, 'ignored', 0],
+    ['invalid_reference', false, 'unresolved', 0],
+    ['invalid_shape', true, 'queued', 0, false],
+  ] as const)('按实际来源分流 %s（来源存在：%s），同一证据不重复调用 AI', async (keyword, available, status, attempts, enabled: boolean = true) => {
+    const { MemoryApplication } = await import('../src/application/memory-application');
+    const app = new MemoryApplication(new FakeRepository() as never);
+    connectHost(app);
+    const queue: CaptureRepairQueueRecord[] = [{
+      id: 'repair:source-routing', workspaceId: 'character:c1', chatKey: 'chat-a', jobId: 'job:repair',
+      batchIndex: 0, collection: 'claims', itemIndex: 0,
+      issues: [{ path: 'claims[0]', keyword, expected: 'source-supported claim' }],
+      sourceRefs: [available ? 'message:1' : 'message:missing'], fallbackSourceRefs: ['message:1'],
+      rejectionId: 'rejection:routing', classification: 'unsupported_evidence',
+      status: 'queued', attemptCount: 0, maxAttempts: 1, createdAt: 1, updatedAt: 1,
+    }];
+    const repairRepository = {
+      listCaptureRepairQueue: vi.fn(async () => structuredClone(queue)),
+      updateCaptureRepairRecord: vi.fn(async (next: CaptureRepairQueueRecord) => { queue[0] = structuredClone(next); }),
+    };
+    const executeActorCapture = vi.fn(async () => ({
+      acceptedLocalIds: { actor: [], location: [], item: [], episode: [], claim: [], inventory: [] },
+      repairDecisions: [], rejections: [],
+    }));
+    const internal = app as unknown as {
+      captureVersion: number;
+      executeActorCapture: typeof executeActorCapture;
+      runDeferredCaptureRepairs(repository: typeof repairRepository, jobId: string, sources: readonly SourceBlock[], settings: typeof MEMORY_DEFAULT_SETTINGS, version: number, chatKey: string): Promise<unknown>;
+    };
+    internal.executeActorCapture = executeActorCapture;
+    for (let run = 0; run < 2; run++) await internal.runDeferredCaptureRepairs(repairRepository, 'job:repair', [{ ...message(1), floor: 1 }], { ...MEMORY_DEFAULT_SETTINGS, structuredRepairEnabled: enabled }, internal.captureVersion, 'chat-a');
+    expect(executeActorCapture).toHaveBeenCalledTimes(attempts);
+    expect(queue[0]).toMatchObject({ status, attemptCount: attempts });
+    expect(queue[0]?.waitingForEvidenceChange === true).toBe(status === 'unresolved');
   });
 
   it('隔离记录只在证据哈希变化后执行最后一次保守复核', async () => {

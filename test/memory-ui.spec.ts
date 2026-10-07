@@ -1674,7 +1674,7 @@ describe('Memory UI 展示适配', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(container.textContent).toContain('初始化当前聊天');
+    expect(container.textContent).toContain('准备初始化');
     expect(container.textContent).toContain('当前 1 个聊天楼层按每组最多 5 层形成 1 批');
     expect(container.textContent).toContain('范围选择和进度均按这些楼层批次计算');
     expect(container.querySelector('[data-source-kind]')?.getAttribute('data-ss-helper-control')).toBe('checkbox');
@@ -1885,6 +1885,33 @@ describe('Memory UI 展示适配', () => {
     dispose();
   });
 
+  it('记录超限后的失败初始化保留进度并调用断点恢复', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const retry = vi.fn(async () => undefined);
+    const initialize = vi.fn(async () => undefined);
+    const reinitialize = vi.fn(async () => undefined);
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getInitializationState: async () => ({ initialized: false, lastCompletedAt: null, selectedSourceKinds: [], attempts: [{ jobId: 'large-job', status: 'failed', updatedAt: 30, totalBatches: 16, selectedSourceKinds: ['message'] }] }),
+      getCaptureProgress: async () => ({ status: 'failed', jobId: 'large-job', batchIndex: 13, completedBatchCount: 13, totalBatches: 16, processedCount: 110, elapsedMs: 4000, failure: { reasonCode: 'WORKSPACE_RECORD_TOO_LARGE', stage: 'server.workspace.write', collection: 'capture-jobs', requestId: 'test:size' } }),
+      retry, initialize, reinitialize,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (container.querySelector('[data-page="initialize"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(container.textContent).toContain('初始化未完成');
+    expect(container.textContent).toContain('已完成批次 13 / 16');
+    expect(container.textContent).toContain('WORKSPACE_RECORD_TOO_LARGE');
+    expect(container.querySelector('[data-action="initialize-start"]')).toBeNull();
+    expect(container.querySelector<HTMLInputElement>('[data-source-kind="message"]')?.disabled).toBe(true);
+    (container.querySelector('[data-action="initialize-resume"]') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(initialize).not.toHaveBeenCalled();
+    expect(reinitialize).not.toHaveBeenCalled();
+    dispose();
+  });
+
   it('选择事实后保留 SDK 虚拟记忆列表的真实滚动位置', async () => {
     const facts: MemoryUiFact[] = Array.from({ length: 8 }, (_, index) => ({
       id: `fact-${index + 1}`,
@@ -1977,14 +2004,50 @@ describe('Memory UI 展示适配', () => {
     expect(started).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(container.textContent).toMatch(/正在提交模型请求|正在提取并写入结构化记忆/u);
+    expect(container.textContent).toMatch(/正在准备来源|正在提取记忆/u);
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(progressCalls).toBeGreaterThan(1);
-    expect(container.textContent).toContain('正在提取并写入结构化记忆');
+    expect(container.textContent).toContain('正在提取记忆');
 
     release();
     await new Promise((resolve) => setTimeout(resolve, 0));
     dispose();
+  });
+
+  it('修复进度重绘保留动画时间轴，新任务不沿用旧动画', async () => {
+    const container = document.createElement('div');
+    document.body.append(container);
+    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'getAnimations');
+    const animations = new WeakMap<Element, { startTime: number | null }>();
+    Object.defineProperty(Element.prototype, 'getAnimations', { configurable: true, value: function (this: Element) {
+      if (!animations.has(this)) animations.set(this, { startTime: null });
+      return [animations.get(this)];
+    } });
+    let jobId = 'repair-1';
+    const dispose = renderMemoryWorkbench(container, workbenchController({
+      getCaptureProgress: async () => ({ status: 'repairing', jobId, batchIndex: 16, totalBatches: 16, processedCount: 139, elapsedMs: 5000 }),
+    }));
+    const refresh = async () => {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    };
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      container.querySelector<HTMLButtonElement>('[data-page="initialize"]')!.click();
+      await new Promise(resolve => setTimeout(resolve, 30));
+      const previous = container.querySelector('.stx-memory-init-progress-loop > span')!;
+      previous.getAnimations()[0]!.startTime = 1234;
+      await refresh();
+      const next = container.querySelector('.stx-memory-init-progress-loop > span')!;
+      expect(next).not.toBe(previous);
+      expect(next.getAnimations()[0]!.startTime).toBe(1234);
+      jobId = 'repair-2';
+      await refresh();
+      expect(container.querySelector('.stx-memory-init-progress-loop > span')!.getAnimations()[0]!.startTime).toBeNull();
+    } finally {
+      dispose();
+      if (descriptor) Object.defineProperty(Element.prototype, 'getAnimations', descriptor);
+      else Reflect.deleteProperty(Element.prototype, 'getAnimations');
+    }
   });
 
   it('隐藏楼层选项同步刷新来源与估算，并按当前选择提交初始化', async () => {
@@ -2011,9 +2074,16 @@ describe('Memory UI 展示适配', () => {
 
     const hiddenOption = container.querySelector<HTMLInputElement>('[data-option="include-hidden-message-floors"]')!;
     expect(hiddenOption.checked).toBe(true);
+    expect(hiddenOption.closest('.stx-memory-init-source-card')?.querySelector('[data-source-kind="message"]')).not.toBeNull();
+    expect(hiddenOption.closest('label')?.querySelectorAll('input')).toHaveLength(1);
+    container.querySelector<HTMLDetailsElement>('[data-init-details="estimate"]')!.open = true;
+    container.querySelector<HTMLElement>('[data-init-scroll="configuration"]')!.scrollTop = 70;
     hiddenOption.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(container.querySelector('.stx-memory-init-source-count')?.textContent).toContain('78 / 119');
+    expect(container.querySelector('.stx-memory-init-source-copy')?.textContent).toContain('78 条 · 已排除 41 项');
+    expect(container.querySelector<HTMLInputElement>('[data-source-kind="message"]')?.checked).toBe(true);
+    expect(container.querySelector<HTMLDetailsElement>('[data-init-details="estimate"]')!.open).toBe(true);
+    expect(container.querySelector<HTMLElement>('[data-init-scroll="configuration"]')!.scrollTop).toBe(70);
     expect(sourceOptions.at(-1)).toBe(false);
     expect(estimateOptions.at(-1)).toBe(false);
 

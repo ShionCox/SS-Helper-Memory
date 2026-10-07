@@ -27,6 +27,7 @@ import {
   GenerationPromptSnapshotPayload,
   ManualFactInput,
   MemoryEvidence,
+  MemoryCandidateRecord,
   MemoryFact,
   MemoryFactVector,
   MemoryFactVectorCoverage,
@@ -202,6 +203,7 @@ function evidenceId(factId: string, sourceRef: string, excerpt: string): string 
 /** Memory 的唯一仓储。领域逻辑留在 Memory，持久化只使用 SDK 通用 WorkspacePort。 */
 export class MemoryRepository {
   private healthSnapshot: MemoryWorkspaceHealth | null = null;
+  private healthRefresh?: { key: string; promise: Promise<MemoryWorkspaceHealth> };
   private workspaceId = '';
   private sourceChatKey = '';
 
@@ -353,6 +355,15 @@ export class MemoryRepository {
   }
 
   async refreshHealth(_chatKey?: string): Promise<MemoryWorkspaceHealth> {
+    const key = JSON.stringify([this.workspaceId, _chatKey?.trim() || this.sourceChatKey]);
+    if (this.healthRefresh?.key === key) return this.healthRefresh.promise;
+    const promise = this.refreshHealthOnce(_chatKey);
+    this.healthRefresh = { key, promise };
+    try { return await promise; }
+    finally { if (this.healthRefresh?.promise === promise) this.healthRefresh = undefined; }
+  }
+
+  private async refreshHealthOnce(_chatKey?: string): Promise<MemoryWorkspaceHealth> {
     const finish = startMemoryPerformanceSpan('repository.health.detailed');
     traceMemoryStartup('repository:health-begin');
     const health = await this.store.health();
@@ -561,6 +572,14 @@ export class MemoryRepository {
     const result = await this.store.read({ workspaceId: this.requireWorkspaceId(), collection: 'facts', recordId: id });
     const fact = result?.value as MemoryFact | undefined;
     return factBelongsToChat(fact, chatKey) ? fact : undefined;
+  }
+
+  async getMemoryCandidate(chatKey: string, id: string): Promise<MemoryCandidateRecord | undefined> {
+    chatKey = this.requireChatKey(chatKey);
+    const workspaceId = this.requireWorkspaceId();
+    const record = await this.store.read({ workspaceId, collection: 'memory-candidates', recordId: id });
+    const candidate = record?.value as unknown as MemoryCandidateRecord | undefined;
+    return candidate?.chatKey === chatKey && candidate.workspaceId === workspaceId ? candidate : undefined;
   }
 
   async upsertManualFact(chatKey: string, input: ManualFactInput): Promise<MemoryFact> {

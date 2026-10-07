@@ -132,7 +132,7 @@ export class MemoryLlmCapabilityMonitor {
       return { blocked: { title: '无法启用 Agent 模式', message: 'Agent 模式的基础工具调用是硬要求，请先将“只读工具”设为“按需使用”。', code: 'LLM_TOOL_CAPABILITY_UNVERIFIED' }, warnings: [] };
     }
     if (enablingAgent && !this.availability.agentRoutes) {
-      return { blocked: { title: '无法启用 Agent 模式', message: '三个工具提取场景尚未全部绑定可用资源，请先在 Memory 的模型路由中完成配置。', code: 'MEMORY_AGENT_ROUTE_UNAVAILABLE' }, warnings: [] };
+      return { blocked: { title: '无法启用 Agent 模式', message: '实体与内容提取尚未全部绑定可用资源，请先在 Memory 的模型路由中完成配置。', code: 'MEMORY_AGENT_ROUTE_UNAVAILABLE' }, warnings: [] };
     }
     if (enablingAgent && !this.availability.agentToolsVerified) {
       return { blocked: { title: '无法启用 Agent 模式', message: '当前选择的一个或多个大语言模型不支持 Agent 模式或尚未通过工具调用验证。', code: 'LLM_TOOL_CAPABILITY_UNVERIFIED' }, warnings: [] };
